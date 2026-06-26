@@ -1,0 +1,38 @@
+[package]
+name = "lsc"
+description = "Limx Shader Compiler - Vulkan SPIR-V 着色器编译工具"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lsc"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+toml.workspace = true
+serde.workspace = true
+walkdir.workspace = true
+glob.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+rayon.workspace = true
+# SPIR-V 编译
+shaderc = "0.8"
+# 文件监控
+notify = "6.1"
+# 哈希计算
+sha2 = "0.10"
+hex = "0.4"
+# JSON
+serde_json = "1.0"
+# 进度条
+indicatif = "0.17"
+console = "0.15"
+# 目录操作
+dirs = "5.0"

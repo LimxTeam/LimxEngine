@@ -1,0 +1,32 @@
+[module]
+name = "LimxLaunch"
+type = "executable"
+namespace = "Limx"
+api_macro = ""
+layer = 4
+description = "引擎启动入口 — 创建窗口、初始化渲染上下文、运行主循环，验证从窗口创建到画面呈现的完整渲染管线"
+
+[dependencies]
+public = ["LimxCore", "LimxRHI", "LimxApplicationCore", "LimxRenderCore", "LimxObject", "LimxEngine", "LimxRenderer"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude = ["*.generated.*"]
+
+[compile]
+defines = []
+features = []
+flags = []
+include_paths = []
+library_paths = []
+libraries = ["user32", "gdi32", "bcrypt"]
+
+[precompiled_header]
+enabled = true
+header = "Launch/LaunchMinimal.h"
+
+[reflection]
+enabled = false
+macros = []

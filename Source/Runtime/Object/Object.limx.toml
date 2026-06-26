@@ -1,0 +1,32 @@
+[module]
+name        = "LimxObject"
+type        = "static"
+namespace   = "Limx"
+api_macro   = "LIMX_OBJECT_API"
+layer       = 3
+description = "Limx 对象系统 — LObject/LType/LRegistry + LOBJECT_BODY/IMPLEMENT_LTYPE 宏系统"
+
+[dependencies]
+public  = ["LimxCore"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = ["LIMX_OBJECT_EXPORTS"]
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = []
+
+[precompiled_header]
+enabled = true
+header  = "Object/ObjectMinimal.h"
+
+[reflection]
+enabled = true
+macros  = ["LCLASS", "LSTRUCT", "LENUM", "LPROPERTY", "LFUNCTION"]

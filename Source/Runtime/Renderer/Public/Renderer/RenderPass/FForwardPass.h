@@ -1,0 +1,147 @@
+// ============================================================
+// 文件名称：FForwardPass.h
+// 创建时间：2026-04-07
+// 创建者  ：LimxTeam
+// 设计哲学：Pass 封装 — 将现有 FRenderer::RecordCommands() 中的前向渲染
+//          逻辑提取为独立 Pass 对象，实现渲染逻辑与帧管理的彻底解耦。
+//          FForwardPass 管理自己的 RenderPass/Framebuffer/Pipeline，
+//          通过 FRenderPassContext 接收场景数据。
+// 功能描述：前向渲染 Pass — 负责最终颜色输出的渲染通道。
+//          使用 triangle.vert/frag 着色器，颜色附件写入交换链图像，
+//          深度测试使用 Equal 比较 (配合 FDepthPrePass 的 Early-Z 优化),
+//          禁止深度写入以避免干扰深度预 Pass 写入的精确深度值。
+// 技术特性：每个交换链图像一个 Framebuffer (颜色 + 共享深度);
+//          管线布局和 set 0 描述符集由 FRenderPassContext 传入;
+//          Execute 等价于现有 FRenderer::RecordCommands() 逻辑;
+//          支持交换链重建时的 OnResize 资源重建。
+//
+// ── 函数/方法表 ──────────────────────────────────────────────
+// │ 函数名                    │ 描述                           │
+// │──────────────────────────│───────────────────────────────│
+// │ GetName()                │ 返回 "ForwardPass"             │
+// │ GetOrder()               │ 返回 200 (在 DepthPrePass 之后) │
+// │ Setup()                  │ 创建 RenderPass/Framebuffer/管线 │
+// │ Execute()                │ 录制前向渲染命令                 │
+// │ OnResize()               │ 重建 Framebuffer                │
+// │ Shutdown()               │ 释放所有 GPU 资源               │
+//
+// ── 结构体字段表 ──────────────────────────────────────────────
+// │ 字段名                    │ 类型                           │ 描述          │
+// │──────────────────────────│──────────────────────────────│──────────────│
+// │ m_RenderPass             │ FRHIRenderPassHandle          │ 颜色+深度渲染通道│
+// │ m_Framebuffers           │ TArray<FRHIFramebufferHandle> │ 每图像一个帧缓冲 │
+// │ m_VertShader             │ FRHIShaderHandle              │ 顶点着色器      │
+// │ m_FragShader             │ FRHIShaderHandle              │ 片段着色器      │
+// │ m_GraphicsPipeline       │ FRHIGraphicsPipelineHandle    │ 图形管线        │
+// │ m_PipelineLayout         │ FRHIPipelineLayoutHandle      │ 管线布局 (外部)  │
+// │ m_SwapchainFormat        │ EPixelFormat                  │ 颜色附件格式    │
+// │ m_SwapchainExtent        │ FRHIExtent2D                  │ 当前交换链尺寸   │
+//
+// ── 更新历史 ──────────────────────────────────────────────────
+// │ 日期         │ 作者       │ 描述                           │
+// │─────────────│──────────│───────────────────────────────│
+// │ 2026-04-07  │ LimxTeam  │ 初始创建 (M0.5 Pass 抽象层)     │
+// ============================================================
+
+#pragma once
+
+#include "Renderer/RenderPass/IRenderPass.h"
+
+namespace Limx
+{
+
+// ============================================================================
+// FForwardPass — 前向渲染通道 (颜色输出 + 共享深度 Equal 测试)
+// ============================================================================
+
+class FForwardPass final : public IRenderPass
+{
+public:
+    FForwardPass() = default;
+    ~FForwardPass() override = default;
+
+    // ====================================================================
+    // IRenderPass 接口实现
+    // ====================================================================
+
+    LIMX_NODISCARD const AnsiChar* GetName() const override
+    {
+        return "ForwardPass";
+    }
+
+    LIMX_NODISCARD UInt32 GetOrder() const override
+    {
+        return 200;
+    }
+
+    ERHIResult Setup(const FPassSetupDesc& desc) override;
+
+    void Execute(IRHICommandBuffer*       commandBuffer,
+                 const FRenderPassContext& context) override;
+
+    ERHIResult OnResize(IRHIDevice*           device,
+                        FRHISwapchainHandle   swapchain,
+                        FRHIExtent2D          newExtent,
+                        UInt32                swapchainImageCount,
+                        FRHITextureHandle     newSharedDepth,
+                        FRHITextureViewHandle newSharedDepthView) override;
+
+    void ReleaseSwapchainResources(IRHIDevice* device) override;
+
+    void Shutdown(IRHIDevice* device) override;
+
+private:
+    // ====================================================================
+    // 内部构建方法
+    // ====================================================================
+
+    /// 创建颜色+深度渲染通道
+    ERHIResult CreateRenderPass(IRHIDevice* device, EPixelFormat swapchainFormat);
+
+    /// 创建每个交换链图像的 Framebuffer (颜色=交换链视图, 深度=共享深度视图)
+    ERHIResult CreateFramebuffers(IRHIDevice*           device,
+                                   FRHISwapchainHandle   swapchain,
+                                   FRHIExtent2D          extent,
+                                   UInt32                imageCount,
+                                   FRHITextureViewHandle sharedDepthView);
+
+    /// 销毁所有 Framebuffer
+    void DestroyFramebuffers(IRHIDevice* device);
+
+    /// 创建着色器模块 (triangle.vert / triangle.frag)
+    ERHIResult CreateShaders(IRHIDevice* device);
+
+    /// 创建图形管线 (DepthCompareOp::Equal, 禁止深度写入)
+    ERHIResult CreateGraphicsPipeline(IRHIDevice* device);
+
+    /// 销毁图形管线和着色器
+    void DestroyPipelineResources(IRHIDevice* device);
+
+    // ====================================================================
+    // 成员
+    // ====================================================================
+
+    /// 颜色 + 深度渲染通道
+    FRHIRenderPassHandle              m_RenderPass;
+
+    /// 每个交换链图像一个 Framebuffer [颜色, 深度]
+    TArray<FRHIFramebufferHandle>     m_Framebuffers;
+
+    /// 顶点/片段着色器模块 (triangle.vert / triangle.frag)
+    FRHIShaderHandle                  m_VertShader;
+    FRHIShaderHandle                  m_FragShader;
+
+    /// 图形管线 (Equal 深度测试, 无深度写入)
+    FRHIGraphicsPipelineHandle        m_GraphicsPipeline;
+
+    /// 管线布局 (由外部 FPassSetupDesc 传入, 不拥有)
+    FRHIPipelineLayoutHandle          m_PipelineLayout;
+
+    /// 交换链格式缓存 (OnResize 时重建 RenderPass 需要)
+    EPixelFormat                      m_SwapchainFormat = EPixelFormat::Unknown;
+
+    /// 当前交换链尺寸缓存
+    FRHIExtent2D                      m_SwapchainExtent = {};
+};
+
+} // namespace Limx

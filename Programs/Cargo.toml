@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "lbt",
+    "lht",
+    "lsc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["LimxTeam"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+# TOML 解析
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+# 文件系统
+walkdir = "2.4"
+glob = "0.3"
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+# 正则表达式
+regex = "1.10"
+# 并行处理
+rayon = "1.8"
+# UUID 生成
+uuid = { version = "1.6", features = ["v4"] }

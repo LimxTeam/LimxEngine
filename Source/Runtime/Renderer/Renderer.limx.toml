@@ -1,0 +1,32 @@
+[module]
+name = "LimxRenderer"
+type = "static"
+namespace = "Limx"
+api_macro = "LIMX_RENDERER_API"
+layer = 3
+description = "渲染器模块 — FRenderer 主入口 + Pass 系统 (IRenderPass/FPassManager/DepthPre/Forward)，编排渲染流程"
+
+[dependencies]
+public = ["LimxCore", "LimxRHI", "LimxApplicationCore", "LimxRenderCore"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude = ["*.generated.*"]
+
+[compile]
+defines = ["LIMX_RENDERER_EXPORTS"]
+features = []
+flags = []
+include_paths = []
+library_paths = []
+libraries = []
+
+[precompiled_header]
+enabled = true
+header = "Renderer/RendererMinimal.h"
+
+[reflection]
+enabled = true
+macros = ["LCLASS", "LSTRUCT", "LENUM", "LPROPERTY", "LFUNCTION"]

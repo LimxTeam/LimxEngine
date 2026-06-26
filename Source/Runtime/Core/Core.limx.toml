@@ -1,0 +1,32 @@
+[module]
+name = "LimxCore"
+type = "static"
+namespace = "Limx"
+api_macro = "LIMX_CORE_API"
+layer = 1
+description = "引擎核心基础设施 — 类型系统、宏定义、类型特征、反射宏"
+
+[dependencies]
+public = []
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude = ["*.generated.*"]
+
+[compile]
+defines = ["LIMX_CORE_EXPORTS"]
+features = []
+flags = []
+include_paths = []
+library_paths = []
+libraries = []
+
+[precompiled_header]
+enabled = true
+header = "Core/CoreMinimal.h"
+
+[reflection]
+enabled = true
+macros = ["LCLASS", "LSTRUCT", "LENUM", "LPROPERTY", "LFUNCTION"]

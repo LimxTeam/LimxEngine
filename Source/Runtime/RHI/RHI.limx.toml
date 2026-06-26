@@ -1,0 +1,32 @@
+[module]
+name = "LimxRHI"
+type = "static"
+namespace = "Limx"
+api_macro = "LIMX_RHI_API"
+layer = 2
+description = "渲染硬件接口 — Vulkan RHI 抽象层，提供跨后端的 GPU 资源管理与命令录制抽象"
+
+[dependencies]
+public = ["LimxCore"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude = ["*.generated.*"]
+
+[compile]
+defines = ["LIMX_RHI_EXPORTS"]
+features = []
+flags = []
+include_paths = ["${VULKAN_SDK}/Include"]
+library_paths = ["${VULKAN_SDK}/Lib"]
+libraries = ["vulkan-1"]
+
+[precompiled_header]
+enabled = true
+header = "RHI/RHIMinimal.h"
+
+[reflection]
+enabled = true
+macros = ["LCLASS", "LSTRUCT", "LENUM", "LPROPERTY", "LFUNCTION"]

@@ -1,0 +1,32 @@
+[module]
+name        = "LimxApplicationCore"
+type        = "static"
+namespace   = "Limx"
+api_macro   = "LIMX_APPLICATIONCORE_API"
+layer       = 2
+description = "应用核心模块 — Win32 窗口管理和输入状态管理，提供平台原生窗口创建/销毁/消息泵和轮询式键盘鼠标输入"
+
+[dependencies]
+public  = ["LimxCore", "LimxRHI"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = ["LIMX_APPLICATIONCORE_EXPORTS"]
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = ["user32", "gdi32"]
+
+[precompiled_header]
+enabled = true
+header  = "ApplicationCore/ApplicationCoreMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []

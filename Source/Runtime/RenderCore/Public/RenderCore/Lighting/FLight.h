@@ -1,0 +1,321 @@
+// ============================================================
+// 文件名称：FLight.h
+// 创建时间：2026-04-07
+// 创建者  ：LimxTeam
+// 设计哲学：数据驱动光源 — 光源对象仅持有 CPU 侧属性参数，
+//          GPU 端数据通过 FLightManager 批量打包上传，
+//          实现 CPU/GPU 数据解耦。光源类型通过枚举区分，
+//          避免虚函数开销，利于 SOA 打包。
+// 功能描述：光源系统核心类型定义 — ELightType 光源类型枚举、
+//          FLightData GPU 端光源数据 (std140 对齐)、
+//          FLightingUBO 场景级光照 UBO 数据布局、
+//          FLight CPU 侧光源对象 (类型+变换+光照属性)。
+// 技术特性：FLightData 按 std140 规则对齐 (16 字节边界)，
+//          单光源 80 字节；FLightingUBO 包含最多 16 盏光源
+//          + 全局光照参数，总计 1344 字节；
+//          FLight 提供便捷工厂创建方向光/点光/聚光灯。
+//
+// ── 枚举表 ──────────────────────────────────────────────────
+// │ 枚举名                     │ 描述                          │
+// │───────────────────────────│──────────────────────────────│
+// │ ELightType                │ 光源类型 (方向光/点光/聚光灯)    │
+//
+// ── 结构体/类表 ──────────────────────────────────────────────
+// │ 名称                       │ 描述                          │
+// │───────────────────────────│──────────────────────────────│
+// │ FLightData                │ 单光源 GPU 数据 (std140, 80B)  │
+// │ FLightingUBO              │ 场景光照 UBO (std140, 1344B)   │
+// │ FLight                    │ CPU 侧光源对象                 │
+//
+// ── 函数/方法表 ──────────────────────────────────────────────
+// │ 函数名                      │ 描述                          │
+// │────────────────────────────│──────────────────────────────│
+// │ FLight::CreateDirectional()│ 创建方向光                     │
+// │ FLight::CreatePoint()      │ 创建点光源                     │
+// │ FLight::CreateSpot()       │ 创建聚光灯                     │
+// │ FLight::ToGpuData()        │ 转换为 GPU 数据                │
+// │ FLight::SetDirection()     │ 设置光源方向                   │
+// │ FLight::SetPosition()      │ 设置光源位置                   │
+// │ FLight::SetColor()         │ 设置光源颜色                   │
+// │ FLight::SetIntensity()     │ 设置光源强度                   │
+// │ FLight::SetRange()         │ 设置衰减距离                   │
+// │ FLight::SetSpotAngles()    │ 设置聚光灯内外锥角              │
+// │ FLight::SetEnabled()       │ 设置启用/禁用                  │
+//
+// ── 更新历史 ──────────────────────────────────────────────────
+// │ 日期         │ 作者       │ 描述                          │
+// │─────────────│──────────│──────────────────────────────│
+// │ 2026-04-07  │ LimxTeam  │ 初始创建 (M0.5 光照系统)       │
+// ============================================================
+
+#pragma once
+
+#include "RenderCore/RenderCoreMinimal.h"
+
+namespace Limx
+{
+
+// ============================================================================
+// ELightType — 光源类型
+// ============================================================================
+
+enum class ELightType : UInt32
+{
+    Directional = 0,   // 方向光 (平行光，无位置，无衰减)
+    Point       = 1,   // 点光源 (全向，有位置，距离衰减)
+    Spot        = 2,   // 聚光灯 (锥形，有位置+方向，距离+角度衰减)
+
+    Count       = 3
+};
+
+// ============================================================================
+// kMaxLightCount — 场景最大光源数量
+// ============================================================================
+
+static constexpr UInt32 kMaxLightCount = 16;
+
+// ============================================================================
+// FLightData — 单光源 GPU 数据 (std140 对齐, 80 字节)
+//
+// std140 布局规则:
+//   vec4 → 16 字节对齐
+//   float → 4 字节对齐，但在 vec4 之后自然对齐
+//   整体结构体按 16 字节倍数填充
+//
+// 内存布局:
+//   偏移 0:  PositionAndType  (vec4) — xyz=位置, w=类型(float cast)
+//   偏移 16: DirectionAndRange (vec4) — xyz=方向, w=衰减距离
+//   偏移 32: ColorAndIntensity (vec4) — xyz=颜色, w=强度
+//   偏移 48: AttenuationParams (vec4) — x=常量衰减, y=线性衰减, z=二次衰减, w=保留
+//   偏移 64: SpotParams        (vec4) — x=内锥角余弦, y=外锥角余弦, z=保留, w=保留
+//   总计: 80 字节 (5 × vec4)
+// ============================================================================
+
+struct FLightData
+{
+    // vec4: xyz=世界空间位置 (方向光忽略), w=光源类型 (float cast of ELightType)
+    Float32 PositionX    = 0.0f;
+    Float32 PositionY    = 0.0f;
+    Float32 PositionZ    = 0.0f;
+    Float32 Type         = 0.0f;
+
+    // vec4: xyz=世界空间方向 (归一化, 点光源忽略), w=最大衰减距离
+    Float32 DirectionX   = 0.0f;
+    Float32 DirectionY   = -1.0f;
+    Float32 DirectionZ   = 0.0f;
+    Float32 Range        = 10.0f;
+
+    // vec4: xyz=光源颜色 (线性空间 RGB), w=光源强度乘数
+    Float32 ColorR       = 1.0f;
+    Float32 ColorG       = 1.0f;
+    Float32 ColorB       = 1.0f;
+    Float32 Intensity    = 1.0f;
+
+    // vec4: 衰减参数 — x=常量, y=线性, z=二次, w=保留 (pad)
+    Float32 AttConstant  = 1.0f;
+    Float32 AttLinear    = 0.09f;
+    Float32 AttQuadratic = 0.032f;
+    Float32 AttPad       = 0.0f;
+
+    // vec4: 聚光灯参数 — x=内锥角余弦, y=外锥角余弦, z=保留, w=保留
+    Float32 SpotInnerCos = 0.9763f;   // cos(12.5°) // NOLINT
+    Float32 SpotOuterCos = 0.9659f;   // cos(15°)   // NOLINT
+    Float32 SpotPad0     = 0.0f;
+    Float32 SpotPad1     = 0.0f;
+};
+
+// 编译时验证 FLightData 大小 (std140 要求 16 字节倍数)
+static_assert(sizeof(FLightData) == 80,
+    "FLightData 必须为 80 字节 (5 × vec4, std140 对齐)");
+
+// ============================================================================
+// FLightingUBO — 场景级光照 Uniform Buffer (std140, set 2, binding 0)
+//
+// 内存布局:
+//   偏移 0:      Lights[16]     — 16 × FLightData = 1280 字节
+//   偏移 1280:   LightCount     (vec4 的 .x) — 活跃光源数量
+//   偏移 1296:   CameraPosition (vec4 的 .xyz) — 相机世界空间位置
+//   偏移 1312:   AmbientColor   (vec4 的 .xyz) — 环境光颜色
+//   偏移 1328:   AmbientIntensity (同上 vec4 的 .w) — 环境光强度
+//   总计: 1344 字节 (偏移 1328 + 16 = 1344, 对齐到 16 字节)
+// ============================================================================
+
+struct FLightingUBO
+{
+    // 光源数据数组 (固定 16 盏，实际使用 LightCount 盏)
+    FLightData Lights[kMaxLightCount];
+
+    // vec4: x=活跃光源数量 (uint→float), y/z/w=保留
+    Float32 LightCount     = 0.0f;
+    Float32 LightCountPad0 = 0.0f;
+    Float32 LightCountPad1 = 0.0f;
+    Float32 LightCountPad2 = 0.0f;
+
+    // vec4: xyz=相机世界空间位置, w=保留
+    Float32 CameraPositionX = 0.0f;
+    Float32 CameraPositionY = 0.0f;
+    Float32 CameraPositionZ = 0.0f;
+    Float32 CameraPositionW = 0.0f;
+
+    // vec4: xyz=环境光颜色 (线性 RGB), w=环境光强度
+    Float32 AmbientColorR    = 0.03f;
+    Float32 AmbientColorG    = 0.03f;
+    Float32 AmbientColorB    = 0.03f;
+    Float32 AmbientIntensity = 1.0f;
+};
+
+// 编译时验证 FLightingUBO 大小
+// 16 × 80 + 3 × 16 = 1280 + 48 = 1328 字节
+// 但 std140 要求数组元素对齐到 16 字节，结构体尾部也需 16 字节对齐
+// 1328 字节已是 16 的倍数
+static_assert(sizeof(FLightingUBO) == 1328,
+    "FLightingUBO 必须为 1328 字节 (std140 对齐)");
+
+// ============================================================================
+// FLight — CPU 侧光源对象
+// ============================================================================
+
+class FLight
+{
+public:
+    LIMX_NON_COPYABLE(FLight);
+
+    FLight();
+    ~FLight() = default;
+
+    // 允许移动
+    FLight(FLight&& other) noexcept;
+    FLight& operator=(FLight&& other) noexcept;
+
+    // ====================================================================
+    // 便捷工厂
+    // ====================================================================
+
+    /// 创建方向光
+    /// @param direction  光照方向 (从光源射出的方向，将被归一化)
+    /// @param color      光源颜色 (线性 RGB)
+    /// @param intensity  光源强度
+    static FLight CreateDirectional(
+        const FVector3& direction,
+        const FLinearColor& color,
+        Float32 intensity);
+
+    /// 创建点光源
+    /// @param position   世界空间位置
+    /// @param color      光源颜色 (线性 RGB)
+    /// @param intensity  光源强度
+    /// @param range      最大衰减距离
+    static FLight CreatePoint(
+        const FVector3& position,
+        const FLinearColor& color,
+        Float32 intensity,
+        Float32 range = 10.0f);
+
+    /// 创建聚光灯
+    /// @param position       世界空间位置
+    /// @param direction      光照方向 (将被归一化)
+    /// @param color          光源颜色 (线性 RGB)
+    /// @param intensity      光源强度
+    /// @param innerAngleDeg  内锥角 (度, 全亮区域)
+    /// @param outerAngleDeg  外锥角 (度, 衰减边界)
+    /// @param range          最大衰减距离
+    static FLight CreateSpot(
+        const FVector3& position,
+        const FVector3& direction,
+        const FLinearColor& color,
+        Float32 intensity,
+        Float32 innerAngleDeg = 12.5f,
+        Float32 outerAngleDeg = 17.5f,
+        Float32 range = 10.0f);
+
+    // ====================================================================
+    // GPU 数据转换
+    // ====================================================================
+
+    /// 将当前光源状态转换为 GPU 数据 (FLightData)
+    LIMX_NODISCARD FLightData ToGpuData() const;
+
+    // ====================================================================
+    // 属性访问器
+    // ====================================================================
+
+    LIMX_NODISCARD ELightType GetType() const { return m_Type; }
+
+    LIMX_NODISCARD const FVector3& GetPosition() const { return m_Position; }
+    void SetPosition(const FVector3& position) { m_Position = position; }
+
+    LIMX_NODISCARD const FVector3& GetDirection() const { return m_Direction; }
+    /// 设置光照方向 (将被归一化)
+    void SetDirection(const FVector3& direction);
+
+    LIMX_NODISCARD const FLinearColor& GetColor() const { return m_Color; }
+    void SetColor(const FLinearColor& color) { m_Color = color; }
+
+    LIMX_NODISCARD Float32 GetIntensity() const { return m_Intensity; }
+    void SetIntensity(Float32 intensity) { m_Intensity = intensity; }
+
+    LIMX_NODISCARD Float32 GetRange() const { return m_Range; }
+    void SetRange(Float32 range) { m_Range = FMath::Max(range, 0.001f); }
+
+    LIMX_NODISCARD Float32 GetAttConstant() const { return m_AttConstant; }
+    LIMX_NODISCARD Float32 GetAttLinear() const { return m_AttLinear; }
+    LIMX_NODISCARD Float32 GetAttQuadratic() const { return m_AttQuadratic; }
+
+    /// 设置衰减参数 (常量/线性/二次)
+    void SetAttenuation(Float32 constant, Float32 linear, Float32 quadratic);
+
+    LIMX_NODISCARD Float32 GetSpotInnerAngle() const { return m_SpotInnerAngleDeg; }
+    LIMX_NODISCARD Float32 GetSpotOuterAngle() const { return m_SpotOuterAngleDeg; }
+
+    /// 设置聚光灯内外锥角 (度)
+    /// @param innerDeg  内锥角 (度, 全亮区域)
+    /// @param outerDeg  外锥角 (度, 衰减边界, 必须 >= 内锥角)
+    void SetSpotAngles(Float32 innerDeg, Float32 outerDeg);
+
+    LIMX_NODISCARD bool IsEnabled() const { return m_IsEnabled; }
+    void SetEnabled(bool isEnabled) { m_IsEnabled = isEnabled; }
+
+    LIMX_NODISCARD const AnsiChar* GetDebugName() const { return m_DebugName; }
+    void SetDebugName(const AnsiChar* name) { m_DebugName = name; }
+
+private:
+    // ====================================================================
+    // 成员
+    // ====================================================================
+
+    ELightType   m_Type               = ELightType::Directional;
+
+    /// 世界空间位置 (方向光忽略)
+    FVector3     m_Position           = FVector3(0.0f, 0.0f, 0.0f);
+
+    /// 光照方向 (归一化, 点光源忽略)
+    FVector3     m_Direction          = FVector3(0.0f, -1.0f, 0.0f);
+
+    /// 光源颜色 (线性 RGB)
+    FLinearColor m_Color              = FLinearColor(1.0f, 1.0f, 1.0f, 1.0f);
+
+    /// 光源强度乘数
+    Float32      m_Intensity          = 1.0f;
+
+    /// 最大衰减距离 (方向光忽略)
+    Float32      m_Range              = 10.0f;
+
+    /// 衰减参数: 1 / (c + l*d + q*d²)
+    Float32      m_AttConstant        = 1.0f;
+    Float32      m_AttLinear          = 0.09f;
+    Float32      m_AttQuadratic       = 0.032f;
+
+    /// 聚光灯内锥角 (度)
+    Float32      m_SpotInnerAngleDeg  = 12.5f;
+
+    /// 聚光灯外锥角 (度)
+    Float32      m_SpotOuterAngleDeg  = 17.5f;
+
+    /// 是否启用
+    bool         m_IsEnabled          = true;
+
+    /// 调试名称 (非拥有指针，不管理生命周期)
+    const AnsiChar* m_DebugName       = "UnnamedLight";
+};
+
+} // namespace Limx

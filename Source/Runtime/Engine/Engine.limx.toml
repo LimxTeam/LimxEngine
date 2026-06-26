@@ -1,0 +1,32 @@
+[module]
+name        = "LimxEngine"
+type        = "static"
+namespace   = "Limx"
+api_macro   = "LIMX_ENGINE_API"
+layer       = 4
+description = "Limx 引擎层 — LNode/LTrait/LSpatialTrait/LScene/LSystem + 渲染桥接 (LMeshTrait/LLightTrait/LCameraTrait/FSceneManager)"
+
+[dependencies]
+public  = ["LimxCore", "LimxObject", "LimxRHI", "LimxApplicationCore", "LimxRenderCore", "LimxRenderer"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = ["LIMX_ENGINE_EXPORTS"]
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = []
+
+[precompiled_header]
+enabled = true
+header  = "Engine/EngineMinimal.h"
+
+[reflection]
+enabled = true
+macros  = ["LCLASS", "LSTRUCT", "LENUM", "LPROPERTY", "LFUNCTION"]
