@@ -32,4 +32,16 @@ static_assert(sizeof(EObjectFlags) == 4,
 static_assert(sizeof(LObject) >= 28,
               "LObject 尺寸不符合预期，请检查成员布局");
 
+// ============================================================================
+// API 宏展开校验
+//
+// 本模块是静态库, API 宏必须展开为空。若 API 头里 _EXPORTS 的判断排在
+// _STATIC 之前 (LBT 对静态库两个宏都定义), 宏会展开为 __declspec(dllexport),
+// 使含模板成员的导出类触发 C4251 并在 /WX 下变成编译错误。
+// 把这一点固化为编译期断言, 让顺序退化在构建阶段就被拦下。
+// ============================================================================
+
+static_assert(sizeof(LIMX_STRINGIFY(LIMX_OBJECT_API)) == 1,
+              "LIMX_OBJECT_API 应展开为空 — 检查该模块 API 头中 _STATIC 与 _EXPORTS 的判断顺序");
+
 } // namespace Limx

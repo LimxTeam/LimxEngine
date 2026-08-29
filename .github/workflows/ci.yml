@@ -1,0 +1,169 @@
+# ============================================================
+# Limx Engine 持续集成
+#
+# 三个作业:
+#   toolchain — Rust 工具链 (lbt/lht/lsc) 的检查、测试与构建
+#   engine    — C++ 引擎全量构建 + 单元测试 + 源码规则检查
+#   shaders   — 着色器编译与 SPIR-V 校验
+#
+# 说明: 本仓库当前没有配置 git remote, 该工作流尚未在真实
+#       GitHub Actions 环境中运行验证过。首次推送后需检查
+#       Vulkan SDK 安装步骤与运行器镜像的兼容性。
+#       本地等价验证请使用 Scripts/verify.ps1。
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  VULKAN_SDK_VERSION: "1.4.350.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ----------------------------------------------------------
+  # Rust 工具链 — 不依赖 Vulkan, 可独立快速反馈
+  # ----------------------------------------------------------
+  toolchain:
+    name: Rust 工具链
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Programs/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Programs/Cargo.lock') }}
+
+      # lsc 依赖 shaderc-sys, 需要 Vulkan SDK 提供的 glslang
+      - name: 安装 Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
+
+      - name: 检查
+        working-directory: Programs
+        run: cargo check --workspace --all-targets
+
+      - name: 测试
+        working-directory: Programs
+        run: cargo test --workspace
+
+      - name: 构建发布版
+        working-directory: Programs
+        run: cargo build --workspace --release
+
+      - name: 上传工具链
+        uses: actions/upload-artifact@v4
+        with:
+          name: limx-toolchain
+          path: |
+            Programs/target/release/lbt.exe
+            Programs/target/release/lht.exe
+            Programs/target/release/lsc.exe
+
+  # ----------------------------------------------------------
+  # C++ 引擎 — 全量构建 + 单元测试
+  # ----------------------------------------------------------
+  engine:
+    name: 引擎构建与测试
+    runs-on: windows-2022
+    needs: toolchain
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
+
+      - name: 配置 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 下载工具链
+        uses: actions/download-artifact@v4
+        with:
+          name: limx-toolchain
+          path: Binaries/Tools
+
+      # 零 STL / 零 CRT / 无裸 new-delete 等强制规则
+      - name: 源码规则检查
+        run: .\Binaries\Tools\lbt.exe check --source-dir Source
+
+      - name: 模块配置校验
+        run: .\Binaries\Tools\lbt.exe validate -s Source --strict
+
+      - name: 全量构建
+        run: .\Binaries\Tools\lbt.exe build -s Source -c development --rebuild
+
+      # 退出码非 0 即判定失败, 无需解析输出文本
+      - name: Core 单元测试
+        run: .\Binaries\Development\Win64\LimxCoreTests.exe
+
+      - name: RHI 单元测试
+        run: .\Binaries\Development\Win64\LimxRHITests.exe
+
+      - name: 资产管线单元测试
+        run: .\Binaries\Development\Win64\LimxAssetTests.exe
+
+      - name: 引擎层单元测试
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: Logs/
+
+  # ----------------------------------------------------------
+  # 着色器 — 编译 + SPIR-V 校验
+  # ----------------------------------------------------------
+  shaders:
+    name: 着色器编译
+    runs-on: windows-2022
+    needs: toolchain
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
+
+      - name: 下载工具链
+        uses: actions/download-artifact@v4
+        with:
+          name: limx-toolchain
+          path: Binaries/Tools
+
+      - name: 编译着色器
+        run: .\Binaries\Tools\lsc.exe compile-all -s Shaders -o Binaries/Shaders --vulkan-version 1.4 -O
+
+      - name: 严格校验
+        run: .\Binaries\Tools\lsc.exe validate -s Shaders --vulkan-version 1.4 --strict

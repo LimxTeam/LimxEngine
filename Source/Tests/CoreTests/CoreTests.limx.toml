@@ -1,0 +1,32 @@
+[module]
+name        = "LimxCoreTests"
+type        = "executable"
+namespace   = "Limx"
+api_macro   = ""
+layer       = 3
+description = "Core 模块单元测试 — 容器/模板/内存/数学/字符串的正确性与泄漏回归"
+
+[dependencies]
+public  = ["LimxCore", "LimxTesting"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = []
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = ["kernel32"]
+
+[precompiled_header]
+enabled = true
+header  = "CoreTests/CoreTestsMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []

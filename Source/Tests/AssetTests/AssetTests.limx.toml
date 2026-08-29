@@ -1,0 +1,32 @@
+[module]
+name        = "LimxAssetTests"
+type        = "executable"
+namespace   = "Limx"
+api_macro   = ""
+layer       = 3
+description = "资产管线单元测试 — OBJ/MTL 与 glTF 解析的正确性、容错与几何补齐"
+
+[dependencies]
+public  = ["LimxCore", "LimxTesting", "LimxAssetPipeline"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = []
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = ["kernel32"]
+
+[precompiled_header]
+enabled = true
+header  = "AssetTests/AssetTestsMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []

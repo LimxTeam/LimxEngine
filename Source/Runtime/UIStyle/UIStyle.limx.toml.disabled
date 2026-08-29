@@ -1,0 +1,49 @@
+# ============================================================
+# UIStyle.limx.toml — 【已禁用】
+#
+# 状态: 模块源码于 2026-04-08 随 "移除 UI 模块依赖，纯渲染管线"
+#       一并移除 (见 Source/Editor/Launch/Private/main.cpp 更新历史)。
+#       目录与本配置予以保留，供后续 Studio 编辑器阶段重建 UI 层时复用。
+#
+# 启用方式: 将文件名改回 "UIStyle.limx.toml"。
+#           LBT 的模块发现按 ends_with(".limx.toml") 匹配，
+#           因此当前 ".disabled" 后缀使本模块完全不参与构建。
+#
+# 启用前必须复核:
+#   1. layer 取值与当时的模块分层是否仍然自洽 (Engine/Launch 现为 layer 4)
+#   2. dependencies 中的模块是否都已存在
+#   3. Public/Private 目录下是否已有实际源文件 — 空模块会导致链接产出空库
+# ============================================================
+
+[module]
+name        = "LimxUIStyle"
+type        = "static"
+namespace   = "Limx"
+api_macro   = "LIMX_UISTYLE_API"
+layer       = 4
+description = "UI 样式层 — 主题、配色、字体度量、样式表解析 (待重建)"
+
+[dependencies]
+public  = ["LimxCore", "LimxUICore"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = ["LIMX_UISTYLE_EXPORTS"]
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = []
+
+[precompiled_header]
+enabled = true
+header  = "UIStyle/UIStyleMinimal.h"
+
+[reflection]
+enabled = true
+macros  = ["LCLASS", "LSTRUCT", "LENUM", "LPROPERTY", "LFUNCTION"]

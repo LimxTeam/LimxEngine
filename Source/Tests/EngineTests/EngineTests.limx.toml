@@ -1,0 +1,32 @@
+[module]
+name        = "LimxEngineTests"
+type        = "executable"
+namespace   = "Limx"
+api_macro   = ""
+layer       = 5
+description = "Engine 模块单元测试 — 空间 Trait 层级、世界变换合成、销毁顺序安全性"
+
+[dependencies]
+public  = ["LimxCore", "LimxTesting", "LimxObject", "LimxEngine"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = []
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = ["kernel32", "user32", "bcrypt"]
+
+[precompiled_header]
+enabled = true
+header  = "EngineTests/EngineTestsMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []

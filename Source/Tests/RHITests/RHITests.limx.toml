@@ -1,0 +1,32 @@
+[module]
+name        = "LimxRHITests"
+type        = "executable"
+namespace   = "Limx"
+api_macro   = ""
+layer       = 3
+description = "RHI 模块单元测试 — 显存子分配算法的正确性、对齐契约、粒度约束与随机压力回归"
+
+[dependencies]
+public  = ["LimxCore", "LimxTesting", "LimxRHI"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = []
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = ["kernel32"]
+
+[precompiled_header]
+enabled = true
+header  = "RHITests/RHITestsMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []

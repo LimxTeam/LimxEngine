@@ -428,3 +428,425 @@ Remaining tooling risks:
   manifest compilation.
 - LSC disassembly is currently raw-ID only; `--raw-id` is now explicit but does
   not switch between two disassembly backends.
+
+---
+
+## 2026-08-29 Day 1 交接更新 — 地基验证与清债
+
+本次接手按七天路线推进，Day 1 聚焦"先验证地基、再加功能"。以下为对上文
+状态的**修订**，上文中被本节覆盖的部分以本节为准。
+
+### 已修复的真实缺陷
+
+按发现顺序列出。除第 1 项外，其余均由新建的单元测试直接捕获。
+
+1. **LBT 编译缓存忽略头文件依赖（严重）**
+   - `Programs/lbt/src/main.rs` 两处构造 `CacheKeyInput` 时把
+     `dependencies_hash` 硬编码为字符串 `"pending"`，缓存键中的头依赖分量
+     恒为常量。后果：修改任何头文件后 LBT 报告"0 个编译, N 个缓存跳过"，
+     复用的 `.obj` 基于旧的类布局，与新编译的 TU 混合链接造成 ODR 违规。
+     实测表现为运行期 `0xC0000374`（堆损坏），且崩溃点与改动处毫无关联。
+   - 修复：在 `compiler/deps.rs` 新增 `IncludeResolver`，递归解析
+     `#include "..."`（带跨模块复用的内容哈希缓存），产出真实的
+     `dependencies_hash`；同时把 include 搜索路径提到源文件循环之外预计算，
+     使缓存解析与实际编译看到同一份路径集；编译前记录的键在回填缓存时复用，
+     避免两处重算导致键漂移。
+   - 验证：触碰 `FVulkanDevice.h` → 重编译 6 个 TU；触碰 `Core/CoreTypes.h`
+     → 重编译全部 48 个 TU；无改动 → 48 个全部命中缓存。
+   - 旧缓存（554 MB）全部基于 `"pending"` 键，已清空。
+
+2. **FPoolAllocator::Deallocate(void*) 导致堆损坏（严重）**
+   - 无尺寸版本的释放直接把指针转交 `m_Fallback->Deallocate`，而该指针来自
+     桶内 chunk，并非独立堆块。通过 `IAllocator` 接口多态使用该分配器的
+     任何调用方（例如注入容器）走的正是这条路径，必然触发。
+     原代码注释自承是"简化实现"。
+   - 修复：为 `TFreeList` 增加 `Owns(ptr)`（chunk 区间 + 块边界双重校验），
+     `Deallocate` 改为逐桶询问归属，全部未命中才判定为回退分配器的大块。
+
+3. **三个分配器是抽象类，根本无法实例化**
+   - `LinearAllocator`、`BlockAllocator`、`FPoolAllocator` 均继承
+     `IAllocator` 却未实现纯虚的 `Reallocate` 与 `GetName`。这说明它们
+     从未被实例化过 — 属于完全未验证的死代码。
+   - 修复：三者补全接口。语义按各自模型定义并在注释中说明取舍：
+     线性分配器仅支持扩展最近一次分配（其余返回 `nullptr`）；
+     定长块分配器在新尺寸不超过块容量时原地返回；
+     池分配器按归属桶获知旧容量后搬迁。
+
+4. **LinearAllocator / FStackAllocator 违反对齐契约**
+   - 两者按"缓冲区内偏移"而非绝对地址做对齐，而底层缓冲区仅按
+     `alignof(void*)`（8 字节）申请。结果：请求 32/64/128/256 字节对齐时
+     返回的指针实际未对齐，AVX / AVX-512 对齐加载会崩溃。
+   - 修复：对齐运算改在绝对地址上进行。
+
+5. **LinearAllocator 对预期失败路径断言**
+   - 容量不足时 `LIMX_ASSERT(false)` 后再返回 `nullptr`。容量耗尽是
+     `IAllocator` 契约中的正常失败，不是程序错误，Debug 构建下会误中断。
+   - 修复：移除断言，保留 `nullptr` 返回。
+
+6. **Vulkan 设备特性未经查询即启用**
+   - `CreateLogicalDevice` 无条件启用 `bufferDeviceAddress`、
+     `dynamicRendering` 等特性，在不支持的 GPU 上 `vkCreateDevice` 直接失败。
+   - 修复：`PickPhysicalDevice` 用 `vkGetPhysicalDeviceFeatures2` 查询
+     1.1/1.2/1.3/1.4 特性链，设备创建时只启用已确认支持的项；
+     并对引擎强依赖的 `dynamicRendering`/`synchronization2` 做显式前置校验。
+
+### Vulkan 版本统一（1.3 → 1.4）
+
+本机 SDK 为 1.4.350，目标统一到 Vulkan 1.4：
+
+- `VulkanCommon.h` 新增 `kLimxTargetApiVersion`(1.4) 与
+  `kLimxMinimumApiVersion`(1.3)。
+- `CreateInstance` 通过 `vkEnumerateInstanceVersion` 与设备 `apiVersion`
+  三方取最小值协商，可在仅支持 1.3 的驱动上自动降级。
+- `IRHIDevice.h` 新增 `ERHIResult::ErrorIncompatibleDriver`。
+- LSC 新增 `TargetEnvironment::Vulkan1_4`（shaderc 0.8.3 的 `EnvVersion`
+  未收录 1.4，按 Vulkan 版本编码规则直接构造）并显式固定 SPIR-V 1.6；
+  CLI 默认值改为 1.4。`Shaders/Shaders.limx.toml` 与 `项目规则.md` 同步。
+- 实测：RTX 3060 上协商为 API 1.4，设备 API 1.4.325，`maintenance5` 可用，
+  8 个着色器全部产出 SPIR-V 1.6，引擎运行正常。
+
+### 新增模块
+
+- **`Source/Runtime/Testing`（LimxTesting，layer 2）** — 零 STL 测试框架。
+  用例经侵入式静态链表在 `main` 之前自动注册（规避静态初始化顺序问题）；
+  `FTrackingAllocator` 以内联记账头统计分配/释放并提供泄漏基线；
+  运行器直写 stdout（Core 的 `ConsoleLogSink` 只走 `OutputDebugStringA`，
+  对 CI 不可见），退出码即结论。
+- **`Source/Tests/CoreTests`（LimxCoreTests，可执行）** — 250 个用例 /
+  7065 项检查，覆盖 TArray、FString（含 SSO 边界）、TMap/TSet（含恒定哈希
+  制造的最坏探测链）、智能指针、TOptional、四种分配器、向量/四元数/矩阵。
+  数学用例以恒等式而非硬编码期望值断言。
+
+### UI 模块处置
+
+`Source/Runtime/UI{Core,Renderer,Style,Widgets}` 的源码已于 2026-04-08 移除，
+目录予以保留。各目录下新增 `*.limx.toml.disabled`（LBT 按
+`ends_with(".limx.toml")` 发现模块，故该后缀完全不参与构建），内含完整配置
+与启用前的复核清单，供后续 Studio 编辑器阶段重建 UI 层时复用。
+过期产物已清理：`LimxUI*.lib`、`Intermediate/Generated/UI*API.generated.h`、
+`Intermediate/Development/Win64/LimxUI*`（约 7 MB）。
+
+### 其他
+
+- `LimxEngine.sln` 已用 `lbt generate-solution` 重新生成，现含全部 10 个
+  模块项目（此前仅引用一个并不存在的 `Core.vcxproj`）。
+- 新增 `.github/workflows/ci.yml`（三作业：工具链 / 引擎 / 着色器）。
+  **注意：本仓库当前没有配置 git remote，该工作流未在真实 GitHub Actions
+  环境验证过**，首次推送后需复核 Vulkan SDK 安装步骤与运行器镜像的兼容性。
+- 新增 `Scripts/verify.ps1` — CI 的本地等价物，是目前唯一经过实测的验证
+  入口，5 个步骤全部通过。
+
+### 上文中已失效的表述
+
+- "无构建产物""不是 Git 仓库" — 现已是 Git 仓库，且 `Binaries/` 下有
+  完整的工具链、SPIR-V 与 `LimxLaunch.exe`。
+- "Vulkan 版本不一致（文档 1.4 / 代码 1.3）" — 已统一到 1.4。
+- "`LRegistry::Destroy` 显式基类析构""`FInputManager` 鼠标按钮越界"
+  "`FSceneManager` 只传相机位置""`pbr.frag` 材质未接入" — 均已在本次接手
+  之前被修复，复核确认。
+- "`LimxEngine.sln` 过期" — 已重新生成。
+
+---
+
+## 2026-08-29 Day 2 交接更新 — Vulkan 显存分配器
+
+### 问题
+
+改造前每个缓冲区与纹理各自调用一次 `vkAllocateMemory`，并各自
+`vkMapMemory`。这带来三个后果：
+
+1. **撞 `maxMemoryAllocationCount`** — 该上限在 AMD/Intel/移动 GPU 上通常为
+   4096。一个真实场景的网格与贴图轻易过万，加载会在中途直接失败。
+   （本机 RTX 3060 的 NVIDIA 驱动上报 `UINT32_MAX`，不受此限，因此这台机器
+   无法复现撞墙；但换到其他驱动上该限制是真实的。）
+2. **驱动侧开销** — 每次 `vkAllocateMemory` 都是重量级调用。
+3. **映射数量** — 同一 `VkDeviceMemory` 同时只允许一个活跃映射，
+   逐资源映射在共享内存后必然违规。
+
+### 新增: FSuballocationRegistry（`Source/Runtime/RHI/Public/RHI/Memory/`）
+
+块内区间分配算法，**刻意不含任何 Vulkan 类型**，因此可在无 GPU 的环境下
+完整单测。这是本次设计上最重要的决定：分配器的缺陷几乎全部集中在区间管理
+（分裂、合并、对齐、粒度）而非 API 调用上。
+
+- 分级自由列表 + 位图跳空桶，分配近似 O(1)
+- 节点携带物理前驱/后继索引，释放时 O(1) 边界合并
+- 支持 `bufferImageGranularity`：线性资源（缓冲区、LINEAR 图像）与非线性
+  资源（OPTIMAL 图像）不共享同一粒度页 —— 违反此规则是未定义行为
+- `Validate()` 校验六项内部不变式（物理链完整、总和守恒、无相邻空闲、
+  自由链表与分桶一致、位图一致、用量吻合），供测试逐步断言
+- 节点槽复用，避免长时间运行下节点数组无界增长
+
+### 新增: FVulkanMemoryAllocator（`Private/Vulkan/`）
+
+- 按内存类型分池，块尺寸取堆容量的 1/8 并收敛到 [32 MiB, 256 MiB]
+- 主机可见的块在创建时**整块映射一次**并长期持有，子分配的地址由基址加
+  偏移得出（规范禁止对同一 `VkDeviceMemory` 建立第二个活跃映射）
+- 超过 16 MiB 的请求走专用 `vkAllocateMemory`，避免在共享块里留下
+  难以复用的尾部空洞
+- 块内最后一个子分配释放后立即销毁该块，显存及时归还驱动
+- 失败路径逐级退让：现有块 → 新建标准块 → 按需求新建刚好够大的块 → 专用分配
+- `Flush`/`Invalidate` 按 `nonCoherentAtomSize` 向外扩展范围并夹紧到块边界
+- 逼近 `maxMemoryAllocationCount` 的 80% 时主动告警
+
+### 接入改动
+
+- `FVulkanBufferData` / `FVulkanTextureData` 的 `VkDeviceMemory Memory`
+  改为 `FVulkanAllocation Allocation`
+- `CreateBuffer` / `CreateTexture` 改走分配器，绑定时传入子分配偏移
+- `CreateTexture` 按 `imageInfo.tiling` 判定线性/非线性，交给粒度约束
+- `MapBuffer` 直接返回块映射基址加偏移；`UnmapBuffer` 只清除本资源的引用，
+  **不做 `vkUnmapMemory`** —— 解除映射会让同块内其他缓冲区的指针一并失效
+- 交换链图像的 `Allocation` 保持无效句柄，其内存归呈现引擎所有
+- 分配器在逻辑设备创建后初始化，在 `vkDestroyDevice` **之前**关闭
+
+### 顺带修复的回归
+
+Day 1 的特性裁剪只复制了原代码明确列出的特性，漏掉了
+`shaderDemoteToHelperInvocation`。面向 SPIR-V 1.6 编译时 glslang 会为
+`discard` 生成 `DemoteToHelperInvocation` 能力，导致 `vkCreateShaderModule`
+被验证层拒绝。现已补充启用该特性及 `shaderTerminateInvocation`、
+`shaderZeroInitializeWorkgroupMemory`（均为条件启用）。
+
+### 验证结果
+
+- **RHITests 新模块**：27 个用例 / 115,861 项检查。含 7000 次确定性随机
+  操作序列，每步校验不变式、区间不重叠、粒度页不共享。随机种子固定，
+  任何失败可精确重放。
+- **实测承载力**：256 MiB 单块容纳 **4755 个典型资源**（占用 254 MiB，
+  利用率 99.2%）。旧路径下这需要 4755 次 `vkAllocateMemory`，已超出
+  4096 的典型上限。
+- **无退化**：12 轮加载/卸载循环后承载量不低于首轮的 90%（实测无下降），
+  证明合并逻辑无残留碎片。
+- **引擎实跑**：全部 GPU 资源仅用 **2 次 `vkAllocateMemory`**（改造前为
+  每资源一次）；正常退出时块数、子分配数、专用分配数、设备分配数全部归零，
+  **零显存泄漏**；Vulkan 验证层无错误。
+
+### 已知限制
+
+- 分配器**非线程安全**。当前渲染路径单线程提交，引入多线程命令录制时
+  必须在此加锁。
+- 未实现碎片整理（defragmentation）。长时间运行且资源尺寸分布剧烈变化的
+  场景可能积累碎片，需要时再补。
+- `FVulkanDevice` 析构时不清理资源池中残留的缓冲区/纹理句柄 —— 这是既有
+  行为，本次未改动。分配器会在关闭时报告未归还的分配数，使泄漏可见。
+
+---
+
+## 2026-08-29 Day 3 交接更新 — 资产解析管线
+
+### 新增: Core/Misc/FJson —— 零 STL JSON 解析器
+
+glTF 是 JSON 格式，引擎此前没有 JSON 能力，故先补上。
+
+- **节点池而非递归类型**：直觉写法是让 `FJsonValue` 内含
+  `TArray<FJsonValue>`，但那要求容器支持不完整类型（标准未保证），
+  且每层嵌套都产生独立堆分配。改用扁平节点数组 + `UInt32` 索引互指。
+- **子索引池**：实现中发现一个真问题 —— 嵌套容器会把自身子节点追加到节点池
+  尾部，父容器的子节点在池中**并不相邻**（`[1,[2],3]` 的三个元素分别是
+  节点 1、2、4）。因此另设子索引池，容器解析期先把子索引压入共享 scratch 栈，
+  结束时整段搬入。共享栈让任意嵌套深度都只用一块缓冲区。
+- 字符串统一解码入连续池，`\uXXXX` 转义支持 UTF-16 代理对并输出 UTF-8。
+- 数字按"尾数 + 十进制指数"解析并一次性缩放，避免逐位累积舍入误差；
+  保留至多 19 位有效数字。非正确舍入，极端精度下可能有 1 ULP 级误差。
+- 严格遵循 RFC 8259：拒绝注释、尾随逗号、前导零、字符串内裸控制字符、
+  根值后的多余内容。错误携带行号与列号。
+- 深度上限 256，拒绝恶意构造的深层嵌套。
+
+### 新增模块: LimxAssetPipeline（layer 2，仅依赖 Core）
+
+刻意**不依赖 RHI** —— 资产解析是纯 CPU 工作。这让它可以完整单元测试，
+且 GPU 上传（Day 4-5）与文件格式彻底解耦。
+
+**中性数据结构**（`FAssetTypes.h`）：所有解析器产出同一套
+`FMeshData` / `FMaterialData` / `FSceneNode` / `FAssetScene`。渲染层只需
+认识这一套，新增格式不必改渲染层。材质统一为金属粗糙度工作流。
+场景层级用数组下标而非指针互指，整个场景是一块可整体拷贝的连续数据。
+
+顶点为 72 字节交错胖顶点（位置/法线/切线/UV0/UV1/颜色），尺寸由
+`static_assert` 钉住 —— 它直接决定顶点缓冲区步长，无意间加成员会让
+GPU 侧属性偏移全部错位。
+
+提供 `GenerateNormals`（面积加权，叉积模长天然正比于三角形面积）与
+`GenerateTangents`（Lengyel 方法 + Gram-Schmidt 正交化 + 手性判定），
+在解析结束时补齐缺失属性，使上传层拿到的永远是属性完整的顶点。
+
+### 新增: FObjLoader —— Wavefront OBJ / MTL
+
+- **顶点去重键是索引三元组**：OBJ 按 (位置/UV/法线) 三个独立索引描述顶点，
+  同一位置在不同面上可配不同法线。用三个源索引组哈希键做折叠，
+  既精确又不必比较浮点值。实测：立方体产出 24 个唯一顶点（8 位置 × 3 法线），
+  只按位置去重会得到 8 个（法线错乱），不去重会得到 36 个。
+- 支持 1 起始正索引与相对末尾的负索引；扇形三角化任意多边形。
+- 按 `usemtl` 切分子网格；每个子网格的包围盒只覆盖自己引用的顶点。
+- 默认翻转 UV 的 V 轴（OBJ 原点在左下，Vulkan 图像原点在左上）。
+- **Phong → PBR 换算**：`roughness = sqrt(2/(Ns+2))`，这是 Blinn-Phong
+  指数与 GGX 粗糙度的通行对应。**金属度默认取 0** —— OBJ 没有金属度概念，
+  从 Ks 反推极不可靠，误判为金属会让材质整体发黑。MTL 若带 PBR 扩展
+  （`Pr`/`Pm`）则一律优先采用，不做近似。
+- 贴图行跳过 `-o`/`-s`/`-bm` 等选项参数；路径分隔符统一为正斜杠。
+- 畸形行跳过而非中止，但每次跳过都记入 `Warnings` 使问题可见。
+
+### 新增: FGltfLoader —— glTF 2.0 / GLB
+
+- **访问器解引用集中一处**：glTF 每段数据都要穿过
+  accessor → bufferView → buffer 三级间接，叠加两层 byteOffset、
+  可选 byteStride、五种 componentType 与 normalized。全部收敛到
+  `FAccessorReader`，各属性读取退化为"取第 i 个元素"。
+- 支持紧密与交错（byteStride）两种布局；索引支持
+  UNSIGNED_BYTE / UNSIGNED_SHORT / UNSIGNED_INT 三种宽度。
+- **越界一律拒绝而非夹紧** —— 夹紧会让损坏的 glTF 静默产出扭曲几何，
+  症状是模型局部变形，极难溯源。
+- 缓冲区支持外部 `.bin`、`data:` URI（base64）与 GLB 二进制块三种来源。
+- GLB 容器校验魔数、版本、块长度与 4 字节对齐；按**魔数而非扩展名**
+  区分 `.gltf` 与 `.glb`（扩展名可能被改过，魔数不会）。
+- 节点变换的 `matrix`（列主序）与 TRS 两种表达统一分解为 `FTransform`。
+- 遇到 `KHR_draco_mesh_compression` / `EXT_meshopt_compression` 判定为
+  **失败而非告警** —— 忽略压缩扩展只会产出空的或错误的几何。
+- 非三角形图元跳过并告警。
+
+### 顺带修复: CoreAPI.h 的宏优先级缺陷
+
+`CoreAPI.h` 中 `LIMX_xxx_EXPORTS` 的判断排在 `LIMX_xxx_STATIC` 之前，
+而 LBT 对静态库会**同时定义**这两个宏（`_STATIC` 由构建工具注入，
+`_EXPORTS` 来自模块 toml）。结果：所有静态库都被按 `__declspec(dllexport)`
+编译。后果是含模板成员的导出类触发 C4251，而 `/WX` 把它变成错误 ——
+这解释了为什么此前 Core 里没有"带 `LIMX_CORE_API` 且含 `TArray` 成员"
+的类：一旦有就编译不过。
+
+各模块自己的 API 头（`ObjectAPI.h`、`TestingAPI.h`）顺序是正确的，
+只有这个聚合文件反了。现已把 `_STATIC` 判断提前（Core / RHI / Renderer 三处）。
+
+### 验证结果
+
+- **CoreTests**：287 用例（JSON 新增 37 个，含交错嵌套、代理对、
+  数字精度、错误定位、非法输入拒绝）
+- **AssetTests 新模块**：68 用例（OBJ/MTL 39 个 + glTF/GLB 29 个）。
+  全部夹具内嵌为字符串字面量或代码构造的 GLB 容器，不依赖外部资产文件。
+- **RHITests**：27 用例
+- `Scripts/verify.ps1` 全部 7 步通过。
+
+### 已知限制
+
+- glTF 不支持动画、蒙皮、变形目标 —— 遇到时忽略。
+- glTF 不支持 Draco / meshopt 压缩 —— 明确判定为失败。
+- 图像**只记录引用，不做解码** —— PNG/JPEG 解码是 Day 4 的内容。
+  `FEmbeddedImage` 目前只保存原始压缩字节。
+- OBJ 忽略平滑组（`s`），法线生成一律按整网格平滑。
+- 仓库内的 Sponza 资产是 **Git LFS 指针**（`.obj` 仅 133 字节，
+  实际 21.6 MB），需 `git lfs pull` 才能用真实资产做端到端验证。
+
+---
+
+## 2026-08-29 Day 4 交接更新 — 图像解码与资源注册表
+
+按用户决定，图像解码全部自研，不引入 stb 等外部库。
+
+### 新增: Core/Misc/FInflate —— DEFLATE 解压
+
+PNG 的像素数据是 zlib 容器封装的 DEFLATE 流，而 Core 已有的 `FCompression`
+是 LZ4 风格的自研格式，与 DEFLATE 毫无共同点，因此单独实现。
+
+- 支持三种块类型：存储 / 固定 Huffman / 动态 Huffman
+- Huffman 采用 zlib 参考实现 puff 的逐位规范解码 —— 比查表慢，
+  但短小到可以逐行核对。解压错误产生的是花屏而非崩溃，极难靠现象定位，
+  正确性因此优先于吞吐（若纹理加载成为瓶颈，可在此引入快速表）
+- **反向引用必须逐字节复制**：DEFLATE 用"距离 1、长度 N"表达游程，
+  源与目标重叠，`memcpy` 会产出错误结果
+- zlib 容器校验 CMF/FLG 与 Adler-32，拒绝预置字典
+
+### 顺带修复: TArray::Add 的自引用悬垂（严重）
+
+实现 inflate 时长数据全部解压失败（长度正确但 Adler-32 不符），
+根因不在 inflate：
+
+`TArray::Add(const T&)` 的实现是「先 `EnsureCapacity` 再拷贝构造」。
+若实参指向数组自身的元素（`values.Add(values[i])`，正是 LZ77 反向引用的
+写法），扩容会释放旧缓冲区，**使传入的引用悬垂**，随后的拷贝读到的是
+已释放内存。容量充足时完全不显现，只有恰好触发扩容的那一次才出错 ——
+表现为偶发的数据损坏。
+
+修复：需要扩容时先把值搬到临时对象再移入新位置（`Add(T&&)` 同样处理）。
+`TArrayTests` 新增四个自引用回归用例钉住该行为。
+
+### 顺带修复: StringFormat 缺十六进制支持
+
+`StringFormat` 只识别 `{}`，不解析 `{:X}`。项目里有 4 处误用（其中
+`FVulkanDeviceInit.cpp` 那处是既有代码），效果是日志里直接打印出
+字面的 `0x{:X}`。图形编程中格式枚举、内存掩码、资源句柄几乎都以十六进制
+阅读，因此新增 `FHex` 包装类型（支持前导补零），并修正全部误用。
+
+### 新增: FPngDecoder
+
+全格式覆盖而非只做常见格式 —— 真实资产库里带调色板的 UI 图标、
+16 位高度图、隔行的网页遗留资源都存在，缺一种就有贴图加载不出来，
+而缺贴图在渲染结果里表现为一片纯色，排查成本远高于一次做全。
+
+- 五种颜色类型、1/2/4/8/16 全部位深、PLTE 调色板、tRNS 透明度
+- 四种滤波器（None/Sub/Up/Average/Paeth）**按字节而非按像素**还原 ——
+  滤波作用于"当前字节"与"左侧一个像素处的同位置字节"，以 bpp 为步长
+  逐字节处理，五种滤波器共用一份实现
+- Adam7 隔行：七遍各自独立反滤波后按采样格点回填。若当成一整幅图
+  反滤波会得到纯噪声
+- **分块 CRC 只告警不拒绝**：PNG 的分块结构使单块损坏未必影响可解码性，
+  拒绝加载会让一处磁盘坏道毁掉整个场景；真正的像素损坏由 IDAT 的
+  zlib 校验和拦下
+
+### 新增: FJpegDecoder
+
+只做基线（SOF0/SOF1），但把基线做全。渐进式与算术编码明确报错而非
+产出花屏。
+
+- 熵解码器内部消化 `0xFF00` 字节填充与 `RSTn` 重启标记，
+  使上层 MCU 循环保持线性
+- **DC 是差分而非绝对值**，重启标记处必须归零 —— 漏掉会让重启点之后的
+  整幅图像出现亮度阶跃，且小图完全正常，只有够大的图才触发
+- 支持任意整数采样因子组合（4:4:4 / 4:2:2 / 4:2:0 / 4:4:0）
+- 色度上采样用**最近邻而非双线性**：双线性会让相邻块的色度互相渗透，
+  在法线贴图这类非颜色数据上造成实际误差
+- IDCT 为可分离的行列两趟浮点变换
+
+### 新增: FImageDecoder（统一入口）
+
+**按魔数而非扩展名分发** —— 资产库里被批量改名的 `.png` 其实是 JPEG
+这类情况很常见，魔数来自文件内容本身，不会说谎。未知格式时报出前几个
+字节，常能一眼认出是文本、LFS 指针还是别的容器。
+
+### 新增: FAssetRegistry
+
+Day 5 资源所有权重构的基础。
+
+- **路径即身份**：同一张贴图常被十几个材质引用，以规范化路径（分隔符统一、
+  转小写）为键去重，使解码次数等于文件数而非引用数
+- **解码选项参与缓存键**：同一 PNG 以"保留 16 位"与"降为 8 位"加载会得到
+  内容不同的两份数据，只以路径为键会让后一次拿到前一次的结果
+- **代际句柄**：槽位卸载后复用，裸指针在那一刻变成悬垂。句柄带代际号后，
+  误用得到的是干脆的 `nullptr` 而非错误的数据
+- **失败也缓存**：损坏的贴图可能被上百个材质引用，不缓存会导致上百次
+  无谓的磁盘访问
+- **卸载是显式的**：引用归零不立即释放。材质切换与 LOD 过渡会让资源在
+  一帧内被放下又拾起，立即释放会造成反复解码抖动
+
+### 验证结果
+
+| 测试集 | 用例 | 检查 |
+|--------|------|------|
+| CoreTests | 307 | 11,532 |
+| RHITests | 27 | 115,861 |
+| AssetTests | 127 | 1,120 |
+
+Day 4 新增：Inflate 15 个、PNG 25 个、JPEG 15 个、AssetRegistry 19 个。
+全部夹具内嵌 —— zlib 向量由标准库生成，PNG 与 JPEG 由脚本按规范手工构造
+（量化表全 1 以消除量化误差，像素值可由坐标公式推导）。
+`Scripts/verify.ps1` 全部 7 步通过。
+
+### 已知限制
+
+- JPEG 不支持渐进式（SOF2）、算术编码、无损、12 位精度 —— 明确报错
+- JPEG 不解析 EXIF 方向标记，图像按存储顺序输出
+- PNG 不支持 APNG 动画扩展，只解首帧
+- **DDS / KTX2 未实现** —— 它们是 GPU 压缩容器，无需 CPU 解码，
+  应走独立的直传路径而非 `FImageDecoder`。Day 5-6 若需要 BC 压缩纹理
+  再补
+- `FAssetRegistry` 非线程安全，不监听文件变更（热重载需外部触发）
+- Inflate 的逐位解码未做查表优化

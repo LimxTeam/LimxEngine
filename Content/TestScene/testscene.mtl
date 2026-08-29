@@ -1,0 +1,23 @@
+# 由 make_test_obj.py 生成的测试材质库
+newmtl CheckerMat
+Kd 1.0 1.0 1.0
+Ks 0.2 0.2 0.2
+Ns 64
+map_Kd checker.png
+map_Bump flat_normal.png
+
+newmtl StripeMat
+Kd 1.0 1.0 1.0
+Ks 0.6 0.6 0.6
+Ns 200
+map_Kd stripes.png
+
+newmtl PlainRed
+Kd 0.85 0.18 0.16
+Ks 0.1 0.1 0.1
+Ns 16
+
+newmtl PlainGreen
+Kd 0.16 0.72 0.30
+Ks 0.4 0.4 0.4
+Ns 90
