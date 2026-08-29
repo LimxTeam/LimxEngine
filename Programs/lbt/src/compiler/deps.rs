@@ -27,6 +27,7 @@
  ******************************************************************************/
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -1008,6 +1009,237 @@ impl DependencyCacheStats {
 //=============================================================================
 // 测试
 //=============================================================================
+
+//=============================================================================
+// 包含解析器 — 编译缓存的头文件依赖来源
+//=============================================================================
+
+/// 递归 #include 解析器
+///
+/// 存在意义: 编译缓存键必须包含"源文件所依赖的全部头文件内容"，否则修改头文件
+/// 后缓存仍会命中，产出的 .obj 基于旧头文件布局，与新编译的 TU 混合链接会造成
+/// ODR 违规乃至堆损坏。本解析器为缓存键提供 dependencies_hash 分量。
+///
+/// 只跟踪引号形式的 `#include "..."`：
+///   - 尖括号形式指向系统/SDK 头，其变动已由缓存键中的 compiler_fingerprint 覆盖
+///   - 引擎自身头文件一律用引号形式包含，与项目规范一致
+///
+/// 解析策略遵循 MSVC 语义: 先查包含者所在目录，再按顺序查 include_dirs。
+pub struct IncludeResolver {
+    /// 文件路径 -> (内容 SHA-256, 其中出现的引号包含名)
+    ///
+    /// 该缓存与 include_dirs 无关 — 键是已解析出的绝对路径，值只取决于文件内容，
+    /// 因此可跨模块安全复用，避免同一头文件被反复读盘与哈希。
+    file_cache: HashMap<PathBuf, FileScanResult>,
+}
+
+/// 单个文件的扫描结果
+#[derive(Debug, Clone)]
+struct FileScanResult {
+    /// 文件内容的 SHA-256
+    content_hash: String,
+    /// 文件中出现的 #include "..." 名称 (未解析为路径)
+    quoted_includes: Vec<String>,
+}
+
+impl Default for IncludeResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IncludeResolver {
+    pub fn new() -> Self {
+        Self {
+            file_cache: HashMap::new(),
+        }
+    }
+
+    /// 已缓存的文件数 — 用于诊断解析器的复用效果
+    pub fn cached_file_count(&self) -> usize {
+        self.file_cache.len()
+    }
+
+    /// 收集源文件递归依赖的全部第一方头文件
+    ///
+    /// 返回值已去重并按路径排序，保证同一组依赖在任何遍历顺序下得到相同结果，
+    /// 从而使 dependencies_hash 稳定可复现。
+    ///
+    /// 无法解析的包含名 (例如指向未加入 include_dirs 的第三方头) 会被跳过 —
+    /// 这些文件不属于第一方源码，其变动通过工具链指纹或显式 --rebuild 覆盖。
+    pub fn collect(&mut self, source: &Path, include_dirs: &[PathBuf]) -> Vec<PathBuf> {
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut pending: VecDeque<PathBuf> = VecDeque::new();
+        let mut dependencies: Vec<PathBuf> = Vec::new();
+
+        pending.push_back(source.to_path_buf());
+        visited.insert(source.to_path_buf());
+
+        while let Some(current) = pending.pop_front() {
+            let scan = match self.scan_file(&current) {
+                Some(scan) => scan,
+                None => continue,
+            };
+
+            let current_dir = current.parent().map(|p| p.to_path_buf());
+
+            for include_name in &scan.quoted_includes {
+                let resolved = match Self::resolve_include(
+                    include_name,
+                    current_dir.as_deref(),
+                    include_dirs,
+                ) {
+                    Some(path) => path,
+                    None => continue,
+                };
+
+                if visited.insert(resolved.clone()) {
+                    dependencies.push(resolved.clone());
+                    pending.push_back(resolved);
+                }
+            }
+        }
+
+        dependencies.sort();
+        dependencies
+    }
+
+    /// 计算源文件全部头依赖的组合哈希 — 直接用作缓存键的 dependencies_hash
+    ///
+    /// 哈希同时覆盖依赖的路径与内容: 新增/删除一个包含会改变路径集合，
+    /// 修改某个头文件会改变其内容哈希，两者都会导致缓存键变化并触发重编译。
+    pub fn dependencies_hash(&mut self, source: &Path, include_dirs: &[PathBuf]) -> String {
+        let dependencies = self.collect(source, include_dirs);
+
+        let mut hasher = Sha256::new();
+
+        for dependency in &dependencies {
+            hasher.update(dependency.to_string_lossy().as_bytes());
+            hasher.update(b"|");
+
+            match self.file_cache.get(dependency) {
+                Some(scan) => hasher.update(scan.content_hash.as_bytes()),
+                // collect 已确保依赖均已扫描, 此分支仅为防御性兜底
+                None => hasher.update(b"UNSCANNED"),
+            }
+
+            hasher.update(b"\n");
+        }
+
+        hex::encode(hasher.finalize())
+    }
+
+    /// 扫描单个文件 — 命中缓存时直接返回, 否则读盘并解析
+    fn scan_file(&mut self, path: &Path) -> Option<FileScanResult> {
+        if let Some(cached) = self.file_cache.get(path) {
+            return Some(cached.clone());
+        }
+
+        let bytes = fs::read(path).ok()?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let content_hash = hex::encode(hasher.finalize());
+
+        // 源码约定为 UTF-8; 出现非法字节时按 lossy 处理即可，
+        // 因为这里只需要提取 #include 行，个别替换字符不影响解析
+        let content = String::from_utf8_lossy(&bytes);
+
+        let result = FileScanResult {
+            content_hash,
+            quoted_includes: Self::scan_quoted_includes(&content),
+        };
+
+        self.file_cache.insert(path.to_path_buf(), result.clone());
+        Some(result)
+    }
+
+    /// 提取文本中的 #include "..." 名称
+    ///
+    /// 采用逐行朴素扫描而非完整预处理:
+    ///   - 行注释 (// #include "x.h") 会被正确跳过
+    ///   - 块注释内或 #if 0 内的 #include 会被计入
+    ///
+    /// 后者是刻意的保守取舍 — 多算依赖只会导致多余的重编译 (结果正确)，
+    /// 漏算依赖则会导致缓存错误命中 (结果损坏)。宁可多编译。
+    fn scan_quoted_includes(content: &str) -> Vec<String> {
+        let mut includes = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+
+            if !trimmed.starts_with('#') {
+                continue;
+            }
+
+            let after_hash = trimmed[1..].trim_start();
+            if !after_hash.starts_with("include") {
+                continue;
+            }
+
+            let after_keyword = after_hash["include".len()..].trim_start();
+            if !after_keyword.starts_with('"') {
+                continue;
+            }
+
+            if let Some(closing) = after_keyword[1..].find('"') {
+                let name = &after_keyword[1..1 + closing];
+                if !name.is_empty() {
+                    includes.push(name.to_string());
+                }
+            }
+        }
+
+        includes
+    }
+
+    /// 将包含名解析为实际文件路径
+    ///
+    /// 顺序遵循 MSVC 对引号形式的处理: 包含者所在目录优先, 其后按声明顺序
+    /// 遍历 include_dirs。首个存在的文件即为结果。
+    fn resolve_include(
+        include_name: &str,
+        includer_dir: Option<&Path>,
+        include_dirs: &[PathBuf],
+    ) -> Option<PathBuf> {
+        if let Some(dir) = includer_dir {
+            let candidate = dir.join(include_name);
+            if candidate.is_file() {
+                return Some(normalize_path(&candidate));
+            }
+        }
+
+        for dir in include_dirs {
+            let candidate = dir.join(include_name);
+            if candidate.is_file() {
+                return Some(normalize_path(&candidate));
+            }
+        }
+
+        None
+    }
+}
+
+/// 归一化路径 — 消除 `.` / `..` 片段并统一分隔符
+///
+/// 不使用 canonicalize: 后者在 Windows 上会返回 `\\?\` 前缀的扩展长度路径，
+/// 且要求文件必须存在。这里只需要保证"同一文件经不同包含路径到达时得到相同键"，
+/// 词法归一化已足够，且不产生额外的系统调用。
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
+}
 
 #[cfg(test)]
 mod tests {

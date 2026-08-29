@@ -179,8 +179,9 @@ pub enum TargetEnvironment {
     Vulkan1_0,
     Vulkan1_1,
     Vulkan1_2,
-    #[default]
     Vulkan1_3,
+    #[default]
+    Vulkan1_4,
 }
 
 impl TargetEnvironment {
@@ -188,12 +189,41 @@ impl TargetEnvironment {
         shaderc::TargetEnv::Vulkan
     }
 
+    /// 目标环境版本号 — 使用 Vulkan 的 API 版本编码
+    /// (major << 22) | (minor << 12) | patch，与 shaderc::EnvVersion 的
+    /// 判别值一致。1.4 在 shaderc 0.8.3 的 EnvVersion 枚举中尚未收录，
+    /// 因此按同一编码规则直接构造。
     pub fn to_shaderc_version(&self) -> u32 {
         match self {
             Self::Vulkan1_0 => shaderc::EnvVersion::Vulkan1_0 as u32,
             Self::Vulkan1_1 => shaderc::EnvVersion::Vulkan1_1 as u32,
             Self::Vulkan1_2 => shaderc::EnvVersion::Vulkan1_2 as u32,
             Self::Vulkan1_3 => shaderc::EnvVersion::Vulkan1_3 as u32,
+            Self::Vulkan1_4 => (1u32 << 22) | (4u32 << 12),
+        }
+    }
+
+    /// 该环境要求的 SPIR-V 版本
+    ///
+    /// Vulkan 1.3 与 1.4 同为 SPIR-V 1.6，故两者产出的字节码目标一致；
+    /// 差异仅体现在 glslang 的验证规则集上。
+    pub fn to_spirv_version(&self) -> shaderc::SpirvVersion {
+        match self {
+            Self::Vulkan1_0 => shaderc::SpirvVersion::V1_0,
+            Self::Vulkan1_1 => shaderc::SpirvVersion::V1_3,
+            Self::Vulkan1_2 => shaderc::SpirvVersion::V1_5,
+            Self::Vulkan1_3 | Self::Vulkan1_4 => shaderc::SpirvVersion::V1_6,
+        }
+    }
+
+    /// 人类可读的版本字符串
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vulkan1_0 => "1.0",
+            Self::Vulkan1_1 => "1.1",
+            Self::Vulkan1_2 => "1.2",
+            Self::Vulkan1_3 => "1.3",
+            Self::Vulkan1_4 => "1.4",
         }
     }
 }
@@ -207,6 +237,7 @@ impl FromStr for TargetEnvironment {
             "vulkan1.1" | "vk1.1" | "1.1" => Ok(Self::Vulkan1_1),
             "vulkan1.2" | "vk1.2" | "1.2" => Ok(Self::Vulkan1_2),
             "vulkan1.3" | "vk1.3" | "1.3" => Ok(Self::Vulkan1_3),
+            "vulkan1.4" | "vk1.4" | "1.4" => Ok(Self::Vulkan1_4),
             _ => Err(format!("未知的目标环境: {}", s)),
         }
     }

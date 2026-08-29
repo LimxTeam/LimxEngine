@@ -804,6 +804,19 @@ fn main() -> Result<()> {
             let mut total_sources = 0;
             let mut skipped_cached = 0;
 
+            // 头文件依赖解析器 — 跨模块共享以复用已扫描文件的内容哈希。
+            // 缓存键必须包含头依赖哈希, 否则修改头文件后缓存仍会命中,
+            // 复用的 .obj 基于旧的类布局, 与新编译的 TU 混合链接会造成
+            // ODR 违规与堆损坏 (实测表现为运行期 0xC0000374)。
+            let mut include_resolver = compiler::deps::IncludeResolver::new();
+
+            // 源文件 -> 缓存键。构建后回填缓存时必须使用与查询时完全相同的键,
+            // 因此这里记录下来而不是二次计算, 避免两处逻辑漂移导致缓存永不命中。
+            let mut source_cache_keys: std::collections::HashMap<
+                std::path::PathBuf,
+                compiler::compile_cache::CacheKey,
+            > = std::collections::HashMap::new();
+
             for module in &modules {
                 let module_name = &module.name;
                 let module_path = &module.path;
@@ -833,36 +846,86 @@ fn main() -> Result<()> {
                 let mut task_ids = Vec::new();
                 let mut expected_objects = Vec::new();
 
+                // ------------------------------------------------------------
+                // 模块级头文件搜索路径 — 同一模块内所有源文件共用, 循环外算一次。
+                // 既作为编译命令的 /I 参数, 也作为缓存键解析头依赖的搜索基准,
+                // 两者共用同一份数据可确保依赖解析与实际编译看到相同的头文件。
+                // ------------------------------------------------------------
+                let mut module_include_dirs: Vec<std::path::PathBuf> = Vec::new();
+                module_include_dirs.push(module_path.join("Public"));
+                module_include_dirs.push(module_path.join("Private"));
+                if !module_include_dirs.contains(&reflection_output) {
+                    module_include_dirs.push(reflection_output.clone());
+                }
+
+                // External 依赖向下传播的预处理器定义
+                let mut module_external_defines: Vec<String> = Vec::new();
+
+                for dep_module in &modules {
+                    if dep_module.name != *module_name {
+                        if dep_module.module_type == crate::core::config::ModuleType::External {
+                            // External 模块: 传播其 include_paths 和 defines 给依赖方
+                            for inc_path in &dep_module.config.compile.include_paths {
+                                let expanded = expand_env_vars(inc_path);
+                                let path = std::path::PathBuf::from(expanded);
+                                if !module_include_dirs.contains(&path) {
+                                    module_include_dirs.push(path);
+                                }
+                            }
+                            for ext_def in &dep_module.config.compile.defines {
+                                if !module_external_defines.contains(ext_def) {
+                                    module_external_defines.push(ext_def.clone());
+                                }
+                            }
+                        } else {
+                            module_include_dirs.push(dep_module.path.join("Public"));
+                        }
+                    }
+                }
+
+                // 模块 [compile] 配置中的额外包含路径 (支持 ${ENV} 展开)
+                for extra_inc in &module.config.compile.include_paths {
+                    let expanded = expand_env_vars(extra_inc);
+                    let inc_path = std::path::PathBuf::from(&expanded);
+                    if !module_include_dirs.contains(&inc_path) {
+                        module_include_dirs.push(inc_path);
+                    }
+                }
+
                 for source in &sources {
                     let object_file = object_file_for_source(source, &intermediate_dir);
 
-                    // 内容寻址缓存检查 (非强制重编译时)
-                    if !rebuild {
-                        if let Ok(source_hash) = compiler::compile_cache::hash_file(source) {
-                            let cache_key_input = compiler::compile_cache::CacheKeyInput {
-                                source_hash,
-                                compiler_fingerprint: format!("{}_{}", comp.name(), comp.version()),
-                                dependencies_hash: "pending".to_string(),
-                                target_platform: format!(
-                                    "{}_{}",
-                                    compiler_config.platform.name(),
-                                    compiler_config.architecture.name()
-                                ),
-                                build_configuration: build_config.name().to_string(),
-                            };
-                            let cache_key =
-                                compiler::compile_cache::compute_cache_key(&cache_key_input);
+                    // 内容寻址缓存键 — 即使 --rebuild 也要计算,
+                    // 构建结束后需用同一个键把新产物写回缓存
+                    if let Ok(source_hash) = compiler::compile_cache::hash_file(source) {
+                        let cache_key_input = compiler::compile_cache::CacheKeyInput {
+                            source_hash,
+                            compiler_fingerprint: format!("{}_{}", comp.name(), comp.version()),
+                            // 递归包含的全部第一方头文件内容哈希
+                            dependencies_hash: include_resolver
+                                .dependencies_hash(source, &module_include_dirs),
+                            target_platform: format!(
+                                "{}_{}",
+                                compiler_config.platform.name(),
+                                compiler_config.architecture.name()
+                            ),
+                            build_configuration: build_config.name().to_string(),
+                        };
+                        let cache_key =
+                            compiler::compile_cache::compute_cache_key(&cache_key_input);
 
-                            if let Some(_hit) = compile_cache.lookup(&cache_key) {
-                                // 缓存命中 — 从缓存恢复产物文件
-                                match compile_cache.restore_artifact(&cache_key, &object_file) {
-                                    Ok(true) => {
-                                        skipped_cached += 1;
-                                        expected_objects.push(object_file);
-                                        continue;
-                                    }
-                                    _ => {} // 恢复失败则重新编译
+                        source_cache_keys.insert(source.clone(), cache_key.clone());
+
+                        // 缓存命中检查 (非强制重编译时)
+                        if !rebuild && compile_cache.lookup(&cache_key).is_some() {
+                            // 缓存命中 — 从缓存恢复产物文件
+                            match compile_cache.restore_artifact(&cache_key, &object_file) {
+                                Ok(true) => {
+                                    skipped_cached += 1;
+                                    expected_objects.push(object_file);
+                                    continue;
                                 }
+                                _ => {} // 恢复失败则重新编译
                             }
                         }
                     }
@@ -873,41 +936,14 @@ fn main() -> Result<()> {
                         module_name,
                     );
 
-                    // 添加包含目录
-                    unit.include_dirs.push(module_path.join("Public"));
-                    unit.include_dirs.push(module_path.join("Private"));
-                    if !unit.include_dirs.contains(&reflection_output) {
-                        unit.include_dirs.push(reflection_output.clone());
-                    }
+                    // 包含目录 — 复用循环外预计算的模块级搜索路径,
+                    // 与缓存键解析头依赖时所用的路径集完全一致
+                    unit.include_dirs = module_include_dirs.clone();
 
-                    for dep_module in &modules {
-                        if dep_module.name != *module_name {
-                            if dep_module.module_type == crate::core::config::ModuleType::External {
-                                // External 模块: 传播其 include_paths 和 defines 给依赖方
-                                for inc_path in &dep_module.config.compile.include_paths {
-                                    let expanded = expand_env_vars(inc_path);
-                                    let path = std::path::PathBuf::from(expanded);
-                                    if !unit.include_dirs.contains(&path) {
-                                        unit.include_dirs.push(path);
-                                    }
-                                }
-                                for ext_def in &dep_module.config.compile.defines {
-                                    if !unit.defines.contains(ext_def) {
-                                        unit.defines.push(ext_def.clone());
-                                    }
-                                }
-                            } else {
-                                unit.include_dirs.push(dep_module.path.join("Public"));
-                            }
-                        }
-                    }
-
-                    // 添加模块 [compile] 配置中的额外包含路径 (支持 ${ENV} 展开)
-                    for extra_inc in &module.config.compile.include_paths {
-                        let expanded = expand_env_vars(extra_inc);
-                        let inc_path = std::path::PathBuf::from(&expanded);
-                        if !unit.include_dirs.contains(&inc_path) {
-                            unit.include_dirs.push(inc_path);
+                    // External 依赖传播下来的预处理器定义
+                    for ext_def in &module_external_defines {
+                        if !unit.defines.contains(ext_def) {
+                            unit.defines.push(ext_def.clone());
                         }
                     }
 
@@ -1290,25 +1326,9 @@ fn main() -> Result<()> {
                         let object_file = object_file_for_source(source, &intermediate_dir);
 
                         if object_file.exists() {
-                            if let Ok(source_hash) = compiler::compile_cache::hash_file(source) {
-                                let cache_key_input = compiler::compile_cache::CacheKeyInput {
-                                    source_hash,
-                                    compiler_fingerprint: format!(
-                                        "{}_{}",
-                                        comp.name(),
-                                        comp.version()
-                                    ),
-                                    dependencies_hash: "pending".to_string(),
-                                    target_platform: format!(
-                                        "{}_{}",
-                                        compiler_config.platform.name(),
-                                        compiler_config.architecture.name()
-                                    ),
-                                    build_configuration: build_config.name().to_string(),
-                                };
-                                let cache_key =
-                                    compiler::compile_cache::compute_cache_key(&cache_key_input);
-
+                            // 复用编译前记录的键 — 必须与查询时的键完全一致,
+                            // 若在此重新计算, 任何输入差异都会让缓存永远无法命中
+                            if let Some(cache_key) = source_cache_keys.get(source).cloned() {
                                 if !compile_cache.contains(&cache_key) {
                                     let artifact_size = std::fs::metadata(&object_file)
                                         .map(|m| m.len())

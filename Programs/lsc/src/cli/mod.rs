@@ -84,8 +84,8 @@ pub struct CompileArgs {
     #[arg(short = 'g', long)]
     pub debug_info: bool,
 
-    /// 目标 Vulkan 版本 (1.0, 1.1, 1.2, 1.3)
-    #[arg(long, default_value = "1.3")]
+    /// 目标 Vulkan 版本 (1.0, 1.1, 1.2, 1.3, 1.4)
+    #[arg(long, default_value = "1.4")]
     pub vulkan_version: String,
 
     /// 生成反射信息
@@ -231,7 +231,7 @@ pub enum Commands {
         strict: bool,
 
         /// 目标 Vulkan 版本
-        #[arg(long, default_value = "1.3")]
+        #[arg(long, default_value = "1.4")]
         vulkan_version: String,
     },
 
@@ -547,7 +547,8 @@ impl CompileArgs {
             "1.0" => crate::core::TargetEnvironment::Vulkan1_0,
             "1.1" => crate::core::TargetEnvironment::Vulkan1_1,
             "1.2" => crate::core::TargetEnvironment::Vulkan1_2,
-            _ => crate::core::TargetEnvironment::Vulkan1_3,
+            "1.3" => crate::core::TargetEnvironment::Vulkan1_3,
+            _ => crate::core::TargetEnvironment::Vulkan1_4,
         }
     }
 }

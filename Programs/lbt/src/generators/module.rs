@@ -51,6 +51,7 @@ pub fn generate_module_header(module: &Module, output_dir: &Path) -> Result<()> 
 
     // 导出宏定义
     let exports_macro = format!("LIMX_{}_EXPORTS", short_name.to_uppercase());
+    let static_macro = format!("LIMX_{}_STATIC", short_name.to_uppercase());
 
     let mut content = String::new();
 
@@ -78,7 +79,13 @@ pub fn generate_module_header(module: &Module, output_dir: &Path) -> Result<()> 
 // API 导出宏
 // =============================================================================
 
-#if defined({exports_macro})
+// 静态库判断必须在最前 —— LBT 对静态库会同时定义 _STATIC 与模块 toml 中
+// 声明的 _EXPORTS。若 _EXPORTS 在前, 静态库会被按 dllexport 编译, 进而对
+// 含模板成员的导出类触发 C4251, 在 /WX 下变成编译错误。
+#if defined({static_macro})
+    // 静态链接 — 符号直接参与链接, 无需导出标记
+    #define {api_macro}
+#elif defined({exports_macro})
     #define {api_macro} __declspec(dllexport)
 #else
     #define {api_macro} __declspec(dllimport)

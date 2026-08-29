@@ -75,16 +75,24 @@ fn generate_api_header_content(
 // API 导出宏
 //=============================================================================
 
-#if defined({name_upper}_EXPORTS)
-    // 构建此模块时导出符号
-    #define {name_upper}_API __declspec(dllexport)
-    #define {name_upper}_TEMPLATE_API
-#elif defined({name_upper}_STATIC)
-    // 静态链接
+// 判断依据必须与 LBT 编译时注入的宏名一致。
+// LBT 由模块 toml 的 api_macro 去掉 "_API" 得到前缀, 即 LIMX_XXX,
+// 因此这里必须用 LIMX_{short_name_upper}_ 而非模块名大写形式 ——
+// 后者永远不会被定义, 会让静态库落入 dllimport 分支。
+//
+// 静态库判断在最前: LBT 对静态库会同时定义 _STATIC 与模块 toml 中声明的
+// _EXPORTS, 若 _EXPORTS 在前, 静态库会被按 dllexport 编译, 进而对含模板
+// 成员的导出类触发 C4251, 在 /WX 下变成编译错误。
+#if defined(LIMX_{short_name_upper}_STATIC)
+    // 静态链接 — 符号直接参与链接, 无需导出标记
     #define {name_upper}_API
     #define {name_upper}_TEMPLATE_API
+#elif defined(LIMX_{short_name_upper}_EXPORTS)
+    // 构建此动态模块时导出符号
+    #define {name_upper}_API __declspec(dllexport)
+    #define {name_upper}_TEMPLATE_API
 #else
-    // 使用此模块时导入符号
+    // 使用此动态模块时导入符号
     #define {name_upper}_API __declspec(dllimport)
     #define {name_upper}_TEMPLATE_API extern
 #endif

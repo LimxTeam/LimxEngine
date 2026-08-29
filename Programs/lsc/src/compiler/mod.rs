@@ -220,6 +220,10 @@ impl ShaderCompiler {
             options.target_environment.to_shaderc_version(),
         );
 
+        // 显式固定 SPIR-V 版本 — shaderc 0.8.3 的 EnvVersion 未收录
+        // Vulkan 1.4，仅靠 set_target_env 无法可靠推导出目标字节码版本
+        shaderc_options.set_target_spirv(options.target_environment.to_spirv_version());
+
         // 设置优化级别
         shaderc_options.set_optimization_level(options.optimization_level.to_shaderc());
 
