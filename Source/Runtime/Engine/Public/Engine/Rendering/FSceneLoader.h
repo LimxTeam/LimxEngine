@@ -101,6 +101,12 @@ struct FSceneLoadResult
 
     /// 导入耗时 (毫秒)
     Float64 ElapsedMilliseconds = 0.0;
+
+    /// 本次导入创建的材质 (非拥有指针, 由 FMaterialManager 管理生命周期)
+    ///
+    /// 卸载场景时必须连同这些材质一起销毁 —— 纹理的存活完全取决于
+    /// "还有多少材质在引用它", 材质不销毁, 纹理就永远收不回来。
+    TArray<FMaterial*> Materials;
 };
 
 // ============================================================================
@@ -130,6 +136,16 @@ public:
         FRenderContext* context,
         const FString& path,
         const FSceneLoadOptions& options = FSceneLoadOptions());
+
+    /// 销毁一次导入创建的全部材质
+    ///
+    /// 与场景销毁配对使用: 场景销毁释放网格引用, 本函数释放纹理引用。
+    /// 两者都完成后调用 FRenderResourceManager::CollectUnreferenced,
+    /// 显存才会真正回落。
+    ///
+    /// @param result LoadInto 的返回值
+    /// @return 销毁的材质数
+    static UInt32 UnloadMaterials(const FSceneLoadResult& result);
 };
 
 } // namespace Limx

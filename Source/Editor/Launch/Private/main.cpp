@@ -27,6 +27,7 @@
 // │ BuildDemoScene()           │ 构建默认演示场景                 │
 // │ BuildStressScene()         │ 构建可配置规模的压力场景          │
 // │ LoadSceneFromFile()        │ 导入资产并自动摆放相机           │
+// │ RunReloadTest()            │ 关卡切换自检 (显存回落验证)       │
 // │ LogBenchmarkReport()       │ 输出基准测量报告                 │
 //
 // ── 更新历史 ──────────────────────────────────────────────────
@@ -84,6 +85,12 @@ struct FLaunchOptions
 
     /// 相机是否置于场景内部 —— 建筑内景必须开启, 否则只看得到外墙
     bool CameraInside = false;
+
+    /// 关卡切换自检 —— 加载 → 卸载 → 再加载, 逐步报告显存
+    ///
+    /// 显存能否回落是"引用计数是否真的接通"的唯一硬指标。靠肉眼看画面
+    /// 完全看不出泄漏, 而泄漏在关卡反复切换后才会致命。
+    bool ReloadTest = false;
 };
 
 // ============================================================================
@@ -215,6 +222,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --scene-scale S  导入时的统一缩放
 ///   --no-textures    不加载纹理, 只保留材质常量
 ///   --camera-inside  相机置于场景内部 (建筑内景用)
+///   --reload-test    关卡切换自检: 加载 → 卸载 → 再加载, 报告显存回落
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -293,6 +301,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--camera-inside"))
         {
             options.CameraInside = true;
+        }
+        else if (WideEquals(arg, L"--reload-test"))
+        {
+            options.ReloadTest = true;
         }
     }
 
@@ -507,7 +519,8 @@ static void BuildStressScene(LScene* scene, FRenderContext* context,
 
 static bool LoadSceneFromFile(LScene* scene, FRenderContext* context,
                               FRenderer* renderer,
-                              const FLaunchOptions& options)
+                              const FLaunchOptions& options,
+                              FSceneLoadResult* outResult = nullptr)
 {
     FSceneLoadOptions loadOptions;
     loadOptions.UniformScale = options.SceneScale;
@@ -518,6 +531,11 @@ static bool LoadSceneFromFile(LScene* scene, FRenderContext* context,
 
     const FSceneLoadResult loadResult =
         FSceneLoader::LoadInto(scene, context, options.ScenePath, loadOptions);
+
+    if (outResult != nullptr)
+    {
+        *outResult = loadResult;
+    }
 
     if (!loadResult.Succeeded)
     {
@@ -612,6 +630,89 @@ static bool LoadSceneFromFile(LScene* scene, FRenderContext* context,
                  options.CameraInside ? "内部" : "全景");
     }
 
+    return true;
+}
+
+// ============================================================================
+// RunReloadTest — 关卡切换自检
+//
+// 加载 → 卸载 → 再加载, 每一步报告显存。中间那一步的显存必须回落到接近
+// 初始值, 否则说明引用计数某处没接通 —— 而这类泄漏靠看画面完全看不出来,
+// 只有在关卡反复切换后才会以"显存耗尽"的形式暴露。
+// ============================================================================
+
+static bool RunReloadTest(FRenderContext* context, FRenderer* renderer,
+                          const FLaunchOptions& options)
+{
+    FRenderResourceManager& resources = context->GetResourceManager();
+
+    const UInt64 baselineBytes = resources.GetStats().GetTotalBytes();
+
+    LIMX_LOG(LogLaunch, Log,
+             "[自检] 基线显存 {} KiB", baselineBytes / 1024);
+
+    for (UInt32 round = 0; round < 2; ++round)
+    {
+        LScene* scene = LScene::Create(FName("ReloadTestScene"));
+
+        if (scene == nullptr)
+        {
+            LIMX_LOG(LogLaunch, Error, "[自检] 场景创建失败");
+            return false;
+        }
+
+        FSceneLoadResult loadResult;
+
+        if (!LoadSceneFromFile(scene, context, renderer, options, &loadResult))
+        {
+            LRegistry::Get().Destroy(scene);
+            return false;
+        }
+
+        const UInt64 loadedBytes = resources.GetStats().GetTotalBytes();
+
+        LIMX_LOG(LogLaunch, Log,
+                 "[自检] 第 {} 轮加载后 — 显存 {} KiB (网格 {} 纹理 {})",
+                 round + 1, loadedBytes / 1024,
+                 resources.GetStats().MeshCount,
+                 resources.GetStats().TextureCount);
+
+        // ---- 卸载 ----
+        //
+        // 顺序要紧: 先销毁场景 (LMeshTrait 析构释放网格引用), 再销毁材质
+        // (释放纹理引用), 最后收割。反过来的话, 材质销毁时 Trait 还活着,
+        // 网格引用未放, 收割只能收回纹理。
+        LRegistry::Get().Destroy(scene);
+
+        const UInt32 destroyedMaterials =
+            FSceneLoader::UnloadMaterials(loadResult);
+
+        const UInt32 collected = resources.CollectUnreferenced();
+
+
+        // 退役资源要等 MaxFramesInFlight 帧才真正销毁。此处没有帧循环,
+        // 直接等 GPU 空闲后冲刷队列。
+        context->GetDevice()->WaitIdle();
+        const UInt32 flushed = resources.FlushPendingReleases();
+
+        const UInt64 unloadedBytes = resources.GetStats().GetTotalBytes();
+
+        LIMX_LOG(LogLaunch, Log,
+                 "[自检] 第 {} 轮卸载后 — 显存 {} KiB "
+                 "(销毁材质 {}, 回收资源 {}, 冲刷 {})",
+                 round + 1, unloadedBytes / 1024,
+                 destroyedMaterials, collected, flushed);
+
+        if (unloadedBytes > baselineBytes)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[自检] 第 {} 轮存在泄漏 — 卸载后 {} KiB > 基线 {} KiB",
+                     round + 1, unloadedBytes / 1024, baselineBytes / 1024);
+            return false;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Log, "[自检] 通过 — 两轮加载卸载后显存完全回落");
     return true;
 }
 
@@ -780,6 +881,23 @@ int WINAPI wWinMain(
     LIMX_CHECK(scene != nullptr);
 
     // 4c. 通过资源管理器创建场景网格, 挂到 LScene 的 LNode+LMeshTrait
+    if (launchOptions.ReloadTest)
+    {
+        const bool passed =
+            RunReloadTest(&renderContext, &renderer, launchOptions);
+
+        LRegistry::Get().Destroy(scene);
+        FSceneManager::Get().Shutdown();
+        renderer.Shutdown();
+        renderContext.Shutdown();
+        window.Destroy();
+
+        FLog::RemoveSink(&fileLogSink);
+        fileLogSink.Close();
+
+        return passed ? 0 : 4;
+    }
+
     if (!launchOptions.ScenePath.IsEmpty())
     {
         if (!LoadSceneFromFile(scene, &renderContext, &renderer,

@@ -77,6 +77,8 @@
 namespace Limx
 {
 
+class FRenderResourceManager;
+
 // ============================================================================
 // 材质纹理槽位常量
 // ============================================================================
@@ -284,7 +286,23 @@ public:
         FRHITextureViewHandle view,
         FRHISamplerHandle    sampler);
 
+    /// 绑定由资源管理器拥有的纹理到指定槽位
+    ///
+    /// 与裸句柄版本的区别在于**所有权**: 本重载会对纹理资源加一次引用,
+    /// 并在解绑/销毁时释放。没有这一步的话, 导入的纹理引用计数永远停在
+    /// 创建时的那一份, CollectUnreferenced 永远收不走它们 —— 关卡切换时
+    /// 显存只增不减。
+    ///
+    /// @param slot     槽位索引 (kMaterialTextureSlot* 常量)
+    /// @param manager  资源管理器 (非拥有, 必须活得比本材质长)
+    /// @param handle   纹理资源句柄
+    void BindTextureResource(UInt32 slot,
+                             FRenderResourceManager* manager,
+                             FTextureResourceHandle handle);
+
     /// 解绑指定槽位 — 回退到默认白色纹理，清除 TextureFlags 对应位
+    ///
+    /// 若该槽位持有的是资源管理器的纹理, 一并释放引用。
     void UnbindTexture(UInt32 slot);
 
     // ========================================================================
@@ -363,6 +381,18 @@ private:
 
     /// 每个槽位的采样器 (未绑定时存储默认采样器)
     FRHISamplerHandle m_Samplers[kMaterialTextureSlotCount];
+
+    /// 释放指定槽位持有的纹理引用 (若有)
+    void ReleaseTextureResource(UInt32 slot);
+
+    /// 各槽位持有的纹理资源句柄 — 无效表示该槽位用的是裸句柄或默认纹理
+    ///
+    /// 与 m_TextureViews 并存而非取代它: 程序化生成的纹理 (棋盘格、
+    /// 默认白图) 不经过资源管理器, 只有裸句柄可用。
+    FTextureResourceHandle m_TextureResources[kMaterialTextureSlotCount];
+
+    /// 资源管理器 — 非拥有; 仅当至少有一个槽位持有资源句柄时非空
+    FRenderResourceManager* m_TextureOwner = nullptr;
 
     /// 默认白色纹理视图 (非拥有，由 FMaterialManager 管理生命周期)
     FRHITextureViewHandle m_DefaultTextureView;

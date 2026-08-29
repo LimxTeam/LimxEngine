@@ -11,6 +11,9 @@
  *   已经是可直接打开的路径，导入器不再二次拼接。同一份贴图被几十个材质
  *   引用是常态，逐材质上传会让显存翻好几倍。
  *
+ *   材质持有纹理引用而非裸句柄 — 导入器放掉创建引用后, 纹理的存活完全
+ *   由"还有多少材质在用它"决定。材质随场景销毁, 引用归零, 显存回落。
+ *
  *   缺失贴图不中断导入 — 真实资产里贴图缺失是常态 (大小写、路径分隔符、
  *   压缩格式不支持)。缺一张贴图就整场导入失败，等于把一个显示问题升级成
  *   一个加载问题。这里记录计数并回退到材质的常量因子。
@@ -178,8 +181,11 @@ FTextureResourceHandle AcquireTexture(FRenderResourceManager& resources,
 }
 
 /// 把一张纹理绑定到材质槽位; 句柄无效时保持默认贴图
+///
+/// 走引用计数版本 —— 材质持有一份自己的引用, 材质销毁时释放。
+/// 这是导入的纹理能在运行时被回收的前提。
 void BindMaterialTexture(FMaterial* material, UInt32 slot,
-                         const FRenderResourceManager& resources,
+                         FRenderResourceManager& resources,
                          FTextureResourceHandle handle)
 {
     if (material == nullptr || !handle.IsValid())
@@ -187,14 +193,7 @@ void BindMaterialTexture(FMaterial* material, UInt32 slot,
         return;
     }
 
-    const FTextureResource* texture = resources.GetTexture(handle);
-
-    if (texture == nullptr || !texture->IsValid())
-    {
-        return;
-    }
-
-    material->BindTexture(slot, texture->View, texture->Sampler);
+    material->BindTextureResource(slot, &resources, handle);
 }
 
 /// 把资产的 alpha 模式映射为渲染层的混合模式
@@ -324,6 +323,7 @@ FSceneLoadResult FSceneLoader::LoadInto(LScene* scene,
     }
 
     result.MaterialCount = static_cast<UInt32>(materials.GetSize());
+    result.Materials     = materials;
     result.TextureCount  = static_cast<UInt32>(textureCache.Handles.GetSize());
 
     // ---- 3. 网格 ----
@@ -436,15 +436,15 @@ FSceneLoadResult FSceneLoader::LoadInto(LScene* scene,
         }
     }
 
-    // 纹理的创建引用**刻意不释放**。
+    // ---- 6. 交出纹理的创建引用 ----
     //
-    // FMaterial::BindTexture 拿到的是裸的 view/sampler 句柄, 材质与资源
-    // 管理器之间没有任何引用关系。此处一旦释放, 纹理的引用计数即归零,
-    // 下一次 CollectUnreferenced 就会把仍被材质描述符集引用的视图销毁掉。
-    //
-    // 因此当前的纹理生命周期是"随资源管理器一同销毁", 运行时无法单独卸载。
-    // 要支持关卡切换时回收纹理, 需要让 FMaterial 也参与引用计数 ——
-    // 那是一处独立的改动, 不应混在导入器里。
+    // 每个引用该纹理的材质都已在 BindTextureResource 中加过自己那一份,
+    // 因此这里可以安全地放掉创建时的引用。材质全部销毁后引用归零,
+    // CollectUnreferenced 即可回收 —— 这正是关卡切换时显存能回落的原因。
+    for (SizeType i = 0; i < textureCache.Handles.GetSize(); ++i)
+    {
+        resources.ReleaseTextureReference(textureCache.Handles[i]);
+    }
 
     result.Bounds = assetScene->Bounds;
 
@@ -469,6 +469,26 @@ FSceneLoadResult FSceneLoader::LoadInto(LScene* scene,
     }
 
     return result;
+}
+
+// ============================================================================
+// UnloadMaterials — 销毁本次导入创建的材质
+// ============================================================================
+
+UInt32 FSceneLoader::UnloadMaterials(const FSceneLoadResult& result)
+{
+    UInt32 destroyed = 0;
+
+    for (SizeType i = 0; i < result.Materials.GetSize(); ++i)
+    {
+        if (result.Materials[i] != nullptr)
+        {
+            FMaterialManager::Get().DestroyMaterial(result.Materials[i]);
+            ++destroyed;
+        }
+    }
+
+    return destroyed;
 }
 
 } // namespace Limx

@@ -41,6 +41,7 @@
 // ============================================================
 
 #include "RenderCore/Material/FMaterial.h"
+#include "RenderCore/Resources/FRenderResourceManager.h"
 
 namespace Limx
 {
@@ -125,6 +126,15 @@ ERHIResult FMaterial::Initialize(
 
 void FMaterial::Shutdown()
 {
+    // 引用释放必须无条件执行 —— 即便设备已置空 (重复 Shutdown),
+    // 纹理引用也不该被漏掉。漏掉的后果是显存永远收不回来。
+    for (UInt32 slot = 0; slot < kMaterialTextureSlotCount; ++slot)
+    {
+        ReleaseTextureResource(slot);
+    }
+
+    m_TextureOwner = nullptr;
+
     if (m_Device == nullptr)
     {
         return;
@@ -216,9 +226,52 @@ void FMaterial::BindTexture(
 // UnbindTexture — 解绑指定槽位，回退到默认白色纹理
 // ============================================================================
 
+void FMaterial::BindTextureResource(UInt32 slot,
+                                    FRenderResourceManager* manager,
+                                    FTextureResourceHandle handle)
+{
+    LIMX_CHECK(slot < kMaterialTextureSlotCount);
+
+    if (manager == nullptr || !handle.IsValid())
+    {
+        return;
+    }
+
+    const FTextureResource* texture = manager->GetTexture(handle);
+
+    if (texture == nullptr || !texture->IsValid())
+    {
+        return;
+    }
+
+    // 先加新引用再放旧引用 —— 反过来时若新旧是同一张纹理, 释放会让引用
+    // 计数瞬间归零, 可能被并发的收割逻辑退役掉。
+    manager->AddTextureReference(handle);
+
+    ReleaseTextureResource(slot);
+
+    m_TextureOwner            = manager;
+    m_TextureResources[slot]  = handle;
+
+    BindTexture(slot, texture->View, texture->Sampler);
+}
+
+void FMaterial::ReleaseTextureResource(UInt32 slot)
+{
+    if (m_TextureOwner == nullptr || !m_TextureResources[slot].IsValid())
+    {
+        return;
+    }
+
+    m_TextureOwner->ReleaseTextureReference(m_TextureResources[slot]);
+    m_TextureResources[slot] = FTextureResourceHandle();
+}
+
 void FMaterial::UnbindTexture(UInt32 slot)
 {
     LIMX_CHECK(slot < kMaterialTextureSlotCount);
+
+    ReleaseTextureResource(slot);
 
     m_TextureViews[slot] = m_DefaultTextureView;
     m_Samplers[slot]     = m_DefaultSampler;
