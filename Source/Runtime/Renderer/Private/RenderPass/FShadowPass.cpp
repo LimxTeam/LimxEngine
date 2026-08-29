@@ -449,6 +449,54 @@ ERHIResult FShadowPass::CreateLightUniforms(
 }
 
 // ============================================================================
+// ComputeCascadeSplits — 对数与均匀的加权切分
+// ============================================================================
+
+void FShadowPass::ComputeCascadeSplits(Float32 nearPlane,
+                                        Float32 shadowDistance,
+                                        UInt32 cascadeCount,
+                                        Float32 lambda,
+                                        Float32* outSplits)
+{
+    if (outSplits == nullptr || cascadeCount == 0)
+    {
+        return;
+    }
+
+    // 近平面必须为正 —— 对数切分要对 far/near 取幂, 零或负数会得到
+    // 非有限值, 而那些值会一路传到正交矩阵里, 表现为阴影整体消失。
+    const Float32 safeNear = (nearPlane > 1.0e-4f) ? nearPlane : 1.0e-4f;
+
+    // 覆盖距离至少比近平面远一个单位, 否则整个级联退化为零厚度
+    const Float32 farPlane =
+        (shadowDistance > safeNear + 1.0f) ? shadowDistance : (safeNear + 1.0f);
+
+    const Float32 range = farPlane - safeNear;
+    const Float32 ratio = farPlane / safeNear;
+
+    const Float32 safeLambda = FMath::Clamp(lambda, 0.0f, 1.0f);
+
+    outSplits[0] = safeNear;
+
+    for (UInt32 i = 1; i <= cascadeCount; ++i)
+    {
+        const Float32 p = static_cast<Float32>(i) /
+                          static_cast<Float32>(cascadeCount);
+
+        const Float32 logSplit     = safeNear * FMath::Pow(ratio, p);
+        const Float32 uniformSplit = safeNear + range * p;
+
+        outSplits[i] =
+            safeLambda * logSplit + (1.0f - safeLambda) * uniformSplit;
+    }
+
+    // 最远一级严格等于覆盖距离 —— 浮点插值在 p=1 处可能差出几个 ulp,
+    // 而着色器用 "距离 > 最后一级边界则判为无遮挡", 差一点就会在最远处
+    // 留下一圈没有阴影的环带。
+    outSplits[cascadeCount] = farPlane;
+}
+
+// ============================================================================
 // SetLightAndBounds — 由场景包围盒拟合光源正交视锥
 // ============================================================================
 
@@ -474,33 +522,13 @@ void FShadowPass::SetLightAndBounds(const FVector3& lightDirection,
 
     // ---- 1. 切分 ----
     //
-    // 实用切分方案: 在对数分布与均匀分布之间插值。
-    //   纯对数在数学上最优 (每级的纹素密度相同), 但最近一级会薄到只有
-    //   几十厘米, 相机稍一移动就跨级, 边界处的突变反而更扎眼。
-    //   纯均匀则把太多精度浪费在远处。
-    // λ=0.75 偏向对数, 是常见取值。
+    // λ=0.75 偏向对数, 是常见取值。算法本身见 ComputeCascadeSplits。
     constexpr Float32 kSplitLambda = 0.75f;
 
-    const Float32 nearPlane = cameraInfo.NearPlane;
-    const Float32 farPlane  = FMath::Max(cameraInfo.ShadowDistance,
-                                         nearPlane + 1.0f);
-    const Float32 range     = farPlane - nearPlane;
-    const Float32 ratio     = farPlane / nearPlane;
-
     Float32 splitDistances[kCascadeCount + 1];
-    splitDistances[0] = nearPlane;
 
-    for (UInt32 i = 1; i <= kCascadeCount; ++i)
-    {
-        const Float32 p = static_cast<Float32>(i) /
-                          static_cast<Float32>(kCascadeCount);
-
-        const Float32 logSplit     = nearPlane * FMath::Pow(ratio, p);
-        const Float32 uniformSplit = nearPlane + range * p;
-
-        splitDistances[i] =
-            kSplitLambda * logSplit + (1.0f - kSplitLambda) * uniformSplit;
-    }
+    ComputeCascadeSplits(cameraInfo.NearPlane, cameraInfo.ShadowDistance,
+                         kCascadeCount, kSplitLambda, splitDistances);
 
     // ---- 2. 逐级拟合 ----
     const FVector3 forward = cameraInfo.Forward.GetSafeNormal();

@@ -114,7 +114,7 @@ cp Programs/target/release/lsc.exe Binaries/Tools/
 ### 验证与基准
 
 ```bash
-# 全量验证：工具链 → 着色器 → 源码规则 → 构建 → 四套单元测试
+# 全量验证：工具链 → 着色器 → 源码规则 → 构建 → 四套单元测试 → 显存回收自检
 powershell Scripts/verify.ps1
 
 # 渲染吞吐基准：同一场景下对照剔除与合批的收益
@@ -144,6 +144,7 @@ LimxLaunch.exe --grid 60 --frames 300 --no-cull --no-sort
 | `--frames <N>` | 渲染 N 帧后输出基准报告并退出 |
 | `--warmup <N>` | 计入统计前跳过的预热帧数（默认 60） |
 | `--no-cull` / `--no-sort` | 关闭视锥剔除 / 状态排序 |
+| `--reload-test` | 关卡切换自检：加载 → 卸载 → 再加载，报告显存回落 |
 
 ### 目录结构
 

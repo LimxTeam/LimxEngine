@@ -164,6 +164,15 @@ void FSceneManager::SyncScene(const LScene* scene, Float32 deltaTime)
     // 要求, 关掉它得到的不是"慢一点", 而是错误的混合结果。
     SortTranslucentBatches();
 
+    // 阴影投射体同样按状态聚类。阴影 Pass 要把这份列表走三遍 (每级一遍),
+    // 不排序的话每个物体都可能重绑一次管线与材质集 —— 代价是主 Pass 的
+    // 三倍。这份列表是主列表剔除前的副本, 因此必须单独排。
+    if (m_IsSortingEnabled && m_ShadowCasterObjects.GetSize() > 1)
+    {
+        Sort(m_ShadowCasterObjects.GetData(),
+             m_ShadowCasterObjects.GetSize(), FBatchStateLess());
+    }
+
     // 6. 统计
     MeasureBatches();
 

@@ -136,6 +136,28 @@ public:
         return m_CascadeSplits[cascade < kCascadeCount ? cascade : 0];
     }
 
+    /// 计算级联切分距离 — 纯函数, 与 GPU 无关
+    ///
+    /// 在对数分布与均匀分布之间按 lambda 加权:
+    ///   纯对数 (lambda=1) 每级纹素密度相同, 数学上最优, 但最近一级会薄到
+    ///   几十厘米, 相机稍一移动就跨级, 边界突变反而更扎眼;
+    ///   纯均匀 (lambda=0) 则把太多精度浪费在远处。
+    ///
+    /// 输出 cascadeCount + 1 个距离: [0] 是近平面, [cascadeCount] 是最远,
+    /// 中间是各级边界。必须严格递增 —— 相等或倒序会让某一级退化为空,
+    /// 而着色器仍会去采样它, 采到的是未初始化的深度。
+    ///
+    /// @param nearPlane      相机近平面
+    /// @param shadowDistance 阴影覆盖的最远距离
+    /// @param cascadeCount   级数
+    /// @param lambda         对数权重 [0, 1]
+    /// @param outSplits      输出数组, 至少 cascadeCount + 1 个元素
+    static void ComputeCascadeSplits(Float32 nearPlane,
+                                     Float32 shadowDistance,
+                                     UInt32 cascadeCount,
+                                     Float32 lambda,
+                                     Float32* outSplits);
+
     // ====================================================================
     // 光源与场景范围
     // ====================================================================

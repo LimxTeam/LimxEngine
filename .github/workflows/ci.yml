@@ -135,6 +135,11 @@ jobs:
       - name: 引擎层单元测试
         run: .\Binaries\Development\Win64\LimxEngineTests.exe
 
+      # 需要真实 GPU —— CI 运行器通常只有软件光栅化器, 该步可能不适用。
+      # 首次触发时若失败, 应确认运行器是否具备 Vulkan 设备, 而非直接删掉。
+      - name: 显存回收自检
+        run: .\Binaries\Development\Win64\LimxLaunch.exe --scene Content/TestScene/testscene.obj --reload-test
+
       - name: 上传失败日志
         if: failure()
         uses: actions/upload-artifact@v4

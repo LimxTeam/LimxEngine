@@ -218,6 +218,13 @@ Invoke-Step 'EngineTests' {
     .\Binaries\Development\Win64\LimxEngineTests.exe
 }
 
+# 显存回收自检 —— 需要真实 GPU, 因此放在单元测试之后单独一步。
+# 它验证的是"引用计数是否真的接通", 而这一点靠单元测试测不到:
+# 泄漏只在 GPU 资源实际分配与释放时才成立。
+Invoke-Step '显存回收自检' {
+    .\Binaries\Development\Win64\LimxLaunch.exe --scene Content/TestScene/testscene.obj --reload-test
+}
+
 # ------------------------------------------------------------
 # 汇总
 # ------------------------------------------------------------
