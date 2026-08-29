@@ -132,6 +132,7 @@ enum class ERHIResult : Int32
     ErrorInvalidHandle   = -7,
     ErrorInvalidParameter = -8,
     ErrorShaderCompilation = -9,
+    ErrorIncompatibleDriver = -10,
 };
 
 // 判断结果是否成功

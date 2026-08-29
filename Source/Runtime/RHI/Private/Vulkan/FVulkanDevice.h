@@ -70,6 +70,7 @@
 #include "RHI/RHI/IRHIDevice.h"
 #include "RHI/RHI/IRHICommandBuffer.h"
 #include "Vulkan/TVulkanResourcePool.h"
+#include "Vulkan/FVulkanMemoryAllocator.h"
 
 namespace Limx
 {
@@ -80,16 +81,23 @@ namespace Limx
 
 struct FVulkanBufferData
 {
-    VkBuffer       Buffer     = VK_NULL_HANDLE;
-    VkDeviceMemory Memory     = VK_NULL_HANDLE;
-    VkDeviceSize   Size       = 0;
-    void*          MappedPtr  = nullptr;
+    VkBuffer     Buffer = VK_NULL_HANDLE;
+    VkDeviceSize Size   = 0;
+
+    /// 显存来自分配器的子分配 — 不再持有独立的 VkDeviceMemory
+    FVulkanAllocation Allocation;
+
+    /// 主机可访问地址 — 等于 Allocation.MappedPtr, 冗余保存以便热路径直取
+    void* MappedPtr = nullptr;
 };
 
 struct FVulkanTextureData
 {
     VkImage        Image            = VK_NULL_HANDLE;
-    VkDeviceMemory Memory           = VK_NULL_HANDLE;
+
+    /// 显存来自分配器 — 交换链图像由呈现引擎拥有内存, 此处保持无效
+    FVulkanAllocation Allocation;
+
     VkFormat       Format           = VK_FORMAT_UNDEFINED;
     VkExtent3D     Extent           = { 0, 0, 0 };
     UInt32         MipLevels        = 1;
@@ -486,6 +494,31 @@ private:
     VkPhysicalDeviceProperties       m_DeviceProperties   = {};
     VkPhysicalDeviceFeatures         m_DeviceFeatures     = {};
     VkPhysicalDeviceMemoryProperties m_MemoryProperties   = {};
+
+    // ====================================================================
+    // 核心版本特性 — 由 vkGetPhysicalDeviceFeatures2 查询填充
+    //
+    // 设备创建时只启用这里查询到为 VK_TRUE 的特性，避免在不支持
+    // 该特性的 GPU 上导致 vkCreateDevice 失败。
+    // ====================================================================
+
+    VkPhysicalDeviceVulkan11Features m_DeviceFeatures11 = {};
+    VkPhysicalDeviceVulkan12Features m_DeviceFeatures12 = {};
+    VkPhysicalDeviceVulkan13Features m_DeviceFeatures13 = {};
+    VkPhysicalDeviceVulkan14Features m_DeviceFeatures14 = {};
+
+    /// 实际协商出的 Vulkan API 版本 (min(实例支持, 设备支持, 引擎目标))
+    UInt32 m_ApiVersion = 0;
+
+    // ====================================================================
+    // 显存分配器
+    //
+    // 所有缓冲区与纹理的显存都经它供应。逐资源调用 vkAllocateMemory 会在
+    // 资源数逼近 maxMemoryAllocationCount (通常 4096) 时直接失败, 分配器
+    // 以大块子分配把设备分配次数与资源数量解耦。
+    // ====================================================================
+
+    FVulkanMemoryAllocator m_MemoryAllocator;
 
     // ====================================================================
     // 全局描述符池

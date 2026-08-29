@@ -76,6 +76,21 @@
 namespace Limx
 {
 
+// ============================================================================
+// API 版本目标
+//
+// 引擎目标 Vulkan 1.4 (对齐 VulkanSDK 1.4.350)。实际使用的版本在
+// FVulkanDevice::CreateInstance 中与 vkEnumerateInstanceVersion 报告的
+// 实例版本、以及所选物理设备的 apiVersion 取最小值后确定，因此在仅支持
+// 1.3 的驱动上仍可正常降级运行。
+// ============================================================================
+
+/// 引擎目标 Vulkan API 版本
+inline constexpr UInt32 kLimxTargetApiVersion = VK_API_VERSION_1_4;
+
+/// 引擎可接受的最低 Vulkan API 版本 — 低于此版本缺少 Sync2/DynamicRendering
+inline constexpr UInt32 kLimxMinimumApiVersion = VK_API_VERSION_1_3;
+
 // 引入 Core::Memory 子命名空间的内存操作函数到 Limx 作用域
 using Memory::MemCopy;
 using Memory::MemMove;

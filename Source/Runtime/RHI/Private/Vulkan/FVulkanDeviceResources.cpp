@@ -64,61 +64,42 @@ ERHIResult FVulkanDevice::CreateBuffer(const FRHIBufferDesc& desc,
     VkMemoryRequirements memReqs;
     vkGetBufferMemoryRequirements(m_Device, buffer, &memReqs);
 
-    // 分配内存
+    // 经分配器子分配显存 —— 缓冲区始终是线性资源
     VkMemoryPropertyFlags memProps = ToVkMemoryPropertyFlags(
         desc.MemoryUsage);
-    UInt32 memoryTypeIndex = FindMemoryType(memReqs.memoryTypeBits,
-                                             memProps);
-    if (memoryTypeIndex == 0xFFFFFFFF)
-    {
-        vkDestroyBuffer(m_Device, buffer, nullptr);
-        return ERHIResult::ErrorOutOfDeviceMemory;
-    }
 
-    VkMemoryAllocateInfo allocInfo = {};
-    allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize  = memReqs.size;
-    allocInfo.memoryTypeIndex = memoryTypeIndex;
+    FVulkanAllocation allocation;
+    ERHIResult allocResult = m_MemoryAllocator.Allocate(
+        memReqs, memProps, ESuballocationType::Linear, allocation);
 
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    vkResult = vkAllocateMemory(m_Device, &allocInfo, nullptr, &memory);
-    if (vkResult != VK_SUCCESS)
+    if (!IsRHISuccess(allocResult))
     {
         vkDestroyBuffer(m_Device, buffer, nullptr);
         LIMX_LOG(LogRHI, Error,
-            "[Vulkan] vkAllocateMemory(缓冲区) 失败: {}", (Int32)vkResult);
-        return ERHIResult::ErrorOutOfDeviceMemory;
+            "[Vulkan] 缓冲区显存分配失败: {} 字节", (UInt64)memReqs.size);
+        return allocResult;
     }
 
-    // 绑定内存
-    vkResult = vkBindBufferMemory(m_Device, buffer, memory, 0);
+    // 绑定到子分配所在的偏移
+    vkResult = vkBindBufferMemory(m_Device, buffer,
+                                   allocation.Memory, allocation.Offset);
     if (vkResult != VK_SUCCESS)
     {
-        vkFreeMemory(m_Device, memory, nullptr);
+        m_MemoryAllocator.Free(allocation);
         vkDestroyBuffer(m_Device, buffer, nullptr);
         LIMX_LOG(LogRHI, Error,
             "[Vulkan] vkBindBufferMemory 失败: {}", (Int32)vkResult);
         return ERHIResult::ErrorUnknown;
     }
 
-    // 对于 CPU 可访问内存，持久映射
-    void* mappedPtr = nullptr;
-    if (desc.MemoryUsage == EMemoryUsage::CpuToGpu ||
-        desc.MemoryUsage == EMemoryUsage::CpuOnly ||
-        desc.MemoryUsage == EMemoryUsage::GpuToCpu)
-    {
-        vkResult = vkMapMemory(m_Device, memory, 0, desc.Size, 0,
-                                &mappedPtr);
-        if (vkResult != VK_SUCCESS)
-        {
-            mappedPtr = nullptr;
-        }
-    }
+    // 主机可见的块在创建时已整块映射, 此处直接取子分配对应的地址;
+    // 对同一 VkDeviceMemory 重复调用 vkMapMemory 会违反规范
+    void* mappedPtr = allocation.MappedPtr;
 
     // 注册到资源池
     FVulkanBufferData data;
     data.Buffer    = buffer;
-    data.Memory    = memory;
+    data.Allocation = allocation;
     data.Size      = desc.Size;
     data.MappedPtr = mappedPtr;
 
@@ -154,13 +135,10 @@ void FVulkanDevice::DestroyBuffer(FRHIBufferHandle& handle)
         return;
     }
 
-    if (data->MappedPtr != nullptr)
-    {
-        vkUnmapMemory(m_Device, data->Memory);
-    }
-
+    // 映射由块统一持有, 单个子分配不做 Unmap
     vkDestroyBuffer(m_Device, data->Buffer, nullptr);
-    vkFreeMemory(m_Device, data->Memory, nullptr);
+    m_MemoryAllocator.Free(data->Allocation);
+    data->MappedPtr = nullptr;
 
     m_Buffers.Free(handle);
 }
@@ -181,29 +159,32 @@ ERHIResult FVulkanDevice::MapBuffer(FRHIBufferHandle handle,
         return ERHIResult::Success;
     }
 
-    // 尝试映射
-    VkResult vkResult = vkMapMemory(m_Device, data->Memory, 0,
-                                      data->Size, 0, outMappedPtr);
-    if (vkResult != VK_SUCCESS)
+    // 映射由显存块在创建时统一建立并长期持有。若此处对子分配再次调用
+    // vkMapMemory, 会对同一 VkDeviceMemory 产生第二个活跃映射 —— 规范禁止。
+    // 因此拿不到地址只有一种可能: 该缓冲区位于非主机可见的内存类型上。
+    if (data->Allocation.MappedPtr == nullptr)
     {
         LIMX_LOG(LogRHI, Error,
-            "[Vulkan] vkMapMemory 失败: {}", (Int32)vkResult);
-        return ERHIResult::ErrorUnknown;
+            "[Vulkan] MapBuffer 失败 — 缓冲区位于设备本地内存, 不可主机访问");
+        return ERHIResult::ErrorInvalidParameter;
     }
 
-    data->MappedPtr = *outMappedPtr;
+    data->MappedPtr = data->Allocation.MappedPtr;
+    *outMappedPtr   = data->MappedPtr;
+
     return ERHIResult::Success;
 }
 
 void FVulkanDevice::UnmapBuffer(FRHIBufferHandle handle)
 {
     FVulkanBufferData* data = m_Buffers.Get(handle);
-    if (data == nullptr || data->MappedPtr == nullptr)
+    if (data == nullptr)
     {
         return;
     }
 
-    vkUnmapMemory(m_Device, data->Memory);
+    // 持久映射归块所有, 子分配层面不做 Unmap —— 解除映射会让同块内
+    // 其他缓冲区的指针一并失效。这里仅清除本资源的便捷引用。
     data->MappedPtr = nullptr;
 }
 
@@ -250,37 +231,36 @@ ERHIResult FVulkanDevice::CreateTexture(const FRHITextureDesc& desc,
     VkMemoryRequirements memReqs;
     vkGetImageMemoryRequirements(m_Device, image, &memReqs);
 
-    // 分配内存
+    // 经分配器子分配显存
+    //
+    // 平铺模式决定粒度类别: OPTIMAL 图像是非线性资源, 不能与缓冲区等
+    // 线性资源共享同一个 bufferImageGranularity 页, 否则行为未定义。
     VkMemoryPropertyFlags memProps = ToVkMemoryPropertyFlags(
         desc.MemoryUsage);
-    UInt32 memoryTypeIndex = FindMemoryType(memReqs.memoryTypeBits,
-                                             memProps);
-    if (memoryTypeIndex == 0xFFFFFFFF)
-    {
-        vkDestroyImage(m_Device, image, nullptr);
-        return ERHIResult::ErrorOutOfDeviceMemory;
-    }
 
-    VkMemoryAllocateInfo allocInfo = {};
-    allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize  = memReqs.size;
-    allocInfo.memoryTypeIndex = memoryTypeIndex;
+    const ESuballocationType suballocationType =
+        (imageInfo.tiling == VK_IMAGE_TILING_LINEAR)
+            ? ESuballocationType::Linear
+            : ESuballocationType::NonLinear;
 
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    vkResult = vkAllocateMemory(m_Device, &allocInfo, nullptr, &memory);
-    if (vkResult != VK_SUCCESS)
+    FVulkanAllocation allocation;
+    ERHIResult allocResult = m_MemoryAllocator.Allocate(
+        memReqs, memProps, suballocationType, allocation);
+
+    if (!IsRHISuccess(allocResult))
     {
         vkDestroyImage(m_Device, image, nullptr);
         LIMX_LOG(LogRHI, Error,
-            "[Vulkan] vkAllocateMemory(纹理) 失败: {}", (Int32)vkResult);
-        return ERHIResult::ErrorOutOfDeviceMemory;
+            "[Vulkan] 纹理显存分配失败: {} 字节", (UInt64)memReqs.size);
+        return allocResult;
     }
 
-    // 绑定内存
-    vkResult = vkBindImageMemory(m_Device, image, memory, 0);
+    // 绑定到子分配所在的偏移
+    vkResult = vkBindImageMemory(m_Device, image,
+                                  allocation.Memory, allocation.Offset);
     if (vkResult != VK_SUCCESS)
     {
-        vkFreeMemory(m_Device, memory, nullptr);
+        m_MemoryAllocator.Free(allocation);
         vkDestroyImage(m_Device, image, nullptr);
         LIMX_LOG(LogRHI, Error,
             "[Vulkan] vkBindImageMemory 失败: {}", (Int32)vkResult);
@@ -290,7 +270,7 @@ ERHIResult FVulkanDevice::CreateTexture(const FRHITextureDesc& desc,
     // 注册到资源池
     FVulkanTextureData data;
     data.Image            = image;
-    data.Memory           = memory;
+    data.Allocation       = allocation;
     data.Format           = imageInfo.format;
     data.Extent           = imageInfo.extent;
     data.MipLevels        = desc.MipLevels;
@@ -311,11 +291,11 @@ void FVulkanDevice::DestroyTexture(FRHITextureHandle& handle)
         return;
     }
 
-    // 交换链图像不需要手动销毁 (由交换链管理)
+    // 交换链图像的内存由呈现引擎拥有, 引擎侧既不分配也不释放
     if (!data->IsSwapchainImage)
     {
         vkDestroyImage(m_Device, data->Image, nullptr);
-        vkFreeMemory(m_Device, data->Memory, nullptr);
+        m_MemoryAllocator.Free(data->Allocation);
     }
 
     m_Textures.Free(handle);

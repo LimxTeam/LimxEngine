@@ -487,7 +487,9 @@ ERHIResult FVulkanDevice::CreateSwapchain(
         // 注册为纹理 (标记为交换链图像，不由我们销毁)
         FVulkanTextureData texData;
         texData.Image            = swapImages[i];
-        texData.Memory           = VK_NULL_HANDLE;
+        // 交换链图像的显存归呈现引擎所有 — 保持无效分配句柄,
+        // 使 DestroyTexture 不会误将其交给分配器回收
+        texData.Allocation       = FVulkanAllocation();
         texData.Format           = selectedFormat.format;
         texData.Extent           = { extent.width, extent.height, 1 };
         texData.MipLevels        = 1;

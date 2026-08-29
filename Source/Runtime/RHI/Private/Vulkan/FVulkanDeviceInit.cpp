@@ -83,6 +83,14 @@ FVulkanDevice::~FVulkanDevice()
         vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
     }
 
+    // 关闭显存分配器 — 必须早于 vkDestroyDevice:
+    // 它内部要调用 vkUnmapMemory / vkFreeMemory, 设备销毁后这些句柄即失效
+    if (m_MemoryAllocator.IsInitialized())
+    {
+        m_MemoryAllocator.LogStats("设备关闭前");
+        m_MemoryAllocator.Shutdown();
+    }
+
     // 销毁逻辑设备
     if (m_Device != VK_NULL_HANDLE)
     {
@@ -157,6 +165,14 @@ ERHIResult FVulkanDevice::Initialize(void* nativeWindowHandle,
         return result;
     }
 
+    // 显存分配器必须在逻辑设备就绪后、任何资源创建之前初始化
+    result = m_MemoryAllocator.Initialize(m_Device, m_MemoryProperties,
+                                          m_DeviceProperties.limits);
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
     result = CreateDescriptorPool();
     if (!IsRHISuccess(result))
     {
@@ -187,13 +203,50 @@ ERHIResult FVulkanDevice::Initialize(void* nativeWindowHandle,
 
 ERHIResult FVulkanDevice::CreateInstance()
 {
+    // ------------------------------------------------------------------
+    // API 版本协商
+    //
+    // 请求高于 loader 支持的 apiVersion 会让 vkCreateInstance 返回
+    // VK_ERROR_INCOMPATIBLE_DRIVER，因此先查询实例支持的版本再取最小值。
+    // vkEnumerateInstanceVersion 自 Vulkan 1.1 起提供；在 1.0 loader 上
+    // 该符号解析为空，此处按 1.0 处理并在后续检查中拒绝。
+    // ------------------------------------------------------------------
+
+    UInt32 instanceVersion = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion(&instanceVersion) != VK_SUCCESS)
+    {
+        instanceVersion = VK_API_VERSION_1_0;
+    }
+
+    if (instanceVersion < kLimxMinimumApiVersion)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] 实例版本过低: {}.{}.{} — 引擎要求至少 1.3",
+            VK_API_VERSION_MAJOR(instanceVersion),
+            VK_API_VERSION_MINOR(instanceVersion),
+            VK_API_VERSION_PATCH(instanceVersion));
+        return ERHIResult::ErrorIncompatibleDriver;
+    }
+
+    m_ApiVersion = (instanceVersion < kLimxTargetApiVersion)
+                       ? instanceVersion
+                       : kLimxTargetApiVersion;
+
+    LIMX_LOG(LogRHI, Log,
+        "[Vulkan] 实例版本 {}.{}.{} — 协商 API 版本 {}.{}",
+        VK_API_VERSION_MAJOR(instanceVersion),
+        VK_API_VERSION_MINOR(instanceVersion),
+        VK_API_VERSION_PATCH(instanceVersion),
+        VK_API_VERSION_MAJOR(m_ApiVersion),
+        VK_API_VERSION_MINOR(m_ApiVersion));
+
     VkApplicationInfo appInfo = {};
     appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName   = "LimxEngine";
     appInfo.applicationVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
     appInfo.pEngineName        = "Limx";
     appInfo.engineVersion      = VK_MAKE_API_VERSION(0, 1, 0, 0);
-    appInfo.apiVersion         = VK_API_VERSION_1_3;
+    appInfo.apiVersion         = m_ApiVersion;
 
     // 必需的实例扩展
     const char* instanceExtensions[] =
@@ -475,9 +528,81 @@ ERHIResult FVulkanDevice::SelectPhysicalDevice()
     vkGetPhysicalDeviceMemoryProperties(
         m_PhysicalDevice, &m_MemoryProperties);
 
+    // ------------------------------------------------------------------
+    // 设备 API 版本可能低于实例版本 — 再次收敛协商版本。
+    // pNext 特性链中的结构体只有在设备 apiVersion 覆盖该版本时才允许
+    // 挂接，否则 vkGetPhysicalDeviceFeatures2 行为未定义。
+    // ------------------------------------------------------------------
+
+    if (m_DeviceProperties.apiVersion < kLimxMinimumApiVersion)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] GPU '{}' API 版本过低: {}.{}.{} — 引擎要求至少 1.3",
+            m_DeviceProperties.deviceName,
+            VK_API_VERSION_MAJOR(m_DeviceProperties.apiVersion),
+            VK_API_VERSION_MINOR(m_DeviceProperties.apiVersion),
+            VK_API_VERSION_PATCH(m_DeviceProperties.apiVersion));
+        return ERHIResult::ErrorIncompatibleDriver;
+    }
+
+    if (m_DeviceProperties.apiVersion < m_ApiVersion)
+    {
+        m_ApiVersion = m_DeviceProperties.apiVersion;
+    }
+
+    // ------------------------------------------------------------------
+    // 查询核心版本特性 — 设备创建时据此裁剪要启用的特性集
+    // ------------------------------------------------------------------
+
+    m_DeviceFeatures11.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    m_DeviceFeatures12.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    m_DeviceFeatures13.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    m_DeviceFeatures14.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+
+    m_DeviceFeatures11.pNext = &m_DeviceFeatures12;
+    m_DeviceFeatures12.pNext = &m_DeviceFeatures13;
+    m_DeviceFeatures13.pNext =
+        (m_ApiVersion >= VK_API_VERSION_1_4) ? &m_DeviceFeatures14 : nullptr;
+    m_DeviceFeatures14.pNext = nullptr;
+
+    VkPhysicalDeviceFeatures2 features2 = {};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &m_DeviceFeatures11;
+
+    vkGetPhysicalDeviceFeatures2(m_PhysicalDevice, &features2);
+
     LIMX_LOG(LogRHI, Log,
-        "[Vulkan] 选择 GPU: {} (评分: {})",
-        m_DeviceProperties.deviceName, bestScore);
+        "[Vulkan] 选择 GPU: {} (评分: {}, API {}.{}.{})",
+        m_DeviceProperties.deviceName, bestScore,
+        VK_API_VERSION_MAJOR(m_DeviceProperties.apiVersion),
+        VK_API_VERSION_MINOR(m_DeviceProperties.apiVersion),
+        VK_API_VERSION_PATCH(m_DeviceProperties.apiVersion));
+
+    LIMX_LOG(LogRHI, Log,
+        "[Vulkan] 关键特性 — DynamicRendering:{} Sync2:{} "
+        "TimelineSemaphore:{} BufferDeviceAddress:{} DescriptorIndexing:{} "
+        "Maintenance5:{} DemoteToHelper:{}",
+        m_DeviceFeatures13.dynamicRendering != VK_FALSE,
+        m_DeviceFeatures13.synchronization2 != VK_FALSE,
+        m_DeviceFeatures12.timelineSemaphore != VK_FALSE,
+        m_DeviceFeatures12.bufferDeviceAddress != VK_FALSE,
+        m_DeviceFeatures12.descriptorIndexing != VK_FALSE,
+        m_DeviceFeatures14.maintenance5 != VK_FALSE,
+        m_DeviceFeatures13.shaderDemoteToHelperInvocation != VK_FALSE);
+
+    // 引擎渲染路径强依赖 Sync2 + DynamicRendering，缺失则无法运行
+    if (m_DeviceFeatures13.dynamicRendering == VK_FALSE ||
+        m_DeviceFeatures13.synchronization2 == VK_FALSE)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] GPU '{}' 缺少必需特性 dynamicRendering/synchronization2",
+            m_DeviceProperties.deviceName);
+        return ERHIResult::ErrorIncompatibleDriver;
+    }
 
     return ERHIResult::Success;
 }
@@ -624,34 +749,61 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
 
-    // Vulkan 1.2 特性 (Timeline Semaphore 等)
+    // ------------------------------------------------------------------
+    // 版本特性裁剪
+    //
+    // 只启用 PickPhysicalDevice 中经 vkGetPhysicalDeviceFeatures2 确认
+    // 设备支持的特性。请求任一不支持的特性都会使 vkCreateDevice 返回
+    // VK_ERROR_FEATURE_NOT_PRESENT 并导致整个设备创建失败。
+    // ------------------------------------------------------------------
+
+    // Vulkan 1.2 特性 (Timeline Semaphore / 描述符索引 / 设备地址等)
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    features12.timelineSemaphore             = VK_TRUE;
-    features12.descriptorIndexing            = VK_TRUE;
-    features12.bufferDeviceAddress           = VK_TRUE;
-    features12.scalarBlockLayout             = VK_TRUE;
-    features12.hostQueryReset                = VK_TRUE;
-    features12.separateDepthStencilLayouts   = VK_TRUE;
+    features12.timelineSemaphore =
+        m_DeviceFeatures12.timelineSemaphore;
+    features12.descriptorIndexing =
+        m_DeviceFeatures12.descriptorIndexing;
+    features12.bufferDeviceAddress =
+        m_DeviceFeatures12.bufferDeviceAddress;
+    features12.scalarBlockLayout =
+        m_DeviceFeatures12.scalarBlockLayout;
+    features12.hostQueryReset =
+        m_DeviceFeatures12.hostQueryReset;
+    features12.separateDepthStencilLayouts =
+        m_DeviceFeatures12.separateDepthStencilLayouts;
 
-    // Vulkan 1.3 特性 (Dynamic Rendering / Sync2)
+    // Vulkan 1.3 特性 (Dynamic Rendering / Sync2) — 已在设备选择阶段
+    // 校验 dynamicRendering/synchronization2 必须存在
     VkPhysicalDeviceVulkan13Features features13 = {};
     features13.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-    features13.dynamicRendering = VK_TRUE;
-    features13.synchronization2 = VK_TRUE;
-    features13.maintenance4     = VK_TRUE;
+    features13.dynamicRendering = m_DeviceFeatures13.dynamicRendering;
+    features13.synchronization2 = m_DeviceFeatures13.synchronization2;
+    features13.maintenance4     = m_DeviceFeatures13.maintenance4;
+
+    // 着色器语言特性 —— 面向 SPIR-V 1.6 编译时 glslang 会为 discard 等语句
+    // 生成 DemoteToHelperInvocation / TerminateInvocation 能力。若不启用对应
+    // 设备特性, vkCreateShaderModule 会因能力未声明而被验证层拒绝。
+    features13.shaderDemoteToHelperInvocation =
+        m_DeviceFeatures13.shaderDemoteToHelperInvocation;
+    features13.shaderTerminateInvocation =
+        m_DeviceFeatures13.shaderTerminateInvocation;
+    features13.shaderZeroInitializeWorkgroupMemory =
+        m_DeviceFeatures13.shaderZeroInitializeWorkgroupMemory;
 
     // 特性链
     features12.pNext = &features13;
+    features13.pNext = nullptr;
 
     VkDeviceCreateInfo createInfo = {};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.pNext                   = &features12;
     createInfo.queueCreateInfoCount    = uniqueCount;
     createInfo.pQueueCreateInfos       = queueCreateInfos;
-    createInfo.enabledExtensionCount   = 1;
+    createInfo.enabledExtensionCount   =
+        static_cast<UInt32>(LIMX_ARRAY_COUNT(deviceExtensions));
     createInfo.ppEnabledExtensionNames = deviceExtensions;
     createInfo.pEnabledFeatures        = &deviceFeatures;
 
@@ -742,8 +894,8 @@ UInt32 FVulkanDevice::FindMemoryType(
     }
 
     LIMX_LOG(LogRHI, Error,
-        "[Vulkan] 未找到匹配的内存类型 (filter=0x{:X} props=0x{:X})",
-        typeFilter, static_cast<UInt32>(properties));
+        "[Vulkan] 未找到匹配的内存类型 (filter={} props={})",
+        FHex(typeFilter), FHex(static_cast<UInt32>(properties)));
 
     return 0xFFFFFFFF;
 }
