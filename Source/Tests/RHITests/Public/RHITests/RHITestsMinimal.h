@@ -20,3 +20,4 @@
 #include "Testing/TestingMinimal.h"
 
 #include "RHI/Memory/FSuballocationRegistry.h"
+#include "RHI/RHI/RHIDefinitions.h"

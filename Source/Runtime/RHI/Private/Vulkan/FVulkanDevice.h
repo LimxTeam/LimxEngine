@@ -370,6 +370,7 @@ public:
     UInt32 GetMaxTextureSize() const override;
     UInt32 GetMaxPushConstantSize() const override;
     Float32 GetMaxAnisotropy() const override;
+    EFormatFeature GetFormatFeatures(EPixelFormat format) const override;
     bool IsRayTracingSupported() const override;
     bool IsMeshShaderSupported() const override;
 

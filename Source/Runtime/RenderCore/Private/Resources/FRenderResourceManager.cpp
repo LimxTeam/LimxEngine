@@ -48,6 +48,12 @@ namespace
 /// 顶点数不超过该值时可用 16 位索引
 constexpr UInt32 kMaxUInt16Index = 65535;
 
+/// 取下一级 mip 的尺寸 —— 不小于 1
+LIMX_NODISCARD Int32 NextMipExtent(Int32 extent)
+{
+    return (extent > 1) ? (extent / 2) : 1;
+}
+
 } // namespace
 
 // ============================================================================
@@ -211,11 +217,34 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
                                                    UInt64 byteCount,
                                                    UInt32 width, UInt32 height,
                                                    EPixelFormat format,
+                                                   UInt32& outMipLevels,
                                                    FRHITextureHandle& outTexture)
 {
     if (pixels == nullptr || byteCount == 0 || width == 0 || height == 0)
     {
         return ERHIResult::ErrorInvalidParameter;
+    }
+
+    // ---- mip 层数取决于格式能力, 而非一厢情愿 ----
+    //
+    // 逐级 blit 要求源格式同时支持 BlitSrc 与线性过滤。缺任一项就退回单层,
+    // 并留下日志 —— 静默降级会让"某些机器上远处纹理闪烁"变成无从追查的问题。
+    const EFormatFeature features = m_Device->GetFormatFeatures(format);
+
+    const bool canGenerateMips = HasFormatFeature(
+        features, EFormatFeature::BlitSrc | EFormatFeature::BlitDst |
+                  EFormatFeature::SampledImageLinear);
+
+    const UInt32 mipLevels =
+        canGenerateMips ? ComputeMipLevelCount(width, height) : 1;
+
+    outMipLevels = mipLevels;
+
+    if (!canGenerateMips && (width > 1 || height > 1))
+    {
+        LIMX_LOG(LogRenderCore, Warning,
+                 "[资源管理器] 格式 {} 不支持逐级 blit, {}x{} 纹理退回单层 mip",
+                 static_cast<UInt32>(format), width, height);
     }
 
     // ---- 暂存缓冲区 ----
@@ -251,11 +280,13 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
     textureDesc.Extent.Width  = width;
     textureDesc.Extent.Height = height;
     textureDesc.Extent.Depth  = 1;
-    textureDesc.MipLevels     = 1;
+    textureDesc.MipLevels     = mipLevels;
     textureDesc.ArrayLayers   = 1;
+    // TransferSrc 是必需的 —— 生成第 N 级要把第 N-1 级当作 blit 源读回来
     textureDesc.Usage         = static_cast<ETextureUsage>(
         static_cast<UInt32>(ETextureUsage::Sampled) |
-        static_cast<UInt32>(ETextureUsage::TransferDst));
+        static_cast<UInt32>(ETextureUsage::TransferDst) |
+        static_cast<UInt32>(ETextureUsage::TransferSrc));
     textureDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
 
     result = m_Device->CreateTexture(textureDesc, outTexture);
@@ -276,7 +307,7 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
         return ERHIResult::ErrorUnknown;
     }
 
-    // 新建纹理处于 Undefined 布局, 先转为传输目标
+    // 全部 mip 层从 Undefined 转为传输目标 —— 新建图像每一层都是 Undefined
     commandBuffer->TransitionImageLayout(
         outTexture,
         EImageLayout::Undefined,
@@ -284,7 +315,8 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
         EPipelineStageFlags::TopOfPipe,
         EPipelineStageFlags::Transfer,
         EAccessFlags::None,
-        EAccessFlags::TransferWrite);
+        EAccessFlags::TransferWrite,
+        0, mipLevels);
 
     FRHIBufferTextureCopyRegion region = {};
     region.BufferOffset      = 0;
@@ -300,7 +332,61 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
                                        EImageLayout::TransferDst,
                                        region);
 
-    // 转为着色器只读, 供片元着色器采样
+    // ---- 逐级降采样生成 mip 链 ----
+    //
+    // 每一级都要等上一级写完才能读: 先把第 i-1 级转成 blit 源 (这次转换
+    // 同时充当写后读的屏障), blit 到第 i 级, 再把第 i-1 级转成着色器只读。
+    // 逐级转换而非整体转换, 是因为同一时刻不同 mip 处于不同布局。
+    Int32 mipWidth  = static_cast<Int32>(width);
+    Int32 mipHeight = static_cast<Int32>(height);
+
+    for (UInt32 level = 1; level < mipLevels; ++level)
+    {
+        commandBuffer->TransitionImageLayout(
+            outTexture,
+            EImageLayout::TransferDst,
+            EImageLayout::TransferSrc,
+            EPipelineStageFlags::Transfer,
+            EPipelineStageFlags::Transfer,
+            EAccessFlags::TransferWrite,
+            EAccessFlags::TransferRead,
+            level - 1, 1);
+
+        const Int32 nextWidth  = NextMipExtent(mipWidth);
+        const Int32 nextHeight = NextMipExtent(mipHeight);
+
+        FRHITextureBlitRegion blit = {};
+        blit.SrcMipLevel   = level - 1;
+        blit.SrcBaseLayer  = 0;
+        blit.SrcLayerCount = 1;
+        blit.SrcOffsetMin  = { 0, 0, 0 };
+        blit.SrcOffsetMax  = { mipWidth, mipHeight, 1 };
+        blit.DstMipLevel   = level;
+        blit.DstBaseLayer  = 0;
+        blit.DstLayerCount = 1;
+        blit.DstOffsetMin  = { 0, 0, 0 };
+        blit.DstOffsetMax  = { nextWidth, nextHeight, 1 };
+
+        commandBuffer->BlitTexture(outTexture, EImageLayout::TransferSrc,
+                                   outTexture, EImageLayout::TransferDst,
+                                   blit, EFilter::Linear);
+
+        // 上一级已经用完, 转为着色器只读
+        commandBuffer->TransitionImageLayout(
+            outTexture,
+            EImageLayout::TransferSrc,
+            EImageLayout::ShaderReadOnly,
+            EPipelineStageFlags::Transfer,
+            EPipelineStageFlags::FragmentShader,
+            EAccessFlags::TransferRead,
+            EAccessFlags::ShaderRead,
+            level - 1, 1);
+
+        mipWidth  = nextWidth;
+        mipHeight = nextHeight;
+    }
+
+    // 最后一级从未作为 blit 源, 仍停在 TransferDst
     commandBuffer->TransitionImageLayout(
         outTexture,
         EImageLayout::TransferDst,
@@ -308,7 +394,8 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
         EPipelineStageFlags::Transfer,
         EPipelineStageFlags::FragmentShader,
         EAccessFlags::TransferWrite,
-        EAccessFlags::ShaderRead);
+        EAccessFlags::ShaderRead,
+        mipLevels - 1, 1);
 
     m_Context->EndSingleTimeCommands(commandBuffer);
 
@@ -336,6 +423,21 @@ FRHISamplerHandle FRenderResourceManager::AcquireSampler(const FSamplerKey& key)
     desc.AddressModeU = key.AddressMode;
     desc.AddressModeV = key.AddressMode;
     desc.AddressModeW = key.AddressMode;
+
+    // MaxLod 必须覆盖实际的 mip 层数。缺省值 1000 虽然也能工作, 但把它写实
+    // 能让"纹理只有 1 层 mip 却按多层采样"这类不一致在创建时就暴露。
+    desc.MinLod = 0.0f;
+    desc.MaxLod = static_cast<Float32>(key.MipLevels);
+
+    // 各向异性此前被无条件启用 —— FSamplerKey::UseAnisotropy 参与了查重键,
+    // 却从未进入描述符, 于是 FTextureUploadOptions::UseAnisotropy=false
+    // 得到的仍是开启各向异性的采样器。
+    desc.IsAnisotropyEnabled = key.UseAnisotropy;
+
+    // 上限取设备实际能力 —— 写死 16 在只支持 8 的设备上会被拒绝
+    const Float32 deviceMaxAnisotropy = m_Device->GetMaxAnisotropy();
+    desc.MaxAnisotropy = (deviceMaxAnisotropy < 16.0f) ? deviceMaxAnisotropy
+                                                       : 16.0f;
 
     FRHISamplerHandle sampler;
 
@@ -551,11 +653,12 @@ FTextureResourceHandle FRenderResourceManager::CreateTexture(
     }
 
     FRHITextureHandle texture;
+    UInt32            mipLevels = 1;
 
     if (!IsRHISuccess(UploadTexture2D(image.Pixels.GetData(),
                                       image.Pixels.GetSize(),
                                       image.Width, image.Height,
-                                      format, texture)))
+                                      format, mipLevels, texture)))
     {
         LIMX_LOG(LogRenderCore, Error,
                  "[资源管理器] 纹理上传失败: {}x{}", image.Width, image.Height);
@@ -568,7 +671,9 @@ FTextureResourceHandle FRenderResourceManager::CreateTexture(
     viewDesc.ViewType        = ETextureType::Texture2D;
     viewDesc.Format          = format;
     viewDesc.BaseMipLevel    = 0;
-    viewDesc.MipLevelCount   = 1;
+    // 视图必须覆盖全部 mip —— 只暴露第 0 级等于生成了 mip 链却永远采不到,
+    // 而画面表现与完全没有 mip 一模一样。
+    viewDesc.MipLevelCount   = mipLevels;
     viewDesc.BaseArrayLayer  = 0;
     viewDesc.ArrayLayerCount = 1;
 
@@ -585,7 +690,7 @@ FTextureResourceHandle FRenderResourceManager::CreateTexture(
     FSamplerKey samplerKey;
     samplerKey.AddressMode   = options.AddressMode;
     samplerKey.UseAnisotropy = options.UseAnisotropy;
-    samplerKey.MipLevels     = 1;
+    samplerKey.MipLevels     = mipLevels;
 
     const FRHISamplerHandle sampler = AcquireSampler(samplerKey);
 
@@ -610,9 +715,14 @@ FTextureResourceHandle FRenderResourceManager::CreateTexture(
     slot.Resource.Sampler     = sampler;
     slot.Resource.Width       = image.Width;
     slot.Resource.Height      = image.Height;
-    slot.Resource.MipLevels   = 1;
+    slot.Resource.MipLevels   = mipLevels;
     slot.Resource.Format      = format;
-    slot.Resource.MemoryBytes = image.Pixels.GetSize();
+    // 完整 mip 链的总面积是基层的 4/3 (等比级数 1 + 1/4 + 1/16 + ...),
+    // 逐级向下取整使实际值略小于该上界。统计取上界而非只算基层,
+    // 否则显存报表会系统性偏低三成。
+    slot.Resource.MemoryBytes =
+        (mipLevels > 1) ? (image.Pixels.GetSize() * 4u / 3u)
+                        : image.Pixels.GetSize();
 
     slot.ReferenceCount = 1;
     slot.IsActive       = true;

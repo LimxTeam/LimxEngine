@@ -792,6 +792,102 @@ struct FRHIVertexInputBinding
 };
 
 // 顶点输入属性描述
+// ============================================================================
+// EFormatFeature — 像素格式在最优平铺下支持的能力
+// ============================================================================
+
+/// 像素格式能力位
+///
+/// 存在的理由: mip 链由 vkCmdBlitImage 逐级降采样生成, 而 blit 要求源格式
+/// 支持 BlitSrc + 线性过滤。这一支持是**按格式、按设备**变化的, 不是普遍
+/// 保证。不查就 blit, 在缺少该能力的设备上会撞上校验层错误, 而症状是
+/// "某些机器上纹理全黑" —— 这类问题在开发机上永远复现不出来。
+enum class EFormatFeature : UInt32
+{
+    None                   = 0,
+
+    /// 可作为采样图像
+    SampledImage           = 1u << 0,
+
+    /// 采样时支持线性过滤 (mip 生成的前提之一)
+    SampledImageLinear     = 1u << 1,
+
+    /// 可作为存储图像
+    StorageImage           = 1u << 2,
+
+    /// 可作为颜色附件
+    ColorAttachment        = 1u << 3,
+
+    /// 颜色附件支持混合
+    ColorAttachmentBlend   = 1u << 4,
+
+    /// 可作为深度模板附件
+    DepthStencilAttachment = 1u << 5,
+
+    /// 可作为 blit 源 (mip 生成的前提之一)
+    BlitSrc                = 1u << 6,
+
+    /// 可作为 blit 目标
+    BlitDst                = 1u << 7,
+};
+
+LIMX_NODISCARD constexpr EFormatFeature operator|(EFormatFeature a,
+                                                   EFormatFeature b)
+{
+    return static_cast<EFormatFeature>(static_cast<UInt32>(a) |
+                                       static_cast<UInt32>(b));
+}
+
+LIMX_NODISCARD constexpr EFormatFeature operator&(EFormatFeature a,
+                                                   EFormatFeature b)
+{
+    return static_cast<EFormatFeature>(static_cast<UInt32>(a) &
+                                       static_cast<UInt32>(b));
+}
+
+/// 测试是否包含全部指定能力位
+LIMX_NODISCARD constexpr bool HasFormatFeature(EFormatFeature value,
+                                                EFormatFeature required)
+{
+    return (static_cast<UInt32>(value) & static_cast<UInt32>(required)) ==
+           static_cast<UInt32>(required);
+}
+
+// ============================================================================
+// Mip 链层数
+// ============================================================================
+
+/// 由尺寸推算完整 mip 链的层数
+///
+/// 逐级折半直到 1x1, 因此层数是 floor(log2(max(w, h))) + 1。
+/// 非二次幂尺寸同样成立 —— Vulkan 规定第 i 级的尺寸是 max(floor(base >> i), 1)。
+///
+/// 这里最容易错的是边界: 1x1 是 1 层不是 0 层, 1024x1024 是 11 层不是 10 层。
+/// 少算一层会让最小的那级 mip 永远采不到, 多算一层会让 vkCreateImage 直接失败。
+LIMX_NODISCARD constexpr UInt32 ComputeMipLevelCount(UInt32 width,
+                                                     UInt32 height)
+{
+    if (width == 0 || height == 0)
+    {
+        return 0;
+    }
+
+    UInt32 extent = (width > height) ? width : height;
+    UInt32 levels = 1;
+
+    while (extent > 1)
+    {
+        extent >>= 1;
+        ++levels;
+    }
+
+    return levels;
+}
+
+// ============================================================================
+// FRHIVertexInputAttribute — 顶点输入属性
+// ============================================================================
+
 struct FRHIVertexInputAttribute
 {
     UInt32       Location = 0;

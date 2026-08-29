@@ -346,6 +346,12 @@ public:
     // 支持的最大各向异性等级
     virtual Float32 GetMaxAnisotropy() const = 0;
 
+    // 查询像素格式在最优平铺 (Optimal Tiling) 下支持的能力
+    //
+    // mip 链生成、后处理的浮点渲染目标、压缩纹理直传, 都依赖具体格式在
+    // 具体设备上的能力。这些能力**不是普遍保证的**, 必须查询而非假定。
+    virtual EFormatFeature GetFormatFeatures(EPixelFormat format) const = 0;
+
     // 是否支持光线追踪
     virtual bool IsRayTracingSupported() const = 0;
 

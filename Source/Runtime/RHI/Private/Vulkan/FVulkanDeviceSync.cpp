@@ -911,6 +911,61 @@ Float32 FVulkanDevice::GetMaxAnisotropy() const
     return m_DeviceProperties.limits.maxSamplerAnisotropy;
 }
 
+EFormatFeature FVulkanDevice::GetFormatFeatures(EPixelFormat format) const
+{
+    VkFormatProperties properties = {};
+    vkGetPhysicalDeviceFormatProperties(m_PhysicalDevice, ToVkFormat(format),
+                                        &properties);
+
+    // 只关心最优平铺 —— 引擎创建的纹理一律用 VK_IMAGE_TILING_OPTIMAL,
+    // 线性平铺的能力位与它无关。
+    const VkFormatFeatureFlags flags = properties.optimalTilingFeatures;
+
+    EFormatFeature result = EFormatFeature::None;
+
+    if (flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+    {
+        result = result | EFormatFeature::SampledImage;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+    {
+        result = result | EFormatFeature::SampledImageLinear;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+    {
+        result = result | EFormatFeature::StorageImage;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
+    {
+        result = result | EFormatFeature::ColorAttachment;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)
+    {
+        result = result | EFormatFeature::ColorAttachmentBlend;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+    {
+        result = result | EFormatFeature::DepthStencilAttachment;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+    {
+        result = result | EFormatFeature::BlitSrc;
+    }
+
+    if (flags & VK_FORMAT_FEATURE_BLIT_DST_BIT)
+    {
+        result = result | EFormatFeature::BlitDst;
+    }
+
+    return result;
+}
+
 bool FVulkanDevice::IsRayTracingSupported() const
 {
     // 通过检查扩展列表判断 (简化实现)

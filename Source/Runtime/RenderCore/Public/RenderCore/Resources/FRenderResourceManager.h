@@ -276,10 +276,15 @@ private:
                             EBufferUsage usage,
                             FRHIBufferHandle& outBuffer);
 
-    /// 创建纹理并上传像素
+    /// 创建纹理、上传像素并逐级生成 mip 链
+    ///
+    /// mip 层数由格式能力决定而非调用方指定 —— 逐级 blit 要求格式支持
+    /// BlitSrc/BlitDst 与线性过滤，不满足时退回单层。实际层数经
+    /// outMipLevels 返回，供视图与采样器使用。
     ERHIResult UploadTexture2D(const void* pixels, UInt64 byteCount,
                                UInt32 width, UInt32 height,
                                EPixelFormat format,
+                               UInt32& outMipLevels,
                                FRHITextureHandle& outTexture);
 
     /// 取或创建匹配配置的采样器
