@@ -26,7 +26,6 @@
 // │ RenderFrame()                │ 执行单帧渲染 (BeginFrame→Pass→EndFrame) │
 // │ SetClearColor()              │ 设置清屏颜色                     │
 // │ OnSwapchainRecreated()       │ 交换链重建后委托 PassManager 重建  │
-// │ CreateScene()                │ 创建场景物体 (VBO+IBO)           │
 // │ CreateUniformBuffers()       │ 创建 Uniform Buffer (ViewProj)   │
 // │ CreateDescriptorResources()  │ 创建 set 0 描述符集布局+描述符集   │
 // │ CreateTextureResources()     │ 创建棋盘格纹理+采样器+纹理视图    │
@@ -108,33 +107,79 @@ struct FModelPushConstant
 };
 
 // ============================================================================
-// FRenderObject — 可渲染物体 (VBO + IBO + 变换)
+// FRenderObject — 一次绘制批次 (渲染视图, 非资源所有者)
 // ============================================================================
 
+/// 单次 DrawIndexed 所需的全部状态
+///
+/// 这是"渲染视图"而非资源: 缓冲区句柄由 FRenderResourceManager 拥有,
+/// 此处只是本帧的一份只读快照。列表每帧由 FSceneManager 重建，
+/// 渲染器不得销毁其中任何 GPU 对象。
+///
+/// 一个网格按材质切分为若干段, 每段一次绘制调用 —— 因此这里的粒度是
+/// "批次"而非"物体"。Sponza 这类单网格多材质的场景没有别的表达方式。
 struct FRenderObject
 {
-    /// GPU 顶点缓冲区
+    /// GPU 顶点缓冲区 (非拥有)
     FRHIBufferHandle VertexBuffer;
     UInt32           VertexCount = 0;
 
-    /// GPU 索引缓冲区
+    /// GPU 索引缓冲区 (非拥有)
     FRHIBufferHandle IndexBuffer;
+
+    /// 本批次在索引缓冲区中的起始位置 (以索引个数计, 非字节)
+    UInt32           IndexOffset = 0;
+
+    /// 本批次的索引个数
     UInt32           IndexCount  = 0;
+
+    /// 索引宽度 — 由网格顶点数决定, 绘制时必须与缓冲区实际宽度一致
+    EIndexType       IndexType   = EIndexType::UInt32;
 
     /// 世界空间变换 (Position + Rotation + Scale)
     FTransform       Transform;
 
-    /// 是否启用旋转动画
-    bool             IsAnimated     = false;
-
-    /// 旋转速度 (弧度/秒)
-    Float32          RotationSpeed  = 0.0f;
+    /// 世界空间包围盒 — 供视锥剔除使用
+    FBoundingBox     WorldBounds;
 
     /// set 1 材质描述符集 — 由 FMaterialManager 分配
     FRHIDescriptorSetHandle MaterialDescriptorSet;
 
     /// 调试名称
     const AnsiChar*  DebugName      = "Unnamed";
+};
+
+// ============================================================================
+// FRenderFrameStats — 帧耗时统计
+// ============================================================================
+
+/// 滚动窗口内的帧耗时统计
+///
+/// 单帧耗时抖动极大 (交换链呈现、驱动调度、Windows 合成都会掺进来),
+/// 拿单帧数字做比较毫无意义。这里保留一个固定长度的滚动窗口, 同时给出
+/// 平均值与最差值 —— 优化的收益要看平均, 卡顿要看最差。
+struct FRenderFrameStats
+{
+    /// 滚动窗口长度 — 60 帧约合 1 秒
+    static constexpr UInt32 kWindowSize = 60;
+
+    /// 最近一帧的 CPU 侧耗时 (毫秒)
+    Float32 LastFrameMs = 0.0f;
+
+    /// 滚动窗口内的平均耗时 (毫秒)
+    Float32 AverageFrameMs = 0.0f;
+
+    /// 滚动窗口内的最差耗时 (毫秒)
+    Float32 WorstFrameMs = 0.0f;
+
+    /// 由平均耗时换算的帧率
+    Float32 AverageFps = 0.0f;
+
+    /// 自初始化以来渲染的帧数
+    UInt64 TotalFrames = 0;
+
+    /// 最近一帧实际提交的绘制批次数
+    UInt32 DrawCallCount = 0;
 };
 
 // ============================================================================
@@ -196,6 +241,15 @@ public:
     /// 获取渲染对象列表 (只读)
     LIMX_NODISCARD const TArray<FRenderObject>& GetRenderObjects() const { return m_RenderObjects; }
 
+    /// 获取帧耗时统计
+    LIMX_NODISCARD const FRenderFrameStats& GetFrameStats() const
+    {
+        return m_FrameStats;
+    }
+
+    /// 清空滚动窗口 — 用于跳过启动阶段的预热帧后重新计时
+    void ResetFrameStats();
+
     /// 设置场景渲染后回调 — 在所有场景 Pass 执行完毕、EndFrame 之前调用
     /// 用于 UI 渲染叠加等需要录制到同一命令缓冲区的操作
     void SetPostSceneRenderCallback(const TFunction<void()>& callback)
@@ -204,16 +258,6 @@ public:
     }
 
 private:
-    /// 创建场景物体 (立方体 + 球体 + 地面)
-    ERHIResult CreateScene();
-
-    /// 销毁场景物体 (VBO/IBO)
-    void DestroyScene();
-
-    /// 从 FMeshData 创建单个渲染物体的 GPU 缓冲区
-    ERHIResult CreateRenderObjectBuffers(
-        const FMeshData& meshData, FRenderObject& outObject);
-
     /// 创建 Uniform Buffer (每帧一个，View+Proj 矩阵)
     ERHIResult CreateUniformBuffers();
 
@@ -237,6 +281,9 @@ private:
 
     /// 每帧更新 View+Proj 矩阵到当前帧的 Uniform Buffer
     void UpdateUniformBuffer(UInt32 frameIndex);
+
+    /// 把一帧的耗时并入滚动窗口并重算统计
+    void RecordFrameTime(Float32 frameMilliseconds);
 
     /// 释放旧尺寸资源 → 重建交换链/帧同步资源 → 重建 Pass 尺寸资源
     ERHIResult RecreateSwapchainResources();
@@ -264,7 +311,7 @@ private:
     FRHITextureViewHandle             m_TextureView;
     FRHISamplerHandle                 m_Sampler;
 
-    // ---- 场景物体 ----
+    // ---- 本帧渲染视图 (非拥有 —— GPU 资源归 FRenderResourceManager) ----
     TArray<FRenderObject>             m_RenderObjects;
 
     // ---- Uniform Buffer (每帧一个用于 View+Proj 矩阵) ----
@@ -283,9 +330,14 @@ private:
     // ---- 相机 ----
     FCamera                           m_Camera;
 
-    // ---- 动画/时间状态 ----
-    Float32                           m_RotationAngle = 0.0f;
+    // ---- 时间状态 ----
     Float64                           m_LastFrameTime = 0.0;
+
+    // ---- 帧耗时统计 (环形窗口) ----
+    FRenderFrameStats                 m_FrameStats;
+    Float32                           m_FrameTimeWindow[FRenderFrameStats::kWindowSize] = {};
+    UInt32                            m_FrameTimeCursor = 0;
+    UInt32                            m_FrameTimeFilled = 0;
 
     // ---- 场景渲染后回调 (供 UI 叠加渲染等) ----
     TFunction<void()>                 m_PostSceneRenderCallback;

@@ -7,7 +7,7 @@ layer       = 3
 description = "渲染核心模块 — 渲染上下文 (交换链+帧同步) 和着色器管理器 (SPIR-V 加载+缓存)，提供渲染基础设施"
 
 [dependencies]
-public  = ["LimxCore", "LimxRHI", "LimxApplicationCore"]
+public  = ["LimxCore", "LimxRHI", "LimxApplicationCore", "LimxAssetPipeline"]
 private = []
 
 [sources]

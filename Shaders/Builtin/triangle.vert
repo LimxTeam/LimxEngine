@@ -7,13 +7,18 @@ layout(location = 2) in vec3 inColor;
 layout(location = 3) in vec2 inTexCoord;
 
 // ── Uniform Buffer: 视图+投影矩阵 (全场景共享, 每帧更新一次) ──
-layout(set = 0, binding = 0) uniform ViewProjUBO {
+// ── 矩阵存储序 ────────────────────────────────────────────────
+// 引擎的 FMatrix 是行主序 (M[行][列], 平移在最后一列)。GLSL 默认按列主序
+// 解读 uniform 中的 mat4, 不加 row_major 就等于把矩阵整体转置 —— 顶点会被
+// 变换到裁剪体之外, 表现为"什么都不显示"而没有任何报错。
+// FMatrix.h 的注释即以"与着色器 row_major 一致"为前提。
+layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
     mat4 view;
     mat4 proj;
 } ubo;
 
 // ── Push Constant: 逐物体 Model 矩阵 ──
-layout(push_constant) uniform PushConstants {
+layout(row_major, push_constant) uniform PushConstants {
     mat4 model;
 } pc;
 

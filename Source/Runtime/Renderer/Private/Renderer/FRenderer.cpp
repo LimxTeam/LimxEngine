@@ -113,16 +113,12 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
         FMath::DegreesToRadians(45.0f), initAspect, 0.1f, 100.0f);
 
     // 按依赖顺序创建 GPU 资源:
-    // 场景(VBO+IBO) → UBO → 纹理 → set0描述符 → 材质系统 → 光照系统 → 管线布局 → Pass系统
+    // UBO → 纹理 → set0描述符 → 材质系统 → 光照系统 → 管线布局 → Pass系统
+    //
+    // 场景网格不在此列 —— 它们由 FRenderResourceManager 拥有, 渲染器只在
+    // SetRenderObjects 收到本帧视图时读取。渲染器是消费者, 不是所有者。
 
-    ERHIResult result = CreateScene();
-    if (!IsRHISuccess(result))
-    {
-        LIMX_LOG(LogRenderer, Error, "[Renderer] 场景创建失败");
-        return result;
-    }
-
-    result = CreateUniformBuffers();
+    ERHIResult result = CreateUniformBuffers();
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] Uniform Buffer 创建失败");
@@ -151,18 +147,12 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
         return result;
     }
 
-    // 创建默认 PBR 材质并绑定到所有场景物体
+    // 创建默认 PBR 材质 —— 供场景层在未指定材质时兜底使用
     m_DefaultMaterial = FMaterialManager::Get().CreateDefaultMaterial("SceneDefaultMaterial");
     if (m_DefaultMaterial == nullptr)
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] 默认材质创建失败");
         return ERHIResult::ErrorUnknown;
-    }
-
-    FRHIDescriptorSetHandle defaultMatDescSet = m_DefaultMaterial->GetDescriptorSet();
-    for (SizeType i = 0; i < m_RenderObjects.GetSize(); ++i)
-    {
-        m_RenderObjects[i].MaterialDescriptorSet = defaultMatDescSet;
     }
 
     // 初始化光照系统 (set 2)
@@ -278,7 +268,9 @@ void FRenderer::Shutdown()
     // 5. 销毁其他资源
     DestroyTextureResources();
     DestroyBufferResources();
-    DestroyScene();
+
+    // 渲染视图只是引用, 清空即可 —— GPU 缓冲区归 FRenderResourceManager
+    m_RenderObjects.Clear();
 
     LIMX_LOG(LogRenderer, Log, "[Renderer] M0.5 渲染器已关闭");
 
@@ -312,8 +304,12 @@ void FRenderer::RenderFrame()
         }
     }
 
+    // 帧耗时从这里开始计 —— 前面的最小化/重建分支属于"这一帧没画",
+    // 把它们算进平均值会让统计随窗口操作漂移。
+    const Float64 frameBeginTime = FPlatformTime::Seconds();
+
     // 计算帧间隔时间 (deltaTime)
-    Float64 currentTime = FPlatformTime::Seconds();
+    Float64 currentTime = frameBeginTime;
     Float32 deltaTime = (m_LastFrameTime > 0.0)
         ? static_cast<Float32>(currentTime - m_LastFrameTime)
         : (1.0f / 60.0f);
@@ -373,6 +369,9 @@ void FRenderer::RenderFrame()
         m_PassManager->ExecuteAll(commandBuffer, execInfo);
     }
 
+    m_FrameStats.DrawCallCount =
+        static_cast<UInt32>(m_RenderObjects.GetSize());
+
     // 场景 Pass 完成后回调 — 供 UI 渲染叠加等操作录制到同一命令缓冲区
     if (m_PostSceneRenderCallback)
     {
@@ -385,6 +384,60 @@ void FRenderer::RenderFrame()
         result == ERHIResult::SuboptimalSwapchain)
     {
         RecreateSwapchainResources();
+    }
+
+    RecordFrameTime(static_cast<Float32>(
+        (FPlatformTime::Seconds() - frameBeginTime) * 1000.0));
+}
+
+// ============================================================================
+// 帧耗时统计
+// ============================================================================
+
+void FRenderer::RecordFrameTime(Float32 frameMilliseconds)
+{
+    ++m_FrameStats.TotalFrames;
+
+    m_FrameStats.LastFrameMs = frameMilliseconds;
+
+    m_FrameTimeWindow[m_FrameTimeCursor] = frameMilliseconds;
+    m_FrameTimeCursor =
+        (m_FrameTimeCursor + 1) % FRenderFrameStats::kWindowSize;
+
+    if (m_FrameTimeFilled < FRenderFrameStats::kWindowSize)
+    {
+        ++m_FrameTimeFilled;
+    }
+
+    Float32 total = 0.0f;
+    Float32 worst = 0.0f;
+
+    for (UInt32 i = 0; i < m_FrameTimeFilled; ++i)
+    {
+        total += m_FrameTimeWindow[i];
+        worst = FMath::Max(worst, m_FrameTimeWindow[i]);
+    }
+
+    m_FrameStats.AverageFrameMs =
+        total / static_cast<Float32>(m_FrameTimeFilled);
+    m_FrameStats.WorstFrameMs = worst;
+
+    // 平均耗时为零时不做除法 —— 高帧率下单帧耗时可能低于计时器分辨率
+    m_FrameStats.AverageFps =
+        (m_FrameStats.AverageFrameMs > 0.0f)
+            ? 1000.0f / m_FrameStats.AverageFrameMs
+            : 0.0f;
+}
+
+void FRenderer::ResetFrameStats()
+{
+    m_FrameStats      = FRenderFrameStats();
+    m_FrameTimeCursor = 0;
+    m_FrameTimeFilled = 0;
+
+    for (UInt32 i = 0; i < FRenderFrameStats::kWindowSize; ++i)
+    {
+        m_FrameTimeWindow[i] = 0.0f;
     }
 }
 
@@ -617,170 +670,6 @@ void FRenderer::DestroyTextureResources()
     device->DestroySampler(m_Sampler);
     device->DestroyTextureView(m_TextureView);
     device->DestroyTexture(m_Texture);
-}
-
-// ============================================================================
-// CreateRenderObjectBuffers — 从 FMeshData 创建单个物体的 VBO + IBO
-// ============================================================================
-
-ERHIResult FRenderer::CreateRenderObjectBuffers(
-    const FMeshData& meshData, FRenderObject& outObject)
-{
-    IRHIDevice* device = m_Context->GetDevice();
-
-    // ---- 顶点缓冲区 ----
-    outObject.VertexCount = static_cast<UInt32>(meshData.Vertices.GetSize());
-    UInt64 vboSize = static_cast<UInt64>(outObject.VertexCount) *
-                     static_cast<UInt64>(sizeof(FMeshVertex));
-
-    FRHIBufferDesc vboDesc =
-        FRHIBufferDesc::Vertex(vboSize, EMemoryUsage::CpuToGpu);
-    vboDesc.DebugName = outObject.DebugName;
-
-    ERHIResult result = device->CreateBuffer(vboDesc, outObject.VertexBuffer);
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    void* mappedPtr = nullptr;
-    result = device->MapBuffer(outObject.VertexBuffer, &mappedPtr);
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    MemCopy(mappedPtr, meshData.Vertices.GetData(), vboSize);
-    device->UnmapBuffer(outObject.VertexBuffer);
-
-    // ---- 索引缓冲区 ----
-    outObject.IndexCount = static_cast<UInt32>(meshData.Indices.GetSize());
-    UInt64 iboSize = static_cast<UInt64>(outObject.IndexCount) *
-                     static_cast<UInt64>(sizeof(UInt16));
-
-    FRHIBufferDesc iboDesc =
-        FRHIBufferDesc::Index(iboSize, EMemoryUsage::CpuToGpu);
-    iboDesc.DebugName = outObject.DebugName;
-
-    result = device->CreateBuffer(iboDesc, outObject.IndexBuffer);
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    result = device->MapBuffer(outObject.IndexBuffer, &mappedPtr);
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    MemCopy(mappedPtr, meshData.Indices.GetData(), iboSize);
-    device->UnmapBuffer(outObject.IndexBuffer);
-
-    return ERHIResult::Success;
-}
-
-// ============================================================================
-// CreateScene — 创建多物体场景 (立方体 + 球体 + 地面平面)
-// ============================================================================
-
-ERHIResult FRenderer::CreateScene()
-{
-    m_RenderObjects.Reserve(3);
-
-    // ---- 物体 0: 旋转立方体 (原点上方) ----
-    {
-        FRenderObject cube;
-        cube.DebugName    = "Cube";
-        cube.IsAnimated   = true;
-        cube.RotationSpeed = FMath::kDegToRad * 90.0f;  // 90°/秒
-        cube.Transform.Translation = FVector3(0.0f, 0.75f, 0.0f);
-        cube.Transform.Scale3D     = FVector3(1.0f, 1.0f, 1.0f);
-
-        FMeshData meshData = FGeometryGenerator::GenerateCube();
-        ERHIResult result = CreateRenderObjectBuffers(meshData, cube);
-        if (!IsRHISuccess(result))
-        {
-            return result;
-        }
-
-        m_RenderObjects.Add(cube);
-    }
-
-    // ---- 物体 1: 静态球体 (右侧) ----
-    {
-        FRenderObject sphere;
-        sphere.DebugName  = "Sphere";
-        sphere.IsAnimated = false;
-        sphere.Transform.Translation = FVector3(2.5f, 0.5f, 0.0f);
-        sphere.Transform.Scale3D     = FVector3(1.0f, 1.0f, 1.0f);
-
-        FMeshData meshData = FGeometryGenerator::GenerateSphere(0.5f, 32, 16);
-        ERHIResult result = CreateRenderObjectBuffers(meshData, sphere);
-        if (!IsRHISuccess(result))
-        {
-            return result;
-        }
-
-        m_RenderObjects.Add(sphere);
-    }
-
-    // ---- 物体 2: 地面平面 ----
-    {
-        FRenderObject ground;
-        ground.DebugName  = "Ground";
-        ground.IsAnimated = false;
-        ground.Transform.Translation = FVector3(0.0f, 0.0f, 0.0f);
-        ground.Transform.Scale3D     = FVector3(1.0f, 1.0f, 1.0f);
-
-        FMeshData meshData = FGeometryGenerator::GeneratePlane(8.0f, 8.0f, 4, 4);
-        ERHIResult result = CreateRenderObjectBuffers(meshData, ground);
-        if (!IsRHISuccess(result))
-        {
-            return result;
-        }
-
-        m_RenderObjects.Add(ground);
-    }
-
-    UInt32 totalVertices = 0;
-    UInt32 totalIndices  = 0;
-    for (SizeType i = 0; i < m_RenderObjects.GetSize(); ++i)
-    {
-        totalVertices += m_RenderObjects[i].VertexCount;
-        totalIndices  += m_RenderObjects[i].IndexCount;
-    }
-
-    LIMX_LOG(LogRenderer, Log,
-             "[Renderer] 场景创建完成 — {} 个物体, {} 顶点, {} 索引",
-             m_RenderObjects.GetSize(), totalVertices, totalIndices);
-
-    return ERHIResult::Success;
-}
-
-// ============================================================================
-// DestroyScene — 销毁所有渲染物体的 GPU 缓冲区
-// ============================================================================
-
-void FRenderer::DestroyScene()
-{
-    if (m_Context == nullptr)
-    {
-        return;
-    }
-
-    IRHIDevice* device = m_Context->GetDevice();
-    if (device == nullptr)
-    {
-        return;
-    }
-
-    for (SizeType i = 0; i < m_RenderObjects.GetSize(); ++i)
-    {
-        device->DestroyBuffer(m_RenderObjects[i].IndexBuffer);
-        device->DestroyBuffer(m_RenderObjects[i].VertexBuffer);
-    }
-    m_RenderObjects.Clear();
 }
 
 // ============================================================================
@@ -1038,27 +927,6 @@ void FRenderer::DestroyBufferResources()
 void FRenderer::UpdateUniformBuffer(UInt32 frameIndex)
 {
     IRHIDevice* device = m_Context->GetDevice();
-
-    // 更新动画时间
-    Float64 currentTime = FPlatformTime::Seconds();
-    Float32 deltaTime = static_cast<Float32>(currentTime - m_LastFrameTime);
-
-    // 更新动画物体的旋转
-    for (SizeType i = 0; i < m_RenderObjects.GetSize(); ++i)
-    {
-        FRenderObject& obj = m_RenderObjects[i];
-        if (obj.IsAnimated)
-        {
-            m_RotationAngle += obj.RotationSpeed * deltaTime;
-
-            // 绕 Y 轴旋转 + 轻微 X 轴倾斜
-            FQuat rotY = FQuat::FromAxisAngle(
-                FVector3(0.0f, 1.0f, 0.0f), m_RotationAngle);
-            FQuat rotX = FQuat::FromAxisAngle(
-                FVector3(1.0f, 0.0f, 0.0f), m_RotationAngle * 0.3f);
-            obj.Transform.Rotation = rotX * rotY;
-        }
-    }
 
     // 更新相机宽高比 (窗口尺寸可能变化)
     FRHIExtent2D extent = m_Context->GetSwapchainExtent();

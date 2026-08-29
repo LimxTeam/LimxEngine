@@ -32,32 +32,25 @@
 
 #pragma once
 
+// RenderCoreMinimal 必须先行 —— 它经 RHIMinimal 引入 windows.h。
+// Core 的若干头文件在 windows.h 缺席时会前向声明 Win32 API (以 _WINDOWS_
+// 为守卫)，若这些头先被拉入，随后真正的 windows.h 会与前向声明冲突。
 #include "RenderCore/RenderCoreMinimal.h"
+
+#include "AssetPipeline/FAssetTypes.h"
 
 namespace Limx
 {
 
 // ============================================================================
-// FMeshVertex — 网格顶点布局 (位置 + 法线 + 颜色 + UV)
+// 顶点与网格类型
+//
+// 程序化几何与资产解析共用 AssetPipeline 的中性结构 (FMeshVertex/FMeshData)，
+// 而不是各自定义一套。此前二者是两个不同的 FMeshVertex：程序化的 44 字节
+// (位置/法线/颜色3/UV)，资产的 72 字节 (含切线与双 UV)。两套布局意味着
+// 两套顶点输入描述、两套着色器，且上传路径必须为它们分支。
+// 统一之后，无论几何来自代码生成还是文件解析，下游都只面对一种布局。
 // ============================================================================
-
-struct FMeshVertex
-{
-    FVector3 Position;   // location 0
-    FVector3 Normal;     // location 1
-    FVector3 Color;      // location 2
-    FVector2 TexCoord;   // location 3
-};
-
-// ============================================================================
-// FMeshData — 生成的网格数据 (CPU 端)
-// ============================================================================
-
-struct FMeshData
-{
-    TArray<FMeshVertex> Vertices;
-    TArray<UInt16>      Indices;
-};
 
 // ============================================================================
 // FGeometryGenerator — 程序化几何体生成器

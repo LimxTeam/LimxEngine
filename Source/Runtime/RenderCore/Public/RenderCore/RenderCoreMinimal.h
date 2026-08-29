@@ -18,6 +18,11 @@
 // Platform + Core 完整基础设施
 #include "RHI/RHIMinimal.h"
 
+// 本模块的 API 导出宏 —— 公开类需要它标注 DLL 边界。
+// 不包含会让 LIMX_xxx_API 在使用处保持未定义, 编译器把它当作普通标识符,
+// 错误信息会指向莫名其妙的位置。
+#include "RenderCore/RenderCoreAPI.h"
+
 // RHI 公共接口
 #include "RHI/RHI/RHIDefinitions.h"
 #include "RHI/RHI/RHIResources.h"
@@ -28,3 +33,7 @@
 
 // ApplicationCore 公共接口
 #include "ApplicationCore/ApplicationCoreMinimal.h"
+
+// GPU 资源管理
+#include "RenderCore/Resources/FRenderResources.h"
+#include "RenderCore/Resources/FRenderResourceManager.h"

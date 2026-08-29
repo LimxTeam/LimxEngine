@@ -89,6 +89,17 @@ ERHIResult FRenderContext::Initialize(const FRenderContextDesc& desc)
         return result;
     }
 
+    // 资源管理器最后初始化 —— 它的上传路径依赖一次性命令缓冲区,
+    // 而后者需要设备与命令池均已就绪。
+    result = m_ResourceManager.Initialize(m_Device.Get(), this);
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error,
+            "[RenderContext] 资源管理器初始化失败: {}",
+            static_cast<Int32>(result));
+        return result;
+    }
+
     LIMX_LOG(LogRenderer, Log,
         "[RenderContext] 初始化完成 — 帧并行数:{} VSync:{}",
         m_MaxFramesInFlight, m_IsVSyncEnabled ? 1 : 0);
@@ -109,6 +120,10 @@ void FRenderContext::Shutdown()
 
     // 等待 GPU 空闲，确保所有提交的命令都已完成
     m_Device->WaitIdle();
+
+    // 资源先于帧资源销毁 —— 上传路径会用到一次性命令缓冲区,
+    // 反过来就会在命令池已销毁后再去申请缓冲区。
+    m_ResourceManager.Shutdown();
 
     DestroyFrameResources();
     DestroySwapchain();
@@ -146,6 +161,12 @@ ERHIResult FRenderContext::BeginFrame()
     }
 
     m_Device->ResetFence(frame.InFlightFence);
+
+    ++m_FrameCounter;
+
+    // 栅栏已通过 —— MaxFramesInFlight 帧之前提交的命令确定已执行完毕,
+    // 此刻回收退役资源不会碰到 GPU 仍在读的对象。
+    m_ResourceManager.ProcessPendingReleases();
 
     // 获取下一个交换链图像
     result = m_Device->AcquireNextImage(

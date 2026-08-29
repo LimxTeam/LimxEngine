@@ -1,20 +1,28 @@
 #version 450
 
-// ── 顶点属性输入 (与 FMeshVertex 完全兼容, location 0-3)
-// 仅使用 inPosition, 其余属性参与顶点绑定以匹配步幅
-layout(location = 0) in vec3 inPosition;
-layout(location = 1) in vec3 inNormal;    // 未使用，但必须声明以匹配 VBO 步幅
-layout(location = 2) in vec3 inColor;    // 未使用
-layout(location = 3) in vec2 inTexCoord; // 未使用
+// ============================================================
+// 深度预 Pass 顶点着色器
+//
+// 只声明位置属性。顶点步幅由管线的 binding 决定 (完整 FMeshVertex, 72 字节),
+// 与着色器声明多少个属性无关 —— 属性按各自偏移量取值。多声明未使用的属性
+// 只会换来 "not consumed by vertex shader" 校验警告。
+// ============================================================
 
-// ── Uniform Buffer: 视图+投影矩阵 (与 triangle.vert 完全一致, set 0 binding 0) ──
-layout(set = 0, binding = 0) uniform ViewProjUBO {
+layout(location = 0) in vec3 inPosition;
+
+// ── Uniform Buffer: 视图+投影矩阵 (set 0 binding 0) ──
+// ── 矩阵存储序 ────────────────────────────────────────────────
+// 引擎的 FMatrix 是行主序 (M[行][列], 平移在最后一列)。GLSL 默认按列主序
+// 解读 uniform 中的 mat4, 不加 row_major 就等于把矩阵整体转置 —— 顶点会被
+// 变换到裁剪体之外, 表现为"什么都不显示"而没有任何报错。
+// FMatrix.h 的注释即以"与着色器 row_major 一致"为前提。
+layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
     mat4 view;
     mat4 proj;
 } ubo;
 
-// ── Push Constant: 逐物体 Model 矩阵 (与 triangle.vert 完全一致) ──
-layout(push_constant) uniform PushConstants {
+// ── Push Constant: 逐物体 Model 矩阵 ──
+layout(row_major, push_constant) uniform PushConstants {
     mat4 model;
 } pc;
 

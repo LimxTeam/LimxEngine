@@ -25,6 +25,7 @@ layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragWorldNormal;
 layout(location = 2) in vec3 fragColor;
 layout(location = 3) in vec2 fragTexCoord;
+layout(location = 4) in vec4 fragWorldTangent;   // xyz = 切线, w = 手性 (±1)
 
 // ── 材质参数 (set 1, binding 0) — 必须匹配 FMaterialParams std140 布局 ──
 layout(set = 1, binding = 0) uniform MaterialUBO {
@@ -203,7 +204,12 @@ vec3 GetLightDirection(LightData light, vec3 fragPos)
 }
 
 // ============================================================
-// 由屏幕导数构造 TBN，避免在网格格式中强制增加 tangent 属性
+// 应用法线贴图
+//
+// 优先使用顶点切线 —— 屏幕导数构造的 TBN 在 UV 接缝与掠射角处会抖动,
+// 且每片段要付 4 次导数运算。顶点切线由资产管线提供 (glTF 直接给出,
+// OBJ 由解析器按三角形 UV 梯度生成), 手性存在 w 分量。
+// w == 0 表示该网格没有有效切线, 此时才退回屏幕导数。
 // ============================================================
 vec3 ApplyNormalMap(vec3 baseNormal)
 {
@@ -216,20 +222,34 @@ vec3 ApplyNormalMap(vec3 baseNormal)
     tangentNormal.xy *= max(material.NormalScale, 0.0);
     tangentNormal.z = sqrt(max(0.0, 1.0 - dot(tangentNormal.xy, tangentNormal.xy)));
 
-    vec3 dp1 = dFdx(fragWorldPos);
-    vec3 dp2 = dFdy(fragWorldPos);
-    vec2 duv1 = dFdx(fragTexCoord);
-    vec2 duv2 = dFdy(fragTexCoord);
-    float det = duv1.x * duv2.y - duv2.x * duv1.y;
+    vec3  T;
+    vec3  B;
 
-    if (abs(det) < 0.0000001)
+    if (abs(fragWorldTangent.w) > 0.5 &&
+        dot(fragWorldTangent.xyz, fragWorldTangent.xyz) > 0.0000001)
     {
-        return baseNormal;
+        // Gram-Schmidt 再正交化 —— 插值后的切线不再严格垂直于法线
+        T = normalize(fragWorldTangent.xyz);
+        T = normalize(T - baseNormal * dot(baseNormal, T));
+        B = cross(baseNormal, T) * fragWorldTangent.w;
     }
+    else
+    {
+        vec3  dp1  = dFdx(fragWorldPos);
+        vec3  dp2  = dFdy(fragWorldPos);
+        vec2  duv1 = dFdx(fragTexCoord);
+        vec2  duv2 = dFdy(fragTexCoord);
+        float det  = duv1.x * duv2.y - duv2.x * duv1.y;
 
-    vec3 T = normalize((dp1 * duv2.y - dp2 * duv1.y) / det);
-    T = normalize(T - baseNormal * dot(baseNormal, T));
-    vec3 B = normalize(cross(baseNormal, T)) * sign(det);
+        if (abs(det) < 0.0000001)
+        {
+            return baseNormal;
+        }
+
+        T = normalize((dp1 * duv2.y - dp2 * duv1.y) / det);
+        T = normalize(T - baseNormal * dot(baseNormal, T));
+        B = normalize(cross(baseNormal, T)) * sign(det);
+    }
 
     return normalize(mat3(T, B, baseNormal) * tangentNormal);
 }

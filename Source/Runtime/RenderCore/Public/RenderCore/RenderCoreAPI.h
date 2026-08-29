@@ -14,7 +14,12 @@
 
 #pragma once
 
-#ifdef LIMX_RENDERCORE_EXPORTS
+// 静态库判断必须在最前 —— LBT 对静态库会同时定义 _STATIC 与模块 toml 中
+// 声明的 _EXPORTS。若 _EXPORTS 在前, 静态库会被按 dllexport 编译, 进而对
+// 含模板成员的导出类触发 C4251, 在 /WX 下变成编译错误。
+#if defined(LIMX_RENDERCORE_STATIC)
+    #define LIMX_RENDERCORE_API
+#elif defined(LIMX_RENDERCORE_EXPORTS)
     #define LIMX_RENDERCORE_API __declspec(dllexport)
 #else
     #define LIMX_RENDERCORE_API __declspec(dllimport)

@@ -15,7 +15,12 @@ layout(location = 0) in vec2 inPos;
 layout(location = 1) in vec2 inUV;
 layout(location = 2) in vec4 inColor;
 
-layout(set = 0, binding = 0) uniform OrthoUBO {
+// ── 矩阵存储序 ────────────────────────────────────────────────
+// 引擎的 FMatrix 是行主序 (M[行][列], 平移在最后一列)。GLSL 默认按列主序
+// 解读 uniform 中的 mat4, 不加 row_major 就等于把矩阵整体转置 —— 顶点会被
+// 变换到裁剪体之外, 表现为"什么都不显示"而没有任何报错。
+// FMatrix.h 的注释即以"与着色器 row_major 一致"为前提。
+layout(row_major, set = 0, binding = 0) uniform OrthoUBO {
     mat4 orthoMatrix;
 } ubo;
 

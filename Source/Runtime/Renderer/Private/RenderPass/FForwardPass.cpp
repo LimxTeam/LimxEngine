@@ -196,23 +196,50 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     if (context.RenderObjects != nullptr)
     {
+        // 记录上一次绑定的状态 —— 批次列表已按材质/网格排序, 相邻批次
+        // 大多共享同一套绑定, 逐个重绑等于把排序的收益原地丢掉。
+        // 用无效句柄作为初值, 保证第一个批次一定会真正绑定一次。
+        FRHIDescriptorSetHandle boundMaterial;
+        FRHIBufferHandle        boundVertexBuffer;
+        FRHIBufferHandle        boundIndexBuffer;
+        EIndexType              boundIndexType = EIndexType::UInt32;
+
         for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
         {
             const FRenderObject& obj = (*context.RenderObjects)[i];
 
-            // 绑定 set 1 — 材质描述符集 (逐物体)
-            commandBuffer->BindDescriptorSet(
-                EPipelineBindPoint::Graphics,
-                context.PipelineLayout,
-                1,
-                obj.MaterialDescriptorSet,
-                nullptr,
-                0
-            );
+            // 绑定 set 1 — 材质描述符集 (逐材质)
+            if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
+            {
+                commandBuffer->BindDescriptorSet(
+                    EPipelineBindPoint::Graphics,
+                    context.PipelineLayout,
+                    1,
+                    obj.MaterialDescriptorSet,
+                    nullptr,
+                    0
+                );
 
-            commandBuffer->BindVertexBuffer(0, obj.VertexBuffer, 0);
-            commandBuffer->BindIndexBuffer(obj.IndexBuffer, 0,
-                                           EIndexType::UInt16);
+                boundMaterial = obj.MaterialDescriptorSet;
+            }
+
+            if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
+            {
+                commandBuffer->BindVertexBuffer(0, obj.VertexBuffer, 0);
+                boundVertexBuffer = obj.VertexBuffer;
+            }
+
+            // 索引宽度由网格顶点数决定 —— 写死 UInt16 会让顶点数超过
+            // 65535 的网格读出错位的索引, 表现为随机穿插的三角形。
+            // 同一缓冲区换了宽度也必须重绑, 因此宽度参与比较。
+            if (obj.IndexBuffer.Packed != boundIndexBuffer.Packed ||
+                obj.IndexType != boundIndexType)
+            {
+                commandBuffer->BindIndexBuffer(obj.IndexBuffer, 0,
+                                               obj.IndexType);
+                boundIndexBuffer = obj.IndexBuffer;
+                boundIndexType   = obj.IndexType;
+            }
 
             FModelPushConstant pushData;
             pushData.Model = obj.Transform.ToMatrix();
@@ -228,7 +255,7 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
             commandBuffer->DrawIndexed(
                 obj.IndexCount,
                 1,
-                0,
+                obj.IndexOffset,
                 0,
                 0
             );
@@ -489,32 +516,48 @@ ERHIResult FForwardPass::CreateGraphicsPipeline(IRHIDevice* device)
     vertexBinding.Stride    = sizeof(FMeshVertex);
     vertexBinding.InputRate = EVertexInputRate::PerVertex;
 
-    FRHIVertexInputAttribute vertexAttributes[4] = {};
+    // 只声明本管线真正读取的属性 —— 声明了却不消费的属性会让校验层报
+    // "not consumed by vertex shader"。TexCoord1 目前无人使用 (光照贴图
+    // 尚未实现), 因此不出现在这里; 它仍占据顶点结构中的 8 字节, 步幅不变。
+    //
+    // 偏移量取自 FMeshVertex 成员而非手写常量: 结构变化时 offsetof 会跟着走,
+    // 手写常量只会静默错位。72 字节的布局静态断言在 FAssetTypes.h 中。
+    FRHIVertexInputAttribute vertexAttributes[5] = {};
 
     vertexAttributes[0].Location = 0;
     vertexAttributes[0].Binding  = 0;
     vertexAttributes[0].Format   = EPixelFormat::RGB32_SFLOAT;
-    vertexAttributes[0].Offset   = 0;
+    vertexAttributes[0].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, Position));
 
     vertexAttributes[1].Location = 1;
     vertexAttributes[1].Binding  = 0;
     vertexAttributes[1].Format   = EPixelFormat::RGB32_SFLOAT;
-    vertexAttributes[1].Offset   = sizeof(Float32) * 3;
+    vertexAttributes[1].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, Normal));
 
     vertexAttributes[2].Location = 2;
     vertexAttributes[2].Binding  = 0;
-    vertexAttributes[2].Format   = EPixelFormat::RGB32_SFLOAT;
-    vertexAttributes[2].Offset   = sizeof(Float32) * 6;
+    vertexAttributes[2].Format   = EPixelFormat::RGBA32_SFLOAT;
+    vertexAttributes[2].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, Tangent));
 
     vertexAttributes[3].Location = 3;
     vertexAttributes[3].Binding  = 0;
     vertexAttributes[3].Format   = EPixelFormat::RG32_SFLOAT;
-    vertexAttributes[3].Offset   = sizeof(Float32) * 9;
+    vertexAttributes[3].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, TexCoord0));
+
+    vertexAttributes[4].Location = 5;
+    vertexAttributes[4].Binding  = 0;
+    vertexAttributes[4].Format   = EPixelFormat::RGBA32_SFLOAT;
+    vertexAttributes[4].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, Color));
 
     pipelineDesc.VertexInput.Bindings       = &vertexBinding;
     pipelineDesc.VertexInput.BindingCount   = 1;
     pipelineDesc.VertexInput.Attributes     = vertexAttributes;
-    pipelineDesc.VertexInput.AttributeCount = 4;
+    pipelineDesc.VertexInput.AttributeCount = 5;
 
     // ---- 输入装配 ----
     pipelineDesc.InputAssembly.Topology                  = EPrimitiveTopology::TriangleList;

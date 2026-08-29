@@ -146,6 +146,12 @@ public:
     }
 
     /// 获取最大并行帧数
+    /// 单调递增的帧序号 — 每次 BeginFrame 自增
+    ///
+    /// 与 GetCurrentFrameIndex 的区别: 后者在 [0, MaxFramesInFlight) 内循环,
+    /// 无法用来判断"某个时刻是否已过去足够多帧"。延迟销毁依赖后一种判断。
+    LIMX_NODISCARD UInt64 GetFrameCounter() const { return m_FrameCounter; }
+
     LIMX_NODISCARD UInt32 GetMaxFramesInFlight() const
     {
         return m_MaxFramesInFlight;
@@ -169,6 +175,25 @@ public:
     void EndSingleTimeCommands(IRHICommandBuffer* commandBuffer);
 
     /// 渲染上下文是否已初始化
+    // ====================================================================
+    // GPU 资源
+    // ====================================================================
+
+    /// 取 GPU 资源管理器
+    ///
+    /// 资源管理器随上下文一同创建与销毁 —— 它持有的 GPU 对象生命周期
+    /// 不能长于设备。挂在上下文上而非渲染器上, 是因为资源的消费者不止渲染器:
+    /// 场景、材质系统都需要引用同一批资源。
+    LIMX_NODISCARD FRenderResourceManager& GetResourceManager()
+    {
+        return m_ResourceManager;
+    }
+
+    LIMX_NODISCARD const FRenderResourceManager& GetResourceManager() const
+    {
+        return m_ResourceManager;
+    }
+
     LIMX_NODISCARD bool IsInitialized() const
     {
         return m_Device.Get() != nullptr;
@@ -206,6 +231,10 @@ private:
     FWindow* m_Window = nullptr;
 
     TUniquePtr<IRHIDevice>                  m_Device;
+
+    /// GPU 资源管理器 —— 网格与纹理的唯一所有者
+    FRenderResourceManager                  m_ResourceManager;
+
     FRHISwapchainHandle                     m_Swapchain;
     TArray<FrameData>                       m_Frames;
     TArray<TUniquePtr<IRHICommandBuffer>>   m_CommandBuffers;
@@ -217,6 +246,9 @@ private:
     // 一次性命令缓冲区临时存储 (BeginSingleTimeCommands/EndSingleTimeCommands)
     TArray<TUniquePtr<IRHICommandBuffer>>   m_SingleTimeCmdBuffers;
     TArray<FRHICommandBufferHandle>         m_SingleTimeCmdHandles;
+
+    /// 单调帧序号 — 延迟销毁按它判断资源是否已脱离 GPU 使用
+    UInt64 m_FrameCounter      = 0;
 
     UInt32 m_CurrentFrame      = 0;
     UInt32 m_CurrentImageIndex = 0;

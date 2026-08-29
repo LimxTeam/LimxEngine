@@ -177,13 +177,30 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
 
     if (context.RenderObjects != nullptr)
     {
+        // 深度预 Pass 不绑材质, 但顶点/索引缓冲区的重绑同样可以跳过。
+        // 两个 Pass 遍历的是同一份已排序列表, 因此命中率也相同。
+        FRHIBufferHandle boundVertexBuffer;
+        FRHIBufferHandle boundIndexBuffer;
+        EIndexType       boundIndexType = EIndexType::UInt32;
+
         for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
         {
             const FRenderObject& obj = (*context.RenderObjects)[i];
 
-            commandBuffer->BindVertexBuffer(0, obj.VertexBuffer, 0);
-            commandBuffer->BindIndexBuffer(obj.IndexBuffer, 0,
-                                           EIndexType::UInt16);
+            if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
+            {
+                commandBuffer->BindVertexBuffer(0, obj.VertexBuffer, 0);
+                boundVertexBuffer = obj.VertexBuffer;
+            }
+
+            if (obj.IndexBuffer.Packed != boundIndexBuffer.Packed ||
+                obj.IndexType != boundIndexType)
+            {
+                commandBuffer->BindIndexBuffer(obj.IndexBuffer, 0,
+                                               obj.IndexType);
+                boundIndexBuffer = obj.IndexBuffer;
+                boundIndexType   = obj.IndexType;
+            }
 
             FModelPushConstant pushData;
             pushData.Model = obj.Transform.ToMatrix();
@@ -199,7 +216,7 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
             commandBuffer->DrawIndexed(
                 obj.IndexCount,
                 1,
-                0,
+                obj.IndexOffset,
                 0,
                 0
             );
@@ -442,32 +459,24 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
     vertexBinding.Stride    = sizeof(FMeshVertex);
     vertexBinding.InputRate = EVertexInputRate::PerVertex;
 
-    FRHIVertexInputAttribute vertexAttributes[4] = {};
+    // 只声明本管线真正读取的属性 —— 声明了却不消费的属性会让校验层报
+    // "not consumed by vertex shader"。步幅仍是完整的 FMeshVertex,
+    // 属性按偏移量取值, 与缓冲区里其余字段的存在与否无关。
+    //
+    // 偏移量取自 FMeshVertex 成员而非手写常量: 结构变化时 offsetof 会跟着走,
+    // 手写常量只会静默错位。72 字节的布局静态断言在 FAssetTypes.h 中。
+    FRHIVertexInputAttribute vertexAttributes[1] = {};
 
     vertexAttributes[0].Location = 0;
     vertexAttributes[0].Binding  = 0;
     vertexAttributes[0].Format   = EPixelFormat::RGB32_SFLOAT;
-    vertexAttributes[0].Offset   = 0;
-
-    vertexAttributes[1].Location = 1;
-    vertexAttributes[1].Binding  = 0;
-    vertexAttributes[1].Format   = EPixelFormat::RGB32_SFLOAT;
-    vertexAttributes[1].Offset   = sizeof(Float32) * 3;
-
-    vertexAttributes[2].Location = 2;
-    vertexAttributes[2].Binding  = 0;
-    vertexAttributes[2].Format   = EPixelFormat::RGB32_SFLOAT;
-    vertexAttributes[2].Offset   = sizeof(Float32) * 6;
-
-    vertexAttributes[3].Location = 3;
-    vertexAttributes[3].Binding  = 0;
-    vertexAttributes[3].Format   = EPixelFormat::RG32_SFLOAT;
-    vertexAttributes[3].Offset   = sizeof(Float32) * 9;
+    vertexAttributes[0].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, Position));
 
     pipelineDesc.VertexInput.Bindings       = &vertexBinding;
     pipelineDesc.VertexInput.BindingCount   = 1;
     pipelineDesc.VertexInput.Attributes     = vertexAttributes;
-    pipelineDesc.VertexInput.AttributeCount = 4;
+    pipelineDesc.VertexInput.AttributeCount = 1;
 
     // ---- 输入装配 ----
     pipelineDesc.InputAssembly.Topology                  = EPrimitiveTopology::TriangleList;

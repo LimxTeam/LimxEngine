@@ -28,6 +28,66 @@ namespace Limx
 {
 
 // ============================================================================
+// 程序化几何的顶点描述
+//
+// 中性顶点 FMeshVertex 有六个属性 (位置/法线/切线/双 UV/颜色)，但程序化
+// 几何只关心其中四个。用一个紧凑描述结构承载字面量表，保持表格可读，
+// 再统一转换为中性顶点并补齐其余属性 —— 直接以中性顶点写字面量会让
+// 每行多出两组占位值，表格将难以核对。
+// ============================================================================
+
+namespace
+{
+
+/// 字面量表中的顶点描述
+struct FProceduralVertex
+{
+    Float32 Position[3];
+    Float32 Normal[3];
+    Float32 Color[3];
+    Float32 TexCoord[2];
+};
+
+/// 转换为中性顶点 — 切线留待 GenerateTangents 统一生成
+FMeshVertex ToMeshVertex(const FProceduralVertex& source)
+{
+    FMeshVertex vertex;
+
+    vertex.Position  = FVector3(source.Position[0], source.Position[1],
+                                source.Position[2]);
+    vertex.Normal    = FVector3(source.Normal[0], source.Normal[1],
+                                source.Normal[2]);
+    vertex.TexCoord0 = FVector2(source.TexCoord[0], source.TexCoord[1]);
+    vertex.TexCoord1 = FVector2(0.0f, 0.0f);
+    vertex.Color     = FVector4(source.Color[0], source.Color[1],
+                                source.Color[2], 1.0f);
+
+    return vertex;
+}
+
+/// 补齐包围盒与切线, 使程序化几何与解析所得的资产具有同样完整的属性
+void FinalizeMesh(FMeshData& mesh, const FName& name)
+{
+    mesh.Name         = name;
+    mesh.HasNormals   = true;
+    mesh.HasTexCoords = true;
+
+    if (mesh.SubMeshes.GetSize() == 0)
+    {
+        FSubMesh section;
+        section.Name        = name;
+        section.IndexOffset = 0;
+        section.IndexCount  = static_cast<UInt32>(mesh.Indices.GetSize());
+        mesh.SubMeshes.Add(section);
+    }
+
+    mesh.RecomputeBounds();
+    mesh.GenerateTangents();
+}
+
+} // namespace
+
+// ============================================================================
 // GenerateCube — 单位立方体 (中心原点, 边长 1.0)
 // ============================================================================
 
@@ -42,7 +102,7 @@ FMeshData FGeometryGenerator::GenerateCube()
     // 每面独立法线, 颜色按面区分
     // 顺序: +X, -X, +Y, -Y, +Z, -Z
 
-    FMeshVertex vertices[] =
+    FProceduralVertex vertices[] =
     {
         // +X 面 (右) — 红色           pos              normal          color                   uv
         { { h, -h, -h}, { 1,  0,  0}, {0.9f, 0.2f, 0.2f}, {0.0f, 1.0f} },
@@ -100,14 +160,16 @@ FMeshData FGeometryGenerator::GenerateCube()
     mesh.Vertices.Reserve(vertexCount);
     for (UInt32 i = 0; i < vertexCount; ++i)
     {
-        mesh.Vertices.Add(vertices[i]);
+        mesh.Vertices.Add(ToMeshVertex(vertices[i]));
     }
 
     mesh.Indices.Reserve(indexCount);
     for (UInt32 i = 0; i < indexCount; ++i)
     {
-        mesh.Indices.Add(indices[i]);
+        mesh.Indices.Add(static_cast<UInt32>(indices[i]));
     }
+
+    FinalizeMesh(mesh, FName("Cube"));
 
     return mesh;
 }
@@ -149,11 +211,11 @@ FMeshData FGeometryGenerator::GeneratePlane(
             // 棋盘格颜色
             bool isEven = ((ix + iz) % 2) == 0;
             vertex.Color = isEven
-                ? FVector3(0.7f, 0.7f, 0.7f)
-                : FVector3(0.3f, 0.3f, 0.3f);
+                ? FVector4(0.7f, 0.7f, 0.7f, 1.0f)
+                : FVector4(0.3f, 0.3f, 0.3f, 1.0f);
 
             // UV 坐标: [0,1] 映射到平面范围
-            vertex.TexCoord = FVector2(
+            vertex.TexCoord0 = FVector2(
                 static_cast<Float32>(ix) / static_cast<Float32>(subdivX),
                 static_cast<Float32>(iz) / static_cast<Float32>(subdivZ));
 
@@ -182,6 +244,8 @@ FMeshData FGeometryGenerator::GeneratePlane(
             mesh.Indices.Add(bottomRight);
         }
     }
+
+    FinalizeMesh(mesh, FName("Plane"));
 
     return mesh;
 }
@@ -231,14 +295,15 @@ FMeshData FGeometryGenerator::GenerateSphere(
                       / static_cast<Float32>(slices);
             Float32 v = static_cast<Float32>(iStack)
                       / static_cast<Float32>(stacks);
-            vertex.Color = FVector3(
+            vertex.Color = FVector4(
                 0.5f + 0.5f * FMath::Cos(u * FMath::kPi * 2.0f),
                 0.5f + 0.5f * FMath::Cos(v * FMath::kPi),
-                0.5f + 0.5f * FMath::Sin(u * FMath::kPi * 2.0f)
+                0.5f + 0.5f * FMath::Sin(u * FMath::kPi * 2.0f),
+                1.0f
             );
 
             // UV 坐标: 经度→U, 纬度→V
-            vertex.TexCoord = FVector2(u, v);
+            vertex.TexCoord0 = FVector2(u, v);
 
             mesh.Vertices.Add(vertex);
         }
@@ -265,6 +330,8 @@ FMeshData FGeometryGenerator::GenerateSphere(
             mesh.Indices.Add(belowNext);
         }
     }
+
+    FinalizeMesh(mesh, FName("Sphere"));
 
     return mesh;
 }
