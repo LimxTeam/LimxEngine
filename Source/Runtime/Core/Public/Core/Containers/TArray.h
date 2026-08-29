@@ -393,15 +393,27 @@ public:
     {
         LIMX_ASSERT(index < m_Size);
 
-        Memory::DestructItems(m_Data + index, 1);
-
         SizeType moveCount = m_Size - index - 1;
+
         if (moveCount > 0)
         {
-            Memory::MoveConstructItems(
+            // 移动**赋值**而非移动构造 —— 目标位置上是已构造的对象,
+            // 赋值会先释放它原有的内容, 正是我们要的语义。
+            //
+            // 旧实现用的是 "析构 index → 移动构造整段 → 析构源段",
+            // 而源段与目标段是重叠的: 移动构造把每个元素前移一位之后,
+            // [index+1, index+moveCount-1] 上放的已经是搬过来的**活对象**,
+            // 再对这一段调析构等于销毁了仍在数组里的元素。
+            //
+            // 对平凡析构的类型 (句柄、浮点) 析构是空操作, 因此这个缺陷
+            // 一直没有暴露; 直到 TArray<TUniquePtr<T>> 第一次用上 RemoveAt,
+            // 表现为删除一个元素连带释放掉它后面的若干个。
+            Memory::MoveAssignItems(
                 m_Data + index, m_Data + index + 1, moveCount);
-            Memory::DestructItems(m_Data + index + 1, moveCount);
         }
+
+        // 只析构末尾那一个 —— 它的内容已被移到前一位, 自身已是空壳
+        Memory::DestructItems(m_Data + m_Size - 1, 1);
 
         --m_Size;
     }

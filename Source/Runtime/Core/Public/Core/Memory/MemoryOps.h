@@ -327,8 +327,26 @@ FORCEINLINE void RelocateItemsBackward(T* destination, T* source, SizeType count
         }
         else
         {
+            // destination <= source: 前向搬移。两段重叠时,
+            // [source, destination + count) 已被搬过来的数据覆盖,
+            // 只有尾部 [destination + count, source + count) 仍持有
+            // 被移空的源对象需要析构。
+            //
+            // 对整段调 DestructItems 会销毁刚搬过来的活对象 —— 对平凡析构
+            // 的类型看不出问题, 对 TUniquePtr 这类就是提前释放。
             MoveConstructItems(destination, source, count);
-            DestructItems(source, count);
+
+            T* tailBegin = destination + count;
+
+            if (tailBegin < source)
+            {
+                tailBegin = source;
+            }
+
+            const SizeType tailCount =
+                static_cast<SizeType>((source + count) - tailBegin);
+
+            DestructItems(tailBegin, tailCount);
         }
     }
 }
