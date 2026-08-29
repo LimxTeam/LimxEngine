@@ -77,6 +77,12 @@ struct FPassSetupDesc
 
     /// FPassManager 创建的共享深度纹理视图
     FRHITextureViewHandle    SharedDepthTextureView;
+
+    /// FPassManager 创建的共享 HDR 颜色目标
+    ///
+    /// FForwardPass 画进它 (而非直接画进交换链), FPostProcessPass 采样它。
+    FRHITextureHandle        SharedColorTexture;
+    FRHITextureViewHandle    SharedColorTextureView;
 };
 
 // ============================================================================
@@ -176,7 +182,9 @@ public:
                                 FRHIExtent2D          newExtent,
                                 UInt32                swapchainImageCount,
                                 FRHITextureHandle     newSharedDepth,
-                                FRHITextureViewHandle newSharedDepthView) = 0;
+                                FRHITextureViewHandle newSharedDepthView,
+                                FRHITextureHandle     newSharedColor,
+                                FRHITextureViewHandle newSharedColorView) = 0;
 
     /// 释放依赖交换链尺寸或图像视图的资源。
     /// 在交换链销毁前调用，避免 framebuffer 持有失效的 swapchain image view。

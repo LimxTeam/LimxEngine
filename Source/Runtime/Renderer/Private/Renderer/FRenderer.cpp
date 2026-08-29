@@ -66,6 +66,7 @@
 #include "RenderCore/Lighting/FLight.h"
 #include "Renderer/RenderPass/FPassManager.h"
 #include "Renderer/RenderPass/FShadowPass.h"
+#include "Renderer/RenderPass/FPostProcessPass.h"
 #include "Renderer/RenderPass/FForwardPass.h"
 #include "Renderer/RenderPass/FDepthPrePass.h"
 
@@ -191,11 +192,13 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_ShadowPass   = MakeUnique<FShadowPass>();
     m_DepthPrePass = MakeUnique<FDepthPrePass>();
     m_ForwardPass  = MakeUnique<FForwardPass>();
+    m_PostProcessPass = MakeUnique<FPostProcessPass>();
     m_PassManager  = MakeUnique<FPassManager>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
+    m_PassManager->RegisterPass(m_PostProcessPass.Get());
 
     FRHISwapchainHandle swapchain  = m_Context->GetSwapchain();
     UInt32              imageCount = device->GetSwapchainImageCount(swapchain);
@@ -485,6 +488,23 @@ void FRenderer::RenderFrame()
 
     RecordFrameTime(static_cast<Float32>(
         (FPlatformTime::Seconds() - frameBeginTime) * 1000.0));
+}
+
+// ============================================================================
+// 曝光
+// ============================================================================
+
+void FRenderer::SetExposure(Float32 exposure)
+{
+    if (m_PostProcessPass)
+    {
+        m_PostProcessPass->SetExposure(exposure);
+    }
+}
+
+Float32 FRenderer::GetExposure() const
+{
+    return m_PostProcessPass ? m_PostProcessPass->GetExposure() : 1.0f;
 }
 
 // ============================================================================

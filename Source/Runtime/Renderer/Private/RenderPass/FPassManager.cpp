@@ -109,6 +109,11 @@ ERHIResult FPassManager::SetupAll(const FPassSetupInfo& info)
 
     // 1. 创建共享深度缓冲区 (D32_SFLOAT, 交换链尺寸)
     ERHIResult result = CreateSharedDepth(info.Device, info.SwapchainExtent);
+
+    if (IsRHISuccess(result))
+    {
+        result = CreateSharedColor(info.Device, info.SwapchainExtent);
+    }
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error,
@@ -126,6 +131,8 @@ ERHIResult FPassManager::SetupAll(const FPassSetupInfo& info)
     setupDesc.PipelineLayout       = info.PipelineLayout;
     setupDesc.SharedDepthTexture   = m_SharedDepthTexture;
     setupDesc.SharedDepthTextureView = m_SharedDepthTextureView;
+    setupDesc.SharedColorTexture     = m_SharedColorTexture;
+    setupDesc.SharedColorTextureView = m_SharedColorTextureView;
 
     for (SizeType i = 0; i < m_Passes.GetSize(); ++i)
     {
@@ -191,9 +198,15 @@ ERHIResult FPassManager::OnResizeAll(IRHIDevice*         device,
     m_SwapchainImageCount = swapchainImageCount;
 
     // 1. 销毁并重建共享深度缓冲区
+    DestroySharedColor(device);
     DestroySharedDepth(device);
 
     ERHIResult result = CreateSharedDepth(device, newExtent);
+
+    if (IsRHISuccess(result))
+    {
+        result = CreateSharedColor(device, newExtent);
+    }
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error,
@@ -209,7 +222,9 @@ ERHIResult FPassManager::OnResizeAll(IRHIDevice*         device,
                                         newExtent,
                                         swapchainImageCount,
                                         m_SharedDepthTexture,
-                                        m_SharedDepthTextureView);
+                                        m_SharedDepthTextureView,
+                                        m_SharedColorTexture,
+                                        m_SharedColorTextureView);
         if (!IsRHISuccess(result))
         {
             LIMX_LOG(LogRenderer, Error,
@@ -242,6 +257,7 @@ void FPassManager::ReleaseSwapchainResources(IRHIDevice* device)
         m_Passes[i - 1]->ReleaseSwapchainResources(device);
     }
 
+    DestroySharedColor(device);
     DestroySharedDepth(device);
 }
 
@@ -263,12 +279,89 @@ void FPassManager::ShutdownAll(IRHIDevice* device)
     }
 
     // 销毁共享深度缓冲区
+    DestroySharedColor(device);
     DestroySharedDepth(device);
 
     m_IsInitialized = false;
 
     LIMX_LOG(LogRenderer, Log,
              "[PassManager] ShutdownAll 完成");
+}
+
+// ============================================================================
+// CreateSharedColor — 创建 RGBA16_SFLOAT 共享 HDR 颜色目标
+//
+// 前向 Pass 画进它, 后处理 Pass 采样它。用 16 位浮点而非 8 位归一化:
+// 光照结果的动态范围远超 [0,1], 8 位在色调映射之前就已经把亮部截断了 ——
+// 那样再好的色调映射曲线也无从发挥。
+// ============================================================================
+
+ERHIResult FPassManager::CreateSharedColor(IRHIDevice* device,
+                                            FRHIExtent2D extent)
+{
+    FRHITextureDesc colorDesc = {};
+    colorDesc.Type          = ETextureType::Texture2D;
+    colorDesc.Format        = EPixelFormat::RGBA16_SFLOAT;
+    colorDesc.Extent        = { extent.Width, extent.Height, 1 };
+    colorDesc.MipLevels     = 1;
+    colorDesc.ArrayLayers   = 1;
+    colorDesc.Samples       = ESampleCount::Count1;
+    colorDesc.Usage         = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::ColorAttachment) |
+        static_cast<UInt32>(ETextureUsage::Sampled));
+    colorDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
+    colorDesc.DebugName     = "SharedHDRColor";
+
+    ERHIResult result = device->CreateTexture(colorDesc, m_SharedColorTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error,
+                 "[PassManager] HDR 颜色目标创建失败 ({}x{})",
+                 extent.Width, extent.Height);
+        return result;
+    }
+
+    FRHITextureViewDesc viewDesc = {};
+    viewDesc.Texture         = m_SharedColorTexture;
+    viewDesc.ViewType        = ETextureType::Texture2D;
+    viewDesc.Format          = EPixelFormat::RGBA16_SFLOAT;
+    viewDesc.BaseMipLevel    = 0;
+    viewDesc.MipLevelCount   = 1;
+    viewDesc.BaseArrayLayer  = 0;
+    viewDesc.ArrayLayerCount = 1;
+
+    result = device->CreateTextureView(viewDesc, m_SharedColorTextureView);
+
+    if (!IsRHISuccess(result))
+    {
+        device->DestroyTexture(m_SharedColorTexture);
+        return result;
+    }
+
+    LIMX_LOG(LogRenderer, Log,
+             "[PassManager] HDR 颜色目标创建完成 — RGBA16_SFLOAT {}x{}",
+             extent.Width, extent.Height);
+
+    return ERHIResult::Success;
+}
+
+// ============================================================================
+// DestroySharedColor
+// ============================================================================
+
+void FPassManager::DestroySharedColor(IRHIDevice* device)
+{
+    if (device == nullptr)
+    {
+        return;
+    }
+
+    device->DestroyTextureView(m_SharedColorTextureView);
+    device->DestroyTexture(m_SharedColorTexture);
+
+    m_SharedColorTextureView = FRHITextureViewHandle();
+    m_SharedColorTexture     = FRHITextureHandle();
 }
 
 // ============================================================================

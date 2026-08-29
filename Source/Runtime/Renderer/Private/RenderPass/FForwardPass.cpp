@@ -54,6 +54,7 @@ ERHIResult FForwardPass::Setup(const FPassSetupDesc& desc)
     m_PipelineLayout  = desc.PipelineLayout;
     m_SwapchainFormat = desc.SwapchainFormat;
     m_SwapchainExtent = desc.SwapchainExtent;
+    m_ColorTargetView = desc.SharedColorTextureView;
 
     // 1. 创建颜色+深度渲染通道
     ERHIResult result = CreateRenderPass(desc.Device, desc.SwapchainFormat);
@@ -139,7 +140,8 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     FRHIRenderPassBeginInfo beginInfo = {};
     beginInfo.RenderPass        = m_RenderPass;
-    beginInfo.Framebuffer       = m_Framebuffers[context.ImageIndex];
+    // HDR 目标只有一张, 因此只有一个 Framebuffer —— 与交换链图像下标无关
+    beginInfo.Framebuffer       = m_Framebuffers[0];
     beginInfo.RenderAreaOffset  = { 0, 0 };
     beginInfo.RenderAreaExtent  = context.SwapchainExtent;
     beginInfo.ClearColors       = &clearColor;
@@ -378,9 +380,16 @@ ERHIResult FForwardPass::OnResize(IRHIDevice*           device,
                                    FRHIExtent2D          newExtent,
                                    UInt32                swapchainImageCount,
                                    FRHITextureHandle     newSharedDepth,
-                                   FRHITextureViewHandle newSharedDepthView)
+                                   FRHITextureViewHandle newSharedDepthView,
+                        FRHITextureHandle     newSharedColor,
+                        FRHITextureViewHandle newSharedColorView)
 {
     m_SwapchainExtent = newExtent;
+
+    // HDR 目标随交换链一同重建, 视图句柄因此换了新的 —— 不更新的话
+    // Framebuffer 会挂在已销毁的旧视图上。
+    (void)newSharedColor;
+    m_ColorTargetView = newSharedColorView;
 
     DestroyFramebuffers(device);
 
@@ -437,17 +446,25 @@ void FForwardPass::Shutdown(IRHIDevice* device)
 ERHIResult FForwardPass::CreateRenderPass(IRHIDevice*  device,
                                            EPixelFormat swapchainFormat)
 {
-    // 附件 0: 颜色附件 — 交换链格式，清除→存储，最终布局 PresentSrc
+    // 附件 0: HDR 颜色附件 — RGBA16_SFLOAT, 清除→存储
+    //
+    // 不再直接画进交换链: 光照结果的动态范围远超 [0,1], 写进 8 位归一化的
+    // 交换链意味着在色调映射之前就把亮部截断了 —— 那样再好的映射曲线也
+    // 无从发挥。最终布局转为着色器只读, 供后处理 Pass 采样。
+    //
+    // swapchainFormat 因此不再参与本 Pass 的附件格式。
+    (void)swapchainFormat;
+
     FRHIAttachmentDesc attachments[2] = {};
 
-    attachments[0].Format         = swapchainFormat;
+    attachments[0].Format         = EPixelFormat::RGBA16_SFLOAT;
     attachments[0].Samples        = ESampleCount::Count1;
     attachments[0].LoadOp         = ELoadOp::Clear;
     attachments[0].StoreOp        = EStoreOp::Store;
     attachments[0].StencilLoadOp  = ELoadOp::DontCare;
     attachments[0].StencilStoreOp = EStoreOp::DontCare;
     attachments[0].InitialLayout  = EImageLayout::Undefined;
-    attachments[0].FinalLayout    = EImageLayout::PresentSrc;
+    attachments[0].FinalLayout    = EImageLayout::ShaderReadOnly;
 
     // 附件 1: 深度附件 — 使用 FDepthPrePass 写入的深度数据 (LoadOp=Load)
     // InitialLayout=DepthStencilAttachment (prepass 后深度缓冲的布局)
@@ -508,16 +525,20 @@ ERHIResult FForwardPass::CreateFramebuffers(IRHIDevice*           device,
                                               UInt32                imageCount,
                                               FRHITextureViewHandle sharedDepthView)
 {
-    m_Framebuffers.Reserve(imageCount);
+    // 只需一个 Framebuffer —— 渲染目标是那一张共享 HDR 纹理, 与交换链
+    // 的多缓冲无关。此前每个交换链图像各建一个, 是因为直接画进交换链。
+    //
+    // 这也意味着相邻帧会写同一张 HDR 纹理: 由帧栅栏保证上一帧已呈现完毕,
+    // 与深度缓冲区一直以来的做法相同。
+    (void)swapchain;
+    (void)imageCount;
 
-    for (UInt32 i = 0; i < imageCount; ++i)
+    m_Framebuffers.Reserve(1);
+
     {
-        FRHITextureViewHandle colorView =
-            device->GetSwapchainImageView(swapchain, i);
-
         FRHITextureViewHandle fbAttachments[2] =
         {
-            colorView,
+            m_ColorTargetView,
             sharedDepthView
         };
 
@@ -528,7 +549,7 @@ ERHIResult FForwardPass::CreateFramebuffers(IRHIDevice*           device,
         fbDesc.Width           = extent.Width;
         fbDesc.Height          = extent.Height;
         fbDesc.Layers          = 1;
-        fbDesc.DebugName       = "ForwardPass_Framebuffer";
+        fbDesc.DebugName       = "ForwardPass_HDRFramebuffer";
 
         FRHIFramebufferHandle framebuffer;
         ERHIResult result = device->CreateFramebuffer(fbDesc, framebuffer);

@@ -479,14 +479,14 @@ void main()
                    lighting.ambientColor.w *
                    albedo * ao;
 
-    // ---- 最终颜色 ----
+    // ---- 最终颜色 — 线性 HDR, 不在此处做色调映射 ----
+    //
+    // 色调映射与 Gamma 校正已移到独立的后处理 Pass。写在这里的话:
+    //   1. 每个片段各自映射一次, 而色调映射按定义是对最终图像的操作;
+    //   2. Bloom、TAA 之类需要的是**线性 HDR** 输入, 颜色若在进入它们之前
+    //      已被映射, 亮部信息已经丢失, 再怎么处理也找不回来;
+    //   3. 曝光是全局参数, 逐材质着色器无处安放。
     vec3 color = ambient + Lo + emissive;
-
-    // ---- HDR → LDR: Reinhard 色调映射 ----
-    color = color / (color + vec3(1.0));
-
-    // ---- Gamma 校正 (线性 → sRGB, γ=2.2) ----
-    color = pow(color, vec3(1.0 / 2.2));
 
     outColor = vec4(color, baseColor.a);
 }

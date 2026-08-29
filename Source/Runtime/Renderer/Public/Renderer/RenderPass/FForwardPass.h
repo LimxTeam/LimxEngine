@@ -84,7 +84,9 @@ public:
                         FRHIExtent2D          newExtent,
                         UInt32                swapchainImageCount,
                         FRHITextureHandle     newSharedDepth,
-                        FRHITextureViewHandle newSharedDepthView) override;
+                        FRHITextureViewHandle newSharedDepthView,
+                        FRHITextureHandle     newSharedColor,
+                        FRHITextureViewHandle newSharedColorView) override;
 
     void ReleaseSwapchainResources(IRHIDevice* device) override;
 
@@ -162,6 +164,9 @@ private:
 
     /// 管线布局 (由外部 FPassSetupDesc 传入, 不拥有)
     FRHIPipelineLayoutHandle          m_PipelineLayout;
+
+    /// 共享 HDR 颜色目标的视图 — 本 Pass 的渲染目标 (非拥有)
+    FRHITextureViewHandle             m_ColorTargetView;
 
     /// 交换链格式缓存 (OnResize 时重建 RenderPass 需要)
     EPixelFormat                      m_SwapchainFormat = EPixelFormat::Unknown;

@@ -197,6 +197,14 @@ private:
     /// 创建共享深度纹理 + 纹理视图 (D32_SFLOAT)
     ERHIResult CreateSharedDepth(IRHIDevice* device, FRHIExtent2D extent);
 
+    /// 创建共享 HDR 颜色目标 (RGBA16_SFLOAT)
+    ///
+    /// 前向 Pass 画进它, 后处理 Pass 采样它。16 位浮点是必需的 ——
+    /// 光照结果的动态范围远超 [0,1], 8 位在色调映射之前就把亮部截断了。
+    ERHIResult CreateSharedColor(IRHIDevice* device, FRHIExtent2D extent);
+
+    void DestroySharedColor(IRHIDevice* device);
+
     /// 销毁共享深度纹理 + 纹理视图
     void DestroySharedDepth(IRHIDevice* device);
 
@@ -215,6 +223,10 @@ private:
 
     /// 共享深度纹理视图
     FRHITextureViewHandle m_SharedDepthTextureView;
+
+    /// 共享 HDR 颜色目标 — 前向 Pass 的渲染目标, 后处理 Pass 的输入
+    FRHITextureHandle     m_SharedColorTexture;
+    FRHITextureViewHandle m_SharedColorTextureView;
 
     /// 缓存的初始化信息 (OnResizeAll 时需要 swapchain/format/imageCount)
     IRHIDevice*           m_Device              = nullptr;

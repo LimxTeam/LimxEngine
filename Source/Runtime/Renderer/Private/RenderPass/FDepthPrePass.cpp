@@ -297,7 +297,9 @@ ERHIResult FDepthPrePass::OnResize(IRHIDevice*           device,
                                     FRHIExtent2D          newExtent,
                                     UInt32                swapchainImageCount,
                                     FRHITextureHandle     newSharedDepth,
-                                    FRHITextureViewHandle newSharedDepthView)
+                                    FRHITextureViewHandle newSharedDepthView,
+                        FRHITextureHandle     newSharedColor,
+                        FRHITextureViewHandle newSharedColorView)
 {
     m_SwapchainExtent    = newExtent;
     m_SharedDepthTexture = newSharedDepth;

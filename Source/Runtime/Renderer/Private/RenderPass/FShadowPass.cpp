@@ -812,7 +812,9 @@ ERHIResult FShadowPass::OnResize(IRHIDevice*           device,
                                   FRHIExtent2D          newExtent,
                                   UInt32                swapchainImageCount,
                                   FRHITextureHandle     newSharedDepth,
-                                  FRHITextureViewHandle newSharedDepthView)
+                                  FRHITextureViewHandle newSharedDepthView,
+                        FRHITextureHandle     newSharedColor,
+                        FRHITextureViewHandle newSharedColorView)
 {
     // 阴影贴图是光源空间的固定分辨率资源 —— 窗口缩放不该让阴影质量抖动
     (void)device;

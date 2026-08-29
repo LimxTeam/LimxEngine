@@ -86,6 +86,7 @@ class FPassManager;
 class FForwardPass;
 class FShadowPass;
 class FDepthPrePass;
+class FPostProcessPass;
 class FMaterial;
 
 // ============================================================================
@@ -278,6 +279,11 @@ public:
         m_ShadowCasterObjects = objects;
     }
 
+    /// 设置色调映射的线性曝光倍数
+    void SetExposure(Float32 exposure);
+
+    LIMX_NODISCARD Float32 GetExposure() const;
+
     /// 设置场景世界包围盒 — 阴影正交视锥据此拟合
     ///
     /// 由 FSceneManager 在收集批次时顺带算出。给得过大浪费阴影贴图精度,
@@ -350,6 +356,7 @@ private:
     TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FForwardPass>          m_ForwardPass;
+    TUniquePtr<FPostProcessPass>      m_PostProcessPass;
 
     /// 场景包围盒 — 阴影视锥的拟合依据, 由 SetSceneBounds 每帧提供
     FBoundingBox                      m_SceneBounds;

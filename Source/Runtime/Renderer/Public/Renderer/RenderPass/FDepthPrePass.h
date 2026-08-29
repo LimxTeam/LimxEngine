@@ -84,7 +84,9 @@ public:
                         FRHIExtent2D          newExtent,
                         UInt32                swapchainImageCount,
                         FRHITextureHandle     newSharedDepth,
-                        FRHITextureViewHandle newSharedDepthView) override;
+                        FRHITextureViewHandle newSharedDepthView,
+                        FRHITextureHandle     newSharedColor,
+                        FRHITextureViewHandle newSharedColorView) override;
 
     void ReleaseSwapchainResources(IRHIDevice* device) override;
 

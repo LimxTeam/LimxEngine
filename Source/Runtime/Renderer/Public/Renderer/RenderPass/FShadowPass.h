@@ -97,7 +97,9 @@ public:
                         FRHIExtent2D          newExtent,
                         UInt32                swapchainImageCount,
                         FRHITextureHandle     newSharedDepth,
-                        FRHITextureViewHandle newSharedDepthView) override;
+                        FRHITextureViewHandle newSharedDepthView,
+                        FRHITextureHandle     newSharedColor,
+                        FRHITextureViewHandle newSharedColorView) override;
 
     /// 释放与交换链尺寸相关的资源
     ///
