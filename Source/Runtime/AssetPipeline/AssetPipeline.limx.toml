@@ -1,0 +1,32 @@
+[module]
+name        = "LimxAssetPipeline"
+type        = "static"
+namespace   = "Limx"
+api_macro   = "LIMX_ASSETPIPELINE_API"
+layer       = 2
+description = "资产管线 — 网格/材质/场景的文件解析 (OBJ/MTL、glTF 2.0/GLB)，产出与图形 API 无关的中性数据，不涉及 GPU 上传"
+
+[dependencies]
+public  = ["LimxCore"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = ["LIMX_ASSETPIPELINE_EXPORTS"]
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = []
+
+[precompiled_header]
+enabled = true
+header  = "AssetPipeline/AssetPipelineMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []
