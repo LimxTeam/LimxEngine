@@ -42,6 +42,14 @@ struct FBatchStateLess
     LIMX_NODISCARD bool operator()(const FRenderObject& a,
                                    const FRenderObject& b) const
     {
+        // 剔除模式是主键中的主键 —— 它决定换哪条管线, 而管线切换的代价
+        // 高于描述符集切换。单面与双面交替出现会让管线来回重绑。
+        if (a.IsDoubleSided != b.IsDoubleSided)
+        {
+            return static_cast<int>(a.IsDoubleSided) <
+                   static_cast<int>(b.IsDoubleSided);
+        }
+
         if (a.MaterialDescriptorSet.Packed != b.MaterialDescriptorSet.Packed)
         {
             return a.MaterialDescriptorSet.Packed <
@@ -91,6 +99,7 @@ void FSceneManager::Shutdown()
     m_Renderer = nullptr;
     m_Stats    = FSceneSyncStats();
     m_SceneRenderObjects.Clear();
+    m_TranslucentObjects.Clear();
     LIMX_LOG(LogEngine, Log, "[FSceneManager] 已关闭");
 }
 
@@ -124,28 +133,36 @@ void FSceneManager::SyncScene(const LScene* scene, Float32 deltaTime)
         CullBatches(frustum);
     }
 
-    // 4. 状态排序
+    // 4. 按混合模式拆分 —— 必须在排序之前, 两条列表的排序规则不同
+    PartitionBatches();
+
+    // 5. 各自排序
     if (m_IsSortingEnabled)
     {
         SortBatches();
     }
 
-    // 5. 统计
+    // 半透明的由远及近排序**不受 --no-sort 影响** —— 它不是优化而是正确性
+    // 要求, 关掉它得到的不是"慢一点", 而是错误的混合结果。
+    SortTranslucentBatches();
+
+    // 6. 统计
     MeasureBatches();
 
-    // 6. 推送
+    // 7. 推送
     m_Renderer->SetRenderObjects(m_SceneRenderObjects);
+    m_Renderer->SetTranslucentObjects(m_TranslucentObjects);
 
     // 只在可见批次数变化时输出 —— 每帧一行会淹没日志, 而"批次数突然变成 0"
     // 恰恰是最需要被看见的事件。
     if (m_Stats.VisibleCount != previousVisible)
     {
         LIMX_LOG(LogEngine, Log,
-                 "[FSceneManager] 可见批次 {} → {} (共 {} 个, 剔除 {} 个 | "
-                 "材质切换 {} 次, 网格切换 {} 次)",
+                 "[FSceneManager] 可见批次 {} → {} (共 {} 个, 剔除 {} 个, "
+                 "半透明 {} 个 | 材质切换 {} 次, 网格切换 {} 次)",
                  previousVisible, m_Stats.VisibleCount, m_Stats.BatchCount,
-                 m_Stats.CulledCount, m_Stats.MaterialSwitchCount,
-                 m_Stats.MeshSwitchCount);
+                 m_Stats.CulledCount, m_Stats.TranslucentCount,
+                 m_Stats.MaterialSwitchCount, m_Stats.MeshSwitchCount);
     }
 }
 
@@ -263,6 +280,62 @@ void FSceneManager::CullBatches(const FFrustum& frustum)
 }
 
 // ============================================================================
+// PartitionBatches — 按混合模式拆分
+// ============================================================================
+
+void FSceneManager::PartitionBatches()
+{
+    m_TranslucentObjects.Clear();
+
+    SizeType writeIndex = 0;
+
+    for (SizeType readIndex = 0; readIndex < m_SceneRenderObjects.GetSize();
+         ++readIndex)
+    {
+        const FRenderObject& object = m_SceneRenderObjects[readIndex];
+
+        // 分类规则集中在 IsBlendedMode 一处 —— 见其文档说明。
+        // Masked 留在不透明列表: 它靠 discard 实现镂空, 不需要混合,
+        // 也照常写深度。
+        if (IsBlendedMode(object.BlendMode))
+        {
+            m_TranslucentObjects.Add(object);
+            continue;
+        }
+
+        if (writeIndex != readIndex)
+        {
+            m_SceneRenderObjects[writeIndex] = m_SceneRenderObjects[readIndex];
+        }
+
+        ++writeIndex;
+    }
+
+    m_SceneRenderObjects.SetSize(writeIndex);
+
+    m_Stats.TranslucentCount =
+        static_cast<UInt32>(m_TranslucentObjects.GetSize());
+}
+
+// ============================================================================
+// SortTranslucentBatches — 由远及近
+// ============================================================================
+
+void FSceneManager::SortTranslucentBatches()
+{
+    if (m_TranslucentObjects.GetSize() < 2)
+    {
+        return;
+    }
+
+    FTranslucentBackToFrontLess predicate;
+    predicate.CameraPosition = m_Renderer->GetCamera().GetPosition();
+
+    Sort(m_TranslucentObjects.GetData(), m_TranslucentObjects.GetSize(),
+         predicate);
+}
+
+// ============================================================================
 // SortBatches — 按材质与网格排序
 // ============================================================================
 
@@ -284,7 +357,13 @@ void FSceneManager::SortBatches()
 void FSceneManager::MeasureBatches()
 {
     m_Stats.VisibleCount =
-        static_cast<UInt32>(m_SceneRenderObjects.GetSize());
+        static_cast<UInt32>(m_SceneRenderObjects.GetSize() +
+                            m_TranslucentObjects.GetSize());
+
+    for (SizeType i = 0; i < m_TranslucentObjects.GetSize(); ++i)
+    {
+        m_Stats.VisibleTriangles += m_TranslucentObjects[i].IndexCount / 3;
+    }
 
     if (m_SceneRenderObjects.GetSize() == 0)
     {

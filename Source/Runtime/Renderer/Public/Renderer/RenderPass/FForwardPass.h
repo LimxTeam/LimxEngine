@@ -112,7 +112,28 @@ private:
     ERHIResult CreateShaders(IRHIDevice* device);
 
     /// 创建图形管线 (DepthCompareOp::Equal, 禁止深度写入)
-    ERHIResult CreateGraphicsPipeline(IRHIDevice* device);
+    /// 创建一条图形管线
+    ///
+    /// 不透明与半透明只在深度与混合状态上不同，其余（着色器、顶点输入、
+    /// 光栅化、渲染通道）完全一致，因此共用同一份描述而非各写一遍 ——
+    /// 两份描述一旦漂移，症状是"半透明物体的顶点布局对不上"这类极难定位的错。
+    ///
+    /// @param isTranslucent 半透明变体：启用 Alpha 混合、深度比较放宽为
+    ///                      LessOrEqual、仍然禁止深度写入
+    /// @param isDoubleSided 双面变体：关闭背面剔除
+    ERHIResult CreateGraphicsPipeline(IRHIDevice* device,
+                                      bool isTranslucent,
+                                      bool isDoubleSided,
+                                      FRHIGraphicsPipelineHandle& outPipeline);
+
+    /// 按混合与剔除取对应管线
+    LIMX_NODISCARD FRHIGraphicsPipelineHandle SelectPipeline(
+        bool isTranslucent, bool isDoubleSided) const
+    {
+        const SizeType index = (isTranslucent ? 2u : 0u) +
+                               (isDoubleSided ? 1u : 0u);
+        return m_Pipelines[index];
+    }
 
     /// 销毁图形管线和着色器
     void DestroyPipelineResources(IRHIDevice* device);
@@ -132,7 +153,12 @@ private:
     FRHIShaderHandle                  m_FragShader;
 
     /// 图形管线 (Equal 深度测试, 无深度写入)
-    FRHIGraphicsPipelineHandle        m_GraphicsPipeline;
+    /// 管线排列 — 下标 = (半透明 ? 2 : 0) + (双面 ? 1 : 0)
+    ///
+    /// 混合与剔除是两个正交的光栅化开关, 组合出四条管线。用下标而非四个
+    /// 具名成员, 是为了让 SelectPipeline 的映射只有一处、且一眼可验。
+    static constexpr SizeType kPipelineVariantCount = 4;
+    FRHIGraphicsPipelineHandle        m_Pipelines[kPipelineVariantCount];
 
     /// 管线布局 (由外部 FPassSetupDesc 传入, 不拥有)
     FRHIPipelineLayoutHandle          m_PipelineLayout;

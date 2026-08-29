@@ -74,6 +74,7 @@
 #include "RenderCore/Camera/FCamera.h"
 #include "ApplicationCore/Input/FInputManager.h"
 #include "RenderCore/Geometry/FGeometryGenerator.h"
+#include "RenderCore/Material/FMaterial.h"
 
 namespace Limx
 {
@@ -139,8 +140,21 @@ struct FRenderObject
     /// 世界空间变换 (Position + Rotation + Scale)
     FTransform       Transform;
 
-    /// 世界空间包围盒 — 供视锥剔除使用
+    /// 世界空间包围盒 — 供视锥剔除与半透明排序使用
     FBoundingBox     WorldBounds;
+
+    /// 混合模式 — 决定这一批走哪条管线
+    ///
+    /// 深度预 Pass 需要区分 Opaque 与 Masked: 后者必须做同样的 alpha 测试,
+    /// 否则会为完全透明的纹素写入深度, 把它背后的东西挡掉。
+    EMaterialBlendMode BlendMode = EMaterialBlendMode::Opaque;
+
+    /// 是否双面渲染 — 与 BlendMode 一起决定管线排列
+    ///
+    /// 植被与薄片几何必须双面: 单面剔除下每片叶子只剩朝向相机的那半边。
+    /// 深度预 Pass 的剔除模式必须与前向 Pass 完全一致, 否则被剔掉的那半边
+    /// 在深度缓冲区里没有值, DepthCompareOp=Equal 会把它整片丢掉。
+    bool IsDoubleSided = false;
 
     /// set 1 材质描述符集 — 由 FMaterialManager 分配
     FRHIDescriptorSetHandle MaterialDescriptorSet;
@@ -235,11 +249,27 @@ public:
     /// 获取默认材质 (供 LMeshTrait 设置材质)
     LIMX_NODISCARD FMaterial* GetDefaultMaterial() { return m_DefaultMaterial; }
 
-    /// 替换本帧渲染对象列表 (由 FSceneManager::SyncScene 每帧调用)
+    /// 替换本帧的不透明/蒙版批次列表 (由 FSceneManager::SyncScene 每帧调用)
     void SetRenderObjects(const TArray<FRenderObject>& objects) { m_RenderObjects = objects; }
 
-    /// 获取渲染对象列表 (只读)
+    /// 替换本帧的半透明批次列表
+    ///
+    /// 与不透明列表分开而非合并后按标志过滤: 两者的绘制顺序要求相反 ——
+    /// 不透明按状态聚类以减少绑定, 半透明必须严格由远及近, 合在一起就没有
+    /// 哪一种排序能同时满足。
+    void SetTranslucentObjects(const TArray<FRenderObject>& objects)
+    {
+        m_TranslucentObjects = objects;
+    }
+
+    /// 获取不透明/蒙版批次列表 (只读)
     LIMX_NODISCARD const TArray<FRenderObject>& GetRenderObjects() const { return m_RenderObjects; }
+
+    /// 获取半透明批次列表 (只读)
+    LIMX_NODISCARD const TArray<FRenderObject>& GetTranslucentObjects() const
+    {
+        return m_TranslucentObjects;
+    }
 
     /// 获取帧耗时统计
     LIMX_NODISCARD const FRenderFrameStats& GetFrameStats() const
@@ -313,6 +343,7 @@ private:
 
     // ---- 本帧渲染视图 (非拥有 —— GPU 资源归 FRenderResourceManager) ----
     TArray<FRenderObject>             m_RenderObjects;
+    TArray<FRenderObject>             m_TranslucentObjects;
 
     // ---- Uniform Buffer (每帧一个用于 View+Proj 矩阵) ----
     TArray<FRHIBufferHandle>          m_UniformBuffers;

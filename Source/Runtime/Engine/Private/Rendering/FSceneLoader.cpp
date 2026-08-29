@@ -280,6 +280,7 @@ FSceneLoadResult FSceneLoader::LoadInto(LScene* scene,
         material->SetNormalScale(source.NormalScale);
         material->SetAlphaCutoff(source.AlphaCutoff);
         material->SetBlendMode(MapBlendMode(source.AlphaMode));
+        material->SetDoubleSided(source.DoubleSided);
 
         if (options.LoadTextures)
         {

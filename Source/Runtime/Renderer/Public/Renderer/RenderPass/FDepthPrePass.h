@@ -110,7 +110,22 @@ private:
     ERHIResult CreateShaders(IRHIDevice* device);
 
     /// 创建 depth-only 图形管线 (DepthCompareOp=Less, DepthWrite=true, 无颜色混合)
-    ERHIResult CreateDepthPipeline(IRHIDevice* device);
+    /// 创建一条 depth-only 管线
+    ///
+    /// @param isDoubleSided 双面变体：关闭背面剔除
+    ///
+    /// 剔除模式必须与 FForwardPass 逐物体一致。前向 Pass 用
+    /// DepthCompareOp=Equal，本 Pass 剔掉的那一面在深度缓冲区里没有值，
+    /// 前向再去画就整片失配 —— 表现为双面材质只剩一半，且那一半还闪烁。
+    ERHIResult CreateDepthPipeline(IRHIDevice* device, bool isDoubleSided,
+                                   FRHIGraphicsPipelineHandle& outPipeline);
+
+    /// 按剔除模式取管线
+    LIMX_NODISCARD FRHIGraphicsPipelineHandle SelectPipeline(
+        bool isDoubleSided) const
+    {
+        return m_DepthPipelines[isDoubleSided ? 1u : 0u];
+    }
 
     /// 销毁管线和着色器
     void DestroyPipelineResources(IRHIDevice* device);
@@ -130,7 +145,9 @@ private:
     FRHIShaderHandle           m_FragShader;
 
     /// depth-only 图形管线
-    FRHIGraphicsPipelineHandle m_DepthPipeline;
+    /// 管线排列 — 下标 0 = 单面, 1 = 双面
+    static constexpr SizeType kPipelineVariantCount = 2;
+    FRHIGraphicsPipelineHandle m_DepthPipelines[kPipelineVariantCount];
 
     /// 管线布局 (由外部 FPassSetupDesc 传入, 不拥有)
     FRHIPipelineLayoutHandle   m_PipelineLayout;

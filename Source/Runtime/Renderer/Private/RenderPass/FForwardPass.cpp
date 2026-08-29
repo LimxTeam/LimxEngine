@@ -87,7 +87,15 @@ ERHIResult FForwardPass::Setup(const FPassSetupDesc& desc)
     }
 
     // 4. 创建图形管线
-    result = CreateGraphicsPipeline(desc.Device);
+    for (SizeType variant = 0;
+         variant < kPipelineVariantCount && IsRHISuccess(result); ++variant)
+    {
+        const bool isTranslucent = (variant & 2u) != 0u;
+        const bool isDoubleSided = (variant & 1u) != 0u;
+
+        result = CreateGraphicsPipeline(desc.Device, isTranslucent,
+                                        isDoubleSided, m_Pipelines[variant]);
+    }
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error,
@@ -141,10 +149,12 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
     commandBuffer->BeginRenderPass(beginInfo);
 
     // ================================================================
-    // 绑定管线 + 设置动态 Viewport/Scissor
+    // 设置动态 Viewport/Scissor
+    //
+    // 管线改为逐物体惰性绑定 —— 单面/双面是两条不同的管线, 在这里固定绑
+    // 一条会让另一类物体用错剔除模式。动态状态在管线切换后依然保持,
+    // 因此 Viewport/Scissor 仍然只设一次。
     // ================================================================
-
-    commandBuffer->BindGraphicsPipeline(m_GraphicsPipeline);
 
     FRHIViewport viewport = {};
     viewport.X        = 0.0f;
@@ -199,6 +209,7 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
         // 记录上一次绑定的状态 —— 批次列表已按材质/网格排序, 相邻批次
         // 大多共享同一套绑定, 逐个重绑等于把排序的收益原地丢掉。
         // 用无效句柄作为初值, 保证第一个批次一定会真正绑定一次。
+        FRHIGraphicsPipelineHandle boundPipeline;
         FRHIDescriptorSetHandle boundMaterial;
         FRHIBufferHandle        boundVertexBuffer;
         FRHIBufferHandle        boundIndexBuffer;
@@ -207,6 +218,17 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
         for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
         {
             const FRenderObject& obj = (*context.RenderObjects)[i];
+
+            // 管线按剔除模式选择 —— 列表已按 IsDoubleSided 聚类,
+            // 因此这里最多切换一次。
+            const FRHIGraphicsPipelineHandle pipeline =
+                SelectPipeline(false, obj.IsDoubleSided);
+
+            if (pipeline.Packed != boundPipeline.Packed)
+            {
+                commandBuffer->BindGraphicsPipeline(pipeline);
+                boundPipeline = pipeline;
+            }
 
             // 绑定 set 1 — 材质描述符集 (逐材质)
             if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
@@ -259,6 +281,87 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
                 0,
                 0
             );
+        }
+    }
+
+    // ================================================================
+    // 半透明批次 — 同一渲染通道内, 换管线继续绘制
+    // ================================================================
+    //
+    // 放在同一个 RenderPass 里而非另起一个: 半透明要读已经画好的不透明像素
+    // 做混合, 另起通道意味着颜色附件要 Store 再 Load 一遍, 在移动端 tile
+    // 架构上这是实打实的带宽开销, 在桌面端也白白多两次布局转换。
+    //
+    // 列表已由 FSceneManager 按到相机的距离由远及近排序 —— 这里只负责按序
+    // 提交, 不再做任何重排。
+    if (context.TranslucentObjects != nullptr &&
+        context.TranslucentObjects->GetSize() > 0)
+    {
+        // 绑定状态跟踪重新开始 —— 换到半透明是个天然边界, 沿用上一段的
+        // 跟踪值只能省下极少几次绑定, 却让"这里到底绑没绑过"变得难以推理。
+        FRHIGraphicsPipelineHandle boundPipeline;
+        FRHIDescriptorSetHandle boundMaterial;
+        FRHIBufferHandle        boundVertexBuffer;
+        FRHIBufferHandle        boundIndexBuffer;
+        EIndexType              boundIndexType = EIndexType::UInt32;
+
+        for (SizeType i = 0; i < context.TranslucentObjects->GetSize(); ++i)
+        {
+            const FRenderObject& obj = (*context.TranslucentObjects)[i];
+
+            // 半透明按距离排序, 双面与单面会交替出现, 管线切换次数无法
+            // 像不透明那样压到一次 —— 正确的混合顺序优先于状态聚类。
+            const FRHIGraphicsPipelineHandle pipeline =
+                SelectPipeline(true, obj.IsDoubleSided);
+
+            if (pipeline.Packed != boundPipeline.Packed)
+            {
+                commandBuffer->BindGraphicsPipeline(pipeline);
+                boundPipeline = pipeline;
+            }
+
+            if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
+            {
+                commandBuffer->BindDescriptorSet(
+                    EPipelineBindPoint::Graphics,
+                    context.PipelineLayout,
+                    1,
+                    obj.MaterialDescriptorSet,
+                    nullptr,
+                    0
+                );
+
+                boundMaterial = obj.MaterialDescriptorSet;
+            }
+
+            if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
+            {
+                commandBuffer->BindVertexBuffer(0, obj.VertexBuffer, 0);
+                boundVertexBuffer = obj.VertexBuffer;
+            }
+
+            if (obj.IndexBuffer.Packed != boundIndexBuffer.Packed ||
+                obj.IndexType != boundIndexType)
+            {
+                commandBuffer->BindIndexBuffer(obj.IndexBuffer, 0,
+                                               obj.IndexType);
+                boundIndexBuffer = obj.IndexBuffer;
+                boundIndexType   = obj.IndexType;
+            }
+
+            FModelPushConstant pushData;
+            pushData.Model = obj.Transform.ToMatrix();
+
+            commandBuffer->PushConstants(
+                context.PipelineLayout,
+                EShaderStage::Vertex,
+                0,
+                sizeof(FModelPushConstant),
+                &pushData
+            );
+
+            commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
+                                       0, 0);
         }
     }
 
@@ -495,7 +598,9 @@ ERHIResult FForwardPass::CreateShaders(IRHIDevice* device)
 // CreateGraphicsPipeline — Equal 深度测试, 禁止深度写入
 // ============================================================================
 
-ERHIResult FForwardPass::CreateGraphicsPipeline(IRHIDevice* device)
+ERHIResult FForwardPass::CreateGraphicsPipeline(
+    IRHIDevice* device, bool isTranslucent, bool isDoubleSided,
+    FRHIGraphicsPipelineHandle& outPipeline)
 {
     FRHIGraphicsPipelineDesc pipelineDesc = {};
 
@@ -565,7 +670,10 @@ ERHIResult FForwardPass::CreateGraphicsPipeline(IRHIDevice* device)
 
     // ---- 光栅化 ----
     pipelineDesc.Rasterization.PolygonMode              = EPolygonMode::Fill;
-    pipelineDesc.Rasterization.CullMode                 = ECullMode::Back;
+    // 双面材质关闭剔除 —— 植被与薄片几何只有一层三角形, 剔掉背面等于
+    // 让每片叶子只剩朝向相机的那半边。
+    pipelineDesc.Rasterization.CullMode                 =
+        isDoubleSided ? ECullMode::None : ECullMode::Back;
     pipelineDesc.Rasterization.FrontFace                = EFrontFace::CounterClockwise;
     pipelineDesc.Rasterization.LineWidth                = 1.0f;
     pipelineDesc.Rasterization.IsDepthClampEnabled      = false;
@@ -576,14 +684,22 @@ ERHIResult FForwardPass::CreateGraphicsPipeline(IRHIDevice* device)
     pipelineDesc.Multisample.RasterizationSamples  = ESampleCount::Count1;
     pipelineDesc.Multisample.IsSampleShadingEnabled = false;
 
-    // ---- 深度模板 — Equal 测试, 禁止深度写入 (Early-Z 配合) ----
+    // ---- 深度模板 ----
+    //
+    // 不透明: Equal —— 深度已由 FDepthPrePass 精确写入, 相等即为可见表面,
+    //         这正是 Early-Z 生效的方式。
+    // 半透明: LessOrEqual —— 半透明批次**不参与**深度预 Pass (它们不该写深度,
+    //         否则会挡住自己身后的同类), 因此深度缓冲区里没有它们的值,
+    //         用 Equal 会把它们全部剔除, 表现为半透明物体彻底消失。
     pipelineDesc.DepthStencil.IsDepthTestEnabled  = true;
     pipelineDesc.DepthStencil.IsDepthWriteEnabled = false;
-    pipelineDesc.DepthStencil.DepthCompareOp      = ECompareOp::Equal;
+    pipelineDesc.DepthStencil.DepthCompareOp      =
+        isTranslucent ? ECompareOp::LessOrEqual : ECompareOp::Equal;
 
-    // ---- 颜色混合 — 不透明直接覆盖 ----
+    // ---- 颜色混合 ----
     FRHIColorBlendAttachmentDesc colorBlendAttachment =
-        FRHIColorBlendAttachmentDesc::Opaque();
+        isTranslucent ? FRHIColorBlendAttachmentDesc::AlphaBlend()
+                      : FRHIColorBlendAttachmentDesc::Opaque();
 
     pipelineDesc.ColorBlend.Attachments      = &colorBlendAttachment;
     pipelineDesc.ColorBlend.AttachmentCount  = 1;
@@ -597,15 +713,23 @@ ERHIResult FForwardPass::CreateGraphicsPipeline(IRHIDevice* device)
     pipelineDesc.PipelineLayout = m_PipelineLayout;
     pipelineDesc.RenderPass     = m_RenderPass;
     pipelineDesc.SubpassIndex   = 0;
-    pipelineDesc.DebugName      = "ForwardPass_Pipeline";
+    pipelineDesc.DebugName =
+        isTranslucent ? (isDoubleSided ? "ForwardPass_Translucent_TwoSided"
+                                       : "ForwardPass_Translucent")
+                      : (isDoubleSided ? "ForwardPass_Opaque_TwoSided"
+                                       : "ForwardPass_Opaque");
 
     ERHIResult result =
-        device->CreateGraphicsPipeline(pipelineDesc, m_GraphicsPipeline);
+        device->CreateGraphicsPipeline(pipelineDesc, outPipeline);
 
     if (IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Log,
-                 "[ForwardPass] 图形管线创建完成 (DepthCompareOp=Equal, DepthWrite=false)");
+                 "[ForwardPass] {}{} 管线创建完成 (DepthCompareOp={}, 混合={})",
+                 isTranslucent ? "半透明" : "不透明",
+                 isDoubleSided ? "/双面" : "/单面",
+                 isTranslucent ? "LessOrEqual" : "Equal",
+                 isTranslucent ? "AlphaBlend" : "关");
     }
 
     return result;
@@ -617,7 +741,10 @@ ERHIResult FForwardPass::CreateGraphicsPipeline(IRHIDevice* device)
 
 void FForwardPass::DestroyPipelineResources(IRHIDevice* device)
 {
-    device->DestroyGraphicsPipeline(m_GraphicsPipeline);
+    for (SizeType variant = 0; variant < kPipelineVariantCount; ++variant)
+    {
+        device->DestroyGraphicsPipeline(m_Pipelines[variant]);
+    }
     device->DestroyShader(m_FragShader);
     device->DestroyShader(m_VertShader);
 }

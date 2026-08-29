@@ -91,8 +91,11 @@ struct FPassExecuteInfo
     /// 交换链当前尺寸
     FRHIExtent2D SwapchainExtent = {};
 
-    /// 场景渲染物体数组 (只读)
+    /// 不透明与蒙版批次 (只读) — 已按材质/网格状态聚类
     const TArray<FRenderObject>* RenderObjects = nullptr;
+
+    /// 半透明批次 (只读) — 已按到相机的距离由远及近排序
+    const TArray<FRenderObject>* TranslucentObjects = nullptr;
 
     /// set 0 描述符集 — ViewProj UBO + 纹理 (对应当前 FrameIndex)
     FRHIDescriptorSetHandle ViewProjDescriptorSet;

@@ -95,8 +95,14 @@ struct FRenderPassContext
     /// 交换链当前尺寸
     FRHIExtent2D SwapchainExtent = {};
 
-    /// 场景渲染物体数组 — 只读引用，Pass 不持有所有权
+    /// 不透明与蒙版批次 — 只读引用，Pass 不持有所有权。已按材质/网格聚类
     const TArray<FRenderObject>* RenderObjects = nullptr;
+
+    /// 半透明批次 — 已按到相机的距离由远及近排序
+    ///
+    /// 与不透明分列而非合并后按标志过滤: 两者的绘制顺序要求相反 ——
+    /// 不透明按状态聚类以减少绑定, 半透明必须严格由远及近。
+    const TArray<FRenderObject>* TranslucentObjects = nullptr;
 
     /// set 0 的描述符集 — 含 ViewProj UBO (binding 0) 和纹理 (binding 1)
     /// 由 FPassManager::ExecuteAll 从帧数据中取出并填入

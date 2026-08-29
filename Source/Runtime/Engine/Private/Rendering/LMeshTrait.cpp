@@ -207,6 +207,8 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         object.WorldBounds           = TransformBounds(mesh->Bounds,
                                                        worldTransform);
         object.MaterialDescriptorSet = material->GetDescriptorSet();
+        object.BlendMode             = material->GetParams().GetBlendMode();
+        object.IsDoubleSided         = material->IsDoubleSided();
         object.DebugName             = debugName;
 
         outObjects.Add(object);
@@ -243,6 +245,8 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
             section.Bounds.IsValid() ? section.Bounds : mesh->Bounds,
             worldTransform);
         object.MaterialDescriptorSet = material->GetDescriptorSet();
+        object.BlendMode             = material->GetParams().GetBlendMode();
+        object.IsDoubleSided         = material->IsDoubleSided();
         object.DebugName             = section.Name.IsEmpty()
                                            ? debugName
                                            : section.Name.GetCStr();

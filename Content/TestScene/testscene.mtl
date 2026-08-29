@@ -21,3 +21,27 @@ newmtl PlainGreen
 Kd 0.16 0.72 0.30
 Ks 0.4 0.4 0.4
 Ns 90
+
+# 半透明面板 —— d < 1 会被 FObjLoader 映射为 EAlphaMode::Blend
+#
+# Ns 刻意取小值: Ns 映射为粗糙度, 高 Ns = 近乎镜面, 而当前没有环境贴图,
+# 镜面材质除了一个高光点之外无处反射, 结果是一片灰 —— 那样就看不出
+# 混合顺序对不对了。取粗糙表面才能让颜色真正参与混合。
+newmtl GlassBlue
+Kd 0.20 0.45 0.95
+Ks 0.05 0.05 0.05
+Ns 8
+d 0.45
+
+newmtl GlassAmber
+Kd 0.98 0.62 0.10
+Ks 0.05 0.05 0.05
+Ns 8
+d 0.55
+
+# 蒙版栅格 —— 贴图 alpha 打孔, 走 discard 而非混合
+newmtl MaskedGrate
+Kd 1.0 1.0 1.0
+Ks 0.2 0.2 0.2
+Ns 40
+map_Kd grate.png

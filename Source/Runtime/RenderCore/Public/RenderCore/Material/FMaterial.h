@@ -117,6 +117,22 @@ enum class EMaterialBlendMode : UInt32
     Count
 };
 
+/// 该混合模式是否需要走"混合"路径
+///
+/// Opaque 与 Masked 都直接覆盖颜色附件: Masked 靠片段着色器 discard 实现
+/// 镂空, 不需要混合, 也照常写深度。真正需要混合的是 Translucent 与 Additive,
+/// 它们不写深度、必须由远及近绘制。
+///
+/// 分类规则单独成函数而非散落在各处的 if: 新增混合模式时, 忘了更新其中
+/// 一处的后果是该模式在某个 Pass 里走错路径 —— 而画面上只表现为
+/// "这个材质有时候不对", 极难定位。
+LIMX_NODISCARD constexpr bool IsBlendedMode(EMaterialBlendMode mode)
+{
+    return mode == EMaterialBlendMode::Translucent ||
+           mode == EMaterialBlendMode::Additive;
+}
+
+
 // ============================================================================
 // FMaterialParams — PBR 材质参数 GPU UBO 数据布局
 //
@@ -163,10 +179,19 @@ struct alignas(16) FMaterialParams
     UInt32   TextureFlags = 0u;
 
     /// 混合模式索引 (EMaterialBlendMode 的底层整数值)
+    ///
+    /// 存为原始整数是 std140 布局的要求 —— 着色器里对应 uint。
+    /// 消费方应通过 GetBlendMode() 取回强类型值。
     UInt32   BlendMode  = static_cast<UInt32>(EMaterialBlendMode::Opaque);
 
     /// 结构体尾部填充 — 保持 64 字节总大小
     Float32  _Padding   = 0.0f;
+
+    /// 取强类型的混合模式
+    LIMX_NODISCARD EMaterialBlendMode GetBlendMode() const
+    {
+        return static_cast<EMaterialBlendMode>(BlendMode);
+    }
 };
 
 static_assert(sizeof(FMaterialParams) == 64,
@@ -236,6 +261,15 @@ public:
     /// 设置混合模式
     void SetBlendMode(EMaterialBlendMode mode);
 
+    /// 设置是否双面渲染
+    ///
+    /// 不进 FMaterialParams —— 它是光栅化状态而非着色器数据, 影响的是
+    /// 选哪条管线, 而不是 UBO 里的某个数值。放进 UBO 只会白占 std140 空间,
+    /// 还会让"改了这个值要重建管线"这件事被标脏机制掩盖掉。
+    void SetDoubleSided(bool doubleSided) { m_IsDoubleSided = doubleSided; }
+
+    LIMX_NODISCARD bool IsDoubleSided() const { return m_IsDoubleSided; }
+
     // ========================================================================
     // 纹理绑定
     // ========================================================================
@@ -269,6 +303,12 @@ public:
     {
         return m_DescriptorSet;
     }
+
+private:
+    /// 是否双面渲染 — 光栅化状态, 决定绘制时选用哪条管线
+    bool m_IsDoubleSided = false;
+
+public:
 
     /// 获取 CPU 侧参数常量引用
     LIMX_NODISCARD const FMaterialParams& GetParams() const

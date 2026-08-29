@@ -362,6 +362,7 @@ void FRenderer::RenderFrame()
         execInfo.ImageIndex            = imageIndex;
         execInfo.SwapchainExtent       = extent;
         execInfo.RenderObjects         = &m_RenderObjects;
+        execInfo.TranslucentObjects    = &m_TranslucentObjects;
         execInfo.ViewProjDescriptorSet = m_DescriptorSets[frameIndex];
         execInfo.PipelineLayout        = m_PipelineLayout;
         execInfo.LightingDescriptorSet = m_LightDescriptorSets[frameIndex];

@@ -86,7 +86,12 @@ ERHIResult FDepthPrePass::Setup(const FPassSetupDesc& desc)
     }
 
     // 4. 创建 depth-only 图形管线
-    result = CreateDepthPipeline(desc.Device);
+    for (SizeType variant = 0;
+         variant < kPipelineVariantCount && IsRHISuccess(result); ++variant)
+    {
+        result = CreateDepthPipeline(desc.Device, variant != 0,
+                                     m_DepthPipelines[variant]);
+    }
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error,
@@ -137,7 +142,7 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
     // 绑定 depth-only 管线 + 设置动态状态
     // ================================================================
 
-    commandBuffer->BindGraphicsPipeline(m_DepthPipeline);
+    // 管线改为逐物体惰性绑定 —— 单面/双面剔除必须与前向 Pass 对齐
 
     FRHIViewport viewport = {};
     viewport.X        = 0.0f;
@@ -177,8 +182,15 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
 
     if (context.RenderObjects != nullptr)
     {
-        // 深度预 Pass 不绑材质, 但顶点/索引缓冲区的重绑同样可以跳过。
-        // 两个 Pass 遍历的是同一份已排序列表, 因此命中率也相同。
+        // 材质集必须绑定 —— Masked 材质要在这里做与前向 Pass **完全相同**的
+        // alpha 测试。不测的话, 深度预 Pass 会为完全透明的纹素写入深度,
+        // 把它背后的东西挡掉; 而前向 Pass 又把这些纹素 discard 掉,
+        // 结果是植被叶片之间出现挖空的黑洞。
+        //
+        // 两个 Pass 的裁剪结论必须逐纹素一致, 否则 DepthCompareOp=Equal
+        // 的 Early-Z 会在边缘处失配。
+        FRHIGraphicsPipelineHandle boundPipeline;
+        FRHIDescriptorSetHandle boundMaterial;
         FRHIBufferHandle boundVertexBuffer;
         FRHIBufferHandle boundIndexBuffer;
         EIndexType       boundIndexType = EIndexType::UInt32;
@@ -186,6 +198,29 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
         for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
         {
             const FRenderObject& obj = (*context.RenderObjects)[i];
+
+            const FRHIGraphicsPipelineHandle pipeline =
+                SelectPipeline(obj.IsDoubleSided);
+
+            if (pipeline.Packed != boundPipeline.Packed)
+            {
+                commandBuffer->BindGraphicsPipeline(pipeline);
+                boundPipeline = pipeline;
+            }
+
+            if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
+            {
+                commandBuffer->BindDescriptorSet(
+                    EPipelineBindPoint::Graphics,
+                    context.PipelineLayout,
+                    1,
+                    obj.MaterialDescriptorSet,
+                    nullptr,
+                    0
+                );
+
+                boundMaterial = obj.MaterialDescriptorSet;
+            }
 
             if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
             {
@@ -438,7 +473,9 @@ ERHIResult FDepthPrePass::CreateShaders(IRHIDevice* device)
 // CreateDepthPipeline — depth-only 管线 (Less 深度测试, 深度写入, 无颜色混合)
 // ============================================================================
 
-ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
+ERHIResult FDepthPrePass::CreateDepthPipeline(
+    IRHIDevice* device, bool isDoubleSided,
+    FRHIGraphicsPipelineHandle& outPipeline)
 {
     FRHIGraphicsPipelineDesc pipelineDesc = {};
 
@@ -465,7 +502,11 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
     //
     // 偏移量取自 FMeshVertex 成员而非手写常量: 结构变化时 offsetof 会跟着走,
     // 手写常量只会静默错位。72 字节的布局静态断言在 FAssetTypes.h 中。
-    FRHIVertexInputAttribute vertexAttributes[1] = {};
+    // 位置用于变换, UV 用于 Masked 材质的 alpha 测试。
+    // Location 不必连续 —— 保持与 FMeshVertex 在前向管线中的编号一致,
+    // 两条管线用同一套 location 号能避免"同一个属性在不同 Pass 里编号不同"
+    // 这种极易看漏的错。
+    FRHIVertexInputAttribute vertexAttributes[2] = {};
 
     vertexAttributes[0].Location = 0;
     vertexAttributes[0].Binding  = 0;
@@ -473,10 +514,16 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
     vertexAttributes[0].Offset   = static_cast<UInt32>(
         LIMX_OFFSET_OF(FMeshVertex, Position));
 
+    vertexAttributes[1].Location = 3;
+    vertexAttributes[1].Binding  = 0;
+    vertexAttributes[1].Format   = EPixelFormat::RG32_SFLOAT;
+    vertexAttributes[1].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, TexCoord0));
+
     pipelineDesc.VertexInput.Bindings       = &vertexBinding;
     pipelineDesc.VertexInput.BindingCount   = 1;
     pipelineDesc.VertexInput.Attributes     = vertexAttributes;
-    pipelineDesc.VertexInput.AttributeCount = 1;
+    pipelineDesc.VertexInput.AttributeCount = 2;
 
     // ---- 输入装配 ----
     pipelineDesc.InputAssembly.Topology                  = EPrimitiveTopology::TriangleList;
@@ -484,7 +531,9 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
 
     // ---- 光栅化 ----
     pipelineDesc.Rasterization.PolygonMode                = EPolygonMode::Fill;
-    pipelineDesc.Rasterization.CullMode                   = ECullMode::Back;
+    // 必须与 FForwardPass 对同一物体的选择完全一致
+    pipelineDesc.Rasterization.CullMode                   =
+        isDoubleSided ? ECullMode::None : ECullMode::Back;
     pipelineDesc.Rasterization.FrontFace                  = EFrontFace::CounterClockwise;
     pipelineDesc.Rasterization.LineWidth                  = 1.0f;
     pipelineDesc.Rasterization.IsDepthClampEnabled        = false;
@@ -516,7 +565,7 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
     pipelineDesc.DebugName      = "DepthPrePass_Pipeline";
 
     ERHIResult result =
-        device->CreateGraphicsPipeline(pipelineDesc, m_DepthPipeline);
+        device->CreateGraphicsPipeline(pipelineDesc, outPipeline);
 
     if (IsRHISuccess(result))
     {
@@ -533,7 +582,10 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(IRHIDevice* device)
 
 void FDepthPrePass::DestroyPipelineResources(IRHIDevice* device)
 {
-    device->DestroyGraphicsPipeline(m_DepthPipeline);
+    for (SizeType variant = 0; variant < kPipelineVariantCount; ++variant)
+    {
+        device->DestroyGraphicsPipeline(m_DepthPipelines[variant]);
+    }
     device->DestroyShader(m_FragShader);
     device->DestroyShader(m_VertShader);
 }
