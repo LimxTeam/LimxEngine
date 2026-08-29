@@ -152,6 +152,7 @@ void FSceneManager::SyncScene(const LScene* scene, Float32 deltaTime)
     // 7. 推送
     m_Renderer->SetRenderObjects(m_SceneRenderObjects);
     m_Renderer->SetTranslucentObjects(m_TranslucentObjects);
+    m_Renderer->SetSceneBounds(m_Stats.SceneBounds);
 
     // 只在可见批次数变化时输出 —— 每帧一行会淹没日志, 而"批次数突然变成 0"
     // 恰恰是最需要被看见的事件。
@@ -240,6 +241,17 @@ void FSceneManager::CollectBatches(const LScene* scene)
     }
 
     m_Stats.BatchCount = static_cast<UInt32>(m_SceneRenderObjects.GetSize());
+
+    // 阴影视锥的拟合依据 —— 在剔除之前累积, 见 FSceneSyncStats::SceneBounds
+    for (SizeType i = 0; i < m_SceneRenderObjects.GetSize(); ++i)
+    {
+        const FBoundingBox& bounds = m_SceneRenderObjects[i].WorldBounds;
+
+        if (bounds.IsValid())
+        {
+            m_Stats.SceneBounds = m_Stats.SceneBounds.Union(bounds);
+        }
+    }
 }
 
 // ============================================================================

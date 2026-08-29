@@ -137,7 +137,14 @@ static_assert(sizeof(FLightData) == 80,
 //   偏移 1296:   CameraPosition (vec4 的 .xyz) — 相机世界空间位置
 //   偏移 1312:   AmbientColor   (vec4 的 .xyz) — 环境光颜色
 //   偏移 1328:   AmbientIntensity (同上 vec4 的 .w) — 环境光强度
-//   总计: 1344 字节 (偏移 1328 + 16 = 1344, 对齐到 16 字节)
+//   偏移 1328:   ShadowViewProj (mat4) — 主方向光的光源视图投影矩阵
+//   偏移 1392:   ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
+//                                        z=阴影贴图边长, w=是否启用
+//   总计: 1408 字节
+//
+// 阴影矩阵放在光照 UBO 而非另建一个: 它逻辑上就是"主方向光的属性",
+// 且与光源数据在同一个更新时机。单独一个 UBO 意味着多一次绑定、
+// 多一份帧同步, 却没有任何一处需要单独更新它。
 // ============================================================================
 
 struct FLightingUBO
@@ -162,14 +169,29 @@ struct FLightingUBO
     Float32 AmbientColorG    = 0.03f;
     Float32 AmbientColorB    = 0.03f;
     Float32 AmbientIntensity = 1.0f;
+
+    // mat4: 主方向光的视图投影矩阵 —— 把世界坐标变换到阴影贴图空间
+    FMatrix ShadowViewProj;
+
+    // vec4: x=深度偏移, y=法线偏移, z=阴影贴图边长, w=是否启用(0/1)
+    //
+    // 两个偏移量分工不同, 都必须有:
+    //   深度偏移抵消"深度贴图分辨率有限导致的自遮挡"(shadow acne);
+    //   法线偏移沿法线把采样点推离表面, 处理掠射角下深度偏移救不了的情形。
+    //   只用深度偏移的话, 掠射角处要么仍有 acne, 要么偏移大到阴影脱离物体
+    //   (peter-panning)。
+    Float32 ShadowDepthBias   = 0.0015f;
+    Float32 ShadowNormalBias  = 0.05f;
+    Float32 ShadowMapSize     = 2048.0f;
+    Float32 ShadowEnabled     = 0.0f;
 };
 
 // 编译时验证 FLightingUBO 大小
-// 16 × 80 + 3 × 16 = 1280 + 48 = 1328 字节
-// 但 std140 要求数组元素对齐到 16 字节，结构体尾部也需 16 字节对齐
-// 1328 字节已是 16 的倍数
-static_assert(sizeof(FLightingUBO) == 1328,
-    "FLightingUBO 必须为 1328 字节 (std140 对齐)");
+// 16 × 80 + 3 × 16 = 1280 + 48 = 1328 字节 (光源 + 计数 + 相机 + 环境光)
+// + mat4 阴影矩阵 64 + vec4 阴影参数 16 = 1408 字节
+// std140 要求数组元素与结构体尾部都对齐到 16 字节, 1408 已是 16 的倍数
+static_assert(sizeof(FLightingUBO) == 1408,
+    "FLightingUBO 必须为 1408 字节 (std140 对齐)");
 
 // ============================================================================
 // FLight — CPU 侧光源对象

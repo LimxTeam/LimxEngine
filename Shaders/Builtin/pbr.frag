@@ -58,12 +58,25 @@ struct LightData {
 };
 
 // ── 光照 UBO (set 2, binding 0) ──
-layout(set = 2, binding = 0) uniform LightingUBO {
+//
+// row_major 与 FMatrix 的行主序存储一致 —— 不加的话 GLSL 按列主序解读,
+// 等于把阴影矩阵整体转置, 阴影坐标会落到完全无关的位置。
+layout(row_major, set = 2, binding = 0) uniform LightingUBO {
     LightData lights[16];
     vec4      lightCountVec;   // x=光源数量
     vec4      cameraPosition;  // xyz=相机世界位置
     vec4      ambientColor;    // xyz=环境光颜色, w=环境光强度
+    mat4      shadowViewProj;  // 主方向光的视图投影矩阵
+    vec4      shadowParams;    // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
 } lighting;
+
+// ── 阴影贴图 (set 2, binding 1) ──
+//
+// sampler2DShadow 而非 sampler2D: 采样时硬件直接做深度比较并在 2x2 邻域
+// 上求平均, 返回 0~1 的通过比例。用普通采样器手写比较的话, 拿到的是
+// 四个纹素线性插值后的**深度值**, 再与参考深度比较 —— 那等于在深度域
+// 里插值, 边缘会出现明显的阶梯。
+layout(set = 2, binding = 1) uniform sampler2DShadow shadowMap;
 
 // ── 片段着色器输出 ──
 layout(location = 0) out vec4 outColor;
@@ -255,6 +268,69 @@ vec3 ApplyNormalMap(vec3 baseNormal)
 }
 
 // ============================================================
+// 阴影因子 — 1.0 表示完全受光, 0.0 表示完全在阴影中
+//
+// 两个偏移量分工不同:
+//   法线偏移沿表面法线把采样点推出去, 在掠射角下效果最好 —— 那里深度
+//   梯度极大, 单靠深度偏移要么不够要么大到让阴影脱离物体(peter-panning)。
+//   深度偏移按 N·L 缩放, 正对光源时几乎为零, 掠射时增大。
+//
+// 3x3 PCF 叠在硬件的 2x2 之上, 等效 6x6 的滤波足迹。
+// ============================================================
+float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
+{
+    if (lighting.shadowParams.w < 0.5)
+    {
+        return 1.0;
+    }
+
+    float depthBias  = lighting.shadowParams.x;
+    float normalBias = lighting.shadowParams.y;
+    float mapSize    = max(lighting.shadowParams.z, 1.0);
+
+    float NdotL = clamp(dot(normal, lightDir), 0.0, 1.0);
+
+    // 沿法线推出采样点 —— 掠射角(NdotL 小)时推得更远
+    vec3 offsetPos = worldPos + normal * (normalBias * (1.0 - NdotL) + normalBias * 0.2);
+
+    vec4 shadowClip = lighting.shadowViewProj * vec4(offsetPos, 1.0);
+
+    // 正交投影下 w 恒为 1, 但保留除法以便将来换成透视光源
+    vec3 projected = shadowClip.xyz / shadowClip.w;
+
+    // XY 从 NDC [-1,1] 映射到纹理坐标 [0,1]; Z 在 Vulkan 下已是 [0,1]
+    vec2 shadowUV = projected.xy * 0.5 + 0.5;
+    float receiverDepth = projected.z;
+
+    // 超出阴影贴图范围或在光源近平面之前 —— 判为无遮挡。
+    // 不做这个判断的话, 场景边缘会被边框颜色或环绕采样染上假阴影。
+    if (receiverDepth > 1.0 || receiverDepth < 0.0)
+    {
+        return 1.0;
+    }
+
+    // 深度偏移随掠射角增大 —— tan(acos(NdotL)) 的廉价近似
+    float slopeScale = clamp(1.0 - NdotL, 0.0, 1.0);
+    float bias = depthBias * (1.0 + slopeScale * 4.0);
+
+    float compareDepth = receiverDepth - bias;
+
+    float texelSize = 1.0 / mapSize;
+    float sum = 0.0;
+
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            vec2 offset = vec2(float(x), float(y)) * texelSize;
+            sum += texture(shadowMap, vec3(shadowUV + offset, compareDepth));
+        }
+    }
+
+    return sum / 9.0;
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 void main()
@@ -352,8 +428,15 @@ void main()
         // N·L 因子
         float NdotL = max(dot(N, L), 0.0);
 
+        // 阴影 —— 当前只有主方向光(第 0 盏)投射阴影。
+        // 其余光源按无遮挡处理: 每盏光一张阴影贴图的代价与收益在这个
+        // 阶段完全不成比例, 而"只有主光有影子"在户外场景里几乎看不出来。
+        float shadow = (i == 0 && int(light.positionAndType.w) == 0)
+                           ? ComputeShadow(fragWorldPos, N, L)
+                           : 1.0;
+
         // 累加该光源贡献
-        Lo += (diffuse + specular) * radiance * NdotL;
+        Lo += (diffuse + specular) * radiance * NdotL * shadow;
     }
 
     // ---- 环境光 ----

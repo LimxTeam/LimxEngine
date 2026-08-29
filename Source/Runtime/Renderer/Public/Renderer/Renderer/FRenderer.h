@@ -84,6 +84,7 @@ class FWindow;
 class FRenderContext;
 class FPassManager;
 class FForwardPass;
+class FShadowPass;
 class FDepthPrePass;
 class FMaterial;
 
@@ -271,6 +272,13 @@ public:
         return m_TranslucentObjects;
     }
 
+    /// 设置场景世界包围盒 — 阴影正交视锥据此拟合
+    ///
+    /// 由 FSceneManager 在收集批次时顺带算出。给得过大浪费阴影贴图精度,
+    /// 过小则场景边缘落在贴图之外, 那里会被判为完全不在阴影中 ——
+    /// 表现为远处物体突然失去阴影。
+    void SetSceneBounds(const FBoundingBox& bounds) { m_SceneBounds = bounds; }
+
     /// 获取帧耗时统计
     LIMX_NODISCARD const FRenderFrameStats& GetFrameStats() const
     {
@@ -333,8 +341,12 @@ private:
 
     // ---- Pass 系统 (通过 TUniquePtr 持有，析构在 .cpp 中完成) ----
     TUniquePtr<FPassManager>          m_PassManager;
+    TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FForwardPass>          m_ForwardPass;
+
+    /// 场景包围盒 — 阴影视锥的拟合依据, 由 SetSceneBounds 每帧提供
+    FBoundingBox                      m_SceneBounds;
 
     // ---- 纹理资源 (棋盘格) ----
     FRHITextureHandle                 m_Texture;

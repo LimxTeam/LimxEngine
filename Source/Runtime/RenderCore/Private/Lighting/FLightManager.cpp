@@ -93,16 +93,29 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     m_Device             = device;
     m_MaxFramesInFlight  = maxFramesInFlight;
 
-    // ---- 创建描述符集布局: set 2, binding 0 — FLightingUBO ----
-    FRHIDescriptorBinding binding = {};
-    binding.Binding    = 0;
-    binding.Type       = EDescriptorType::UniformBuffer;
-    binding.Count      = 1;
-    binding.StageFlags = EShaderStage::Vertex | EShaderStage::Fragment;
+    // ---- 创建描述符集布局 ----
+    //   set 2, binding 0 — FLightingUBO
+    //   set 2, binding 1 — 阴影贴图 (深度纹理 + 比较采样器)
+    //
+    // 阴影贴图放在 set 2 而非 set 0: set 0 的描述符集也会被阴影 Pass 自己
+    // 绑定 (它需要光源矩阵), 把正在写入的阴影贴图放进去会形成"同一帧内
+    // 既作为附件写入又作为纹理读取"的冲突。set 2 只有前向 Pass 绑定,
+    // 天然避开这个问题。
+    FRHIDescriptorBinding bindings[2] = {};
+
+    bindings[0].Binding    = 0;
+    bindings[0].Type       = EDescriptorType::UniformBuffer;
+    bindings[0].Count      = 1;
+    bindings[0].StageFlags = EShaderStage::Vertex | EShaderStage::Fragment;
+
+    bindings[1].Binding    = 1;
+    bindings[1].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[1].Count      = 1;
+    bindings[1].StageFlags = EShaderStage::Fragment;
 
     FRHIDescSetLayoutDesc layoutDesc = {};
-    layoutDesc.Bindings     = &binding;
-    layoutDesc.BindingCount = 1;
+    layoutDesc.Bindings     = bindings;
+    layoutDesc.BindingCount = 2;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -325,6 +338,13 @@ void FLightManager::UploadLightData(
     uboData.AmbientColorB    = 0.03f;
     uboData.AmbientIntensity = 1.0f;
 
+    // 阴影 —— 矩阵与参数由渲染器在阴影 Pass 之后写入本管理器
+    uboData.ShadowViewProj    = m_ShadowViewProj;
+    uboData.ShadowDepthBias   = m_ShadowDepthBias;
+    uboData.ShadowNormalBias  = m_ShadowNormalBias;
+    uboData.ShadowMapSize     = m_ShadowMapSize;
+    uboData.ShadowEnabled     = m_IsShadowEnabled ? 1.0f : 0.0f;
+
     // 映射 UBO 并写入
     void* mappedPtr = nullptr;
     ERHIResult result = m_Device->MapBuffer(
@@ -334,6 +354,22 @@ void FLightManager::UploadLightData(
         MemCopy(mappedPtr, &uboData, sizeof(FLightingUBO));
         m_Device->UnmapBuffer(m_LightUBOs[frameIndex]);
     }
+}
+
+// ============================================================================
+// SetShadowMatrix — 记录主方向光的阴影矩阵与参数
+// ============================================================================
+
+void FLightManager::SetShadowMatrix(const FMatrix& shadowViewProj,
+                                     Float32 depthBias,
+                                     Float32 normalBias,
+                                     Float32 shadowMapSize)
+{
+    m_ShadowViewProj   = shadowViewProj;
+    m_ShadowDepthBias  = depthBias;
+    m_ShadowNormalBias = normalBias;
+    m_ShadowMapSize    = shadowMapSize;
+    m_IsShadowEnabled  = true;
 }
 
 // ============================================================================

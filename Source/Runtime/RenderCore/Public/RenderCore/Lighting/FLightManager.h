@@ -122,6 +122,30 @@ public:
     void UploadLightData(UInt32 frameIndex, const FVector3& cameraPosition);
 
     // ====================================================================
+    // 阴影
+    // ====================================================================
+
+    /// 设置主方向光的阴影矩阵与参数
+    ///
+    /// 由渲染器在阴影 Pass 计算出光源视锥后调用。矩阵随光照 UBO 一同上传,
+    /// 因此片段着色器拿到的矩阵与本帧实际绘制阴影贴图用的矩阵必然一致 ——
+    /// 两者若来自不同时刻, 阴影会整体偏移一帧, 表现为快速移动时阴影"拖尾"。
+    ///
+    /// @param shadowViewProj 光源的视图投影矩阵
+    /// @param depthBias      深度偏移, 抵消自遮挡
+    /// @param normalBias     法线偏移, 处理掠射角
+    /// @param shadowMapSize  阴影贴图边长 (像素)
+    void SetShadowMatrix(const FMatrix& shadowViewProj,
+                         Float32 depthBias,
+                         Float32 normalBias,
+                         Float32 shadowMapSize);
+
+    /// 关闭阴影 — 片段着色器将全部按无遮挡处理
+    void DisableShadow() { m_IsShadowEnabled = false; }
+
+    LIMX_NODISCARD bool IsShadowEnabled() const { return m_IsShadowEnabled; }
+
+    // ====================================================================
     // GPU 资源访问器 (供集成者使用)
     // ====================================================================
 
@@ -149,7 +173,15 @@ private:
     TArray<FRHIBufferHandle>    m_LightUBOs;
 
     /// 描述符集布局 (set 2, binding 0: UniformBuffer, Vertex+Fragment)
+
     FRHIDescSetLayoutHandle     m_DescSetLayout;
+    
+    /// 主方向光的阴影矩阵与参数 —— 随光照 UBO 一同上传
+    FMatrix m_ShadowViewProj;
+    Float32 m_ShadowDepthBias  = 0.0015f;
+    Float32 m_ShadowNormalBias = 0.05f;
+    Float32 m_ShadowMapSize    = 2048.0f;
+    bool    m_IsShadowEnabled  = false;
 
     /// RHI 设备 (非拥有指针)
     IRHIDevice*                 m_Device = nullptr;

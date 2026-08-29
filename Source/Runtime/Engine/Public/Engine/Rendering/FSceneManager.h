@@ -80,6 +80,13 @@ struct FSceneSyncStats
     /// 其中的半透明批次数
     UInt32 TranslucentCount = 0;
 
+    /// 全部批次的世界包围盒 (剔除**之前**)
+    ///
+    /// 阴影视锥据此拟合, 因此必须用剔除前的完整范围: 相机看不到的物体
+    /// 照样会往可见区域投影, 用剔除后的范围会让画面外的物体不投影,
+    /// 表现为转动相机时阴影凭空出现或消失。
+    FBoundingBox SceneBounds;
+
     /// 可见批次覆盖的三角形数
     UInt64 VisibleTriangles = 0;
 

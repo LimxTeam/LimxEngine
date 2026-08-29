@@ -65,6 +65,7 @@
 #include "RenderCore/Lighting/FLightManager.h"
 #include "RenderCore/Lighting/FLight.h"
 #include "Renderer/RenderPass/FPassManager.h"
+#include "Renderer/RenderPass/FShadowPass.h"
 #include "Renderer/RenderPass/FForwardPass.h"
 #include "Renderer/RenderPass/FDepthPrePass.h"
 
@@ -178,14 +179,6 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
             2.0f,
             8.0f));
 
-    // 创建 set 2 光照描述符集
-    result = CreateLightingDescriptorSets();
-    if (!IsRHISuccess(result))
-    {
-        LIMX_LOG(LogRenderer, Error, "[Renderer] 光照描述符集创建失败");
-        return result;
-    }
-
     // 创建管线布局 (set 0 + set 1 材质 + set 2 光照 + Push Constant)
     result = CreatePipelineLayout();
     if (!IsRHISuccess(result))
@@ -194,11 +187,13 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
         return result;
     }
 
-    // 初始化 Pass 系统
+    // 初始化 Pass 系统 —— 阴影 Pass 的 Order 最小, 先于深度预 Pass 执行
+    m_ShadowPass   = MakeUnique<FShadowPass>();
     m_DepthPrePass = MakeUnique<FDepthPrePass>();
     m_ForwardPass  = MakeUnique<FForwardPass>();
     m_PassManager  = MakeUnique<FPassManager>();
 
+    m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
 
@@ -217,6 +212,29 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] PassManager SetupAll 失败");
+        return result;
+    }
+
+    // 阴影 Pass 需要一份与 set 0 布局兼容的描述符集来放光源矩阵。
+    // 必须在 SetupAll 之后 —— 那时阴影贴图才存在; 也必须在
+    // CreateLightingDescriptorSets 之前, 后者要写入阴影贴图视图。
+    result = m_ShadowPass->CreateLightUniforms(
+        device, m_DescSetLayout, m_TextureView, m_Sampler, frameCount);
+
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[Renderer] 阴影光源 UBO 创建失败");
+        return result;
+    }
+
+    // set 2 光照描述符集必须在 SetupAll 之后创建 —— 它的 binding 1 指向
+    // 阴影贴图, 而阴影贴图是阴影 Pass 在 Setup 里建的。
+    // 管线布局只依赖描述符集**布局**(来自 FLightManager::Initialize),
+    // 不依赖描述符集本身, 因此把这一步后移不影响 CreatePipelineLayout。
+    result = CreateLightingDescriptorSets();
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[Renderer] 光照描述符集创建失败");
         return result;
     }
 
@@ -345,6 +363,53 @@ void FRenderer::RenderFrame()
 
     // 每帧上传材质脏数据
     FMaterialManager::Get().UploadDirtyMaterials();
+
+    // ---- 阴影: 拟合光源视锥 → 写回矩阵 → 更新光源 UBO ----
+    //
+    // 必须在 UploadLightData 之前: 阴影矩阵是光照 UBO 的一部分, 顺序反了
+    // 片段着色器拿到的就是上一帧的矩阵, 快速转动光源时阴影会滞后一帧。
+    if (m_ShadowPass)
+    {
+        const FLightManager& lightManager = FLightManager::Get();
+
+        bool hasDirectionalLight = false;
+        FVector3 lightDirection(0.0f, -1.0f, 0.0f);
+
+        for (UInt32 i = 0; i < lightManager.GetLightCount(); ++i)
+        {
+            const FLight& light = lightManager.GetLight(i);
+
+            if (light.GetType() == ELightType::Directional && light.IsEnabled())
+            {
+                lightDirection      = light.GetDirection();
+                hasDirectionalLight = true;
+                break;
+            }
+        }
+
+        if (hasDirectionalLight && m_SceneBounds.IsValid())
+        {
+            m_ShadowPass->SetLightAndBounds(lightDirection, m_SceneBounds);
+        }
+
+        if (m_ShadowPass->HasValidLight())
+        {
+            m_ShadowPass->UpdateLightUniform(m_Context->GetDevice(),
+                                             frameIndex);
+
+            FLightManager::Get().SetShadowMatrix(
+                m_ShadowPass->GetShadowViewProj(),
+                0.0015f,
+                m_SceneBounds.IsValid()
+                    ? m_SceneBounds.GetExtent().Length() * 0.002f
+                    : 0.05f,
+                static_cast<Float32>(FShadowPass::kShadowMapSize));
+        }
+        else
+        {
+            FLightManager::Get().DisableShadow();
+        }
+    }
 
     // 每帧上传光照 UBO (含当前相机位置)
     FLightManager::Get().UploadLightData(frameIndex, m_Camera.GetPosition());
@@ -858,15 +923,27 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             return result;
         }
 
-        // 将该帧的光照 UBO 绑定到 set 2 binding 0
-        FRHIDescriptorWrite write = FRHIDescriptorWrite::UniformBuffer(
+        // set 2 binding 0 = 光照 UBO, binding 1 = 阴影贴图
+        //
+        // 阴影贴图在整个运行期都是同一张纹理, 因此只需在这里写一次;
+        // 内容每帧被阴影 Pass 重写, 但描述符指向的对象不变。
+        FRHIDescriptorWrite writes[2];
+
+        writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
             0,
             FLightManager::Get().GetLightUBO(i),
             0,
             sizeof(FLightingUBO));
 
-        device->UpdateDescriptorSets(&write, 1);
+        writes[1] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet,
+            1,
+            m_ShadowPass->GetShadowMapView(),
+            m_ShadowPass->GetShadowSampler(),
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(writes, 2);
 
         m_LightDescriptorSets.Add(descSet);
     }
