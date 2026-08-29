@@ -94,6 +94,19 @@ public:
     LIMX_NODISCARD LSpatialTrait*                GetParent()   const { return m_Parent; }
     LIMX_NODISCARD const TArray<LSpatialTrait*>& GetChildren() const { return m_Children; }
 
+    // ====================================================================
+    // 生命周期覆盖
+    // ====================================================================
+
+    /// 附加到节点时自动挂到该节点的根空间 Trait 之下
+    ///
+    /// 不这样做的话, 节点变换与其上的空间 Trait 是两棵互不相干的树 ——
+    /// 节点被摆到某处, 而它的网格/相机仍留在原点, 且没有任何报错。
+    void OnAttached(LNode* owner) override;
+
+    /// 从节点分离时脱离层级, 避免留下指向已销毁父级的指针
+    void OnDetached() override;
+
 protected:
     FTransform             m_LocalTransform;
     LSpatialTrait*         m_Parent   = nullptr;

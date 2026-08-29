@@ -55,7 +55,13 @@ class LIMX_ENGINE_API LTrait : public LObject
 
 public:
     LTrait();
-    ~LTrait() override = default;
+
+    /// 析构时从宿主节点的 Trait 表中摘掉自己
+    ///
+    /// 不这样做的话, 通过 LRegistry::Destroy 直接销毁一个仍被节点持有的
+    /// Trait, 会在节点表里留下悬垂指针 —— 场景销毁时对同一块内存二次释放,
+    /// 崩溃点距离真正的错误已经隔了很远。
+    ~LTrait() override;
 
     // ====================================================================
     // 标识

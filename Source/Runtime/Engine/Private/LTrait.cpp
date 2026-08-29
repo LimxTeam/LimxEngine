@@ -36,4 +36,22 @@ LTrait::LTrait()
 {
 }
 
+// ============================================================================
+// 析构
+// ============================================================================
+
+LTrait::~LTrait()
+{
+    // 从宿主节点的 Trait 表中摘掉自己。
+    //
+    // LNode::RemoveTrait 会先摘表再销毁, 走到这里时 m_Owner 已是 nullptr;
+    // 而 LRegistry::Destroy 被直接调用时不会摘表, 全靠这一步兜住。
+    // 两条路径都不能在节点表里留下悬垂指针。
+    if (m_Owner != nullptr)
+    {
+        m_Owner->InternalForgetTrait(this);
+        m_Owner = nullptr;
+    }
+}
+
 } // namespace Limx

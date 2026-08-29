@@ -2,35 +2,44 @@
 // 文件名称：LMeshTrait.h
 // 创建时间：2026-04-07
 // 创建者  ：LimxTeam
-// 设计哲学：桥接模式 — LMeshTrait 将 Engine 层的节点/变换与 Luminance
-//          渲染层的 FRenderObject 解耦，FSceneManager 通过
-//          BuildRenderObject() 收集渲染数据，每帧重建渲染列表。
-// 功能描述：LMeshTrait — 网格渲染 Trait，持有 GPU 缓冲区句柄和材质引用，
-//          通过 BuildRenderObject 输出 FRenderObject 供 FSceneManager 使用。
+// 设计哲学：引用而非拥有 — LMeshTrait 只持有资源句柄，GPU 缓冲区的
+//          所有权属于 FRenderResourceManager。此前 Trait 直接握着
+//          FRHIBufferHandle，等于把资源生命周期分散到了场景图的每个
+//          节点上；一旦要加载任意资产，就没有任何一处能回答"这块显存
+//          还有人用吗"。改为句柄引用后，答案只有资源管理器一处。
+//
+//          一个网格按材质切分为多段，因此导出的是渲染批次列表而非
+//          单个渲染对象 — Sponza 这类单网格多材质的场景没有别的表达方式。
+// 功能描述：LMeshTrait — 网格渲染 Trait，持有网格资源句柄与逐槽位材质，
+//          通过 BuildRenderObjects 输出绘制批次供 FSceneManager 使用。
 //
 // ── 函数/方法表 ──────────────────────────────────────────────
-// │ 函数名                       │ 描述                        │
-// │────────────────────────────│──────────────────────────│
-// │ SetMeshData(vbo,ibo,count)  │ 设置 GPU 缓冲区和索引数量   │
-// │ SetMaterial(mat)            │ 设置 PBR 材质               │
-// │ SetVisible(bool)            │ 控制可见性                  │
-// │ IsVisible()                 │ 当前是否可见                │
-// │ BuildRenderObject(out)      │ 填充 FRenderObject 供渲染   │
-// │ HasValidMesh()              │ 检查 VBO/IBO 是否有效       │
+// │ 函数名                        │ 描述                        │
+// │─────────────────────────────│──────────────────────────│
+// │ SetMesh(manager, handle)     │ 绑定资源管理器与网格句柄     │
+// │ ClearMesh()                  │ 解除绑定并释放引用          │
+// │ GetMeshHandle()              │ 当前网格句柄                │
+// │ SetMaterial(mat)             │ 设置默认 PBR 材质           │
+// │ SetSectionMaterial(slot,mat) │ 设置指定材质槽位的材质       │
+// │ SetVisible(bool)             │ 控制可见性                  │
+// │ IsVisible()                  │ 当前是否可见                │
+// │ BuildRenderObjects(out)      │ 追加绘制批次供渲染          │
+// │ HasValidMesh()               │ 句柄是否指向存活的网格       │
 //
 // ── 结构体字段表 ──────────────────────────────────────────────
-// │ 字段名           │ 类型                  │ 描述            │
-// │─────────────────│──────────────────────│───────────────│
-// │ m_VertexBuffer   │ FRHIBufferHandle     │ 顶点缓冲区      │
-// │ m_IndexBuffer    │ FRHIBufferHandle     │ 索引缓冲区      │
-// │ m_IndexCount     │ UInt32              │ 索引数量        │
-// │ m_Material       │ FMaterial*          │ 材质 (非拥有)   │
-// │ m_IsVisible      │ bool                │ 可见性标志      │
+// │ 字段名             │ 类型                     │ 描述          │
+// │───────────────────│─────────────────────────│─────────────│
+// │ m_ResourceManager  │ FRenderResourceManager*  │ 资源管理器    │
+// │ m_MeshHandle       │ FMeshResourceHandle      │ 网格句柄      │
+// │ m_Material         │ FMaterial*               │ 默认材质      │
+// │ m_SectionMaterials │ TArray<FMaterial*>       │ 逐槽位材质    │
+// │ m_IsVisible        │ bool                     │ 可见性标志    │
 //
 // ── 更新历史 ──────────────────────────────────────────────────
-// │ 日期         │ 作者       │ 描述                           │
-// │─────────────│──────────│───────────────────────────────│
-// │ 2026-04-07  │ LimxTeam  │ 初始创建 (M1.0 Engine 渲染桥接) │
+// │ 日期         │ 作者       │ 描述                             │
+// │─────────────│──────────│─────────────────────────────────│
+// │ 2026-04-07  │ LimxTeam  │ 初始创建 (M1.0 Engine 渲染桥接)   │
+// │ 2026-08-29  │ LimxTeam  │ 改为资源句柄引用, 支持多材质分段   │
 // ============================================================
 
 #pragma once
@@ -38,6 +47,7 @@
 #include "Engine/LSpatialTrait.h"
 #include "Renderer/Renderer/FRenderer.h"
 #include "RenderCore/Material/FMaterial.h"
+#include "RenderCore/Resources/FRenderResourceManager.h"
 #include "RHI/RHI/RHIResources.h"
 
 namespace Limx
@@ -53,31 +63,57 @@ class LIMX_ENGINE_API LMeshTrait : public LSpatialTrait
 
 public:
     LMeshTrait();
-    ~LMeshTrait() override = default;
+    ~LMeshTrait() override;
 
     // ====================================================================
-    // 网格数据
+    // 网格资源
     // ====================================================================
 
-    /// 设置 GPU 缓冲区（由外部创建并传入）
-    void SetMeshData(FRHIBufferHandle vertexBuffer,
-                     FRHIBufferHandle indexBuffer,
-                     UInt32           indexCount);
+    /// 绑定网格资源
+    ///
+    /// Trait 在此对资源加一次引用, 在 ClearMesh/析构时释放。引用计数归零
+    /// 不会立即卸载资源, 由 FRenderResourceManager::CollectUnreferenced 收割。
+    /// @param manager 资源管理器 (非拥有, 必须活得比本 Trait 长)
+    /// @param handle  网格句柄
+    void SetMesh(FRenderResourceManager* manager, FMeshResourceHandle handle);
 
-    LIMX_NODISCARD FRHIBufferHandle GetVertexBuffer() const { return m_VertexBuffer; }
-    LIMX_NODISCARD FRHIBufferHandle GetIndexBuffer()  const { return m_IndexBuffer; }
-    LIMX_NODISCARD UInt32           GetIndexCount()   const { return m_IndexCount; }
+    /// 解除网格绑定并释放引用
+    void ClearMesh();
 
-    /// 检查是否有有效的 GPU 缓冲区
+    LIMX_NODISCARD FMeshResourceHandle GetMeshHandle() const
+    {
+        return m_MeshHandle;
+    }
+
+    LIMX_NODISCARD FRenderResourceManager* GetResourceManager() const
+    {
+        return m_ResourceManager;
+    }
+
+    /// 句柄是否仍指向存活的网格
     LIMX_NODISCARD bool HasValidMesh() const;
+
+    /// 取网格资源 — 句柄失效返回 nullptr
+    LIMX_NODISCARD const FMeshResource* GetMeshResource() const;
 
     // ====================================================================
     // 材质
     // ====================================================================
 
-    /// 设置 PBR 材质（非拥有引用）
+    /// 设置默认 PBR 材质（非拥有引用）— 用于未指定槽位材质的分段
     void SetMaterial(FMaterial* material) { m_Material = material; }
     LIMX_NODISCARD FMaterial* GetMaterial() const { return m_Material; }
+
+    /// 设置指定材质槽位的材质（非拥有引用）
+    ///
+    /// 槽位号来自 FMeshSection::MaterialSlot, 即资产自身的材质索引。
+    /// 数组按需增长, 未设置的槽位回落到默认材质。
+    /// @param slot     材质槽位, 负值直接忽略
+    /// @param material 材质, 可为 nullptr 表示清除
+    void SetSectionMaterial(Int32 slot, FMaterial* material);
+
+    /// 取指定槽位的材质 — 未设置时返回默认材质
+    LIMX_NODISCARD FMaterial* GetSectionMaterial(Int32 slot) const;
 
     // ====================================================================
     // 可见性
@@ -90,10 +126,13 @@ public:
     // 渲染数据导出
     // ====================================================================
 
-    /// 从当前 Trait 状态填充 FRenderObject，供 FSceneManager 每帧调用
-    /// @param outObject  输出的渲染对象
-    /// @return 数据有效（有网格和材质）则返回 true
-    bool BuildRenderObject(FRenderObject& outObject) const;
+    /// 把本 Trait 的全部绘制批次追加到输出列表, 供 FSceneManager 每帧调用
+    ///
+    /// 追加而非覆写 —— 一个网格可能产出多个批次, 调用方通常在同一个
+    /// 列表上遍历整个场景。
+    /// @param outObjects 输出列表 (追加)
+    /// @return 追加的批次数; 0 表示不可见或资源无效
+    UInt32 BuildRenderObjects(TArray<FRenderObject>& outObjects) const;
 
     // ====================================================================
     // 生命周期覆盖
@@ -103,11 +142,11 @@ public:
     void OnDetached() override;
 
 private:
-    FRHIBufferHandle  m_VertexBuffer;
-    FRHIBufferHandle  m_IndexBuffer;
-    UInt32            m_IndexCount = 0;
-    FMaterial*        m_Material   = nullptr;
-    bool              m_IsVisible  = true;
+    FRenderResourceManager* m_ResourceManager = nullptr;
+    FMeshResourceHandle     m_MeshHandle;
+    FMaterial*              m_Material        = nullptr;
+    TArray<FMaterial*>      m_SectionMaterials;
+    bool                    m_IsVisible       = true;
 };
 
 } // namespace Limx

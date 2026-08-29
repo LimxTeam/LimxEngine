@@ -7,7 +7,7 @@ layer       = 4
 description = "Limx 引擎层 — LNode/LTrait/LSpatialTrait/LScene/LSystem + 渲染桥接 (LMeshTrait/LLightTrait/LCameraTrait/FSceneManager)"
 
 [dependencies]
-public  = ["LimxCore", "LimxObject", "LimxRHI", "LimxApplicationCore", "LimxRenderCore", "LimxRenderer"]
+public  = ["LimxCore", "LimxObject", "LimxRHI", "LimxApplicationCore", "LimxRenderCore", "LimxRenderer", "LimxAssetPipeline"]
 private = []
 
 [sources]

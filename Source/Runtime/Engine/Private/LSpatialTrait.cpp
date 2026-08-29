@@ -38,7 +38,19 @@ LSpatialTrait::~LSpatialTrait()
     {
         DetachFromParent();
     }
-    // 子级已由 LNode/LScene 通过 LRegistry::Destroy 管理
+
+    // 子级的所有权归 LNode/LScene, 但它们的 m_Parent 指向本对象。
+    // 只清空 m_Children 而不解除子级的反向指针, 就会留下一批 m_Parent 悬垂的
+    // Trait —— 它们随后析构时会往已释放的内存里写, 表现为关闭阶段的访问违规。
+    // 销毁顺序不该成为正确性的前提, 因此这里主动把反向指针清掉。
+    for (SizeType i = 0; i < m_Children.GetSize(); ++i)
+    {
+        if (m_Children[i] != nullptr)
+        {
+            m_Children[i]->m_Parent = nullptr;
+        }
+    }
+
     m_Children.Clear();
 }
 
@@ -111,6 +123,38 @@ void LSpatialTrait::SetLocalLocation(const FVector3& location)
 FVector3 LSpatialTrait::GetLocalLocation() const
 {
     return m_LocalTransform.Translation;
+}
+
+// ============================================================================
+// 生命周期
+// ============================================================================
+
+void LSpatialTrait::OnAttached(LNode* owner)
+{
+    LTrait::OnAttached(owner);
+
+    if (owner == nullptr)
+    {
+        return;
+    }
+
+    // 挂到节点的根空间 Trait 之下, 使本地变换成为"相对节点"的变换。
+    //
+    // 根空间 Trait 自己会走到这里但取到的 root 是 nullptr ——
+    // LScene::SpawnNode 先 AddTrait 再 SetRootSpatial, 顺序保证了这一点;
+    // 即便顺序改变, AttachTo 也会拒绝把节点挂到自己身上。
+    LSpatialTrait* root = owner->GetRootSpatial();
+
+    if (root != nullptr && root != this && m_Parent == nullptr)
+    {
+        AttachTo(root);
+    }
+}
+
+void LSpatialTrait::OnDetached()
+{
+    DetachFromParent();
+    LTrait::OnDetached();
 }
 
 // ============================================================================

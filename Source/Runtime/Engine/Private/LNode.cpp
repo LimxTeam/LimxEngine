@@ -69,6 +69,25 @@ void LNode::RemoveTrait(FName traitName)
     LRegistry::Get().Destroy(trait);
 }
 
+void LNode::InternalForgetTrait(const LTrait* trait)
+{
+    if (trait == nullptr)
+    {
+        return;
+    }
+
+    // 按指针而非名称查找 —— Trait 名称在生命周期中可被改写,
+    // 而这里要摘掉的是"这一个对象", 不是"叫这个名字的那一个"。
+    for (auto& pair : m_Traits)
+    {
+        if (pair.Value == trait)
+        {
+            m_Traits.Remove(pair.Key);
+            return;
+        }
+    }
+}
+
 void LNode::GetAllTraits(TArray<LTrait*>& outTraits) const
 {
     outTraits.Clear();
