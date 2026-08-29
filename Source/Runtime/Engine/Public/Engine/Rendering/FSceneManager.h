@@ -231,6 +231,12 @@ private:
     /// 拆分后的半透明批次
     TArray<FRenderObject> m_TranslucentObjects;
 
+    /// 阴影投射体 —— 相机剔除**之前**的不透明与蒙版批次
+    ///
+    /// 单独留一份而非复用主列表: 主列表会被就地压缩掉被剔除的元素,
+    /// 而阴影需要的正是那些被剔掉的物体。
+    TArray<FRenderObject> m_ShadowCasterObjects;
+
     FSceneSyncStats       m_Stats;
 
     bool                  m_IsCullingEnabled = true;

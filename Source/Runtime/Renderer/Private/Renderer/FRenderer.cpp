@@ -389,7 +389,24 @@ void FRenderer::RenderFrame()
 
         if (hasDirectionalLight && m_SceneBounds.IsValid())
         {
-            m_ShadowPass->SetLightAndBounds(lightDirection, m_SceneBounds);
+            FShadowPass::FCameraFrustumInfo cameraInfo;
+            cameraInfo.Position    = m_Camera.GetPosition();
+            cameraInfo.Forward     = m_Camera.GetForwardVector();
+            cameraInfo.Up          = FVector3(0.0f, 1.0f, 0.0f);
+            cameraInfo.FovY        = m_Camera.GetFovY();
+            cameraInfo.AspectRatio = m_Camera.GetAspectRatio();
+            cameraInfo.NearPlane   = m_Camera.GetNearPlane();
+
+            // 阴影覆盖距离取场景直径与相机远平面的较小者 —— 场景本身
+            // 就那么大时, 把级联铺到几百米外纯属浪费精度。
+            const Float32 sceneDiameter =
+                m_SceneBounds.GetExtent().Length() * 2.0f;
+
+            cameraInfo.ShadowDistance =
+                FMath::Min(sceneDiameter, m_Camera.GetFarPlane());
+
+            m_ShadowPass->SetLightAndBounds(lightDirection, m_SceneBounds,
+                                            cameraInfo);
         }
 
         if (m_ShadowPass->HasValidLight())
@@ -397,13 +414,26 @@ void FRenderer::RenderFrame()
             m_ShadowPass->UpdateLightUniform(m_Context->GetDevice(),
                                              frameIndex);
 
-            FLightManager::Get().SetShadowMatrix(
-                m_ShadowPass->GetShadowViewProj(),
-                0.0015f,
-                m_SceneBounds.IsValid()
-                    ? m_SceneBounds.GetExtent().Length() * 0.002f
-                    : 0.05f,
-                static_cast<Float32>(FShadowPass::kShadowMapSize));
+            FCascadedShadowInfo shadowInfo;
+
+            for (UInt32 i = 0; i < FShadowPass::kCascadeCount; ++i)
+            {
+                shadowInfo.CascadeViewProj[i] =
+                    m_ShadowPass->GetCascadeViewProj(i);
+                shadowInfo.CascadeSplits[i] = m_ShadowPass->GetCascadeSplit(i);
+            }
+
+            shadowInfo.DepthBias = 0.0015f;
+
+            // 法线偏移按最近一级的纹素世界尺寸缩放 —— 用固定值的话,
+            // 大场景里偏移不足仍有 acne, 小场景里偏移过大又让阴影脱离物体。
+            shadowInfo.NormalBias =
+                m_ShadowPass->GetCascadeSplit(0) * 0.004f;
+
+            shadowInfo.ShadowMapSize =
+                static_cast<Float32>(FShadowPass::kShadowMapSize);
+
+            FLightManager::Get().SetShadowInfo(shadowInfo);
         }
         else
         {
@@ -428,6 +458,7 @@ void FRenderer::RenderFrame()
         execInfo.SwapchainExtent       = extent;
         execInfo.RenderObjects         = &m_RenderObjects;
         execInfo.TranslucentObjects    = &m_TranslucentObjects;
+        execInfo.ShadowCasterObjects   = &m_ShadowCasterObjects;
         execInfo.ViewProjDescriptorSet = m_DescriptorSets[frameIndex];
         execInfo.PipelineLayout        = m_PipelineLayout;
         execInfo.LightingDescriptorSet = m_LightDescriptorSets[frameIndex];

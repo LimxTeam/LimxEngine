@@ -14,15 +14,25 @@
  *   与片段着色器采样用的矩阵必须是同一个。让两处各自计算，快速转向时会
  *   相差一帧，表现为阴影"拖尾"。
  *
- *   投影体积按场景包围盒拟合 — 方向光没有位置，只有方向；要把它变成可渲染的
- *   视锥，必须先决定"覆盖多大范围"。用场景包围盒是单张阴影贴图能做的最好选择：
- *   保证不漏，代价是远处精度被近处稀释。级联阴影正是为解决这一点而存在。
+ *   级联按相机视锥的深度切片拟合，而非整个场景 — 用一张贴图覆盖整个场景时，
+ *   近处的纹素密度被远处稀释：Sponza 30 单位宽的中庭挤进 2048²，脚下与
+ *   三十米外分到的精度完全一样，而人眼对脚下的阴影边缘敏感得多。
+ *   切成三级后，最近一级只需覆盖几米，纹素密度提高一个量级。
+ *
+ *   每级拟合到切片的**包围球**而非视锥角点的 AABB — 包围球在相机旋转时
+ *   半径不变，正交体积因而尺寸恒定；用 AABB 的话体积随视角摆动，
+ *   阴影边缘会随相机转动而闪烁 (shimmering)。这是级联阴影最经典的坑。
+ *
+ *   级联选择按到相机的**径向距离**而非视空间 Z — 与包围球拟合口径一致：
+ *   球是按径向距离定义的，若改用平面距离选级，切片角落会选到未覆盖该处的
+ *   级别，表现为视野边缘出现一圈错误阴影。
  *
  * 技术特性:
  *   - 深度专用 RenderPass，无颜色附件
+ *   - 3 级级联，共用一张 2048² × 3 层的深度纹理数组
  *   - 复用 depth_only 着色器，Masked 材质在阴影中同样镂空
  *   - 单面/双面两条管线，与前向 Pass 的剔除选择保持一致
- *   - 正面剔除可选：绘制背面能把自遮挡推到物体内部
+ *   - 正面剔除：绘制背面能把自遮挡推到物体内部
  *
  * 依赖关系:
  *   内部: Renderer/RenderPass/IRenderPass.h
@@ -46,12 +56,18 @@ namespace Limx
 class FShadowPass final : public IRenderPass
 {
 public:
-    /// 阴影贴图边长 — 正方形
+    /// 单级阴影贴图边长 — 正方形
     ///
-    /// 2048 是质量与显存的折中: 单张 D32 深度图占 16 MiB。再高一档
-    /// (4096) 要 64 MiB，而在没有级联的情况下，把整个场景塞进一张图时
-    /// 精度的瓶颈是投影体积而非分辨率 —— 加分辨率的收益远小于加级联。
+    /// 2048 × 3 层 D32 共 48 MiB。加分辨率与加级联都能提精度, 但级联的
+    /// 收益是"把精度花在该花的地方", 分辨率是均摊 —— 同样的显存,
+    /// 3 级 2048 远好于 1 级 4096。
     static constexpr UInt32 kShadowMapSize = 2048;
+
+    /// 级联层数
+    ///
+    /// 3 级是常见取舍: 2 级在中距离仍有明显的精度断层, 4 级起每级的
+    /// 覆盖范围已经很接近, 增加的绘制开销换不回可见的质量。
+    static constexpr UInt32 kCascadeCount = 3;
 
     FShadowPass()           = default;
     ~FShadowPass() override = default;
@@ -106,23 +122,48 @@ public:
         return m_ShadowSampler;
     }
 
-    /// 本帧使用的光源视图投影矩阵
-    LIMX_NODISCARD const FMatrix& GetShadowViewProj() const
+    /// 指定级联的光源视图投影矩阵
+    LIMX_NODISCARD const FMatrix& GetCascadeViewProj(UInt32 cascade) const
     {
-        return m_ShadowViewProj;
+        return m_CascadeViewProj[cascade < kCascadeCount ? cascade : 0];
+    }
+
+    /// 各级联的外边界 — 到相机的径向距离
+    LIMX_NODISCARD Float32 GetCascadeSplit(UInt32 cascade) const
+    {
+        return m_CascadeSplits[cascade < kCascadeCount ? cascade : 0];
     }
 
     // ====================================================================
     // 光源与场景范围
     // ====================================================================
 
-    /// 设置方向光方向与场景包围盒 — 由渲染器每帧在 Execute 之前调用
+    /// 相机视锥参数 — 级联切分的依据
+    struct FCameraFrustumInfo
+    {
+        FVector3 Position;
+        FVector3 Forward;
+        FVector3 Up;
+        Float32  FovY        = 1.0f;
+        Float32  AspectRatio = 1.0f;
+        Float32  NearPlane   = 0.1f;
+
+        /// 阴影覆盖的最远距离
+        ///
+        /// 刻意与相机远平面解耦: 远平面常设到几百米以求不裁掉天空盒,
+        /// 而阴影在几十米外已无实际意义。用远平面切级会把两级浪费在
+        /// 看不出阴影的距离上。
+        Float32  ShadowDistance = 60.0f;
+    };
+
+    /// 设置方向光方向、相机视锥与场景包围盒 — 每帧在 Execute 之前调用
     ///
-    /// 包围盒决定正交投影体积。给得过大会浪费阴影贴图精度，
-    /// 过小则场景边缘直接落在阴影贴图之外 —— 那里会被判为"完全不在阴影中"，
-    /// 表现为远处物体突然失去阴影。
+    /// 级联体积由相机视锥切片拟合; 场景包围盒只用来确定光源沿光线方向的
+    /// 推移距离, 保证整个场景都落在近平面之后 —— 否则相机身后的高大物体
+    /// 会被光源近平面裁掉, 它投下的阴影随之消失。
     void SetLightAndBounds(const FVector3& lightDirection,
-                           const FBoundingBox& sceneBounds);
+                           const FBoundingBox& sceneBounds,
+                           const FCameraFrustumInfo& cameraInfo);
 
     /// 是否已具备可用的光源信息
     LIMX_NODISCARD bool HasValidLight() const { return m_HasValidLight; }
@@ -138,13 +179,13 @@ public:
                                    FRHISamplerHandle fillerSampler,
                                    UInt32 frameCount);
 
-    /// 把本帧的光源矩阵写入对应帧的 UBO
+    /// 把本帧各级联的光源矩阵写入对应的 UBO
     void UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex);
 
 private:
     ERHIResult CreateShadowMap(IRHIDevice* device);
     ERHIResult CreateShadowRenderPass(IRHIDevice* device);
-    ERHIResult CreateFramebuffer(IRHIDevice* device);
+    ERHIResult CreateFramebuffers(IRHIDevice* device);
     ERHIResult CreateShaders(IRHIDevice* device);
     ERHIResult CreateShadowPipeline(IRHIDevice* device, bool isDoubleSided,
                                     FRHIGraphicsPipelineHandle& outPipeline);
@@ -161,11 +202,20 @@ private:
     // ====================================================================
 
     FRHITextureHandle          m_ShadowMap;
+
+    /// 采样视图 — 覆盖全部层, 类型为 2D 数组
     FRHITextureViewHandle      m_ShadowMapView;
+
+    /// 逐层视图 — 每级一个, 作为 Framebuffer 的深度附件
+    ///
+    /// 数组视图不能直接当附件用: 渲染目标必须是单层。因此采样与渲染
+    /// 需要两套视图指向同一张纹理。
+    FRHITextureViewHandle      m_CascadeViews[kCascadeCount];
+    FRHIFramebufferHandle      m_CascadeFramebuffers[kCascadeCount];
+
     FRHISamplerHandle          m_ShadowSampler;
 
     FRHIRenderPassHandle       m_RenderPass;
-    FRHIFramebufferHandle      m_Framebuffer;
 
     FRHIShaderHandle           m_VertShader;
     FRHIShaderHandle           m_FragShader;
@@ -179,7 +229,11 @@ private:
     TArray<FRHIBufferHandle>        m_LightUniformBuffers;
     TArray<FRHIDescriptorSetHandle> m_LightDescriptorSets;
 
-    FMatrix  m_ShadowViewProj;
+    FMatrix  m_CascadeViewProj[kCascadeCount];
+
+    /// 各级外边界的径向距离
+    Float32  m_CascadeSplits[kCascadeCount] = {};
+
     FVector3 m_LightDirection = FVector3(0.0f, -1.0f, 0.0f);
     bool     m_HasValidLight  = false;
 };

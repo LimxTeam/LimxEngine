@@ -7,9 +7,9 @@
  *   方向光阴影 Pass 实现 — 光源视锥拟合、深度渲染、比较采样器
  *
  * 设计哲学:
- *   正交体积按场景包围球而非包围盒拟合 — 包围球在光源旋转时半径不变，
- *   而包围盒在光源方向上的投影长度会随角度变化。用包围盒会让阴影贴图的
- *   有效分辨率随太阳角度抖动，表现为转动光源时阴影边缘"呼吸"。
+ *   每级拟合到相机视锥切片的包围球 — 球在相机旋转时半径不变，正交体积
+ *   因而尺寸恒定；用视锥角点的 AABB 会让体积随视角摆动，阴影边缘随相机
+ *   转动闪烁。进一步把正交中心吸附到纹素网格上，消除亚像素级的抖动。
  *
  *   绘制背面而非正面 — 自遮挡(shadow acne)的根源是深度贴图的量化误差。
  *   只记录背面深度后，正面着色点与记录深度之间隔着整个物体的厚度，
@@ -60,7 +60,7 @@ ERHIResult FShadowPass::Setup(const FPassSetupDesc& desc)
         return result;
     }
 
-    result = CreateFramebuffer(desc.Device);
+    result = CreateFramebuffers(desc.Device);
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[ShadowPass] Framebuffer 创建失败");
@@ -88,8 +88,8 @@ ERHIResult FShadowPass::Setup(const FPassSetupDesc& desc)
     }
 
     LIMX_LOG(LogRenderer, Log,
-             "[ShadowPass] 初始化完成 — {}x{} D32_SFLOAT",
-             kShadowMapSize, kShadowMapSize);
+             "[ShadowPass] 初始化完成 — {} 级级联, 每级 {}x{} D32_SFLOAT",
+             kCascadeCount, kShadowMapSize, kShadowMapSize);
 
     return ERHIResult::Success;
 }
@@ -104,7 +104,9 @@ ERHIResult FShadowPass::CreateShadowMap(IRHIDevice* device)
         kShadowMapSize, kShadowMapSize,
         EPixelFormat::D32_SFLOAT,
         ESampleCount::Count1);
-    depthDesc.DebugName = "ShadowMap";
+    depthDesc.Type        = ETextureType::Texture2DArray;
+    depthDesc.ArrayLayers = kCascadeCount;
+    depthDesc.DebugName   = "ShadowMapArray";
 
     ERHIResult result = device->CreateTexture(depthDesc, m_ShadowMap);
     if (!IsRHISuccess(result))
@@ -112,20 +114,43 @@ ERHIResult FShadowPass::CreateShadowMap(IRHIDevice* device)
         return result;
     }
 
-    FRHITextureViewDesc viewDesc = {};
-    viewDesc.Texture         = m_ShadowMap;
-    viewDesc.ViewType        = ETextureType::Texture2D;
-    viewDesc.Format          = EPixelFormat::D32_SFLOAT;
-    viewDesc.BaseMipLevel    = 0;
-    viewDesc.MipLevelCount   = 1;
-    viewDesc.BaseArrayLayer  = 0;
-    viewDesc.ArrayLayerCount = 1;
+    // 采样视图 —— 覆盖全部层
+    FRHITextureViewDesc arrayViewDesc = {};
+    arrayViewDesc.Texture         = m_ShadowMap;
+    arrayViewDesc.ViewType        = ETextureType::Texture2DArray;
+    arrayViewDesc.Format          = EPixelFormat::D32_SFLOAT;
+    arrayViewDesc.BaseMipLevel    = 0;
+    arrayViewDesc.MipLevelCount   = 1;
+    arrayViewDesc.BaseArrayLayer  = 0;
+    arrayViewDesc.ArrayLayerCount = kCascadeCount;
 
-    result = device->CreateTextureView(viewDesc, m_ShadowMapView);
+    result = device->CreateTextureView(arrayViewDesc, m_ShadowMapView);
     if (!IsRHISuccess(result))
     {
         device->DestroyTexture(m_ShadowMap);
         return result;
+    }
+
+    // 逐层视图 —— 渲染目标必须是单层, 数组视图不能直接作附件
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
+    {
+        FRHITextureViewDesc layerViewDesc = {};
+        layerViewDesc.Texture         = m_ShadowMap;
+        layerViewDesc.ViewType        = ETextureType::Texture2D;
+        layerViewDesc.Format          = EPixelFormat::D32_SFLOAT;
+        layerViewDesc.BaseMipLevel    = 0;
+        layerViewDesc.MipLevelCount   = 1;
+        layerViewDesc.BaseArrayLayer  = cascade;
+        layerViewDesc.ArrayLayerCount = 1;
+
+        result = device->CreateTextureView(layerViewDesc,
+                                           m_CascadeViews[cascade]);
+        if (!IsRHISuccess(result))
+        {
+            device->DestroyTextureView(m_ShadowMapView);
+            device->DestroyTexture(m_ShadowMap);
+            return result;
+        }
     }
 
     // ---- 比较采样器 ----
@@ -226,18 +251,29 @@ ERHIResult FShadowPass::CreateShadowRenderPass(IRHIDevice* device)
 // CreateFramebuffer
 // ============================================================================
 
-ERHIResult FShadowPass::CreateFramebuffer(IRHIDevice* device)
+ERHIResult FShadowPass::CreateFramebuffers(IRHIDevice* device)
 {
-    FRHIFramebufferDesc fbDesc = {};
-    fbDesc.RenderPass      = m_RenderPass;
-    fbDesc.Attachments     = &m_ShadowMapView;
-    fbDesc.AttachmentCount = 1;
-    fbDesc.Width           = kShadowMapSize;
-    fbDesc.Height          = kShadowMapSize;
-    fbDesc.Layers          = 1;
-    fbDesc.DebugName       = "ShadowPass_Framebuffer";
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
+    {
+        FRHIFramebufferDesc fbDesc = {};
+        fbDesc.RenderPass      = m_RenderPass;
+        fbDesc.Attachments     = &m_CascadeViews[cascade];
+        fbDesc.AttachmentCount = 1;
+        fbDesc.Width           = kShadowMapSize;
+        fbDesc.Height          = kShadowMapSize;
+        fbDesc.Layers          = 1;
+        fbDesc.DebugName       = "ShadowPass_CascadeFramebuffer";
 
-    return device->CreateFramebuffer(fbDesc, m_Framebuffer);
+        const ERHIResult result = device->CreateFramebuffer(
+            fbDesc, m_CascadeFramebuffers[cascade]);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
+    return ERHIResult::Success;
 }
 
 // ============================================================================
@@ -366,10 +402,12 @@ ERHIResult FShadowPass::CreateLightUniforms(
     FRHITextureViewHandle fillerTextureView, FRHISamplerHandle fillerSampler,
     UInt32 frameCount)
 {
-    m_LightUniformBuffers.Reserve(frameCount);
-    m_LightDescriptorSets.Reserve(frameCount);
+    const UInt32 totalCount = frameCount * kCascadeCount;
 
-    for (UInt32 i = 0; i < frameCount; ++i)
+    m_LightUniformBuffers.Reserve(totalCount);
+    m_LightDescriptorSets.Reserve(totalCount);
+
+    for (UInt32 i = 0; i < totalCount; ++i)
     {
         FRHIBufferDesc bufferDesc =
             FRHIBufferDesc::Uniform(sizeof(FViewProjUBO));
@@ -415,7 +453,8 @@ ERHIResult FShadowPass::CreateLightUniforms(
 // ============================================================================
 
 void FShadowPass::SetLightAndBounds(const FVector3& lightDirection,
-                                     const FBoundingBox& sceneBounds)
+                                     const FBoundingBox& sceneBounds,
+                                     const FCameraFrustumInfo& cameraInfo)
 {
     if (!sceneBounds.IsValid())
     {
@@ -433,29 +472,136 @@ void FShadowPass::SetLightAndBounds(const FVector3& lightDirection,
 
     m_LightDirection = direction;
 
-    // ---- 用包围球而非包围盒 ----
+    // ---- 1. 切分 ----
     //
-    // 包围球的半径与光源方向无关, 因此正交体积的尺寸在光源转动时保持恒定,
-    // 阴影贴图的有效分辨率也就恒定。改用包围盒的话, 盒在光源方向上的投影
-    // 长度随角度变化, 转动太阳时阴影边缘会"呼吸"。
-    const FVector3 center = sceneBounds.GetCenter();
-    const Float32  radius = (sceneBounds.Max - center).Length();
+    // 实用切分方案: 在对数分布与均匀分布之间插值。
+    //   纯对数在数学上最优 (每级的纹素密度相同), 但最近一级会薄到只有
+    //   几十厘米, 相机稍一移动就跨级, 边界处的突变反而更扎眼。
+    //   纯均匀则把太多精度浪费在远处。
+    // λ=0.75 偏向对数, 是常见取值。
+    constexpr Float32 kSplitLambda = 0.75f;
 
-    // 光源放在包围球外一个半径处, 保证整个球都落在近平面之后
-    const FVector3 eye = center - direction * (radius * 2.0f);
+    const Float32 nearPlane = cameraInfo.NearPlane;
+    const Float32 farPlane  = FMath::Max(cameraInfo.ShadowDistance,
+                                         nearPlane + 1.0f);
+    const Float32 range     = farPlane - nearPlane;
+    const Float32 ratio     = farPlane / nearPlane;
 
-    // 上方向避开与光线平行 —— 平行时 LookAt 的叉积退化为零向量
-    const FVector3 up = (FMath::Abs(direction.Y) > 0.99f)
-                            ? FVector3(0.0f, 0.0f, 1.0f)
-                            : FVector3(0.0f, 1.0f, 0.0f);
+    Float32 splitDistances[kCascadeCount + 1];
+    splitDistances[0] = nearPlane;
 
-    const FMatrix view = FMatrix::LookAt(eye, center, up);
+    for (UInt32 i = 1; i <= kCascadeCount; ++i)
+    {
+        const Float32 p = static_cast<Float32>(i) /
+                          static_cast<Float32>(kCascadeCount);
 
-    const FMatrix projection = FMatrix::Ortho(
-        -radius, radius, -radius, radius, 0.0f, radius * 4.0f);
+        const Float32 logSplit     = nearPlane * FMath::Pow(ratio, p);
+        const Float32 uniformSplit = nearPlane + range * p;
 
-    m_ShadowViewProj = projection * view;
-    m_HasValidLight  = true;
+        splitDistances[i] =
+            kSplitLambda * logSplit + (1.0f - kSplitLambda) * uniformSplit;
+    }
+
+    // ---- 2. 逐级拟合 ----
+    const FVector3 forward = cameraInfo.Forward.GetSafeNormal();
+    const FVector3 right   = FVector3::Cross(forward,
+                                             cameraInfo.Up).GetSafeNormal();
+    const FVector3 up      = FVector3::Cross(right, forward).GetSafeNormal();
+
+    const Float32 tanHalfFovY = FMath::Tan(cameraInfo.FovY * 0.5f);
+    const Float32 tanHalfFovX = tanHalfFovY * cameraInfo.AspectRatio;
+
+    // 光源沿光线方向后撤的距离 —— 取场景包围球直径, 保证相机身后的物体
+    // 也落在光源近平面之后。漏掉它, 身后的高塔就不会在地面上投影。
+    const Float32 sceneRadius =
+        (sceneBounds.Max - sceneBounds.GetCenter()).Length();
+
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
+    {
+        const Float32 sliceNear = splitDistances[cascade];
+        const Float32 sliceFar  = splitDistances[cascade + 1];
+
+        m_CascadeSplits[cascade] = sliceFar;
+
+        // ---- 切片的八个角点 ----
+        FVector3 corners[8];
+        UInt32   cornerIndex = 0;
+
+        for (UInt32 farSide = 0; farSide < 2; ++farSide)
+        {
+            const Float32 distance = (farSide == 0) ? sliceNear : sliceFar;
+            const FVector3 center  = cameraInfo.Position + forward * distance;
+            const Float32 halfH    = tanHalfFovY * distance;
+            const Float32 halfW    = tanHalfFovX * distance;
+
+            corners[cornerIndex++] = center - right * halfW - up * halfH;
+            corners[cornerIndex++] = center + right * halfW - up * halfH;
+            corners[cornerIndex++] = center + right * halfW + up * halfH;
+            corners[cornerIndex++] = center - right * halfW + up * halfH;
+        }
+
+        // ---- 包围球 ----
+        //
+        // 球心取八角点的平均, 半径取到最远角点的距离。这个球在相机绕自身
+        // 旋转时半径恒定 —— 这正是级联稳定性的来源。
+        FVector3 sphereCenter(0.0f, 0.0f, 0.0f);
+
+        for (UInt32 i = 0; i < 8; ++i)
+        {
+            sphereCenter = sphereCenter + corners[i];
+        }
+
+        sphereCenter = sphereCenter * (1.0f / 8.0f);
+
+        Float32 sphereRadius = 0.0f;
+
+        for (UInt32 i = 0; i < 8; ++i)
+        {
+            const Float32 distance = (corners[i] - sphereCenter).Length();
+            sphereRadius = FMath::Max(sphereRadius, distance);
+        }
+
+        // 略微放大, 避免边界处因浮点误差漏采
+        sphereRadius = FMath::Ceil(sphereRadius * 16.0f) / 16.0f;
+
+        // ---- 光源视图 ----
+        const FVector3 lightUp = (FMath::Abs(direction.Y) > 0.99f)
+                                     ? FVector3(0.0f, 0.0f, 1.0f)
+                                     : FVector3(0.0f, 1.0f, 0.0f);
+
+        const FVector3 eye =
+            sphereCenter - direction * (sphereRadius + sceneRadius * 2.0f);
+
+        FMatrix view = FMatrix::LookAt(eye, sphereCenter, lightUp);
+
+        // ---- 纹素吸附 ----
+        //
+        // 把正交体积的中心对齐到阴影贴图的纹素网格上。不做的话, 相机
+        // 每移动一点点, 整个投影就平移不到一个纹素的距离, 阴影边缘随之
+        // 抖动 —— 静止时看不出, 一走动就满屏爬行。
+        const Float32 texelsPerUnit =
+            static_cast<Float32>(kShadowMapSize) / (sphereRadius * 2.0f);
+
+        const FVector3 centerLightSpace = view.TransformPosition(sphereCenter);
+
+        const FVector3 snappedLightSpace(
+            FMath::Floor(centerLightSpace.X * texelsPerUnit) / texelsPerUnit,
+            FMath::Floor(centerLightSpace.Y * texelsPerUnit) / texelsPerUnit,
+            centerLightSpace.Z);
+
+        const FVector3 snapOffset = snappedLightSpace - centerLightSpace;
+
+        const Float32 depthExtent = sphereRadius * 2.0f + sceneRadius * 4.0f;
+
+        FMatrix projection = FMatrix::Ortho(
+            -sphereRadius + snapOffset.X, sphereRadius + snapOffset.X,
+            -sphereRadius + snapOffset.Y, sphereRadius + snapOffset.Y,
+            0.0f, depthExtent);
+
+        m_CascadeViewProj[cascade] = projection * view;
+    }
+
+    m_HasValidLight = true;
 }
 
 // ============================================================================
@@ -464,25 +610,32 @@ void FShadowPass::SetLightAndBounds(const FVector3& lightDirection,
 
 void FShadowPass::UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex)
 {
-    if (frameIndex >= m_LightUniformBuffers.GetSize())
+    // 每帧每级一份 UBO —— 下标按 (帧 × 级数 + 级) 展开
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
     {
-        return;
-    }
+        const SizeType index =
+            static_cast<SizeType>(frameIndex) * kCascadeCount + cascade;
 
-    // depth_only.vert 读的是 view 与 proj 两个矩阵并相乘。这里把合成好的
-    // 矩阵放进 proj, view 置为单位阵 —— 相乘结果不变, 而阴影贴图与
-    // 片段着色器用的是**同一个** m_ShadowViewProj, 不存在两处各算一遍
-    // 而出现细微差异的可能。
-    FViewProjUBO uboData;
-    uboData.View = FMatrix::Identity();
-    uboData.Proj = m_ShadowViewProj;
+        if (index >= m_LightUniformBuffers.GetSize())
+        {
+            return;
+        }
 
-    void* mapped = nullptr;
-    if (IsRHISuccess(device->MapBuffer(m_LightUniformBuffers[frameIndex],
-                                       &mapped)))
-    {
-        Memory::MemCopy(mapped, &uboData, sizeof(FViewProjUBO));
-        device->UnmapBuffer(m_LightUniformBuffers[frameIndex]);
+        // depth_only.vert 读的是 view 与 proj 两个矩阵并相乘。这里把合成好
+        // 的矩阵放进 proj, view 置为单位阵 —— 相乘结果不变, 而阴影贴图与
+        // 片段着色器用的是**同一个** m_CascadeViewProj, 不存在两处各算一遍
+        // 而出现细微差异的可能。
+        FViewProjUBO uboData;
+        uboData.View = FMatrix::Identity();
+        uboData.Proj = m_CascadeViewProj[cascade];
+
+        void* mapped = nullptr;
+        if (IsRHISuccess(device->MapBuffer(m_LightUniformBuffers[index],
+                                           &mapped)))
+        {
+            Memory::MemCopy(mapped, &uboData, sizeof(FViewProjUBO));
+            device->UnmapBuffer(m_LightUniformBuffers[index]);
+        }
     }
 }
 
@@ -500,13 +653,21 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     commandBuffer->BeginDebugLabel("ShadowPass", 0.9f, 0.9f, 0.3f);
 
+    // 逐级各走一遍完整的渲染通道。
+    //
+    // 没有用几何着色器或 multiview 一次写多层: 前者在移动端支持参差,
+    // 后者要求所有层共享同一套绘制调用 —— 而级联的意义恰恰在于每级
+    // 可以剔除掉不影响它的物体。三次通道换来的是各级独立可优化。
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
+    {
+
     FRHIClearDepthStencilValue clearDepth = {};
     clearDepth.Depth   = 1.0f;
     clearDepth.Stencil = 0;
 
     FRHIRenderPassBeginInfo beginInfo = {};
     beginInfo.RenderPass        = m_RenderPass;
-    beginInfo.Framebuffer       = m_Framebuffer;
+    beginInfo.Framebuffer       = m_CascadeFramebuffers[cascade];
     beginInfo.RenderAreaOffset  = { 0, 0 };
     beginInfo.RenderAreaExtent  = { kShadowMapSize, kShadowMapSize };
     beginInfo.ClearColors       = nullptr;
@@ -533,21 +694,35 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     commandBuffer->SetScissor(scissor);
 
-    // set 0 = 光源矩阵 (而非相机矩阵)
-    if (context.FrameIndex < m_LightDescriptorSets.GetSize())
+    // set 0 = 本级的光源矩阵 (而非相机矩阵)
+    const SizeType uniformIndex =
+        static_cast<SizeType>(context.FrameIndex) * kCascadeCount + cascade;
+
+    if (uniformIndex < m_LightDescriptorSets.GetSize())
     {
         commandBuffer->BindDescriptorSet(
             EPipelineBindPoint::Graphics,
             context.PipelineLayout,
             0,
-            m_LightDescriptorSets[context.FrameIndex],
+            m_LightDescriptorSets[uniformIndex],
             nullptr,
             0);
     }
 
-    // 只绘制不透明与蒙版批次 —— 半透明不投射不透明阴影, 把它们画进深度图
-    // 会让玻璃在地面上留下一块实心黑影。
-    if (context.RenderObjects != nullptr)
+    // 用**未经相机剔除**的投射体列表 —— 相机背后的物体照样会把影子投进画面。
+    // 半透明不在其中: 把它们画进深度图会让玻璃在地面上留下一块实心黑影。
+    //
+    // 改按本级的光源视锥再剔一次: 每级只覆盖一小段视锥, 绝大多数投射体
+    // 与它无关。不剔的话, 最近那一级也要画完整个场景, 而它实际只影响
+    // 脚下几米。
+    const FFrustum cascadeFrustum =
+        FFrustum::FromViewProjection(m_CascadeViewProj[cascade]);
+
+    const TArray<FRenderObject>* casters =
+        (context.ShadowCasterObjects != nullptr) ? context.ShadowCasterObjects
+                                                 : context.RenderObjects;
+
+    if (casters != nullptr)
     {
         FRHIGraphicsPipelineHandle boundPipeline;
         FRHIDescriptorSetHandle    boundMaterial;
@@ -555,9 +730,17 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
         FRHIBufferHandle           boundIndexBuffer;
         EIndexType                 boundIndexType = EIndexType::UInt32;
 
-        for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
+        for (SizeType i = 0; i < casters->GetSize(); ++i)
         {
-            const FRenderObject& obj = (*context.RenderObjects)[i];
+            const FRenderObject& obj = (*casters)[i];
+
+            // 包围盒无效时保守保留 —— 与相机剔除同一原则:
+            // 把"信息缺失"当成"不投影"会静默丢掉阴影。
+            if (obj.WorldBounds.IsValid() &&
+                !cascadeFrustum.IsAABBVisible(obj.WorldBounds))
+            {
+                continue;
+            }
 
             const FRHIGraphicsPipelineHandle pipeline =
                 SelectPipeline(obj.IsDoubleSided);
@@ -614,6 +797,9 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
     }
 
     commandBuffer->EndRenderPass();
+
+    } // 级联循环
+
     commandBuffer->EndDebugLabel();
 }
 
@@ -674,7 +860,12 @@ void FShadowPass::Shutdown(IRHIDevice* device)
     device->DestroyShader(m_FragShader);
     device->DestroyShader(m_VertShader);
 
-    device->DestroyFramebuffer(m_Framebuffer);
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
+    {
+        device->DestroyFramebuffer(m_CascadeFramebuffers[cascade]);
+        device->DestroyTextureView(m_CascadeViews[cascade]);
+    }
+
     device->DestroyRenderPass(m_RenderPass);
 
     device->DestroySampler(m_ShadowSampler);

@@ -97,6 +97,9 @@ struct FPassExecuteInfo
     /// 半透明批次 (只读) — 已按到相机的距离由远及近排序
     const TArray<FRenderObject>* TranslucentObjects = nullptr;
 
+    /// 阴影投射体 (只读) — 未经相机视锥剔除的不透明与蒙版批次
+    const TArray<FRenderObject>* ShadowCasterObjects = nullptr;
+
     /// set 0 描述符集 — ViewProj UBO + 纹理 (对应当前 FrameIndex)
     FRHIDescriptorSetHandle ViewProjDescriptorSet;
 

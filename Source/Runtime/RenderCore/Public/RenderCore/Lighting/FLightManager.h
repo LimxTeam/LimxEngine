@@ -131,14 +131,8 @@ public:
     /// 因此片段着色器拿到的矩阵与本帧实际绘制阴影贴图用的矩阵必然一致 ——
     /// 两者若来自不同时刻, 阴影会整体偏移一帧, 表现为快速移动时阴影"拖尾"。
     ///
-    /// @param shadowViewProj 光源的视图投影矩阵
-    /// @param depthBias      深度偏移, 抵消自遮挡
-    /// @param normalBias     法线偏移, 处理掠射角
-    /// @param shadowMapSize  阴影贴图边长 (像素)
-    void SetShadowMatrix(const FMatrix& shadowViewProj,
-                         Float32 depthBias,
-                         Float32 normalBias,
-                         Float32 shadowMapSize);
+    /// @param info 级联矩阵、切分距离与偏移参数
+    void SetShadowInfo(const FCascadedShadowInfo& info);
 
     /// 关闭阴影 — 片段着色器将全部按无遮挡处理
     void DisableShadow() { m_IsShadowEnabled = false; }
@@ -176,12 +170,9 @@ private:
 
     FRHIDescSetLayoutHandle     m_DescSetLayout;
     
-    /// 主方向光的阴影矩阵与参数 —— 随光照 UBO 一同上传
-    FMatrix m_ShadowViewProj;
-    Float32 m_ShadowDepthBias  = 0.0015f;
-    Float32 m_ShadowNormalBias = 0.05f;
-    Float32 m_ShadowMapSize    = 2048.0f;
-    bool    m_IsShadowEnabled  = false;
+    /// 主方向光的级联阴影数据 —— 随光照 UBO 一同上传
+    FCascadedShadowInfo m_ShadowInfo;
+    bool                m_IsShadowEnabled = false;
 
     /// RHI 设备 (非拥有指针)
     IRHIDevice*                 m_Device = nullptr;

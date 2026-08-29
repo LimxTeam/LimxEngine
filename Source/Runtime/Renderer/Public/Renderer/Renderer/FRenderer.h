@@ -272,6 +272,12 @@ public:
         return m_TranslucentObjects;
     }
 
+    /// 替换本帧的阴影投射体列表 (未经相机剔除)
+    void SetShadowCasterObjects(const TArray<FRenderObject>& objects)
+    {
+        m_ShadowCasterObjects = objects;
+    }
+
     /// 设置场景世界包围盒 — 阴影正交视锥据此拟合
     ///
     /// 由 FSceneManager 在收集批次时顺带算出。给得过大浪费阴影贴图精度,
@@ -356,6 +362,7 @@ private:
     // ---- 本帧渲染视图 (非拥有 —— GPU 资源归 FRenderResourceManager) ----
     TArray<FRenderObject>             m_RenderObjects;
     TArray<FRenderObject>             m_TranslucentObjects;
+    TArray<FRenderObject>             m_ShadowCasterObjects;
 
     // ---- Uniform Buffer (每帧一个用于 View+Proj 矩阵) ----
     TArray<FRHIBufferHandle>          m_UniformBuffers;

@@ -339,10 +339,18 @@ void FLightManager::UploadLightData(
     uboData.AmbientIntensity = 1.0f;
 
     // 阴影 —— 矩阵与参数由渲染器在阴影 Pass 之后写入本管理器
-    uboData.ShadowViewProj    = m_ShadowViewProj;
-    uboData.ShadowDepthBias   = m_ShadowDepthBias;
-    uboData.ShadowNormalBias  = m_ShadowNormalBias;
-    uboData.ShadowMapSize     = m_ShadowMapSize;
+    for (UInt32 i = 0; i < FLightingUBO::kShadowCascadeCount; ++i)
+    {
+        uboData.CascadeViewProj[i] = m_ShadowInfo.CascadeViewProj[i];
+    }
+
+    uboData.CascadeSplit0 = m_ShadowInfo.CascadeSplits[0];
+    uboData.CascadeSplit1 = m_ShadowInfo.CascadeSplits[1];
+    uboData.CascadeSplit2 = m_ShadowInfo.CascadeSplits[2];
+
+    uboData.ShadowDepthBias   = m_ShadowInfo.DepthBias;
+    uboData.ShadowNormalBias  = m_ShadowInfo.NormalBias;
+    uboData.ShadowMapSize     = m_ShadowInfo.ShadowMapSize;
     uboData.ShadowEnabled     = m_IsShadowEnabled ? 1.0f : 0.0f;
 
     // 映射 UBO 并写入
@@ -357,19 +365,13 @@ void FLightManager::UploadLightData(
 }
 
 // ============================================================================
-// SetShadowMatrix — 记录主方向光的阴影矩阵与参数
+// SetShadowInfo — 记录主方向光的级联阴影数据
 // ============================================================================
 
-void FLightManager::SetShadowMatrix(const FMatrix& shadowViewProj,
-                                     Float32 depthBias,
-                                     Float32 normalBias,
-                                     Float32 shadowMapSize)
+void FLightManager::SetShadowInfo(const FCascadedShadowInfo& info)
 {
-    m_ShadowViewProj   = shadowViewProj;
-    m_ShadowDepthBias  = depthBias;
-    m_ShadowNormalBias = normalBias;
-    m_ShadowMapSize    = shadowMapSize;
-    m_IsShadowEnabled  = true;
+    m_ShadowInfo      = info;
+    m_IsShadowEnabled = true;
 }
 
 // ============================================================================

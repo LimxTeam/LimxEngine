@@ -100,6 +100,7 @@ void FSceneManager::Shutdown()
     m_Stats    = FSceneSyncStats();
     m_SceneRenderObjects.Clear();
     m_TranslucentObjects.Clear();
+    m_ShadowCasterObjects.Clear();
     LIMX_LOG(LogEngine, Log, "[FSceneManager] 已关闭");
 }
 
@@ -128,6 +129,23 @@ void FSceneManager::SyncScene(const LScene* scene, Float32 deltaTime)
     CollectBatches(scene);
 
     // 3. 视锥剔除
+    //
+    // 剔除**之前**先留一份给阴影 —— 相机背后的物体照样会把影子投进画面,
+    // 用剔除后的列表画阴影贴图, 这些投射体会直接消失。
+    //
+    // 顺带滤掉半透明: 把玻璃画进深度图, 它在地面上会留下一块实心黑影。
+    // 这一步必须在这里做而不能等 PartitionBatches —— 那时列表已被剔除
+    // 压缩过了。
+    m_ShadowCasterObjects.Clear();
+
+    for (SizeType i = 0; i < m_SceneRenderObjects.GetSize(); ++i)
+    {
+        if (!IsBlendedMode(m_SceneRenderObjects[i].BlendMode))
+        {
+            m_ShadowCasterObjects.Add(m_SceneRenderObjects[i]);
+        }
+    }
+
     if (m_IsCullingEnabled)
     {
         CullBatches(frustum);
@@ -152,6 +170,7 @@ void FSceneManager::SyncScene(const LScene* scene, Float32 deltaTime)
     // 7. 推送
     m_Renderer->SetRenderObjects(m_SceneRenderObjects);
     m_Renderer->SetTranslucentObjects(m_TranslucentObjects);
+    m_Renderer->SetShadowCasterObjects(m_ShadowCasterObjects);
     m_Renderer->SetSceneBounds(m_Stats.SceneBounds);
 
     // 只在可见批次数变化时输出 —— 每帧一行会淹没日志, 而"批次数突然变成 0"

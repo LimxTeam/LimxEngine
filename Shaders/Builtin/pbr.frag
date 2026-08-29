@@ -66,17 +66,20 @@ layout(row_major, set = 2, binding = 0) uniform LightingUBO {
     vec4      lightCountVec;   // x=光源数量
     vec4      cameraPosition;  // xyz=相机世界位置
     vec4      ambientColor;    // xyz=环境光颜色, w=环境光强度
-    mat4      shadowViewProj;  // 主方向光的视图投影矩阵
-    vec4      shadowParams;    // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
+    mat4      cascadeViewProj[3];  // 各级联的视图投影矩阵
+    vec4      cascadeSplits;         // xyz=各级外边界的径向距离
+    vec4      shadowParams;          // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
 } lighting;
 
-// ── 阴影贴图 (set 2, binding 1) ──
+// ── 阴影贴图数组 (set 2, binding 1) ──
 //
-// sampler2DShadow 而非 sampler2D: 采样时硬件直接做深度比较并在 2x2 邻域
-// 上求平均, 返回 0~1 的通过比例。用普通采样器手写比较的话, 拿到的是
-// 四个纹素线性插值后的**深度值**, 再与参考深度比较 —— 那等于在深度域
+// sampler2DArrayShadow 而非 sampler2DArray: 采样时硬件直接做深度比较并在
+// 2x2 邻域上求平均, 返回 0~1 的通过比例。用普通采样器手写比较的话, 拿到的
+// 是四个纹素线性插值后的**深度值**, 再与参考深度比较 —— 那等于在深度域
 // 里插值, 边缘会出现明显的阶梯。
-layout(set = 2, binding = 1) uniform sampler2DShadow shadowMap;
+layout(set = 2, binding = 1) uniform sampler2DArrayShadow shadowMap;
+
+const int SHADOW_CASCADE_COUNT = 3;
 
 // ── 片段着色器输出 ──
 layout(location = 0) out vec4 outColor;
@@ -288,12 +291,43 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
     float normalBias = lighting.shadowParams.y;
     float mapSize    = max(lighting.shadowParams.z, 1.0);
 
+    // ---- 选级 ----
+    //
+    // 按到相机的径向距离而非视空间 Z: 级联体积是按包围球拟合的, 球以径向
+    // 距离定义。两者口径不一致时, 切片角落会选到未覆盖该处的级别,
+    // 表现为视野边缘出现一圈错误阴影。
+    float viewDistance = length(worldPos - lighting.cameraPosition.xyz);
+
+    int cascade = SHADOW_CASCADE_COUNT - 1;
+
+    if (viewDistance < lighting.cascadeSplits.x)
+    {
+        cascade = 0;
+    }
+    else if (viewDistance < lighting.cascadeSplits.y)
+    {
+        cascade = 1;
+    }
+
+    // 超出最后一级的覆盖范围 —— 判为无遮挡, 而不是硬套最后一级。
+    // 硬套的话, 远处会采到贴图边界外的值, 呈现为一道贯穿地平线的假阴影。
+    if (viewDistance > lighting.cascadeSplits.z)
+    {
+        return 1.0;
+    }
+
     float NdotL = clamp(dot(normal, lightDir), 0.0, 1.0);
 
-    // 沿法线推出采样点 —— 掠射角(NdotL 小)时推得更远
-    vec3 offsetPos = worldPos + normal * (normalBias * (1.0 - NdotL) + normalBias * 0.2);
+    // 法线偏移随级别放大 —— 每级的纹素世界尺寸约按切分比例增长,
+    // 用同一个偏移量的话, 远处那级仍会有 acne。
+    float cascadeScale = 1.0;
+    if (cascade == 1) { cascadeScale = 2.5; }
+    else if (cascade == 2) { cascadeScale = 6.0; }
 
-    vec4 shadowClip = lighting.shadowViewProj * vec4(offsetPos, 1.0);
+    vec3 offsetPos = worldPos +
+                     normal * (normalBias * cascadeScale * (1.0 - NdotL * 0.5));
+
+    vec4 shadowClip = lighting.cascadeViewProj[cascade] * vec4(offsetPos, 1.0);
 
     // 正交投影下 w 恒为 1, 但保留除法以便将来换成透视光源
     vec3 projected = shadowClip.xyz / shadowClip.w;
@@ -302,8 +336,6 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
     vec2 shadowUV = projected.xy * 0.5 + 0.5;
     float receiverDepth = projected.z;
 
-    // 超出阴影贴图范围或在光源近平面之前 —— 判为无遮挡。
-    // 不做这个判断的话, 场景边缘会被边框颜色或环绕采样染上假阴影。
     if (receiverDepth > 1.0 || receiverDepth < 0.0)
     {
         return 1.0;
@@ -311,19 +343,22 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
 
     // 深度偏移随掠射角增大 —— tan(acos(NdotL)) 的廉价近似
     float slopeScale = clamp(1.0 - NdotL, 0.0, 1.0);
-    float bias = depthBias * (1.0 + slopeScale * 4.0);
+    float bias = depthBias * cascadeScale * (1.0 + slopeScale * 4.0);
 
     float compareDepth = receiverDepth - bias;
 
     float texelSize = 1.0 / mapSize;
     float sum = 0.0;
 
+    // 3x3 PCF 叠在硬件的 2x2 之上, 等效 6x6 的滤波足迹
     for (int y = -1; y <= 1; ++y)
     {
         for (int x = -1; x <= 1; ++x)
         {
             vec2 offset = vec2(float(x), float(y)) * texelSize;
-            sum += texture(shadowMap, vec3(shadowUV + offset, compareDepth));
+            sum += texture(shadowMap,
+                           vec4(shadowUV + offset, float(cascade),
+                                compareDepth));
         }
     }
 

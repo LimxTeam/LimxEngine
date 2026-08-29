@@ -129,6 +129,28 @@ static_assert(sizeof(FLightData) == 80,
     "FLightData 必须为 80 字节 (5 × vec4, std140 对齐)");
 
 // ============================================================================
+// FCascadedShadowInfo — 渲染器交给光照系统的级联阴影数据
+// ============================================================================
+
+/// 级联阴影信息
+///
+/// 单独成结构而非一串参数: 参数数量已到七个, 顺序写错编译器不会报错
+/// (都是 Float32/FMatrix), 而症状是阴影整体错位, 极难定位到调用点。
+struct FCascadedShadowInfo
+{
+    static constexpr UInt32 kCascadeCount = 3;
+
+    FMatrix CascadeViewProj[kCascadeCount];
+
+    /// 各级外边界的径向距离
+    Float32 CascadeSplits[kCascadeCount] = {};
+
+    Float32 DepthBias     = 0.0015f;
+    Float32 NormalBias    = 0.05f;
+    Float32 ShadowMapSize = 2048.0f;
+};
+
+// ============================================================================
 // FLightingUBO — 场景级光照 Uniform Buffer (std140, set 2, binding 0)
 //
 // 内存布局:
@@ -137,14 +159,18 @@ static_assert(sizeof(FLightData) == 80,
 //   偏移 1296:   CameraPosition (vec4 的 .xyz) — 相机世界空间位置
 //   偏移 1312:   AmbientColor   (vec4 的 .xyz) — 环境光颜色
 //   偏移 1328:   AmbientIntensity (同上 vec4 的 .w) — 环境光强度
-//   偏移 1328:   ShadowViewProj (mat4) — 主方向光的光源视图投影矩阵
-//   偏移 1392:   ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
+//   偏移 1344:   CascadeViewProj[3] (mat4×3) — 各级联的光源视图投影矩阵
+//   偏移 1536:   CascadeSplits  (vec4) — xyz=各级外边界的径向距离
+//   偏移 1552:   ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
 //                                        z=阴影贴图边长, w=是否启用
-//   总计: 1408 字节
+//   总计: 1568 字节
 //
-// 阴影矩阵放在光照 UBO 而非另建一个: 它逻辑上就是"主方向光的属性",
+// 阴影数据放在光照 UBO 而非另建一个: 它逻辑上就是"主方向光的属性",
 // 且与光源数据在同一个更新时机。单独一个 UBO 意味着多一次绑定、
 // 多一份帧同步, 却没有任何一处需要单独更新它。
+//
+// 注意 std140: mat4 数组的每个元素本就 16 字节对齐, 无需额外填充;
+// 但结构体在数组之前必须已对齐到 16, 因此环境光那一组 vec4 之后正好接上。
 // ============================================================================
 
 struct FLightingUBO
@@ -170,8 +196,21 @@ struct FLightingUBO
     Float32 AmbientColorB    = 0.03f;
     Float32 AmbientIntensity = 1.0f;
 
-    // mat4: 主方向光的视图投影矩阵 —— 把世界坐标变换到阴影贴图空间
-    FMatrix ShadowViewProj;
+    /// 级联层数 — 必须与 FShadowPass::kCascadeCount 及着色器常量一致
+    static constexpr UInt32 kShadowCascadeCount = 3;
+
+    // mat4[3]: 各级联的视图投影矩阵 —— 把世界坐标变换到该级的阴影贴图空间
+    FMatrix CascadeViewProj[kShadowCascadeCount];
+
+    // vec4: xyz=各级外边界的径向距离, w=保留
+    //
+    // 用径向距离而非视空间 Z: 级联体积是按包围球拟合的, 球以径向距离定义。
+    // 两者口径不一致时, 切片角落会选到未覆盖该处的级别, 表现为视野边缘
+    // 出现一圈错误阴影。
+    Float32 CascadeSplit0 = 0.0f;
+    Float32 CascadeSplit1 = 0.0f;
+    Float32 CascadeSplit2 = 0.0f;
+    Float32 CascadeSplitPad = 0.0f;
 
     // vec4: x=深度偏移, y=法线偏移, z=阴影贴图边长, w=是否启用(0/1)
     //
@@ -188,10 +227,10 @@ struct FLightingUBO
 
 // 编译时验证 FLightingUBO 大小
 // 16 × 80 + 3 × 16 = 1280 + 48 = 1328 字节 (光源 + 计数 + 相机 + 环境光)
-// + mat4 阴影矩阵 64 + vec4 阴影参数 16 = 1408 字节
-// std140 要求数组元素与结构体尾部都对齐到 16 字节, 1408 已是 16 的倍数
-static_assert(sizeof(FLightingUBO) == 1408,
-    "FLightingUBO 必须为 1408 字节 (std140 对齐)");
+// + mat4×3 级联矩阵 192 + vec4 切分 16 + vec4 阴影参数 16 = 1552 字节
+// std140 要求数组元素与结构体尾部都对齐到 16 字节, 1552 已是 16 的倍数
+static_assert(sizeof(FLightingUBO) == 1552,
+    "FLightingUBO 必须为 1552 字节 (std140 对齐)");
 
 // ============================================================================
 // FLight — CPU 侧光源对象

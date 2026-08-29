@@ -164,6 +164,7 @@ void FPassManager::ExecuteAll(IRHICommandBuffer*     commandBuffer,
     context.SwapchainExtent        = info.SwapchainExtent;
     context.RenderObjects          = info.RenderObjects;
     context.TranslucentObjects     = info.TranslucentObjects;
+    context.ShadowCasterObjects    = info.ShadowCasterObjects;
     context.ViewProjDescriptorSet  = info.ViewProjDescriptorSet;
     context.PipelineLayout         = info.PipelineLayout;
     context.LightingDescriptorSet  = info.LightingDescriptorSet;

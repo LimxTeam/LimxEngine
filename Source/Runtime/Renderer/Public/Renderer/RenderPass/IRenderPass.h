@@ -104,6 +104,12 @@ struct FRenderPassContext
     /// 不透明按状态聚类以减少绑定, 半透明必须严格由远及近。
     const TArray<FRenderObject>* TranslucentObjects = nullptr;
 
+    /// 阴影投射体 (只读) — **未经相机视锥剔除**的不透明与蒙版批次
+    ///
+    /// 相机背后的物体照样会把影子投进画面, 因此阴影 Pass 不能用相机剔除后
+    /// 的列表。这里给的是剔除前的全量, 由阴影 Pass 各自按光源视锥再剔一次。
+    const TArray<FRenderObject>* ShadowCasterObjects = nullptr;
+
     /// set 0 的描述符集 — 含 ViewProj UBO (binding 0) 和纹理 (binding 1)
     /// 由 FPassManager::ExecuteAll 从帧数据中取出并填入
     FRHIDescriptorSetHandle ViewProjDescriptorSet;
