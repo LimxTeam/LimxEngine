@@ -129,9 +129,86 @@ public:
         m_TotalAllocated--;
     }
 
+    /// 重分配 — 定长块分配器的语义受限实现
+    ///
+    /// 定长块无法扩展: 每块尺寸在构造时固定, 相邻块另有归属。
+    /// 因此仅在新尺寸仍能放进一块时返回原指针 (无需搬迁),
+    /// 否则按 IAllocator 契约返回 nullptr 并保持原内存不变。
+    /// 需要变长存储的调用方应改用 FPoolAllocator 或默认分配器。
+    LIMX_NODISCARD void* Reallocate(
+        void* pointer,
+        SizeType newSize,
+        SizeType alignment = kDefaultAlignment) override
+    {
+        LIMX_UNUSED(alignment);
+
+        if (newSize == 0)
+        {
+            Deallocate(pointer);
+            return nullptr;
+        }
+
+        if (pointer == nullptr)
+        {
+            return Allocate(newSize, alignment);
+        }
+
+        // 新尺寸仍在一块之内 — 原地满足, 无需任何搬迁
+        if (newSize <= m_BlockSize)
+        {
+            return pointer;
+        }
+
+        // 超出块容量 — 无法满足, 原内存保持有效
+        return nullptr;
+    }
+
+    LIMX_NODISCARD const AnsiChar* GetName() const override
+    {
+        return "BlockAllocator";
+    }
+
     // ========================================================================
     // 状态查询
     // ========================================================================
+
+    /// 判断指针是否由本分配器分出
+    ///
+    /// 遍历页链表做地址区间与块边界双重校验。供上层分配器 (如 FPoolAllocator)
+    /// 在只有指针、没有原始尺寸时定位归属桶, 从而避免把本分配器的内存
+    /// 错误地交给其他分配器释放。
+    ///
+    /// 复杂度 O(页数); 页数 = 已分配块数 / 每页块数, 实际使用中很小。
+    LIMX_NODISCARD bool Owns(const void* pointer) const
+    {
+        if (pointer == nullptr)
+        {
+            return false;
+        }
+
+        const UInt8* target = static_cast<const UInt8*>(pointer);
+        const SizeType pageDataSize = m_BlockSize * m_BlocksPerPage;
+
+        for (const PageHeader* page = m_PageList;
+             page != nullptr;
+             page = page->NextPage)
+        {
+            const UInt8* dataBegin =
+                reinterpret_cast<const UInt8*>(page) + sizeof(PageHeader);
+            const UInt8* dataEnd = dataBegin + pageDataSize;
+
+            if (target < dataBegin || target >= dataEnd)
+            {
+                continue;
+            }
+
+            // 落在页内还需对齐到块边界 — 页中间的任意地址不是合法块起点
+            const SizeType offset = static_cast<SizeType>(target - dataBegin);
+            return (offset % m_BlockSize) == 0;
+        }
+
+        return false;
+    }
 
     /// 每块字节数
     LIMX_NODISCARD SizeType GetBlockSize() const { return m_BlockSize; }

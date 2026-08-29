@@ -33,6 +33,7 @@
 #include "Core/Memory/IAllocator.h"
 #include "Core/Memory/DefaultAllocator.h"
 #include "Core/Memory/TFreeList.h"
+#include "Core/Memory/MemoryOps.h"
 
 namespace Limx
 {
@@ -101,15 +102,94 @@ public:
         return m_Fallback->Allocate(size, alignment);
     }
 
+    /// 释放 — 不带尺寸信息的 IAllocator 标准入口
+    ///
+    /// 必须先定位指针归属的桶再释放。早期实现直接转交 m_Fallback，
+    /// 那会把桶内 chunk 里的地址当作独立堆块归还给系统分配器，
+    /// 造成堆损坏; 而通过 IAllocator 接口多态使用本分配器的调用方
+    /// (如注入到容器) 走的正是这条无尺寸路径, 因此该缺陷必然被触发。
+    ///
+    /// 现按桶逐个询问归属: 命中则由该桶回收, 全部未命中才说明是
+    /// 超出池管理范围、当初由 m_Fallback 分出的大块。
     void Deallocate(void* ptr) override
     {
         if (!ptr) return;
 
-        // 检查是否属于某个桶
-        // 注: 简化实现 — 调用者需要知道原始大小
-        // 实际使用中建议配合 TObjectPool 或已知大小的场景
-        // 此处回退到底层分配器
+        for (SizeType index = 0; index < kBucketCount; ++index)
+        {
+            if (m_Buckets[index] && m_Buckets[index]->Owns(ptr))
+            {
+                m_Buckets[index]->Deallocate(ptr);
+                return;
+            }
+        }
+
+        // 无桶认领 — 只可能来自超大分配的回退路径
         m_Fallback->Deallocate(ptr);
+    }
+
+    /// 重分配 — 按新尺寸重新选桶并搬迁数据
+    ///
+    /// 旧块尺寸由其归属桶的块大小给出, 因此无需调用方提供原始尺寸;
+    /// 拷贝量取新旧尺寸的较小者, 避免读越界。
+    LIMX_NODISCARD void* Reallocate(
+        void* ptr,
+        SizeType newSize,
+        SizeType alignment = kDefaultAlignment) override
+    {
+        if (ptr == nullptr)
+        {
+            return Allocate(newSize, alignment);
+        }
+
+        if (newSize == 0)
+        {
+            Deallocate(ptr);
+            return nullptr;
+        }
+
+        // 定位旧块所在桶以获知其容量
+        SizeType oldCapacity = 0;
+        SizeType ownerBucket = kBucketCount;
+
+        for (SizeType index = 0; index < kBucketCount; ++index)
+        {
+            if (m_Buckets[index] && m_Buckets[index]->Owns(ptr))
+            {
+                oldCapacity = m_Buckets[index]->GetBlockSize();
+                ownerBucket = index;
+                break;
+            }
+        }
+
+        if (ownerBucket == kBucketCount)
+        {
+            // 不属于任何桶 — 原先走的是回退分配器, 继续交给它处理
+            return m_Fallback->Reallocate(ptr, newSize, alignment);
+        }
+
+        // 新尺寸仍在原块容量内 — 无需搬迁
+        if (newSize <= oldCapacity)
+        {
+            return ptr;
+        }
+
+        void* newBlock = Allocate(newSize, alignment);
+        if (newBlock == nullptr)
+        {
+            // 分配失败时原内存必须保持有效
+            return nullptr;
+        }
+
+        Memory::MemCopy(newBlock, ptr, oldCapacity);
+        m_Buckets[ownerBucket]->Deallocate(ptr);
+
+        return newBlock;
+    }
+
+    LIMX_NODISCARD const AnsiChar* GetName() const override
+    {
+        return "FPoolAllocator";
     }
 
     /// 带大小信息的释放 — 路由到正确的桶

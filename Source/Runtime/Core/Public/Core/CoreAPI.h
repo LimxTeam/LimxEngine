@@ -11,6 +11,10 @@
  *
  * 设计哲学:
  *   模块编译时定义 LIMX_xxx_EXPORTS 宏，自动切换导出/导入
+ *   静态库额外定义 LIMX_xxx_STATIC，该宏优先级最高使 API 展开为空 ——
+ *   LBT 对静态库会同时定义 _STATIC 与模块 toml 中声明的 _EXPORTS，
+ *   若 _EXPORTS 判断在前，静态库会被错误地按 dllexport 编译，
+ *   进而对含模板成员的导出类触发 C4251
  *   静态库编译时所有 API 宏展开为空
  *
  * 技术特性:
@@ -47,28 +51,28 @@
 // ============================================================================
 
 // --- LimxCore ---
-#if defined(LIMX_CORE_EXPORTS)
-    #define LIMX_CORE_API LIMX_DLLEXPORT
-#elif defined(LIMX_CORE_STATIC)
+#if defined(LIMX_CORE_STATIC)
     #define LIMX_CORE_API
+#elif defined(LIMX_CORE_EXPORTS)
+    #define LIMX_CORE_API LIMX_DLLEXPORT
 #else
     #define LIMX_CORE_API LIMX_DLLIMPORT
 #endif
 
 // --- LimxRHI (渲染硬件接口) ---
-#if defined(LIMX_RHI_EXPORTS)
-    #define LIMX_RHI_API LIMX_DLLEXPORT
-#elif defined(LIMX_RHI_STATIC)
+#if defined(LIMX_RHI_STATIC)
     #define LIMX_RHI_API
+#elif defined(LIMX_RHI_EXPORTS)
+    #define LIMX_RHI_API LIMX_DLLEXPORT
 #else
     #define LIMX_RHI_API LIMX_DLLIMPORT
 #endif
 
 // --- LimxRenderer (渲染器) ---
-#if defined(LIMX_RENDERER_EXPORTS)
-    #define LIMX_RENDERER_API LIMX_DLLEXPORT
-#elif defined(LIMX_RENDERER_STATIC)
+#if defined(LIMX_RENDERER_STATIC)
     #define LIMX_RENDERER_API
+#elif defined(LIMX_RENDERER_EXPORTS)
+    #define LIMX_RENDERER_API LIMX_DLLEXPORT
 #else
     #define LIMX_RENDERER_API LIMX_DLLIMPORT
 #endif

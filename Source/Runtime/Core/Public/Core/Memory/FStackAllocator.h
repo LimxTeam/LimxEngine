@@ -84,8 +84,19 @@ public:
         LIMX_ASSERT(size > 0);
         LIMX_ASSERT(alignment > 0 && (alignment & (alignment - 1)) == 0);
 
-        // 对齐栈顶
-        SizeType aligned = (m_Top + alignment - 1) & ~(alignment - 1);
+        // 必须按绝对地址对齐, 而非按缓冲区内偏移对齐。
+        //
+        // 底层缓冲区仅保证 16 字节对齐, 若只把 m_Top 向上取整到 alignment,
+        // 则 m_Buffer + alignedTop 在 alignment > 16 (AVX 的 32、AVX-512 的 64)
+        // 时并不满足请求对齐, 调用方用对齐加载指令访问会直接崩溃。
+        const UInt64 baseAddress = reinterpret_cast<UInt64>(m_Buffer);
+        const UInt64 currentAddress = baseAddress + static_cast<UInt64>(m_Top);
+        const UInt64 alignmentMask = static_cast<UInt64>(alignment) - 1;
+        const UInt64 alignedAddress =
+            (currentAddress + alignmentMask) & ~alignmentMask;
+
+        const SizeType aligned =
+            static_cast<SizeType>(alignedAddress - baseAddress);
 
         if (aligned + size > m_Capacity)
         {

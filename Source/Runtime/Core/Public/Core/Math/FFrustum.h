@@ -70,31 +70,40 @@ struct FFrustum
     FFrustum() = default;
 
     /// 从视图-投影矩阵提取 6 个裁剪平面 (Gribb/Hartmann 方法)
-    /// @param viewProjection 视图矩阵 × 投影矩阵 (行主序)
+    ///
+    /// 传入的必须是 **投影 × 视图** 的乘积 —— 引擎的矩阵是列向量语义
+    /// (clip = P · V · v), 顺序写反会得到一个与相机毫无关系的裁剪体。
+    ///
+    /// 近平面按 Vulkan 的深度约定提取。裁剪条件是:
+    ///   -w ≤ x ≤ w,  -w ≤ y ≤ w,  **0 ≤ z ≤ w**
+    /// 最后一条与 OpenGL 的 -w ≤ z 不同, 因此近平面是 row2 本身而非
+    /// row3 + row2。用 OpenGL 的式子不会漏掉可见物体, 但近平面会退化到
+    /// 相机身后, 剔除率白白损失一截。
+    ///
+    /// @param projectionView 投影矩阵 × 视图矩阵 (行主序)
     LIMX_NODISCARD static FFrustum FromViewProjection(
-        const FMatrix& viewProjection)
+        const FMatrix& projectionView)
     {
         FFrustum frustum;
 
         // 行主序矩阵: M[row][col]
         // 左平面:   row3 + row0
         frustum.Planes[0] = ExtractPlane(
-            viewProjection, 3, 0, 1.0f);
+            projectionView, 3, 0, 1.0f);
         // 右平面:   row3 - row0
         frustum.Planes[1] = ExtractPlane(
-            viewProjection, 3, 0, -1.0f);
+            projectionView, 3, 0, -1.0f);
         // 下平面:   row3 + row1
         frustum.Planes[2] = ExtractPlane(
-            viewProjection, 3, 1, 1.0f);
+            projectionView, 3, 1, 1.0f);
         // 上平面:   row3 - row1
         frustum.Planes[3] = ExtractPlane(
-            viewProjection, 3, 1, -1.0f);
-        // 近平面:   row3 + row2
-        frustum.Planes[4] = ExtractPlane(
-            viewProjection, 3, 2, 1.0f);
+            projectionView, 3, 1, -1.0f);
+        // 近平面:   row2 (Vulkan 深度范围 [0, 1])
+        frustum.Planes[4] = PlaneFromRow(projectionView, 2);
         // 远平面:   row3 - row2
         frustum.Planes[5] = ExtractPlane(
-            viewProjection, 3, 2, -1.0f);
+            projectionView, 3, 2, -1.0f);
 
         // 归一化所有平面
         for (Int32 index = 0; index < kPlaneCount; ++index)
@@ -222,6 +231,13 @@ struct FFrustum
 private:
     /// 从矩阵提取平面辅助
     /// rowA ± rowB 的组合
+    /// 取单行作为平面 — 近平面在 Vulkan 深度约定下只用到 row2
+    static FPlane PlaneFromRow(const FMatrix& m, Int32 row)
+    {
+        return FPlane(FVector3(m.M[row][0], m.M[row][1], m.M[row][2]),
+                      m.M[row][3]);
+    }
+
     static FPlane ExtractPlane(const FMatrix& m,
                                 Int32 rowA, Int32 rowB,
                                 Float32 sign)

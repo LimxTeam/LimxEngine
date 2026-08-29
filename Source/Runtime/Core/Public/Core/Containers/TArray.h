@@ -291,16 +291,41 @@ public:
     /// @return 新元素的索引
     SizeType Add(const T& element)
     {
-        EnsureCapacity(m_Size + 1);
-        new (m_Data + m_Size) T(element);
+        // 自引用安全: element 可能指向本数组内部 (例如 values.Add(values[0])
+        // 或 LZ77 反向引用那样从已写入区域回读)。扩容会释放旧缓冲区，
+        // 使传入的引用悬垂，随后的拷贝构造读到的是已释放内存。
+        // 因此需要扩容时先把值搬到临时对象，再从临时对象移入新位置。
+        if (m_Size >= m_Capacity)
+        {
+            T temporary(element);
+
+            EnsureCapacity(m_Size + 1);
+            new (m_Data + m_Size) T(MoveTemp(temporary));
+        }
+        else
+        {
+            new (m_Data + m_Size) T(element);
+        }
+
         return m_Size++;
     }
 
     /// 在末尾追加元素 (移动)
     SizeType Add(T&& element)
     {
-        EnsureCapacity(m_Size + 1);
-        new (m_Data + m_Size) T(MoveTemp(element));
+        // 同 Add(const T&): 右值引用同样可能绑定到本数组内部的元素
+        if (m_Size >= m_Capacity)
+        {
+            T temporary(MoveTemp(element));
+
+            EnsureCapacity(m_Size + 1);
+            new (m_Data + m_Size) T(MoveTemp(temporary));
+        }
+        else
+        {
+            new (m_Data + m_Size) T(MoveTemp(element));
+        }
+
         return m_Size++;
     }
 

@@ -432,26 +432,38 @@ struct FMatrix
         );
     }
 
-    /// 透视投影矩阵 (Vulkan NDC: Y 翻转, Z 范围 [0, 1])
+    /// 透视投影矩阵 (右手系视空间 + Vulkan NDC: Y 翻转, Z 范围 [0, 1])
+    ///
+    /// 手性必须与 LookAt 一致 —— LookAt 产出的视空间以 -Z 为前方,
+    /// 相机前方的点视空间 z 为负。若这里按 +Z 前方 (D3D 风格) 构造,
+    /// 每个可见点的裁剪空间 w 都是负数, 会被整体裁掉:
+    /// 屏幕上只剩清屏色, 而校验层不会报任何错误。
+    ///
     /// @param fovY         垂直视场角 (弧度)
     /// @param aspectRatio  宽高比
-    /// @param nearPlane    近裁剪面
-    /// @param farPlane     远裁剪面
+    /// @param nearPlane    近裁剪面 (正数)
+    /// @param farPlane     远裁剪面 (正数)
     LIMX_NODISCARD static FMatrix Perspective(Float32 fovY, Float32 aspectRatio,
                                                Float32 nearPlane, Float32 farPlane)
     {
         Float32 tanHalfFov = FMath::Tan(fovY * 0.5f);
-        Float32 rangeInv = 1.0f / (farPlane - nearPlane);
+
+        // near - far 为负 —— 右手系下 z' = A*z + B 需要 A、B 同为负值,
+        // 才能把 z ∈ [-far, -near] 映射到深度 [1, 0] 的正确朝向。
+        Float32 rangeInv = 1.0f / (nearPlane - farPlane);
 
         return FMatrix(
             1.0f / (aspectRatio * tanHalfFov), 0.0f,                  0.0f,                            0.0f,
             0.0f,                              -1.0f / tanHalfFov,    0.0f,                            0.0f,
-            0.0f,                              0.0f,                  farPlane * rangeInv,             -farPlane * nearPlane * rangeInv,
-            0.0f,                              0.0f,                  1.0f,                            0.0f
+            0.0f,                              0.0f,                  farPlane * rangeInv,             farPlane * nearPlane * rangeInv,
+            0.0f,                              0.0f,                  -1.0f,                           0.0f
         );
     }
 
-    /// 正交投影矩阵 (Vulkan NDC)
+    /// 正交投影矩阵 (右手系视空间 + Vulkan NDC)
+    ///
+    /// 与 Perspective 同理: 视空间 -Z 为前方, 因此深度项取负号,
+    /// 把 z ∈ [-far, -near] 映射到 [1, 0]。
     LIMX_NODISCARD static FMatrix Ortho(Float32 left, Float32 right,
                                          Float32 bottom, Float32 top,
                                          Float32 nearPlane, Float32 farPlane)
@@ -461,10 +473,10 @@ struct FMatrix
         Float32 invFN = 1.0f / (farPlane - nearPlane);
 
         return FMatrix(
-            2.0f * invRL, 0.0f,          0.0f,     -(right + left) * invRL,
-            0.0f,        -2.0f * invTB,  0.0f,      (top + bottom) * invTB,
-            0.0f,         0.0f,          invFN,     -nearPlane * invFN,
-            0.0f,         0.0f,          0.0f,      1.0f
+            2.0f * invRL, 0.0f,          0.0f,      -(right + left) * invRL,
+            0.0f,        -2.0f * invTB,  0.0f,       (top + bottom) * invTB,
+            0.0f,         0.0f,         -invFN,     -nearPlane * invFN,
+            0.0f,         0.0f,          0.0f,       1.0f
         );
     }
 };

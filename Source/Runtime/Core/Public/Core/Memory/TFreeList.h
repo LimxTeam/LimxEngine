@@ -141,19 +141,63 @@ public:
     }
 
     /// 活跃块数 (已分配 - 空闲)
+    /// 判断指针是否由本自由列表分出
+    ///
+    /// 遍历 chunk 链表做地址区间与块边界双重校验。上层分配器在只持有指针、
+    /// 不知道原始尺寸时靠它定位归属, 从而避免把本列表的内存错误地交给
+    /// 其他分配器释放 (那会直接损坏堆)。
+    ///
+    /// 复杂度 O(chunk 数); chunk 数 = 总块数 / 每 chunk 块数, 实际很小。
+    LIMX_NODISCARD bool Owns(const void* ptr) const
+    {
+        if (ptr == nullptr)
+        {
+            return false;
+        }
+
+        const UInt8* target = static_cast<const UInt8*>(ptr);
+        const SizeType headerSize = GetChunkHeaderSize();
+        const SizeType dataSize   = m_BlockSize * m_BlocksPerChunk;
+
+        for (const Chunk* chunk = m_ChunkHead;
+             chunk != nullptr;
+             chunk = chunk->Next)
+        {
+            const UInt8* dataBegin =
+                reinterpret_cast<const UInt8*>(chunk) + headerSize;
+            const UInt8* dataEnd = dataBegin + dataSize;
+
+            if (target < dataBegin || target >= dataEnd)
+            {
+                continue;
+            }
+
+            // 落在 chunk 内还需对齐到块边界 — 块中间的地址不是合法起点
+            const SizeType offset = static_cast<SizeType>(target - dataBegin);
+            return (offset % m_BlockSize) == 0;
+        }
+
+        return false;
+    }
+
     LIMX_NODISCARD SizeType GetActiveCount() const
     {
         return m_TotalBlocks - m_FreeCount;
     }
 
 private:
+    /// Chunk 头的对齐后尺寸 — GrowChunk 与 Owns 必须使用同一算法,
+    /// 否则 Owns 计算出的数据区起点会与实际布局错位
+    LIMX_NODISCARD SizeType GetChunkHeaderSize() const
+    {
+        return (sizeof(Chunk) + m_Alignment - 1) & ~(m_Alignment - 1);
+    }
+
     /// 分配新的 Chunk 并切分为空闲块
     void GrowChunk()
     {
         // Chunk 布局: [Chunk 头] + [Block × blocksPerChunk]
-        SizeType headerSize = sizeof(Chunk);
-        headerSize = (headerSize + m_Alignment - 1) &
-                     ~(m_Alignment - 1);
+        SizeType headerSize = GetChunkHeaderSize();
 
         SizeType totalSize = headerSize +
                              m_BlockSize * m_BlocksPerChunk;

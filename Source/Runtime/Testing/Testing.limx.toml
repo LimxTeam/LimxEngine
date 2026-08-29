@@ -1,0 +1,32 @@
+[module]
+name        = "LimxTesting"
+type        = "static"
+namespace   = "Limx"
+api_macro   = "LIMX_TESTING_API"
+layer       = 2
+description = "测试框架 — 零 STL 单元测试基础设施 (用例注册/断言/运行器/分配追踪)，仅供 Source/Tests 下的测试可执行文件链接，不进入引擎运行时"
+
+[dependencies]
+public  = ["LimxCore"]
+private = []
+
+[sources]
+include_dirs = ["Public"]
+private_dirs = ["Private"]
+exclude      = ["*.generated.*"]
+
+[compile]
+defines       = ["LIMX_TESTING_EXPORTS"]
+features      = []
+flags         = []
+include_paths = []
+library_paths = []
+libraries     = []
+
+[precompiled_header]
+enabled = true
+header  = "Testing/TestingMinimal.h"
+
+[reflection]
+enabled = false
+macros  = []

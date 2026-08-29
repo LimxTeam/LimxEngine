@@ -39,6 +39,38 @@ namespace Limx
 
 /// 格式化参数 — 将各种类型转换为字符串片段
 /// 内联 64 字节缓冲区，大多数数值转换不触发堆分配
+/// 十六进制格式化包装
+///
+/// StringFormat 的占位符只有 {} 一种形式，不解析 {:X} 之类的格式说明符。
+/// 图形编程中格式枚举、内存类型掩码、资源句柄几乎都以十六进制阅读，
+/// 因此用一个显式包装类型表达意图: StringFormat("掩码 {}", FHex(mask))。
+struct FHex
+{
+    /// 待格式化的值
+    UInt64 Value = 0;
+
+    /// 最少输出的十六进制位数, 不足时前补零; 0 表示不补
+    UInt32 MinDigits = 0;
+
+    explicit FHex(UInt64 value, UInt32 minDigits = 0)
+        : Value(value)
+        , MinDigits(minDigits)
+    {
+    }
+
+    explicit FHex(UInt32 value, UInt32 minDigits = 0)
+        : Value(static_cast<UInt64>(value))
+        , MinDigits(minDigits)
+    {
+    }
+
+    explicit FHex(Int32 value, UInt32 minDigits = 0)
+        : Value(static_cast<UInt64>(static_cast<UInt32>(value)))
+        , MinDigits(minDigits)
+    {
+    }
+};
+
 class FStringFormatArg
 {
     static constexpr SizeType kBufferSize = 64;
@@ -142,6 +174,39 @@ public:
         m_Buffer[1] = 'x';
         m_Length = 2 + FormatHex(m_Buffer + 2, kBufferSize - 2,
                                   reinterpret_cast<UInt64>(pointer));
+        m_Buffer[m_Length] = '\0';
+    }
+
+    FStringFormatArg(const FHex& hex)
+    {
+        m_Buffer[0] = '0';
+        m_Buffer[1] = 'x';
+
+        const SizeType digits = FormatHex(m_Buffer + 2, kBufferSize - 2,
+                                          hex.Value);
+
+        // 需要补零时把已写入的数字整体右移, 空出的高位填 '0'
+        if (hex.MinDigits > digits && (2 + hex.MinDigits) < kBufferSize)
+        {
+            const SizeType padding = hex.MinDigits - digits;
+
+            for (SizeType i = digits; i > 0; --i)
+            {
+                m_Buffer[2 + padding + i - 1] = m_Buffer[2 + i - 1];
+            }
+
+            for (SizeType i = 0; i < padding; ++i)
+            {
+                m_Buffer[2 + i] = '0';
+            }
+
+            m_Length = 2 + hex.MinDigits;
+        }
+        else
+        {
+            m_Length = 2 + digits;
+        }
+
         m_Buffer[m_Length] = '\0';
     }
 
