@@ -81,6 +81,9 @@ struct FLaunchOptions
 
     /// 是否加载纹理 —— 关闭可把几何吞吐与纹理带宽分开测量
     bool LoadTextures = true;
+
+    /// 相机是否置于场景内部 —— 建筑内景必须开启, 否则只看得到外墙
+    bool CameraInside = false;
 };
 
 // ============================================================================
@@ -211,6 +214,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --scene P    导入资产文件 P (.obj / .gltf / .glb)
 ///   --scene-scale S  导入时的统一缩放
 ///   --no-textures    不加载纹理, 只保留材质常量
+///   --camera-inside  相机置于场景内部 (建筑内景用)
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -285,6 +289,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--no-textures"))
         {
             options.LoadTextures = false;
+        }
+        else if (WideEquals(arg, L"--camera-inside"))
+        {
+            options.CameraInside = true;
         }
     }
 
@@ -529,6 +537,11 @@ static bool LoadSceneFromFile(LScene* scene, FRenderContext* context,
     context->GetResourceManager().LogStats("资产导入后");
 
     // ---- 按包围盒摆放相机 ----
+    //
+    // 两种取景互相排斥, 没有一个默认值能同时伺候好两类资产:
+    //   - 单个物体: 站在包围球外侧看全貌 (默认)
+    //   - 建筑内景: 站在场景内部, 否则只看得到外墙 —— Sponza 正是如此
+    // 因此由 --camera-inside 显式选择, 而不是靠包围盒长宽比去猜。
     if (loadResult.Bounds.IsValid())
     {
         const FVector3 center = loadResult.Bounds.GetCenter();
@@ -537,27 +550,66 @@ static bool LoadSceneFromFile(LScene* scene, FRenderContext* context,
         const Float32 radius = FMath::Max(
             extent.X, FMath::Max(extent.Y, extent.Z));
 
-        // 站在包围球外侧约两倍半径处, 45° 视场下能把整个场景收进画面
-        const Float32 distance = FMath::Max(radius * 2.0f, 1.0f);
+        FCamera& camera = renderer->GetCamera();
 
-        renderer->GetCamera().SetPosition(
-            FVector3(center.X, center.Y + radius * 0.35f, center.Z - distance));
-        renderer->GetCamera().SetRotation(FMath::kPi, -0.15f);
+        Float32 farPlane = 1.0f;
+
+        if (options.CameraInside)
+        {
+            // 沿最长水平轴后撤小半程, 贴近地面, 望向场景另一头。
+            //
+            // 后撤量刻意只取半边长的 0.45 —— 包围盒的边界处往往正是墙体
+            // 内部 (Sponza 的外墙很厚), 贴着边界摆相机会直接把镜头埋进墙里。
+            // 取中段能保证落在开阔地面上。
+            const bool isXLonger = extent.X >= extent.Z;
+
+            const Float32 kAxisBackoff = 0.45f;
+
+            const Float32 eyeHeight =
+                loadResult.Bounds.Min.Y + extent.Y * 0.35f;
+
+            if (isXLonger)
+            {
+                camera.SetPosition(FVector3(
+                    center.X - extent.X * kAxisBackoff, eyeHeight, center.Z));
+                // 偏航 -π/2 使前方向量指向 +X
+                camera.SetRotation(-FMath::kPi * 0.5f, -0.05f);
+            }
+            else
+            {
+                camera.SetPosition(FVector3(
+                    center.X, eyeHeight, center.Z - extent.Z * kAxisBackoff));
+                camera.SetRotation(FMath::kPi, -0.05f);
+            }
+
+            farPlane = radius * 6.0f;
+        }
+        else
+        {
+            // 站在包围球外侧约两倍半径处, 60° 视场下能把整个场景收进画面
+            const Float32 distance = FMath::Max(radius * 2.0f, 1.0f);
+
+            camera.SetPosition(FVector3(
+                center.X, center.Y + radius * 0.35f, center.Z - distance));
+            camera.SetRotation(FMath::kPi, -0.15f);
+
+            farPlane = distance + radius * 4.0f;
+        }
 
         // 远裁剪面必须包住整个场景, 否则远端会被整片切掉
-        renderer->GetCamera().SetPerspective(
+        camera.SetPerspective(
             FMath::DegreesToRadians(60.0f),
-            renderer->GetCamera().GetAspectRatio(),
+            camera.GetAspectRatio(),
             FMath::Max(radius * 0.001f, 0.01f),
-            distance + radius * 4.0f);
+            farPlane);
 
         LIMX_LOG(LogLaunch, Log,
                  "[Launch] 场景包围盒 min=({},{},{}) max=({},{},{}), "
-                 "相机距离 {}",
+                 "取景 {}",
                  loadResult.Bounds.Min.X, loadResult.Bounds.Min.Y,
                  loadResult.Bounds.Min.Z, loadResult.Bounds.Max.X,
                  loadResult.Bounds.Max.Y, loadResult.Bounds.Max.Z,
-                 distance);
+                 options.CameraInside ? "内部" : "全景");
     }
 
     return true;
