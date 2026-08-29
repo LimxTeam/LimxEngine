@@ -68,42 +68,101 @@
 |------|----------|----------|
 | **操作系统** | Windows 10 64-bit | Windows 11 64-bit |
 | **编译器** | MSVC 19.38+ (VS 2022 17.8+) | 最新版 VS 2022 |
-| **GPU** | RTX 2060 / RX 6600 | RTX 4080+ |
-| **Vulkan SDK** | 1.4.321.1+ | 最新版 |
+| **GPU** | 支持 Vulkan 1.3+ 的独立显卡 | RTX 4080+ |
+| **Vulkan SDK** | 1.3+（引擎按本机 SDK 协商版本，1.4 可用则启用 1.4） | 1.4.350 |
+| **Rust 工具链** | stable（用于构建 lbt/lht/lsc） | 最新 stable |
 | **内存** | 16 GB | 32 GB+ |
+
+### 前置：放置第三方 SDK
+
+`Source/ThirdParty/` **不纳入版本控制**（厂商 SDK 体积约 630 MB）。克隆后需
+自行放置以下两个目录才能完成构建：
+
+```
+Source/ThirdParty/NvidiaDLSS/    # include/ + lib/
+Source/ThirdParty/IntelOIDN/     # include/ + lib/
+```
 
 ### 构建步骤
 
+本项目**不使用 CMake**。构建由自研的 Rust 工具链驱动：`lbt`（构建）、
+`lht`（反射代码生成）、`lsc`（着色器编译）。
+
 ```bash
 # 克隆仓库
-git clone https://github.com/aspect-ux/Limx.git
-cd Limx
+git clone https://github.com/LimxTeam/LimxEngine.git
+cd LimxEngine
 
-# 配置项目 (CMake)
-cmake -B build -G "Visual Studio 17 2022" -A x64
+# 构建 Rust 工具链并发布到 Binaries/Tools
+cd Programs && cargo build --workspace --release && cd ..
+cp Programs/target/release/lbt.exe Binaries/Tools/
+cp Programs/target/release/lht.exe Binaries/Tools/
+cp Programs/target/release/lsc.exe Binaries/Tools/
 
-# 编译
-cmake --build build --config Release
+# 编译着色器 + C++（lbt 内部会依次调用 lht 与 lsc）
+./Binaries/Tools/lbt.exe build -s Source -c development
 
-# 运行示例
-./build/bin/Release/LimxDemo.exe
+# 运行
+./Binaries/Development/Win64/LimxLaunch.exe
 ```
+
+### 验证与基准
+
+```bash
+# 全量验证：工具链 → 着色器 → 源码规则 → 构建 → 四套单元测试
+powershell Scripts/verify.ps1
+
+# 渲染吞吐基准：同一场景下对照剔除与合批的收益
+powershell Scripts/benchmark.ps1
+```
+
+### 运行参数
+
+```bash
+# 加载任意 OBJ / glTF / GLB 场景
+LimxLaunch.exe --scene Content/Sponza/Sponza.gltf --camera-inside
+
+# 压力场景 + 基准报告（N×N 个物体，渲染 300 帧后退出）
+LimxLaunch.exe --grid 60 --frames 300
+
+# 对照开关
+LimxLaunch.exe --grid 60 --frames 300 --no-cull --no-sort
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--scene <路径>` | 导入 `.obj` / `.gltf` / `.glb` 场景 |
+| `--scene-scale <倍数>` | 导入时的统一缩放 |
+| `--camera-inside` | 相机置于场景内部（建筑内景用） |
+| `--no-textures` | 不加载纹理，只保留材质常量 |
+| `--grid <N>` | 构建 N×N 压力场景 |
+| `--frames <N>` | 渲染 N 帧后输出基准报告并退出 |
+| `--warmup <N>` | 计入统计前跳过的预热帧数（默认 60） |
+| `--no-cull` / `--no-sort` | 关闭视锥剔除 / 状态排序 |
 
 ### 目录结构
 
 ```
-Limx/
+LimxEngine/
 ├── Source/
-│   ├── Platform/     # 硬件抽象层 (Vulkan RHI)
-│   ├── Core/         # 基础设施 (内存、数学、容器)
-│   ├── Luminance/    # 渲染核心 (VisBuffer、光照)
-│   ├── Neural/       # 神经渲染 (NRC、3DGS)
-│   ├── Synergy/      # 生态集成 (USD、协议)
-│   └── Studio/       # 编辑器
-├── Shaders/               # HLSL/GLSL 着色器
-├── Docs/                  # 文档
-├── Examples/              # 示例项目
-└── ThirdParty/            # 第三方依赖
+│   ├── Runtime/
+│   │   ├── Core/            # 基础设施（容器、内存、数学、JSON、DEFLATE）
+│   │   ├── Object/          # 对象系统（LObject、反射、注册表）
+│   │   ├── RHI/             # 图形硬件抽象层（Vulkan 后端、显存子分配器）
+│   │   ├── ApplicationCore/ # 窗口与输入
+│   │   ├── RenderCore/      # 渲染上下文、相机、材质、GPU 资源管理器
+│   │   ├── Renderer/        # 渲染器与 Pass 系统（深度预 Pass、前向 Pass）
+│   │   ├── AssetPipeline/   # 资产解析（OBJ/glTF）与图像解码（PNG/JPEG）
+│   │   ├── Engine/          # 场景图、Trait 系统、场景导入器
+│   │   └── Testing/         # 零 STL 单元测试框架
+│   ├── Editor/Launch/       # 启动器（可执行入口）
+│   ├── Tests/               # Core / RHI / Asset / Engine 四套单元测试
+│   └── ThirdParty/          # 第三方 SDK（不入库，见上方"前置"）
+├── Programs/                # Rust 工具链：lbt / lht / lsc
+├── Shaders/Builtin/         # GLSL 着色器
+├── Scripts/                 # verify.ps1（验证）、benchmark.ps1（基准）
+├── Content/                 # 测试资产
+└── Docs/                    # 设计文档与交接记录
 ```
 
 ---

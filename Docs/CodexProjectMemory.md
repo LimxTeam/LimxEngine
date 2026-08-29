@@ -357,20 +357,23 @@ Current integration status:
 
 ## High-Priority Risks To Address Before Feature Work
 
-1. Fix or validate `LRegistry::Destroy` derived destructor dispatch.
-2. Decide Vulkan target version: docs say 1.4, code/shaders target 1.3.
-3. Establish a reliable shader compile step before launch.
-4. Regenerate or replace stale `LimxEngine.sln`.
-5. Decide policy for `#pragma warning(disable: 4273)` in Core CRT forward
-   declaration files.
-6. Fix `FInputManager` mouse button bounds or enum/storage mismatch.
-7. Replace or formally encapsulate raw `new/delete` in `FThread` and
-   `TRefCounted` if the allocator rule is absolute.
-8. Complete material parameter binding in `pbr.frag` or document current shader
-   material limitations.
-9. Make camera trait sync actually transfer rotation/FOV/aspect, not only
-   position.
-10. Confirm build/tool behavior only after the user allows running tools.
+> **2026-08-29 状态复核**：下表为本清单在 Day 1–7 之后的实际状态。
+> 标注为"未处理"的条目并非不重要，只是不在这七天的作业面上 —— 未经验证
+> 就划掉比留着更危险。
+
+| # | 条目 | 状态 |
+|---|------|------|
+| 1 | `LRegistry::Destroy` 派生析构分发 | **部分处理** — 分发本身经 `DestroySelf()` 正常工作；Day 6 修掉了它引出的悬垂指针问题（`~LTrait` 不摘宿主表、`~LSpatialTrait` 不清子级父指针） |
+| 2 | Vulkan 目标版本（文档 1.4 / 代码 1.3） | **已解决**（Day 1）— 统一按本机 SDK 协商，实测 1.4.350 |
+| 3 | 启动前可靠的着色器编译步骤 | **已解决**（Day 1）— `lbt build` 内部调用 `lsc`，`verify.ps1` 第 1 步独立校验 |
+| 4 | 过时的 `LimxEngine.sln` | **已解决**（Day 7）— `lbt generate-solution` 重新生成，14 个模块齐全 |
+| 5 | `#pragma warning(disable: 4273)` 政策 | **未处理** — 仍存在于 `FName.h` 与 `FString.h`，用于抑制 CRT 前向声明的 dll 链接不一致 |
+| 6 | `FInputManager` 鼠标按键越界 / 枚举与存储不匹配 | **未处理** — 未核查 |
+| 7 | `FThread` 与 `TRefCounted` 中的裸 `new`/`delete` | **未处理** — 仍存在（`FThread.h:166/186/282`、`TRefCounted.h:93`）。若"禁止裸 new/delete"是绝对规则，这两处需要显式豁免或改写 |
+| 8 | `pbr.frag` 材质参数绑定不完整 | **已解决** — 材质 UBO 与 5 张贴图槽位全部接通，`FSceneLoader` 按用途分流 sRGB/线性 |
+| 9 | 相机 Trait 同步只传位置，不传旋转/FOV/宽高比 | **已解决** — `FSceneManager::ResolveCamera` 传递 `SetAspectRatio` + `BuildViewMatrix` + `BuildProjectionMatrix` |
+| 10 | 工具运行需先获得用户许可 | **已解决** — 构建、测试、基准均已获授权并实测通过 |
+
 
 ## Development Approach For Future Work
 
@@ -850,3 +853,214 @@ Day 4 新增：Inflate 15 个、PNG 25 个、JPEG 15 个、AssetRegistry 19 个�
   再补
 - `FAssetRegistry` 非线程安全，不监听文件变更（热重载需外部触发）
 - Inflate 的逐位解码未做查表优化
+
+---
+
+## 2026-08-29 Day 5 交接更新 — GPU 资源所有权归位
+
+### 问题
+
+所有权方向是反的：`FRenderer` 持有 GPU 缓冲区，场景节点只引用裸句柄。
+渲染器是消费者而非所有者，这个方向让"加载任意场景"无从谈起 —— 每加一种
+资产，渲染器就要为它的生命周期负一次责。
+
+### 改动
+
+| | 之前 | 之后 |
+|---|---|---|
+| GPU 缓冲区所有者 | `FRenderer` | `FRenderResourceManager`（挂在 `FRenderContext` 上） |
+| `LMeshTrait` 持有 | 裸 `FRHIBufferHandle` | `FMeshResourceHandle` + 引用计数 |
+| 渲染粒度 | 一个物体一次绘制 | 一个**子网格**一次绘制 |
+| 顶点格式 | 44 字节 / 4 属性 | 72 字节 / 6 属性（含切线、次 UV） |
+
+资源管理器挂在 `FRenderContext` 而非 `FRenderer` 上，因为资源的消费者不止
+渲染器：场景、材质系统都要引用同一批资源。
+
+`FRenderer` 删去 `CreateScene` / `DestroyScene` / `CreateRenderObjectBuffers`
+共 164 行，现在只读本帧视图。
+
+### 延迟销毁
+
+引用归零的资源可能仍被尚未执行完的命令缓冲区引用。第一次跑
+`CollectUnreferenced` 时校验层报了 6 条
+`VUID-vkDestroyBuffer-buffer-00922`。
+
+资源改为先"退役"进待销毁队列，记录退役时的单调帧序号，等
+`MaxFramesInFlight` 帧之后（那一帧的栅栏已经通过）才真正销毁。槽位可以
+立即复用，因为 GPU 对象已从槽位中移出。
+
+`FRenderContext` 为此增加了单调帧计数器 —— `GetCurrentFrameIndex` 在
+`[0, MaxFramesInFlight)` 内循环，无法用来判断"是否已过去足够多帧"。
+
+### 三个吃掉整个画面的历史缺陷
+
+重构完成后编译通过、日志干净、批次数正确、句柄全部有效，但屏幕上只有
+清屏色。逐层探针切下去找到三个互相独立的原因，全部早于本次接手：
+
+1. **着色器矩阵存储序**。`FMatrix` 是行主序（头文件注释写着"与着色器
+   row_major 一致"），但四个着色器的 uniform 块都没写 `row_major`，
+   GLSL 按默认列主序解读，等于整体转置。
+2. **投影矩阵手性与 LookAt 不匹配**。`LookAt` 是右手系（视线 -Z），
+   `Perspective`/`Ortho` 却按左手系（+Z）构造。两者单独看都对，组合起来
+   让每个可见点的裁剪空间 w 为负，全部被裁掉。
+3. **空间 Trait 不挂到节点根变换之下**。`LMeshTrait` 用自己的单位变换，
+   节点摆到哪儿都没用。修完这个又暴露出 `~LSpatialTrait` 只清
+   `m_Children` 不清子级的 `m_Parent`，关闭时访问违规（`0xC0000005`）。
+
+共同点：三者都不产生任何报错，校验层也不会提示。**这类"静默正确性"
+缺陷只能靠断言完整链路的测试拦下，而不是断言单个函数的返回值。**
+
+### 防回归
+
+`MathTests.cpp` 新增 9 个用例，断言的是 **view → proj 整条链路**：相机
+前方的点 w 必须为正、近/远平面映射到 0/1、深度随距离单调、Vulkan Y 朝下、
+单位立方体八个角全在裁剪体内。原有用例只测了 `LookAt`，因此手性不匹配
+一直看不见。
+
+`verify.ps1` 增加着色器 lint：含矩阵成员的 uniform/push_constant 块必须带
+`row_major`。**第一版因 PowerShell 的 `ForEach-Object` 子作用域陷阱恒为
+"通过"** —— 子作用域里的 `+=` 会先读外层变量再在本地新建同名变量。改用
+`foreach` 语句，并构造违规验证它确实会红。
+
+---
+
+## 2026-08-29 Day 6 交接更新 — 剔除、合批与任意场景导入
+
+### 视锥剔除与状态排序
+
+剔除与排序放在 `FSceneManager`（生产端）而非渲染器（消费端）：渲染器拿到的
+应当是一份可以照单全收的批次列表。把可见性判断留给渲染器，等于要求每个
+Pass 各实现一遍，而 `FDepthPrePass` 与 `FForwardPass` 一旦剔除结果不一致，
+`DepthCompareOp=Equal` 的 Early-Z 就会失效。
+
+排序键以材质为主、网格为次 —— 材质描述符集的切换代价高于顶点缓冲区绑定。
+两个 Pass 都跳过冗余绑定。
+
+`FFrustum` 近平面此前用 OpenGL 的 `row3 + row2`；Vulkan 深度范围是 `[0,1]`，
+近平面应为 `row2` 本身。旧公式把近平面推到设定距离的一半处，剔除率白丢。
+**第一版测试通不过检验 —— 两种公式都过**，于是把断言卡到两者的分歧区间上，
+再故意退回旧公式验证它确实会红。
+
+### 基准数据
+
+`Scripts/benchmark.ps1`，同一 exe、同一场景（60×60 = 3600 物体 / 48.5 万
+三角形 / 8 材质），只切开关：
+
+| 配置 | 可见批次 | 材质切换 | 平均帧耗时 | 加速比 |
+|---|---:|---:|---:|---:|
+| 基线（都关） | 3600 | 3600 | 32.46 ms | — |
+| 仅剔除 | 1880 | 1876 | 17.39 ms | 1.87× |
+| 仅排序 | 3600 | 8 | 13.15 ms | 2.47× |
+| 剔除 + 排序 | 1880 | 8 | 7.10 ms | **4.57×** |
+
+排序后材质切换 8 次 = 材质种类数，网格切换 24 次 = 8 材质 × 3 网格，
+均为理论下界。
+
+**排序的收益比剔除还大**，因为冗余描述符集绑定的成本高于被剔掉的三角形。
+
+### Sponza
+
+Khronos glTF-Sample-Assets 版本，19.2 万顶点 / 26.2 万三角形 / 103 批次 /
+25 材质 / 69 张贴图（全部由自研 PNG + 基线 JPEG 解码器解出，缺失 0）。
+
+| 配置 | 可见批次 | 三角形 | 平均帧耗时 |
+|---|---:|---:|---:|
+| 都关 | 103 | 262,267 | 0.852 ms |
+| 仅排序 | 103 | 262,267 | 0.787 ms |
+| 仅剔除 | 15 | 22,384 | 0.423 ms |
+| 剔除 + 排序 | 15 | 22,384 | 0.430 ms |
+
+剔除掉 85.4% 的批次。**排序在这里没有收益，甚至略微为负** —— 只剩 15 个
+批次时，排序本身的开销已和它省下的绑定次数相当。合批的价值随批次数增长，
+103 个批次还不到门槛。这个反差比单看一组数字有用得多。
+
+### 场景导入
+
+新增 `FSceneLoader`（Engine 层），打通 文件 → 解析 → 纹理解码去重 →
+材质创建 → 网格上传 → 节点生成。
+
+- 基色与自发光按 sRGB 上传，法线/金属粗糙度/遮蔽按线性 —— 依据是贴图在
+  材质中的用途，而非文件声明
+- 同路径贴图只上传一次（真实场景里几十个材质共享同一批贴图）
+- 缺失贴图记数并回退到常量因子，不中断导入 —— 贴图缺失在真实资产里是常态，
+  为此让整场导入失败，等于把显示问题升级成加载问题
+
+顺带更正一处契约：`FTextureReference::Path` 的注释写作"相对路径"，但 OBJ
+与 glTF 两个解析器写入的都是已拼好的完整路径。按解析器的实际行为更正说明，
+并去掉导入器里多余的二次拼接（症状是 `dir/dir/tex.png`，贴图静默缺失）。
+
+### 新增 EngineTests
+
+场景图与 Trait 层级是纯 CPU 逻辑，却正是"物体渲染到错误位置"和"关闭时
+崩溃"两类问题的源头。12 个用例覆盖节点变换传递、层级合成、旋转下的偏移、
+销毁顺序安全性。**第 9 个用例当场崩出了 `~LTrait` 不从宿主节点 Trait 表中
+摘掉自己的缺陷** —— `LRegistry::Destroy` 留下悬垂指针，场景销毁时二次释放。
+
+---
+
+## 2026-08-29 Day 7 交接更新 — 稳定性验证与文档对齐
+
+### 稳定性
+
+| 项目 | 方法 | 结果 |
+|---|---|---|
+| 交换链重建 | 8 次尺寸变更（200×150 ↔ 1920×1080）+ 最小化/还原 | 重建 10 次，退出码 0，零告警 |
+| 长跑泄漏 | Sponza 场景运行 30 秒（约 7 万帧），逐 3 秒采样 | 工作集 345.3 → 347.7 MB 后**完全持平**，句柄数稳定 |
+| 显存泄漏 | 每次退出检查分配器统计 | `块:0 子分配:0 专用:0 设备分配数 0` |
+| 校验层 | 演示 / 压力 / OBJ / Sponza 四类场景 | **全部零错误零告警** |
+| 错误路径 | 不存在的路径、非法 glTF、不支持的扩展名 | 记录错误 → 回退内置场景 → 退出码 0，无崩溃 |
+
+### 仓库整理
+
+远端旧仓库被删除后，`Source/ThirdParty/DLSS_Sample_App` 下的 67 个 Git LFS
+指针成了**指向不存在对象的死指针**（本地对象缓存为空），LFS 预推送钩子
+直接拒绝推送。
+
+整个 `Source/ThirdParty` 从历史中剔除（`git filter-branch --index-filter`），
+磁盘文件保留，改由 `.gitignore` 排除。跟踪文件 2227 → 501。
+
+**注意**：`filter-branch` 结束时会把工作区重置到新 HEAD，磁盘上的
+`Source/ThirdParty/` 会被一并删除。已从 `refs/original` 恢复全部 1726 个
+文件（用 `git archive` 时需以 `-c filter.lfs.process=` 绕过 LFS smudge
+过滤器，否则它会去抓已不存在的对象而中断）。
+
+**Sponza 的原始 LFS 资产已永久丢失** —— 对象只存在于被删除的远端，本地
+缓存为空。现使用 Khronos glTF-Sample-Assets 版本，置于 `Content/Sponza/`
+（不入库）。
+
+### README 更正
+
+README 的"快速开始"一节与仓库实际状态完全不符，在仓库公开后属于误导：
+
+| 项 | README 原文 | 实际 |
+|---|---|---|
+| 克隆地址 | `aspect-ux/Limx.git` | `LimxTeam/LimxEngine.git` |
+| 构建方式 | CMake | `lbt`（无 CMakeLists.txt） |
+| 可执行文件 | `LimxDemo.exe` | `LimxLaunch.exe` |
+| 目录结构 | `Source/{Platform,Luminance,Neural,Synergy,Studio}` | 均不存在 |
+
+已改为与实际一致，并补上第三方 SDK 的前置说明与运行参数表。README 后续的
+设计哲学与架构章节属于项目愿景，未作改动。
+
+### 遗留事项
+
+- **`FMaterial` 未参与纹理引用计数**。材质持有裸 `view`/`sampler` 句柄，
+  与资源管理器无引用关系，因此导入的纹理运行时无法单独回收，只能随资源
+  管理器整体销毁。Sponza 的 278 MB 纹理正是受此影响最大的场景。要支持
+  关卡切换时回收显存，需让 `FMaterial` 也参与引用计数。
+- **资产导入是同步的**。Sponza 导入耗时 6.6 秒，绝大部分花在 69 张 JPEG
+  的解码上，未并行化。加载时间成为问题时，多线程解码是最直接的一刀。
+- **`.github/workflows/ci.yml` 从未在真实环境跑通**。`Scripts/verify.ps1`
+  是当前唯一经过实测的验证入口（9 步）。
+- 本地 `.git` 仍保留 `refs/original` 与 `backup-before-filter`（约 209 MB），
+  是回滚历史重写的唯一退路。确认无误后可 `git gc --prune=now` 清理。
+
+### 测试总量
+
+| 测试集 | 用例 | 检查 |
+|--------|-----:|-----:|
+| CoreTests | 325 | 15,335 |
+| RHITests | 27 | 115,861 |
+| AssetTests | 127 | 1,120 |
+| EngineTests | 12 | 61 |
+| **合计** | **491** | **132,377** |
