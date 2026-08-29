@@ -6,10 +6,14 @@
 #   engine    — C++ 引擎全量构建 + 单元测试 + 源码规则检查
 #   shaders   — 着色器编译与 SPIR-V 校验
 #
-# 说明: 本仓库当前没有配置 git remote, 该工作流尚未在真实
-#       GitHub Actions 环境中运行验证过。首次推送后需检查
-#       Vulkan SDK 安装步骤与运行器镜像的兼容性。
-#       本地等价验证请使用 Scripts/verify.ps1。
+# 说明: 该工作流尚未在真实 GitHub Actions 环境中验证过。
+#       仓库已于 2026-08-29 推送到 LimxTeam/LimxEngine, 首次触发后
+#       需重点检查 Vulkan SDK 安装步骤与运行器镜像的兼容性。
+#
+#       Source/ThirdParty 不入库, 但这不影响构建 —— 两个 SDK 是
+#       External 类型模块且无引擎模块依赖, 已实测确认。
+#
+#       本地等价验证请使用 Scripts/verify.ps1 (九步, 唯一经过实测的入口)。
 # ============================================================
 
 name: CI

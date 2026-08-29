@@ -1019,6 +1019,12 @@ Khronos glTF-Sample-Assets 版本，19.2 万顶点 / 26.2 万三角形 / 103 批
 整个 `Source/ThirdParty` 从历史中剔除（`git filter-branch --index-filter`），
 磁盘文件保留，改由 `.gitignore` 排除。跟踪文件 2227 → 501。
 
+**已实测确认目录缺失不影响构建**：把 `Source/ThirdParty` 整个移开后，
+`lbt` 发现 14 个模块（而非 16），构建成功、`verify.ps1` 九步全过、
+Sponza 正常渲染。NvidiaDLSS 与 IntelOIDN 是 `External` 类型模块，
+当前没有任何引擎模块依赖它们。（README 初稿曾把它们写成构建前置，
+是未经验证的推断，已更正。）
+
 **注意**：`filter-branch` 结束时会把工作区重置到新 HEAD，磁盘上的
 `Source/ThirdParty/` 会被一并删除。已从 `refs/original` 恢复全部 1726 个
 文件（用 `git archive` 时需以 `-c filter.lfs.process=` 绕过 LFS smudge

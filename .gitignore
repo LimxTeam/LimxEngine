@@ -137,7 +137,8 @@ Docs/latex/
 # 211 MB 打包体积。DLSS_Sample_App 的媒体资源还是一批指向已不存在对象的
 # Git LFS 指针 —— 它们会让推送被直接拒绝。
 #
-# 克隆本仓库后需自行放置这两个 SDK 才能完成构建：
+# 目录缺失不影响构建：两个 SDK 是 External 类型模块且无引擎模块依赖，
+# lbt 只会少发现两个模块。将来接入 DLSS / OIDN 时再放置：
 #   Source/ThirdParty/NvidiaDLSS/  (include/ + lib/)
 #   Source/ThirdParty/IntelOIDN/   (include/ + lib/)
 #-------------------------------------------------------------------------------

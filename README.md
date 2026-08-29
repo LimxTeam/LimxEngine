@@ -73,10 +73,15 @@
 | **Rust 工具链** | stable（用于构建 lbt/lht/lsc） | 最新 stable |
 | **内存** | 16 GB | 32 GB+ |
 
-### 前置：放置第三方 SDK
+### 关于第三方 SDK
 
-`Source/ThirdParty/` **不纳入版本控制**（厂商 SDK 体积约 630 MB）。克隆后需
-自行放置以下两个目录才能完成构建：
+`Source/ThirdParty/` **不纳入版本控制**（厂商 SDK 体积约 630 MB）。
+
+**这不影响构建。** NvidiaDLSS 与 IntelOIDN 在构建系统中是 `External` 类型
+模块，当前没有任何引擎模块依赖它们；目录缺失时 `lbt` 只会少发现两个模块，
+构建、全部单元测试与场景渲染均不受影响（已实测）。
+
+将来接入 DLSS 超分或 OIDN 降噪时，再按下列路径放置对应 SDK：
 
 ```
 Source/ThirdParty/NvidiaDLSS/    # include/ + lib/
