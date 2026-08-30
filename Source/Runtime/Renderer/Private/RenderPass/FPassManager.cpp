@@ -182,9 +182,22 @@ void FPassManager::ExecuteAll(IRHICommandBuffer*     commandBuffer,
     context.SharedDepthTextureView = m_SharedDepthTextureView;
 
     // 按 Order 顺序执行 Pass (已在 Register/Sort 时保证顺序)
+    //
+    // 计时在这里统一施加 —— 每个 Pass 都被包住, 新增 Pass 无需改动任何
+    // 地方就会自动出现在计时表里。
     for (SizeType i = 0; i < m_Passes.GetSize(); ++i)
     {
+        if (info.Profiler != nullptr)
+        {
+            info.Profiler->BeginScope(commandBuffer, m_Passes[i]->GetName());
+        }
+
         m_Passes[i]->Execute(commandBuffer, context);
+
+        if (info.Profiler != nullptr)
+        {
+            info.Profiler->EndScope(commandBuffer);
+        }
     }
 }
 

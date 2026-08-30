@@ -733,6 +733,69 @@ void FVulkanDevice::DestroyQueryPool(FRHIQueryPoolHandle& handle)
     m_QueryPools.Free(handle);
 }
 
+ERHIResult FVulkanDevice::GetQueryResults(FRHIQueryPoolHandle handle,
+                                           UInt32 firstQuery,
+                                           UInt32 queryCount,
+                                           UInt64* outResults,
+                                           bool wait)
+{
+    FVulkanQueryPoolData* data = m_QueryPools.Get(handle);
+
+    if (data == nullptr || outResults == nullptr || queryCount == 0)
+    {
+        return ERHIResult::ErrorInvalidParameter;
+    }
+
+    if (firstQuery + queryCount > data->Count)
+    {
+        return ERHIResult::ErrorInvalidParameter;
+    }
+
+    // WITH_AVAILABILITY 不用 —— 它会在每个结果后多塞一个可用位, 使步长
+    // 翻倍。这里靠返回值区分就绪与否: 全部就绪返回 VK_SUCCESS, 否则
+    // VK_NOT_READY, 而未就绪的槽位保持原值不被写入。
+    VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT;
+
+    if (wait)
+    {
+        flags |= VK_QUERY_RESULT_WAIT_BIT;
+    }
+
+    const VkResult vkResult = vkGetQueryPoolResults(
+        m_Device,
+        data->Pool,
+        firstQuery,
+        queryCount,
+        static_cast<SizeType>(queryCount) * sizeof(UInt64),
+        outResults,
+        sizeof(UInt64),
+        flags);
+
+    if (vkResult == VK_NOT_READY)
+    {
+        return ERHIResult::NotReady;
+    }
+
+    if (vkResult != VK_SUCCESS)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] vkGetQueryPoolResults 失败: {}", (Int32)vkResult);
+        return ERHIResult::ErrorUnknown;
+    }
+
+    return ERHIResult::Success;
+}
+
+Float32 FVulkanDevice::GetTimestampPeriod() const
+{
+    return m_DeviceProperties.limits.timestampPeriod;
+}
+
+UInt32 FVulkanDevice::GetTimestampValidBits() const
+{
+    return m_TimestampValidBits;
+}
+
 // ============================================================================
 // 命令提交与呈现
 // ============================================================================

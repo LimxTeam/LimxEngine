@@ -16,7 +16,12 @@
 #   powershell Scripts/benchmark.ps1 -SkipImport      # 只跑渲染那半段
 #
 # 脚本分两段: 前半段量渲染吞吐 (逐帧), 后半段量资产导入 (一次性)。
-# 后者是回归哨兵 —— 导入耗时超出预算就以 1 退出。
+# 两段都是回归哨兵 —— 超出预算就以 1 退出。
+#
+# 逐帧那一段同时报 CPU 帧时与 GPU 帧时。两者的比值是判断瓶颈在哪一侧的
+# 唯一依据: 第五阶段 Day 1 实测 60x60 网格下 CPU 16.0 ms 而 GPU 1.7 ms,
+# 也就是说显卡有近十倍余量闲着, 而此前四周所有"优化"量到的都是 CPU 侧。
+# 没有这一列, 很容易把 CPU 瓶颈的改善说成"渲染变快了"。
 #
 # 退出码: 0 全部完成 | 1 存在运行失败或导入超预算
 # ============================================================
@@ -38,7 +43,15 @@ param(
     # 导入耗时预算 (ms)。0 表示只报告不判定。
     #
     # 默认值是基线的三倍 —— 见下方 $ImportBaseline 的说明。
-    [double]$ImportBudgetMs = 0
+    [double]$ImportBudgetMs = 0,
+
+    # 未埋点 GPU 时间的上限 (%)
+    #
+    # 整帧是一对独立的时间戳, 不是各 Pass 相加, 所以两者的差额是真实测量
+    # 而非恒等式。Day 1 实测干净状态下为 0.7%~1.9%; 故意让一个 Pass 不计时
+    # 会跳到 35.8%。取 5% 作上限, 既容得下驱动侧的零碎开销, 又能抓住整个
+    # Pass 级别的漏埋。
+    [double]$UnaccountedBudgetPct = 5.0
 )
 
 $ErrorActionPreference = 'Continue'
@@ -142,16 +155,50 @@ foreach ($config in $Configurations) {
     $avgMs    = if ($timeLine   -match '平均 ([\d.]+) ms') { [double]$Matches[1] } else { 0 }
     $worstMs  = if ($timeLine   -match '最差 ([\d.]+) ms') { [double]$Matches[1] } else { 0 }
 
+    # GPU 侧
+    $gpuLine = (Select-String -Path $Log -Pattern '\[基准\] GPU 整帧').Line
+
+    $gpuMs        = if ($gpuLine -match 'GPU 整帧 ([\d.]+) ms')  { [double]$Matches[1] } else { 0 }
+    $unaccountedPct = if ($gpuLine -match '未埋点 [\d.]+ ms \(([\d.]+)%') { [double]$Matches[1] } else { -1 }
+
+    # 逐 Pass 明细 —— 打印出来供人看, 不参与判定
+    $passLines = (Select-String -Path $Log -Pattern '\[基准\] GPU Pass').Line
+
     $Results += [PSCustomObject]@{
         配置       = $config.Name
         可见批次   = $visible
         材质切换   = $switches
-        平均耗时ms = [math]::Round($avgMs, 2)
-        最差耗时ms = [math]::Round($worstMs, 2)
+        CPUms      = [math]::Round($avgMs, 2)
+        GPUms      = [math]::Round($gpuMs, 2)
+        瓶颈       = if ($gpuMs -gt 0 -and $avgMs -gt 0) {
+                         if ($gpuMs -gt $avgMs * 0.8) { 'GPU' } else { 'CPU' }
+                     } else { '?' }
         帧率       = if ($avgMs -gt 0) { [math]::Round(1000.0 / $avgMs, 1) } else { 0 }
     }
 
-    Write-Host "    平均 $([math]::Round($avgMs,2)) ms  可见 $visible  材质切换 $switches" -ForegroundColor Green
+    Write-Host "    CPU $([math]::Round($avgMs,2)) ms | GPU $([math]::Round($gpuMs,2)) ms  可见 $visible  材质切换 $switches" -ForegroundColor Green
+
+    foreach ($p in $passLines) {
+        if ($p -match 'GPU Pass (.+?) — ([\d.]+) ms \(([\d.]+)%') {
+            Write-Host ("      {0,-18} {1,7:N3} ms  {2,5:N1}%" -f $Matches[1], [double]$Matches[2], [double]$Matches[3])
+        }
+    }
+
+    # 未埋点比例 —— 新增 Pass 忘了计时时这里会跳起来。
+    #
+    # 判定放在这里而不是只打印: 漏埋的表现是某个 Pass 的时间凭空消失,
+    # 不报错、不崩溃, 而逐 Pass 表看起来依然完整。
+    if ($unaccountedPct -lt 0) {
+        Write-Host '      未取到 GPU 计时' -ForegroundColor Yellow
+    }
+    elseif ($unaccountedPct -gt $UnaccountedBudgetPct) {
+        Write-Host ("      未埋点 {0:N1}% 超出上限 {1:N1}% — 可能有 Pass 漏了计时" -f `
+            $unaccountedPct, $UnaccountedBudgetPct) -ForegroundColor Red
+        $Failed = $true
+    }
+    else {
+        Write-Host ("      未埋点 {0:N1}%" -f $unaccountedPct) -ForegroundColor DarkGray
+    }
 }
 
 Write-Host ''
@@ -165,16 +212,25 @@ $Results | Format-Table -AutoSize
 #
 # 条数不写死: 加了第五个配置 (IBL) 之后这里曾经还写着 -eq 4, 结果只要
 # HDRI 存在整段加速比就静悄悄不打印了。
-if ($Results.Count -ge 2 -and $Results[0].平均耗时ms -gt 0) {
-    $baseline = $Results[0].平均耗时ms
+if ($Results.Count -ge 2 -and $Results[0].CPUms -gt 0) {
+    $baseline = $Results[0].CPUms
 
-    Write-Host '  相对基线的加速比:'
+    Write-Host '  相对基线的加速比 (CPU 帧时):'
     foreach ($row in $Results[1..($Results.Count - 1)]) {
-        if ($row.平均耗时ms -gt 0) {
-            $speedup = [math]::Round($baseline / $row.平均耗时ms, 2)
+        if ($row.CPUms -gt 0) {
+            $speedup = [math]::Round($baseline / $row.CPUms, 2)
             Write-Host "    $($row.配置): ${speedup}x"
         }
     }
+    Write-Host ''
+
+    # 明确标注这个加速比是 CPU 侧的。
+    #
+    # 上面每一行的"瓶颈"列若为 CPU, 就说明 GPU 一直在等 —— 那时这个倍数
+    # 衡量的是提交端的开销下降, 与着色器快慢无关。把它说成"渲染变快了"
+    # 是这一列存在的理由。
+    $gpuBound = @($Results | Where-Object { $_.瓶颈 -eq 'GPU' }).Count
+    Write-Host "  $gpuBound/$($Results.Count) 个配置为 GPU 受限"
     Write-Host ''
 }
 

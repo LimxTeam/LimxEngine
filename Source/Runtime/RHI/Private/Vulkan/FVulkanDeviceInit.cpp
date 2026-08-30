@@ -682,6 +682,14 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
         m_TransferQueueFamily = m_GraphicsQueueFamily;
     }
 
+    // 时间戳有效位数 —— 取图形队列族的, 因为逐 Pass 计时都打在图形队列上
+    if (m_GraphicsQueueFamily != 0xFFFFFFFF &&
+        m_GraphicsQueueFamily < queryCount)
+    {
+        m_TimestampValidBits =
+            queueProps[m_GraphicsQueueFamily].timestampValidBits;
+    }
+
     if (m_GraphicsQueueFamily == 0xFFFFFFFF ||
         m_PresentQueueFamily == 0xFFFFFFFF)
     {

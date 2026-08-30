@@ -75,6 +75,7 @@
 #include "ApplicationCore/Input/FInputManager.h"
 #include "RenderCore/Geometry/FGeometryGenerator.h"
 #include "RenderCore/Material/FMaterial.h"
+#include "RenderCore/Profiling/FGpuProfiler.h"
 
 namespace Limx
 {
@@ -247,6 +248,12 @@ public:
     /// 获取 Pass 管理器 (供外部注册额外 Pass，如 LUIPass)
     LIMX_NODISCARD FPassManager* GetPassManager() { return m_PassManager.Get(); }
 
+    /// GPU 逐 Pass 计时器 — 结果在若干帧后才可用, 见 IsStale()
+    LIMX_NODISCARD const FGpuProfiler& GetGpuProfiler() const
+    {
+        return m_GpuProfiler;
+    }
+
     /// 获取渲染上下文 (供外部子系统初始化使用)
     LIMX_NODISCARD FRenderContext* GetRenderContext() { return m_Context; }
 
@@ -402,6 +409,19 @@ private:
 
     // ---- Pass 系统 (通过 TUniquePtr 持有，析构在 .cpp 中完成) ----
     TUniquePtr<FPassManager>          m_PassManager;
+
+    /// GPU 逐 Pass 计时器
+    ///
+    /// 归渲染器所有而非 PassManager: 查询池的生命周期与设备绑定, 而
+    /// PassManager 在交换链重建时会重建自己的资源。
+    FGpuProfiler                      m_GpuProfiler;
+
+    /// 单调递增的帧号 — 决定计时器用哪个环形槽位
+    ///
+    /// 不能复用 GetCurrentFrameIndex(): 那个值在 0..MaxFramesInFlight-1
+    /// 之间循环, 与计时器的槽位数不一定同周期, 复用会让两个不同的帧
+    /// 落到同一槽, 后写的覆盖前写的。
+    UInt64                            m_GpuFrameNumber = 0;
     TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FSkyPass>              m_SkyPass;

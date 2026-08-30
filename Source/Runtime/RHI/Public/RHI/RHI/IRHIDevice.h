@@ -136,9 +136,67 @@ enum class ERHIResult : Int32
 };
 
 // 判断结果是否成功
+//
+// 注意 NotReady / Timeout / SuboptimalSwapchain 都是非负值, 因此都算"成功"。
+// 需要区分"拿到结果"与"还没好"时, 必须显式比较 ERHIResult::Success ——
+// 用 IsRHISuccess 会把 NotReady 当成拿到了结果, 而那时输出缓冲里是旧数据。
 inline constexpr bool IsRHISuccess(ERHIResult result)
 {
     return static_cast<Int32>(result) >= 0;
+}
+
+// ============================================================================
+// 时间戳差值计算
+// ============================================================================
+
+/// 计算两个原始时间戳之间的 tick 差
+///
+/// @param begin     起点原始值 (可能含未定义高位)
+/// @param end       终点原始值
+/// @param validMask 有效位掩码, 由有效位数构造
+///
+/// 两件事必须在这里处理, 而且都只在极少数情况下才显形:
+///
+///   高位未定义 —— 有效位数少于 64 时, 时间戳的高位内容是未规定的。
+///     不掩掉就做差, 得到的不是"略有偏差"而是完全随机的数。
+///
+///   计数器回绕 —— 掩码之后仍可能 end < begin。此时按模运算补回一个周期。
+///     返回 0 会谎报成"这段不耗时"; 取绝对值会得到接近整个计数器周期的
+///     巨大值。两种都比正确答案更难被发现, 因为它们看起来像是"真的测到了"。
+///
+/// 提成自由函数是为了能脱离 GPU 测试 —— 真实硬件上等一次回绕需要数百年。
+LIMX_NODISCARD inline UInt64 ComputeTimestampDelta(UInt64 begin,
+                                                   UInt64 end,
+                                                   UInt64 validMask)
+{
+    const UInt64 maskedBegin = begin & validMask;
+    const UInt64 maskedEnd   = end   & validMask;
+
+    if (maskedEnd >= maskedBegin)
+    {
+        return maskedEnd - maskedBegin;
+    }
+
+    return validMask - maskedBegin + maskedEnd + 1;
+}
+
+/// 由有效位数构造掩码
+///
+/// 位数为 0 时返回 0 —— 那表示该队列不支持时间戳, 任何差值都无意义。
+/// 位数 >= 64 时返回全 1; 直接写 (1 << 64) - 1 是未定义行为。
+LIMX_NODISCARD inline UInt64 MakeTimestampMask(UInt32 validBits)
+{
+    if (validBits == 0)
+    {
+        return 0;
+    }
+
+    if (validBits >= 64)
+    {
+        return ~static_cast<UInt64>(0);
+    }
+
+    return (static_cast<UInt64>(1) << validBits) - 1;
 }
 
 // ============================================================================
@@ -315,6 +373,36 @@ public:
     virtual ERHIResult CreateQueryPool(const FRHIQueryPoolDesc& desc,
                                         FRHIQueryPoolHandle& outHandle) = 0;
     virtual void DestroyQueryPool(FRHIQueryPoolHandle& handle) = 0;
+
+    /// 回读查询结果
+    ///
+    /// @param handle     查询池
+    /// @param firstQuery 起始下标
+    /// @param queryCount 个数
+    /// @param outResults 输出缓冲, 至少 queryCount 个 UInt64
+    /// @param wait       true 则阻塞直到结果就绪; false 时未就绪返回 NotReady
+    ///
+    /// 时间戳的单位是设备 tick, 乘 GetTimestampPeriod() 得到纳秒。
+    ///
+    /// wait=true 会让 CPU 等 GPU —— 逐帧计时应当传 false 并读若干帧之前的
+    /// 那一组, 否则量到的是"等待 GPU"而不是"GPU 干活"。
+    virtual ERHIResult GetQueryResults(FRHIQueryPoolHandle handle,
+                                        UInt32 firstQuery,
+                                        UInt32 queryCount,
+                                        UInt64* outResults,
+                                        bool wait) = 0;
+
+    /// 时间戳一个 tick 对应多少纳秒
+    ///
+    /// 各家硬件差别很大 (NVIDIA 通常是 1.0, AMD 常见 40 左右), 因此绝不能
+    /// 假定 tick 就是纳秒。返回 0 表示该队列不支持时间戳。
+    virtual Float32 GetTimestampPeriod() const = 0;
+
+    /// 时间戳的有效位数
+    ///
+    /// 少于 64 位时高位是未定义的, 必须先掩掉再做差 —— 否则跨越回绕点的
+    /// 那一帧会得到一个巨大的负值 (以无符号解释则是天文数字)。
+    virtual UInt32 GetTimestampValidBits() const = 0;
 
     // ====================================================================
     // 命令提交与呈现

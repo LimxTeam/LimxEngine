@@ -47,6 +47,7 @@
 #pragma once
 
 #include "Renderer/RenderPass/IRenderPass.h"
+#include "RenderCore/Profiling/FGpuProfiler.h"
 
 namespace Limx
 {
@@ -121,6 +122,14 @@ struct FPassExecuteInfo
 
     /// set 2 光照描述符集 — 含 FLightingUBO (对应当前 FrameIndex)
     FRHIDescriptorSetHandle LightingDescriptorSet;
+
+    /// GPU 计时器 (可空)
+    ///
+    /// 非空时 ExecuteAll 会把每个 Pass 包进一个计时作用域。放在这里而不是
+    /// 让各 Pass 自己埋点, 是因为"是否漏埋"必须是结构上不可能的事 ——
+    /// 靠每个 Pass 自觉调用, 新增 Pass 时必然会有人忘记, 而漏埋的表现是
+    /// 该 Pass 的时间凭空消失, 不报错。
+    FGpuProfiler* Profiler = nullptr;
 };
 
 // ============================================================================

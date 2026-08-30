@@ -351,6 +351,13 @@ public:
     ERHIResult CreateQueryPool(const FRHIQueryPoolDesc& desc,
                                 FRHIQueryPoolHandle& outHandle) override;
     void DestroyQueryPool(FRHIQueryPoolHandle& handle) override;
+    ERHIResult GetQueryResults(FRHIQueryPoolHandle handle,
+                                UInt32 firstQuery,
+                                UInt32 queryCount,
+                                UInt64* outResults,
+                                bool wait) override;
+    Float32 GetTimestampPeriod() const override;
+    UInt32 GetTimestampValidBits() const override;
 
     // ====================================================================
     // IRHIDevice 接口实现 — 命令提交与呈现
@@ -495,6 +502,12 @@ private:
     // ====================================================================
 
     VkPhysicalDeviceProperties       m_DeviceProperties   = {};
+
+    /// 图形队列的时间戳有效位数 (0 = 该队列不支持时间戳)
+    ///
+    /// 这是**队列族**属性而非设备属性 —— 同一块卡上不同队列族的位数可以
+    /// 不同, 甚至有的队列族完全不支持时间戳。
+    UInt32                           m_TimestampValidBits = 0;
     VkPhysicalDeviceFeatures         m_DeviceFeatures     = {};
     VkPhysicalDeviceMemoryProperties m_MemoryProperties   = {};
 

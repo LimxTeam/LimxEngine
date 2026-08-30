@@ -45,6 +45,7 @@
 #include "RenderCore/Material/FMaterialManager.h"
 #include "Engine/Rendering/FSceneLoader.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
+#include "RenderCore/Profiling/FGpuProfiler.h"
 #include "AssetPipeline/FImageDecoder.h"
 
 namespace Limx
@@ -1719,6 +1720,57 @@ static void LogBenchmarkReport(const FLaunchOptions& options,
              "[基准] 帧耗时: 平均 {} ms | 最差 {} ms | 平均帧率 {} | 总帧数 {}",
              frameStats.AverageFrameMs, frameStats.WorstFrameMs,
              frameStats.AverageFps, frameStats.TotalFrames);
+
+    // ---- 逐 Pass GPU 计时 ----
+    //
+    // 这里报的是最后一次成功回读的那一帧, 不是平均值 —— 平均需要跨帧
+    // 累加, 而累加器的重置时机与预热帧的边界一旦对不齐, 得到的数字会
+    // 混进首帧的管线编译开销。单帧快照口径明确, 且它足以回答"时间花在
+    // 哪一个 Pass"这个问题。
+    {
+        const FGpuProfiler& profiler = renderer.GetGpuProfiler();
+
+        if (!profiler.IsSupported())
+        {
+            LIMX_LOG(LogLaunch, Log, "[基准] GPU 计时: 硬件不支持");
+        }
+        else if (profiler.GetResolvedFrameCount() == 0)
+        {
+            LIMX_LOG(LogLaunch, Warning,
+                     "[基准] GPU 计时: 无有效样本 — 查询结果始终未就绪");
+        }
+        else
+        {
+            const Float64 frameMs = profiler.GetFrameMilliseconds();
+            const Float64 sumMs   = profiler.GetScopeSumMilliseconds();
+
+            for (UInt32 i = 0; i < profiler.GetScopeCount(); ++i)
+            {
+                const FGpuScopeResult& scope = profiler.GetScope(i);
+
+                LIMX_LOG(LogLaunch, Log,
+                         "[基准] GPU Pass {} — {} ms ({}%)",
+                         (scope.Name != nullptr) ? scope.Name : "?",
+                         scope.Milliseconds,
+                         (frameMs > 0.0)
+                             ? (scope.Milliseconds / frameMs * 100.0) : 0.0);
+            }
+
+            // 未埋点的部分 = 整帧 − 各 Pass 之和。
+            //
+            // 整帧是独立的一对时间戳, 不是各 Pass 相加, 所以这个差额是
+            // 一个真实的测量结果而非恒等式。它偏大就说明有 GPU 工作没被
+            // 任何作用域覆盖 —— 那正是"漏埋"的定义。
+            const Float64 unaccounted = frameMs - sumMs;
+
+            LIMX_LOG(LogLaunch, Log,
+                     "[基准] GPU 整帧 {} ms | 各 Pass 之和 {} ms | "
+                     "未埋点 {} ms ({}%) | 已回读 {} 帧",
+                     frameMs, sumMs, unaccounted,
+                     (frameMs > 0.0) ? (unaccounted / frameMs * 100.0) : 0.0,
+                     profiler.GetResolvedFrameCount());
+        }
+    }
 
     // 两个口径都报。资产显存是关卡加载/卸载能控制的部分, 设备总量才是
     // 真实占用 —— 渲染目标、阴影贴图、IBL 的立方体贴图、逐帧 UBO 都不

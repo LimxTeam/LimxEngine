@@ -107,6 +107,9 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     IRHIDevice* device    = m_Context->GetDevice();
     UInt32      frameCount = m_Context->GetMaxFramesInFlight();
 
+    // GPU 计时器 —— 硬件不支持时会自行停用, 不影响后续初始化
+    m_GpuProfiler.Initialize(device);
+
     // 初始化相机 — 位于 (0, 2.5, -5)，俰视场景中心，45° FOV
     FRHIExtent2D initExtent = m_Context->GetSwapchainExtent();
     Float32 initAspect = static_cast<Float32>(initExtent.Width) /
@@ -284,6 +287,8 @@ void FRenderer::Shutdown()
         device->WaitIdle();
     }
 
+    m_GpuProfiler.Shutdown(device);
+
     // 1. 关闭 Pass 系统 (内部销毁共享深度和帧缓冲)
     if (m_PassManager)
     {
@@ -387,6 +392,17 @@ void FRenderer::RenderFrame()
     UInt32 frameIndex = m_Context->GetCurrentFrameIndex();
     UpdateUniformBuffer(frameIndex);
 
+    // GPU 计时开帧 —— 必须在任何 RenderPass 之外, 因为要重置查询池
+    {
+        IRHICommandBuffer* timingBuffer =
+            m_Context->GetCurrentCommandBuffer();
+
+        if (timingBuffer != nullptr)
+        {
+            m_GpuProfiler.BeginFrame(timingBuffer, m_GpuFrameNumber);
+        }
+    }
+
     // 每帧上传材质脏数据
     FMaterialManager::Get().UploadDirtyMaterials();
 
@@ -488,6 +504,7 @@ void FRenderer::RenderFrame()
         execInfo.ViewProjDescriptorSet = m_DescriptorSets[frameIndex];
         execInfo.PipelineLayout        = m_PipelineLayout;
         execInfo.LightingDescriptorSet = m_LightDescriptorSets[frameIndex];
+        execInfo.Profiler              = &m_GpuProfiler;
 
         m_PassManager->ExecuteAll(commandBuffer, execInfo);
     }
@@ -500,6 +517,22 @@ void FRenderer::RenderFrame()
     {
         m_PostSceneRenderCallback();
     }
+
+    // GPU 计时收帧 —— 打下整帧终点并非阻塞回读若干帧之前的那一组。
+    //
+    // 放在 UI 回调之后: 整帧终点应当覆盖这一帧提交的全部 GPU 工作, 否则
+    // "各 Pass 之和 vs 整帧"的差额会把 UI 的开销算成"漏埋"。
+    {
+        IRHICommandBuffer* timingBuffer =
+            m_Context->GetCurrentCommandBuffer();
+
+        if (timingBuffer != nullptr)
+        {
+            m_GpuProfiler.EndFrame(timingBuffer, m_Context->GetDevice());
+        }
+    }
+
+    ++m_GpuFrameNumber;
 
     // 结束帧 (提交 + 呈现)
     result = m_Context->EndFrame();
