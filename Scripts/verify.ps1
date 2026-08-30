@@ -225,6 +225,17 @@ Invoke-Step '显存回收自检' {
     .\Binaries\Development\Win64\LimxLaunch.exe --scene Content/TestScene/testscene.obj --reload-test
 }
 
+# IBL 白炉自检 —— 同样需要真实 GPU。
+# 它用一个各方向辐射度恒为 1 的合成环境跑完整条 IBL 预计算链, 断言三条
+# 解析可知的性质: 辐照度处处为 1、预滤波每一级都为 1、BRDF 表的 A+B 不
+# 超过 1。这三条不依赖任何具体 HDRI, 因此不需要外部资产。
+#
+# 这条链上的错误几乎全是"看着差不多"的: 卷积系数差一个 π、mip 与粗糙度
+# 的映射错位、归一化除错了分母 —— 画面上一律只表现为"环境光有点不对"。
+Invoke-Step 'IBL 白炉自检' {
+    .\Binaries\Development\Win64\LimxLaunch.exe --furnace-check
+}
+
 # ------------------------------------------------------------
 # 汇总
 # ------------------------------------------------------------

@@ -117,6 +117,12 @@ struct FLaunchOptions
     /// 这是能用一行数字判定卷积对错的地方。
     bool ProbeIrradiance = false;
 
+    /// 白炉自检 —— 跑完 IBL 各级预计算的数值断言后立即退出, 以退出码报告
+    ///
+    /// 与 --furnace 的区别: 后者是让人看的 (渲染出来对着背景比), 前者是
+    /// 让 CI 跑的 (读回数值直接断言)。
+    bool FurnaceCheck = false;
+
     /// 白炉测试 —— 用各方向恒为 1 的合成环境替代 HDRI, 并关掉全部直接光
     ///
     /// 能量守恒唯一的客观判据: 反照率为 1 的表面在这个环境下必须原样反射
@@ -310,6 +316,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --probe-brdf     输出 BRDF 查找表的采样网格 (数值校验用)
 ///   --material-grid N  构建 N×N 球体阵列 (横向粗糙度, 纵向金属度)
 ///   --furnace        白炉测试: 合成均匀环境 + 关闭直接光
+///   --furnace-check  白炉自检: 断言 IBL 各级预计算, 以退出码报告
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -434,6 +441,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--furnace"))
         {
             options.Furnace = true;
+        }
+        else if (WideEquals(arg, L"--furnace-check"))
+        {
+            options.FurnaceCheck = true;
         }
     }
 
@@ -1008,6 +1019,177 @@ static void RunFurnaceChecks(const FEnvironmentMap& environmentMap,
                      static_cast<Int32>((1.0f - (a + b)) * 100.0f));
         }
     }
+}
+
+// ============================================================================
+// RunFurnaceSelfTest — 白炉自检, 以退出码报告结果
+//
+// 把白炉从"看一眼截图"变成一条可以跑在 CI 里的断言。它一次覆盖整条 IBL 链:
+//   等距柱状解码 → 立方体贴图 → mip 链 → 辐照度卷积 → 镜面预滤波 →
+//   BRDF 查找表。
+//
+// 三条判据都是解析可知的, 不依赖任何具体环境贴图:
+//   L 恒为 1 时 E = ∫cosθ dω = π, 而辐照度贴图存的是 E/π —— 应处处为 1;
+//   恒为 1 的环境按 GGX 加权平均后仍是 1 —— 预滤波每一级都应为 1;
+//   BRDF 表的 A+B 是单次散射的方向反照率 —— 不得大于 1 (那意味着凭空
+//     多出能量), 且粗糙度趋零时应趋近 1 (镜面无损)。
+//
+// 容差按 RGBA16F 的量化精度给: 半精度在 1.0 附近的间隔是 2^-10 ≈ 0.001,
+// 再加上求积本身的截断, 1% 是合理的界。
+// ============================================================================
+
+static bool RunFurnaceSelfTest(FRenderContext* context)
+{
+    FEnvironmentMap environmentMap;
+
+    const FImageData furnace = BuildFurnaceEnvironment();
+
+    if (!IsRHISuccess(environmentMap.BuildFromEquirect(context, furnace)))
+    {
+        LIMX_LOG(LogLaunch, Error, "[白炉自检] 合成环境构建失败");
+        return false;
+    }
+
+    // 容差: 半精度在 1.0 附近的间隔约 0.001, 求积截断再占几分之一个百分点
+    constexpr Float32 kTolerance = 0.01f;
+
+    bool passed = true;
+
+    // ---- 一、辐照度处处为 1 ----
+    {
+        TArray<Float32> pixels;
+        UInt32          faceSize = 0;
+
+        if (!environmentMap.ReadbackIrradiance(context, pixels, faceSize))
+        {
+            LIMX_LOG(LogLaunch, Error, "[白炉自检] 辐照度读回失败");
+            return false;
+        }
+
+        Float32 minValue = 1.0e30f;
+        Float32 maxValue = -1.0e30f;
+
+        const SizeType texelCount =
+            static_cast<SizeType>(faceSize) * faceSize * 6;
+
+        for (SizeType i = 0; i < texelCount; ++i)
+        {
+            for (SizeType channel = 0; channel < 3; ++channel)
+            {
+                const Float32 value = pixels[i * 4 + channel];
+
+                if (value < minValue) { minValue = value; }
+                if (value > maxValue) { maxValue = value; }
+            }
+        }
+
+        const bool ok = (minValue > 1.0f - kTolerance) &&
+                        (maxValue < 1.0f + kTolerance);
+
+        passed = passed && ok;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[白炉自检] 辐照度 min={} max={} — {}",
+                 minValue, maxValue, ok ? "通过" : "不通过");
+    }
+
+    // ---- 二、预滤波每一级都为 1 ----
+    for (UInt32 level = 0; level < FEnvironmentMap::kPrefilterMipLevels;
+         ++level)
+    {
+        TArray<Float32> pixels;
+        UInt32          faceSize = 0;
+
+        if (!environmentMap.ReadbackPrefiltered(context, level, pixels,
+                                                faceSize))
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[白炉自检] 预滤波第 {} 级读回失败", level);
+            return false;
+        }
+
+        Float32 minValue = 1.0e30f;
+        Float32 maxValue = -1.0e30f;
+
+        const SizeType texelCount =
+            static_cast<SizeType>(faceSize) * faceSize * 6;
+
+        for (SizeType i = 0; i < texelCount; ++i)
+        {
+            for (SizeType channel = 0; channel < 3; ++channel)
+            {
+                const Float32 value = pixels[i * 4 + channel];
+
+                if (value < minValue) { minValue = value; }
+                if (value > maxValue) { maxValue = value; }
+            }
+        }
+
+        const bool ok = (minValue > 1.0f - kTolerance) &&
+                        (maxValue < 1.0f + kTolerance);
+
+        passed = passed && ok;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[白炉自检] 预滤波 mip {} ({}x{}) min={} max={} — {}",
+                 level, faceSize, faceSize, minValue, maxValue,
+                 ok ? "通过" : "不通过");
+    }
+
+    // ---- 三、BRDF 表不得凭空造出能量 ----
+    {
+        TArray<Float32> lut;
+        UInt32          size = 0;
+
+        if (!environmentMap.ReadbackBrdfLut(context, lut, size))
+        {
+            LIMX_LOG(LogLaunch, Error, "[白炉自检] BRDF 表读回失败");
+            return false;
+        }
+
+        Float32 worstSum      = 0.0f;
+        Float32 smoothestSum  = 0.0f;
+
+        for (UInt32 y = 0; y < size; ++y)
+        {
+            for (UInt32 x = 0; x < size; ++x)
+            {
+                const SizeType index =
+                    (static_cast<SizeType>(y) * size + x) * 2;
+
+                const Float32 sum = lut[index] + lut[index + 1];
+
+                if (sum > worstSum) { worstSum = sum; }
+
+                // 最平滑的一行 (y=0) 应当几乎无损
+                if (y == 0 && sum > smoothestSum) { smoothestSum = sum; }
+            }
+        }
+
+        const bool noGain  = worstSum <= 1.0f + kTolerance;
+        const bool mirrorOk = smoothestSum > 1.0f - kTolerance;
+
+        passed = passed && noGain && mirrorOk;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[白炉自检] BRDF A+B 全表最大 {} (须 ≤1), "
+                 "最光滑一行 {} (须 ≈1) — {}",
+                 worstSum, smoothestSum,
+                 (noGain && mirrorOk) ? "通过" : "不通过");
+    }
+
+    // 释放顺序与创建相反, 且要先等 GPU 空闲
+    if (context->GetDevice() != nullptr)
+    {
+        context->GetDevice()->WaitIdle();
+    }
+
+    environmentMap.Release();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[白炉自检] {}", passed ? "全部通过" : "存在不通过项");
+
+    return passed;
 }
 
 // ============================================================================
@@ -1687,6 +1869,22 @@ int WINAPI wWinMain(
     LIMX_CHECK(scene != nullptr);
 
     // 4c. 通过资源管理器创建场景网格, 挂到 LScene 的 LNode+LMeshTrait
+    if (launchOptions.FurnaceCheck)
+    {
+        const bool passed = RunFurnaceSelfTest(&renderContext);
+
+        LRegistry::Get().Destroy(scene);
+        FSceneManager::Get().Shutdown();
+        renderer.Shutdown();
+        renderContext.Shutdown();
+        window.Destroy();
+
+        FLog::RemoveSink(&fileLogSink);
+        fileLogSink.Close();
+
+        return passed ? 0 : 5;
+    }
+
     if (launchOptions.ReloadTest)
     {
         const bool passed =

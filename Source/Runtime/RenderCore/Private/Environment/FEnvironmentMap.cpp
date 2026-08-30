@@ -1369,20 +1369,50 @@ ERHIResult FEnvironmentMap::IntegrateBrdfLut(FRenderContext* context)
 // ============================================================================
 
 bool FEnvironmentMap::ReadbackIrradiance(FRenderContext*  context,
-                                         TArray<Float32>& outPixels,
-                                         UInt32&          outFaceSize) const
+                                        TArray<Float32>& outPixels,
+                                        UInt32&          outFaceSize) const
+{
+    return ReadbackCubeMip(context, m_Irradiance, 0, outPixels, outFaceSize);
+}
+
+bool FEnvironmentMap::ReadbackPrefiltered(FRenderContext*  context,
+                                          UInt32           mipLevel,
+                                          TArray<Float32>& outPixels,
+                                          UInt32&          outFaceSize) const
+{
+    return ReadbackCubeMip(context, m_Prefiltered, mipLevel,
+                           outPixels, outFaceSize);
+}
+
+// ============================================================================
+// ReadbackCubeMip — 两个公开读回接口的共同实现
+// ============================================================================
+
+bool FEnvironmentMap::ReadbackCubeMip(FRenderContext*      context,
+                                      const FCubeResource& resource,
+                                      UInt32               mipLevel,
+                                      TArray<Float32>&     outPixels,
+                                      UInt32&              outFaceSize) const
 {
     outPixels.Clear();
     outFaceSize = 0;
 
-    if (context == nullptr || m_Device == nullptr || !m_Irradiance.IsValid())
+    if (context == nullptr || m_Device == nullptr || !resource.IsValid())
+    {
+        return false;
+    }
+
+    if (mipLevel >= resource.MipLevels)
     {
         return false;
     }
 
     IRHIDevice* device = context->GetDevice();
 
-    const UInt32   faceSize   = m_Irradiance.FaceSize;
+    const UInt32 faceSize = (resource.FaceSize >> mipLevel) > 0
+                          ? (resource.FaceSize >> mipLevel)
+                          : 1u;
+
     const SizeType texelCount =
         static_cast<SizeType>(faceSize) * faceSize * kCubeFaceCount;
 
@@ -1393,7 +1423,7 @@ bool FEnvironmentMap::ReadbackIrradiance(FRenderContext*  context,
     readbackDesc.Size        = byteSize;
     readbackDesc.Usage       = EBufferUsage::TransferDst;
     readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
-    readbackDesc.DebugName   = "EnvironmentMap.IrradianceReadback";
+    readbackDesc.DebugName   = "EnvironmentMap.CubeReadback";
 
     FRHIBufferHandle readback;
 
@@ -1411,39 +1441,39 @@ bool FEnvironmentMap::ReadbackIrradiance(FRenderContext*  context,
     }
 
     commandBuffer->TransitionImageLayout(
-        m_Irradiance.Texture,
+        resource.Texture,
         EImageLayout::ShaderReadOnly,
         EImageLayout::TransferSrc,
         EPipelineStageFlags::FragmentShader,
         EPipelineStageFlags::Transfer,
         EAccessFlags::ShaderRead,
         EAccessFlags::TransferRead,
-        0, 1, 0, kCubeFaceCount);
+        mipLevel, 1, 0, kCubeFaceCount);
 
     // 六个面一次拷完 —— 它们在内存里就是连续的数组层
     FRHIBufferTextureCopyRegion region = {};
     region.BufferOffset      = 0;
     region.BufferRowLength   = 0;
     region.BufferImageHeight = 0;
-    region.MipLevel          = 0;
+    region.MipLevel          = mipLevel;
     region.BaseLayer         = 0;
     region.LayerCount        = kCubeFaceCount;
     region.TextureOffset     = { 0, 0, 0 };
     region.TextureExtent     = { faceSize, faceSize, 1 };
 
-    commandBuffer->CopyTextureToBuffer(m_Irradiance.Texture,
+    commandBuffer->CopyTextureToBuffer(resource.Texture,
                                        EImageLayout::TransferSrc,
                                        readback, region);
 
     commandBuffer->TransitionImageLayout(
-        m_Irradiance.Texture,
+        resource.Texture,
         EImageLayout::TransferSrc,
         EImageLayout::ShaderReadOnly,
         EPipelineStageFlags::Transfer,
         EPipelineStageFlags::FragmentShader,
         EAccessFlags::TransferRead,
         EAccessFlags::ShaderRead,
-        0, 1, 0, kCubeFaceCount);
+        mipLevel, 1, 0, kCubeFaceCount);
 
     context->EndSingleTimeCommands(commandBuffer);
 

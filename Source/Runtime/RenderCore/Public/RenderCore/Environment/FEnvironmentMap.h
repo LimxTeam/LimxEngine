@@ -227,6 +227,18 @@ public:
                                            TArray<Float32>& outPixels,
                                            UInt32&          outFaceSize) const;
 
+    /// 把预滤波贴图的某一级 mip 读回内存 (RGBA32F, 六个面依次排列)
+    ///
+    /// 预滤波是整条 IBL 链里最难靠肉眼判断的一环: 它的每一级都是模糊的,
+    /// 而"该有多模糊"没有直觉上的参照。级间映射错位、某一级没被写入、
+    /// 采样 mip 选偏一档, 画面上都只表现为"反射的感觉不太对"。
+    ///
+    /// @param mipLevel 要读取的级别; 超出范围时返回 false
+    LIMX_NODISCARD bool ReadbackPrefiltered(FRenderContext*  context,
+                                            UInt32           mipLevel,
+                                            TArray<Float32>& outPixels,
+                                            UInt32&          outFaceSize) const;
+
     /// 把 BRDF 查找表读回内存 (RG32F 两通道)
     ///
     /// 这张表有一条硬性质可以自查: 白炉条件下 (F0=1, 环境恒为 1) 应有
@@ -240,6 +252,13 @@ public:
                                         UInt32&          outSize) const;
 
 private:
+    /// 把一张立方体贴图的指定 mip 读回内存 —— 两个公开读回接口的共同实现
+    LIMX_NODISCARD bool ReadbackCubeMip(FRenderContext*      context,
+                                        const FCubeResource& resource,
+                                        UInt32               mipLevel,
+                                        TArray<Float32>&     outPixels,
+                                        UInt32&              outFaceSize) const;
+
     /// 把源图上传为一张可采样的 2D 纹理
     ERHIResult UploadEquirect(FRenderContext* context,
                               const FImageData& equirect);

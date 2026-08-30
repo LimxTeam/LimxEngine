@@ -34,6 +34,7 @@
 #include "Core/HAL/PlatformTypes.h"
 #include "Core/CoreMacros.h"
 #include "Core/Templates/TFunction.h"
+#include "Core/HAL/FPlatformMemory.h"
 
 // Windows 线程 API 前向声明
 #if LIMX_PLATFORM_WINDOWS
@@ -259,7 +260,24 @@ public:
     }
 
     /// 获取硬件并发数 (逻辑 CPU 数)
-    LIMX_NODISCARD static UInt32 HardwareConcurrency();
+    ///
+    /// 此前只有声明没有定义 —— 没有任何调用方, 因此也就从来没有链接失败过。
+    /// 这类"声明了却没实现"的接口是定时炸弹: 第一个用它的人拿到的不是
+    /// 编译期错误, 而是一条指不到源头的链接错误。
+    ///
+    /// 查询失败时返回 1 而非 0: 调用方普遍拿它做除数或线程数, 返回 0
+    /// 会一路传成除零或"零个工作线程"。
+    LIMX_NODISCARD static UInt32 HardwareConcurrency()
+    {
+        // 复用 FPlatformMemory 里已有的查询, 不再重复声明一遍 Win32 结构 ——
+        // 同一个系统信息被两处各自声明, 迟早会有一处的字段顺序写错, 而那种
+        // 错误读出来的是相邻字段的值, 看着像个合理的数字。
+        const UInt32 count = FPlatformMemory::GetProcessorCount();
+
+        // 查询失败时返回 1 而非 0: 调用方普遍拿它做除数或线程数,
+        // 返回 0 会一路传成除零或"零个工作线程"。
+        return (count > 0) ? count : 1u;
+    }
 
 private:
     // ========================================================================

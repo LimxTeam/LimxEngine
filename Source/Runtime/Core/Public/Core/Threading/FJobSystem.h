@@ -58,10 +58,21 @@ public:
     /// 递增
     void Increment() { m_Count.Increment(); }
 
-    /// 递减并返回新值
+    /// 递减并返回**递减后**的剩余值
+    ///
+    /// 调用方靠它判断"我是不是最后一个" —— 返回 0 即代表本次递减把计数
+    /// 清空了, 收尾工作该由这一个调用者来做。
+    ///
+    /// 原先这里在 TAtomic::Decrement() 之后又减了一次 1。而 TAtomic 的
+    /// Decrement 底层是 _InterlockedDecrement, 本就返回递减后的值 ——
+    /// 多减的这一次让返回值比真实剩余数少 1。后果是把 N 个作业的完成回调
+    /// 提前到第 N-1 个作业结束时触发, 最后一个还在跑。
+    ///
+    /// 而 IsComplete() 直接读计数, 并不受影响 —— 于是两个接口对"完成"
+    /// 的判断彼此矛盾, 具体表现取决于调用方用了哪一个。
     LIMX_NODISCARD Int32 Decrement()
     {
-        return m_Count.Decrement() - 1;
+        return m_Count.Decrement();
     }
 
     /// 当前值
@@ -214,9 +225,18 @@ public:
             SizeType rangeEnd = rangeBegin + batchSize;
             if (rangeEnd > count) rangeEnd = count;
 
-            // 捕获 body 引用和范围
+            // 按**值**捕获迭代体, 不能按引用。
+            //
+            // body 是一个引用参数, 而 Create 返回的批次通常比调用点活得久 ——
+            // 最常见的写法就是直接传一个临时 lambda:
+            //     FParallelFor::Create(n, 64, [](SizeType b, SizeType e){ ... });
+            // 那个临时对象在整条语句结束时就析构了, 按引用捕获的话, 批次里
+            // 每个作业都握着一根悬垂引用, 而它们要到之后才被执行。
+            //
+            // 这种错误不会在创建时报任何问题, 只会在执行时读到已释放的内存 ——
+            // 小对象上往往还"碰巧能跑", 换个分配器或加点负载才崩。
             FJob job;
-            job.EntryPoint = [&body, rangeBegin, rangeEnd]()
+            job.EntryPoint = [body, rangeBegin, rangeEnd]()
             {
                 body(rangeBegin, rangeEnd);
             };

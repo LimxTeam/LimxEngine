@@ -65,10 +65,12 @@ enum class TaskState : UInt8
 class FTask
 {
 public:
-    FTask()
+    /// @param owner 创建它的调度器 —— 后继任务就绪时要入回**同一个**队列
+    explicit FTask(FTaskGraph* owner = nullptr)
         : m_State(static_cast<Int32>(TaskState::Pending))
         , m_WaitCount(0)
         , m_RefCount(1)
+        , m_Owner(owner)
     {
     }
 
@@ -156,6 +158,14 @@ private:
     TAtomic<Int32>     m_RefCount;        ///< 引用计数
     TArray<FTask*>     m_Successors;      ///< 后继任务列表
     FMutex             m_SuccessorMutex;  ///< 后继列表保护锁
+
+    /// 所属调度器
+    ///
+    /// 必须逐任务记住, 不能在 NotifySuccessors 里取全局单例 —— 那样一来,
+    /// 任何非单例的 FTaskGraph 实例, 它的后继任务都会被投递到全局那一个
+    /// 队列里去。全局实例若未初始化, 这些任务就永远不会被执行, 而调用方
+    /// 只会看到 WaitForAll 一直等不到结果。
+    FTaskGraph*        m_Owner;
 };
 
 // ============================================================================
@@ -303,8 +313,11 @@ public:
 
         if (workerCount == 0)
         {
-            // 至少 1 个工作线程，最多 (硬件线程 - 1)
-            workerCount = 4;  // 默认后备值
+            // 留一个核给主线程 —— 工作线程占满全部硬件线程时, 主线程的
+            // 提交与等待会和它们争抢, 反而拖慢整体。
+            const UInt32 hardware = FThread::HardwareConcurrency();
+
+            workerCount = (hardware > 1) ? (hardware - 1) : 1;
         }
 
         m_IsRunning.Store(true);
@@ -325,6 +338,11 @@ public:
         {
             return;
         }
+
+        // 先排空再停。原先直接置停止标志, 队列里没跑完的任务会被整批丢弃 ——
+        // 它们持有的调度器引用也就永远不会释放, 那是一次确定的内存泄漏。
+        // 而函数的文档一直写的是"等待所有任务完成"。
+        WaitForAll();
 
         m_IsRunning.Store(false);
 
@@ -351,7 +369,7 @@ public:
     {
         void* memory = GetDefaultAllocator().Allocate(
             sizeof(FTask), alignof(FTask));
-        FTask* task = new (memory) FTask();
+        FTask* task = new (memory) FTask(this);
         task->SetWork(MoveTemp(work));
         return FTaskHandle(task);
     }
@@ -386,27 +404,22 @@ public:
         return handle;
     }
 
-    /// 等待所有已提交任务完成
+    /// 等待所有已提交任务完成 (含它们派生出的后继)
+    ///
+    /// 判据只有一个: 待办数归零。它在入队时加、执行完后减, 因此"排队中"
+    /// 与"执行中"都被同一个计数覆盖, 两者之间不存在空隙。
     void WaitForAll()
     {
-        while (true)
+        while (m_PendingTaskCount.Load() > 0)
         {
-            {
-                FScopeLock lock(m_QueueMutex);
-                if (m_ReadyQueue.IsEmpty())
-                {
-                    break;
-                }
-            }
             FThread::Yield();
         }
+    }
 
-        // 再等一小段确保执行中的任务也完成
-        // 简单自旋等待活跃任务归零
-        while (m_ActiveTaskCount.Load() > 0)
-        {
-            FThread::Yield();
-        }
+    /// 当前尚未完成的任务数 (排队中 + 执行中)
+    LIMX_NODISCARD Int32 GetPendingTaskCount() const
+    {
+        return m_PendingTaskCount.Load();
     }
 
     // ========================================================================
@@ -437,6 +450,11 @@ private:
                 task->Execute();
                 m_ActiveTaskCount.FetchSub(1);
                 task->Release();  // 释放调度器引用
+
+                // 减在最后: Execute 内部可能通过 NotifySuccessors 再入队
+                // 若干后继, 那些任务的待办数已经在入队时加过了。先减再执行
+                // 会让计数在两者之间短暂归零。
+                m_PendingTaskCount.FetchSub(1);
             }
             else
             {
@@ -453,6 +471,16 @@ private:
     /// 将就绪任务入队
     void EnqueueReady(FTask* task)
     {
+        // 待办数在**入队之前**加, 在执行完之后减 —— 这样它在任务的整个
+        // 生命周期里都不为零, 中间没有任何窗口。
+        //
+        // 原先 WaitForAll 是"先看队列空、再看执行中为零", 这两个条件之间
+        // 存在一个真实的空隙: 工作线程刚把任务取出队列、还没来得及给
+        // 执行中计数加一。那一瞬间两个条件同时成立, WaitForAll 就会在任务
+        // 还没跑的情况下返回。这种竞态在轻负载下几乎不出现, 一旦出现表现
+        // 为"偶尔少算了一个任务", 极难复现。
+        m_PendingTaskCount.FetchAdd(1);
+
         {
             FScopeLock lock(m_QueueMutex);
             m_ReadyQueue.Add(task);
@@ -484,6 +512,9 @@ private:
     FConditionVariable m_WakeCondition;    ///< 工作线程唤醒条件
     TAtomic<bool>      m_IsRunning;        ///< 运行标志
     TAtomic<Int32>     m_ActiveTaskCount;  ///< 当前执行中的任务数
+
+    /// 尚未完成的任务数 —— 排队中与执行中都算
+    TAtomic<Int32>     m_PendingTaskCount;
     UInt32             m_WorkerCount;      ///< 工作线程数量
 };
 
@@ -505,9 +536,11 @@ inline void FTask::NotifySuccessors()
             Int32 expected = static_cast<Int32>(TaskState::Pending);
             bool wasSet = successor->m_State.CompareExchange(
                 expected, static_cast<Int32>(TaskState::Ready));
-            if (wasSet)
+
+            // 入回**它自己**那个调度器, 而不是全局单例
+            if (wasSet && successor->m_Owner != nullptr)
             {
-                FTaskGraph::Get().EnqueueReady(successor);
+                successor->m_Owner->EnqueueReady(successor);
             }
         }
     }
