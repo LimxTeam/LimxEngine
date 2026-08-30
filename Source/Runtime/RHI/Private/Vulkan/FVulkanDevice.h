@@ -507,6 +507,27 @@ private:
 
     VkPhysicalDeviceProperties       m_DeviceProperties   = {};
 
+    /// 管线缓存 — 跨进程持久化到磁盘
+    ///
+    /// 驱动把编译好的管线状态存进去, 下次启动直接复用, 省掉重新编译
+    /// 着色器的时间。缓存内容与驱动版本、设备强绑定, 换了显卡或更新了
+    /// 驱动就会失效 —— Vulkan 在头部记了 UUID, 不匹配时驱动自己会忽略,
+    /// 不需要我们判断。
+    VkPipelineCache                  m_PipelineCache = VK_NULL_HANDLE;
+
+    /// 缓存文件路径
+    FString                          m_PipelineCachePath;
+
+    /// 累计的图形管线创建耗时 (毫秒) 与条数 — 用来量缓存的收益
+    Float64                          m_PipelineCreateMs    = 0.0;
+    UInt32                           m_PipelineCreateCount = 0;
+
+    /// 从磁盘装载管线缓存
+    void LoadPipelineCache();
+
+    /// 把管线缓存写回磁盘
+    void SavePipelineCache();
+
     /// 图形队列的时间戳有效位数 (0 = 该队列不支持时间戳)
     ///
     /// 这是**队列族**属性而非设备属性 —— 同一块卡上不同队列族的位数可以

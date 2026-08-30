@@ -42,6 +42,7 @@
 // ============================================================
 
 #include "Vulkan/FVulkanDevice.h"
+#include "Core/HAL/FPlatformTime.h"
 
 namespace Limx
 {
@@ -693,9 +694,18 @@ ERHIResult FVulkanDevice::CreateGraphicsPipeline(
     pipelineInfo.renderPass          = renderPass;
     pipelineInfo.subpass             = desc.SubpassIndex;
 
+    // 累计管线创建耗时 —— 用来量管线缓存到底值多少。
+    //
+    // 只能累计而不能取单次: 单条管线的创建在有无缓存两种情况下都只有
+    // 几毫秒, 而启动时要建十几条, 差别在总量上才看得出来。
+    const Float64 createBegin = FPlatformTime::Seconds();
+
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vkResult = vkCreateGraphicsPipelines(
-        m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+        m_Device, m_PipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+
+    m_PipelineCreateMs += (FPlatformTime::Seconds() - createBegin) * 1000.0;
+    ++m_PipelineCreateCount;
     if (vkResult != VK_SUCCESS)
     {
         LIMX_LOG(LogRHI, Error,
@@ -759,7 +769,7 @@ ERHIResult FVulkanDevice::CreateComputePipeline(
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vkResult = vkCreateComputePipelines(
-        m_Device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &pipeline);
+        m_Device, m_PipelineCache, 1, &createInfo, nullptr, &pipeline);
     if (vkResult != VK_SUCCESS)
     {
         LIMX_LOG(LogRHI, Error,

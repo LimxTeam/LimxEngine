@@ -34,6 +34,7 @@
 // ============================================================
 
 #include "Vulkan/FVulkanDevice.h"
+#include "Core/HAL/FPlatformFile.h"
 
 namespace Limx
 {
@@ -75,6 +76,19 @@ FVulkanDevice::~FVulkanDevice()
     if (m_Device != VK_NULL_HANDLE)
     {
         vkDeviceWaitIdle(m_Device);
+    }
+
+    LIMX_LOG(LogRHI, Display,
+        "[Vulkan] 管线创建 — 共 {} 条, 累计 {} ms",
+        m_PipelineCreateCount, m_PipelineCreateMs);
+
+    // 管线缓存写回 —— 必须在 vkDestroyDevice 之前
+    SavePipelineCache();
+
+    if (m_PipelineCache != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineCache(m_Device, m_PipelineCache, nullptr);
+        m_PipelineCache = VK_NULL_HANDLE;
     }
 
     // 销毁描述符池
@@ -172,6 +186,9 @@ ERHIResult FVulkanDevice::Initialize(void* nativeWindowHandle,
     {
         return result;
     }
+
+    // 管线缓存要在任何管线创建之前就绪
+    LoadPipelineCache();
 
     result = CreateDescriptorPool();
     if (!IsRHISuccess(result))
@@ -931,6 +948,92 @@ UInt32 FVulkanDevice::GetQueueFamilyIndex(EQueueType type) const
         case EQueueType::Compute:  return m_ComputeQueueFamily;
         case EQueueType::Transfer: return m_TransferQueueFamily;
         default:                   return m_GraphicsQueueFamily;
+    }
+}
+
+// ============================================================================
+// 管线缓存
+// ============================================================================
+
+void FVulkanDevice::LoadPipelineCache()
+{
+    m_PipelineCachePath = FString("Intermediate/PipelineCache.bin");
+
+    TArray<UInt8> blob;
+
+    if (FPlatformFile::Exists(m_PipelineCachePath))
+    {
+        blob = FPlatformFile::ReadAllBytes(m_PipelineCachePath);
+    }
+
+    VkPipelineCacheCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+
+    // 内容与驱动版本、设备强绑定。Vulkan 在缓存头部记了设备 UUID 与驱动
+    // 版本, 不匹配时驱动自己会忽略这份数据并从空开始 —— 不需要我们判断,
+    // 也不该自己解析那个头部 (它的布局是实现细节)。
+    if (!blob.IsEmpty())
+    {
+        createInfo.initialDataSize = blob.GetSize();
+        createInfo.pInitialData    = blob.GetData();
+    }
+
+    const VkResult result = vkCreatePipelineCache(
+        m_Device, &createInfo, nullptr, &m_PipelineCache);
+
+    if (result != VK_SUCCESS)
+    {
+        // 缓存建不出来不是致命错误 —— 退回逐次编译即可
+        LIMX_LOG(LogRHI, Warning,
+            "[Vulkan] vkCreatePipelineCache 失败: {} — 本次不使用管线缓存",
+            (Int32)result);
+
+        m_PipelineCache = VK_NULL_HANDLE;
+        return;
+    }
+
+    LIMX_LOG(LogRHI, Display,
+        "[Vulkan] 管线缓存 — 装入 {} 字节 (来自 {})",
+        blob.GetSize(),
+        blob.IsEmpty() ? "空, 首次运行或已失效" : m_PipelineCachePath.GetCStr());
+}
+
+void FVulkanDevice::SavePipelineCache()
+{
+    if (m_PipelineCache == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    SizeType size = 0;
+
+    if (vkGetPipelineCacheData(m_Device, m_PipelineCache, &size, nullptr)
+        != VK_SUCCESS || size == 0)
+    {
+        return;
+    }
+
+    TArray<UInt8> blob;
+    blob.SetSize(size);
+
+    if (vkGetPipelineCacheData(m_Device, m_PipelineCache, &size, blob.GetData())
+        != VK_SUCCESS)
+    {
+        return;
+    }
+
+    // 目录可能不存在 (干净克隆里 Intermediate/ 不入库)
+    FPlatformFile::CreateDirectoryTree(FString("Intermediate"));
+
+    if (FPlatformFile::WriteAllBytes(m_PipelineCachePath, blob.GetData(), size))
+    {
+        LIMX_LOG(LogRHI, Display,
+            "[Vulkan] 管线缓存 — 写回 {} 字节", size);
+    }
+    else
+    {
+        LIMX_LOG(LogRHI, Warning,
+            "[Vulkan] 管线缓存写回失败: {}", m_PipelineCachePath.GetCStr());
     }
 }
 
