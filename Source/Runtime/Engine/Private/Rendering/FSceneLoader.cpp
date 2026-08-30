@@ -178,51 +178,38 @@ void CollectPendingTexture(const FAssetScene&       assetScene,
     pending.Add(MoveTemp(entry));
 }
 
-/// 并行解码全部待解码纹理, 再串行上传进缓存
+/// 投递一波纹理解码 —— **不等待**, 完成情况由 outCounter 反映
 ///
-/// 为什么要分成"扇出解码 + 收拢上传"两段:
-///   解码是纯 CPU 且解码器无可变静态状态, 可以随便扇出;
-///   上传要走命令缓冲区, 而 BeginSingleTimeCommands 用的是同一个命令池,
-///   Vulkan 要求命令池由调用方外部同步 —— 多线程同时从一个池里分配是
-///   未定义行为。资源管理器本身也一把锁都没有。
-///
-/// 因此上传留在调用线程上。实测它只占导入总时间的 2%, 并行化它的收益
-/// 远小于给整条资源路径加锁的代价与风险。
-void PrefetchTextures(FRenderResourceManager& resources,
-                      FTextureCache&          cache,
-                      const FAssetScene&      assetScene,
-                      TArray<FPendingTexture>& pending,
-                      bool                     useAnisotropy,
-                      UInt32&                  outMissingCount,
-                      FTextureTiming&          timing)
+/// 非阻塞是为了让下一波能在本波收尾之前就排上队。逐波阻塞的话, 每一波
+/// 末尾都要等最慢的那张图, 而那段时间里其余工作线程全都闲着 —— 实测
+/// 波长 16 时这项损耗高达三分之一 (816 ms vs 一次解完的 610 ms)。
+void DispatchTextureWave(FTaskGraph&        graph,
+                         FPendingTexture*   entries,
+                         const FAssetScene& assetScene,
+                         SizeType           begin,
+                         SizeType           end,
+                         FJobCounter&       outCounter)
 {
-    if (pending.IsEmpty())
+    outCounter.Reset(0);
+
+    if (end <= begin)
     {
         return;
     }
 
-    // ---- 扇出解码 ----
-    const Float64 decodeBegin = FPlatformTime::Seconds();
+    const FAssetScene* scenePtr = &assetScene;
+    FPendingTexture*   base     = entries + begin;
 
-    {
-        // 图随本次导入建、随本次导入拆。相比常驻一张全局图, 这里多付出的
-        // 是几毫秒的线程创建 —— 与数秒的解码相比可以忽略, 换来的是不必
-        // 处理全局图的初始化与关闭时序。等到有多处需要它时再提升为常驻。
-        FTaskGraph graph;
-        graph.Initialize(0);
-
-        FPendingTexture*   entries     = pending.GetData();
-        const FAssetScene* scenePtr    = &assetScene;
-
-        // 批大小取 1: 每张图的解码耗时差异很大 (贴图尺寸从 512 到 2048
-        // 不等), 细粒度才能让先做完的线程立刻接下一张。
-        FJobExecutor::ParallelFor(
-            graph, pending.GetSize(), 1,
-            [entries, scenePtr](SizeType begin, SizeType end)
+    // 批大小取 1: 每张图的解码耗时差异很大 (贴图尺寸从 512 到 2048
+    // 不等), 细粒度才能让先做完的线程立刻接下一张。
+    FJobBatch batch = FParallelFor::Create(
+        end - begin, 1,
+        TFunction<void(SizeType, SizeType)>(
+            [base, scenePtr](SizeType first, SizeType last)
             {
-                for (SizeType i = begin; i < end; ++i)
+                for (SizeType i = first; i < last; ++i)
                 {
-                    FPendingTexture& entry = entries[i];
+                    FPendingTexture& entry = base[i];
 
                     FImageDecodeResult decodeResult;
 
@@ -253,17 +240,23 @@ void PrefetchTextures(FRenderResourceManager& resources,
                         entry.Error = decodeResult.ErrorMessage;
                     }
                 }
-            });
+            }),
+        &outCounter);
 
-        graph.Shutdown();
-    }
+    FJobExecutor::Dispatch(graph, batch);
+}
 
-    timing.DecodeMs += (FPlatformTime::Seconds() - decodeBegin) * 1000.0;
-
-    // ---- 收拢上传 ----
-    const Float64 uploadBegin = FPlatformTime::Seconds();
-
-    for (SizeType i = 0; i < pending.GetSize(); ++i)
+/// 传一波纹理 —— 串行上传 [begin, end) 并释放各自的像素内存
+void UploadTextureWave(FRenderResourceManager& resources,
+                       FTextureCache&          cache,
+                       TArray<FPendingTexture>& pending,
+                       SizeType                 begin,
+                       SizeType                 end,
+                       bool                     useAnisotropy,
+                       UInt32&                  outMissingCount,
+                       FTextureTiming&          timing)
+{
+    for (SizeType i = begin; i < end; ++i)
     {
         FPendingTexture& entry = pending[i];
 
@@ -293,12 +286,112 @@ void PrefetchTextures(FRenderResourceManager& resources,
 
         cache.Add(entry.Key, handle);
 
-        // 像素数据已经进了显存, 立刻放掉 —— 69 张 2K 贴图解出来是几百 MiB,
-        // 全留到导入结束会让内存峰值翻好几倍。
+        // 像素数据已经进了显存, 立刻放掉
         entry.Image.Reset();
     }
+}
 
-    timing.UploadMs += (FPlatformTime::Seconds() - uploadBegin) * 1000.0;
+/// 分波并行解码, 逐波上传
+///
+/// 为什么要分成"扇出解码 + 收拢上传"两段:
+///   解码是纯 CPU 且解码器无可变静态状态, 可以随便扇出;
+///   上传要走命令缓冲区, 而 BeginSingleTimeCommands 用的是同一个命令池,
+///   Vulkan 要求命令池由调用方外部同步 —— 多线程同时从一个池里分配是
+///   未定义行为。资源管理器本身也一把锁都没有。
+///
+/// 因此上传留在调用线程上。实测它只占导入总时间的 2%, 并行化它的收益
+/// 远小于给整条资源路径加锁的代价与风险。
+///
+/// 为什么要分波而不是一次解完:
+///   一次解完时, 所有解码结果会同时驻留在内存里 —— Sponza 的 69 张图
+///   解出来是 272 MiB, 而这个数字随场景的贴图总量线性增长, 五百张图的
+///   场景就是 2 GiB。分波把峰值钉在"一波的大小"上, 与场景规模无关。
+void PrefetchTextures(FRenderResourceManager& resources,
+                      FTextureCache&          cache,
+                      const FAssetScene&      assetScene,
+                      TArray<FPendingTexture>& pending,
+                      bool                     useAnisotropy,
+                      UInt32&                  outMissingCount,
+                      FTextureTiming&          timing)
+{
+    if (pending.IsEmpty())
+    {
+        return;
+    }
+
+    // 图随本次导入建、随本次导入拆。相比常驻一张全局图, 这里多付出的
+    // 是几毫秒的线程创建 —— 与数百毫秒的解码相比可以忽略, 换来的是不必
+    // 处理全局图的初始化与关闭时序。等到有多处需要它时再提升为常驻。
+    FTaskGraph graph;
+    graph.Initialize(0);
+
+    // 波长取工作线程数: 每个线程平均领到一张图, 而流水线保证它做完之后
+    // 立刻有下一波的活可接, 不必等本波收齐。
+    const UInt32 workerCount = FThread::HardwareConcurrency();
+
+    SizeType waveSize = static_cast<SizeType>((workerCount > 1) ? workerCount : 2);
+
+    if (waveSize < 2)
+    {
+        waveSize = 2;
+    }
+
+    const SizeType total = pending.GetSize();
+
+    // 两个计数器轮流用 —— 同一时刻最多两波在飞 (一波在解, 一波在传),
+    // 因此峰值内存被钉在两倍波长上, 与场景的贴图总数无关。
+    FJobCounter counters[2];
+
+    SizeType waveIndex = 0;
+    SizeType waveBegin = 0;
+    SizeType waveEnd   = (waveSize < total) ? waveSize : total;
+
+    DispatchTextureWave(graph, pending.GetData(), assetScene,
+                        waveBegin, waveEnd, counters[0]);
+
+    while (waveBegin < total)
+    {
+        // 先把下一波排上队, 再去等本波。
+        //
+        // 顺序反过来的话, 本波最后一张图还在解时其余线程全都闲着 ——
+        // 那正是逐波阻塞的损耗来源。
+        const SizeType nextBegin = waveEnd;
+        SizeType       nextEnd   = nextBegin + waveSize;
+
+        if (nextEnd > total)
+        {
+            nextEnd = total;
+        }
+
+        if (nextBegin < total)
+        {
+            DispatchTextureWave(graph, pending.GetData(), assetScene,
+                                nextBegin, nextEnd,
+                                counters[(waveIndex + 1) % 2]);
+        }
+
+        const Float64 decodeBegin = FPlatformTime::Seconds();
+
+        while (!counters[waveIndex % 2].IsComplete())
+        {
+            FThread::Yield();
+        }
+
+        timing.DecodeMs += (FPlatformTime::Seconds() - decodeBegin) * 1000.0;
+
+        const Float64 uploadBegin = FPlatformTime::Seconds();
+
+        UploadTextureWave(resources, cache, pending, waveBegin, waveEnd,
+                          useAnisotropy, outMissingCount, timing);
+
+        timing.UploadMs += (FPlatformTime::Seconds() - uploadBegin) * 1000.0;
+
+        waveBegin = nextBegin;
+        waveEnd   = nextEnd;
+        ++waveIndex;
+    }
+
+    graph.Shutdown();
 }
 
 /// 取或上传一张纹理
