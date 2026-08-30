@@ -674,12 +674,18 @@ void FShadowPass::UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex)
 void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
                            const FRenderPassContext& context)
 {
-    if (!m_HasValidLight)
-    {
-        return;
-    }
-
     commandBuffer->BeginDebugLabel("ShadowPass", 0.9f, 0.9f, 0.3f);
+
+    // 没有有效光源时也要走一遍通道, 只清不画。
+    //
+    // 直觉上"没有阴影就直接返回"是对的, 但阴影贴图的描述符始终指向这张
+    // 深度图, 而片段着色器里那句 sampler2DArrayShadow 只要出现在代码里,
+    // Vulkan 就要求它在绘制时处于 SHADER_READ_ONLY 布局 —— 着色器有没有
+    // 真的去采样并不重要。直接返回会让它停在 UNDEFINED, 验证层立刻报错。
+    //
+    // 清成深度 1.0 恰好也是正确的语义: 比较采样用 LessOrEqual, 参考深度
+    // 永远 ≤1.0, 于是处处判为无遮挡。
+    const bool hasCasters = m_HasValidLight;
 
     // 逐级各走一遍完整的渲染通道。
     //
@@ -750,7 +756,7 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
         (context.ShadowCasterObjects != nullptr) ? context.ShadowCasterObjects
                                                  : context.RenderObjects;
 
-    if (casters != nullptr)
+    if (hasCasters && casters != nullptr)
     {
         FRHIGraphicsPipelineHandle boundPipeline;
         FRHIDescriptorSetHandle    boundMaterial;

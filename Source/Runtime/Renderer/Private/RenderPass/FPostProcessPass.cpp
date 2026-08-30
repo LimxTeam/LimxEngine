@@ -42,7 +42,14 @@ namespace
 struct FTonemapPushConstant
 {
     Float32 Exposure = 1.0f;
-    Float32 Pad0     = 0.0f;
+
+    /// 是否由着色器做 sRGB 编码 (1.0) 还是交给硬件 (0.0)
+    ///
+    /// 交换链拿到 B8G8R8A8_SRGB 时, 硬件在写入时已经做了同一条编码 ——
+    /// 着色器再编一次就是两遍 gamma。而两遍 gamma 不产生任何瑕疵, 只是
+    /// 把整幅图往亮处推, 看着像"曝光高了点", 靠肉眼几乎不可能发现。
+    Float32 EncodeSrgb = 0.0f;
+
     Float32 Pad1     = 0.0f;
     Float32 Pad2     = 0.0f;
 };
@@ -103,8 +110,10 @@ ERHIResult FPostProcessPass::Setup(const FPassSetupDesc& desc)
     }
 
     LIMX_LOG(LogRenderer, Log,
-             "[PostProcessPass] 初始化完成 — ACES 色调映射, {}x{}",
-             desc.SwapchainExtent.Width, desc.SwapchainExtent.Height);
+             "[PostProcessPass] 初始化完成 — ACES 色调映射, {}x{}, "
+             "sRGB 编码由{}完成",
+             desc.SwapchainExtent.Width, desc.SwapchainExtent.Height,
+             IsSRGBFormat(m_SwapchainFormat) ? "硬件" : "着色器");
 
     return ERHIResult::Success;
 }
@@ -434,6 +443,9 @@ void FPostProcessPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     FTonemapPushConstant pushData;
     pushData.Exposure = m_Exposure;
+
+    // sRGB 格式的目标由硬件编码, 着色器就不能再编一次
+    pushData.EncodeSrgb = IsSRGBFormat(m_SwapchainFormat) ? 0.0f : 1.0f;
 
     commandBuffer->PushConstants(
         m_PipelineLayout,

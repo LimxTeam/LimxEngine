@@ -321,12 +321,22 @@ FMeshData FGeometryGenerator::GenerateSphere(
                 (iStack + 1) * (slices + 1) + iSlice);
             UInt16 belowNext = static_cast<UInt16>(below + 1);
 
+            // 缠绕方向必须与立方体、平面以及导入的 glTF/OBJ 一致:
+            // 从**球外**看去为逆时针 (右手定则的面法线朝外)。
+            //
+            // 原先写的是 (current, below, next), 叉积指向球心内侧 —— 于是
+            // 背面剔除把朝向相机的那半球全部剔掉, 画面上留下的是远侧半球,
+            // 法线正好背对相机。
+            //
+            // 这个错误极难看出来: 球的轮廓一模一样, 只有着色不对。而漫反射
+            // 加上一盏主光, 远侧半球看着也像是"光从另一边来"。它是被白炉
+            // 测试抓出来的 —— 那是第一次有已知真值可以拿来核对法线。
             mesh.Indices.Add(current);
-            mesh.Indices.Add(below);
             mesh.Indices.Add(next);
+            mesh.Indices.Add(below);
 
-            mesh.Indices.Add(next);
             mesh.Indices.Add(below);
+            mesh.Indices.Add(next);
             mesh.Indices.Add(belowNext);
         }
     }

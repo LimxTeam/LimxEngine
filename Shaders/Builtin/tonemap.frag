@@ -22,7 +22,7 @@ layout(set = 0, binding = 0) uniform sampler2D hdrColor;
 
 layout(push_constant) uniform TonemapParams {
     float exposure;      // 线性曝光倍数
-    float _pad0;
+    float encodeSrgb;    // 1 = 由本着色器做 sRGB 编码, 0 = 交给硬件
     float _pad1;
     float _pad2;
 } params;
@@ -62,6 +62,14 @@ vec3 ACESFitted(vec3 color)
 //
 // 用分段精确式而非 pow(x, 1/2.2): 后者在暗部与真实 sRGB 曲线偏差可达
 // 数个色阶, 在渐变与阴影过渡处会显出色带。
+//
+// **只在目标不是 sRGB 格式时才该调用它。** 交换链通常拿到的是
+// B8G8R8A8_SRGB, 那种格式在写入时由硬件完成同一条编码 —— 这里再编一次
+// 就是两遍 gamma, 画面会整体发灰发亮。
+//
+// 这个错误极难靠肉眼发现: 双重编码不会产生任何瑕疵, 只是把整幅图往亮处
+// 推, 看着像"曝光调高了一点"。它是被白炉测试抓出来的 —— 那是第一次有一个
+// 已知的真值 (环境辐射度恒为 1) 可以拿来对照渲染出的像素。
 vec3 LinearToSRGB(vec3 linearColor)
 {
     vec3 lo = linearColor * 12.92;
@@ -77,5 +85,12 @@ void main()
 
     vec3 mapped = ACESFitted(hdr);
 
-    outColor = vec4(LinearToSRGB(mapped), 1.0);
+    // 目标是 sRGB 格式时交给硬件, 否则自己编码 —— 交换链格式在不同驱动
+    // 上并不总能拿到期望的那一个, 因此这件事必须由运行时决定而非写死。
+    if (params.encodeSrgb > 0.5)
+    {
+        mapped = LinearToSRGB(mapped);
+    }
+
+    outColor = vec4(mapped, 1.0);
 }

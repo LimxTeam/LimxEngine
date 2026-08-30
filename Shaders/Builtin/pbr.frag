@@ -165,19 +165,50 @@ vec3 FresnelSchlick(float cosTheta, vec3 F0)
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// 带粗糙度修正的菲涅尔 —— 只用于环境项
+// 微表面间多次散射的能量补偿
 //
-// 标准 Schlick 在掠射角一律涨到 1, 那是完全光滑表面的行为。粗糙表面的
-// 微平面朝向各异, 掠射角下真正对齐到镜面方向的比例低得多, 反射因此
-// 达不到 1。不修正的话粗糙金属边缘会镶一圈过亮的白边。
+// 单次散射的 GGX 只统计"入射 → 一次反弹 → 出射"的光。粗糙表面的微平面
+// 互相遮挡, 被挡住的那部分光其实会在微平面之间继续弹射, 最终仍有相当一部分
+// 射出去 —— 单次散射模型把它们全当作被吸收了。
 //
-// max(1-roughness, F0) 是 Sébastien Lagarde 给出的近似: 粗糙度越高,
-// 掠射角的上限越低, 而下限始终不低于 F0 本身。
-vec3 FresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
+// 白炉测试给出的实测: 粗糙度 1 的金属只反射回 31% 的入射能量, 丢掉的
+// 69% 全是这些多次弹射。而画面上它只表现为"粗糙金属偏暗", 看着像
+// 材质参数没调好。
+//
+// 这里用 Fdez-Agüera (2019) 的近似: 丢失的能量 Ems = 1-(A+B) 按平均
+// 菲涅尔 F_avg 做等比级数求和补回。它不需要任何额外贴图 —— 所需的
+// A、B 就是已有的 BRDF 查找表。
+//
+// F_avg 的 1/21 来自 Schlick 菲涅尔在半球上的解析平均:
+//   ∫F(θ)cosθ dω / π = F0 + (1-F0)/21
+struct FEnergyTerms
 {
-    vec3 ceiling = max(vec3(1.0 - roughness), F0);
+    vec3 SingleScatter;   // FssEss —— 单次散射的镜面权重
+    vec3 MultiScatter;    // FmsEms —— 多次弹射补回的能量
+    vec3 Diffuse;         // kD    —— 剩给漫反射的能量
+};
 
-    return F0 + (ceiling - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+FEnergyTerms ComputeEnergyTerms(vec2 envBrdf, vec3 F0, vec3 diffuseColor)
+{
+    FEnergyTerms terms;
+
+    terms.SingleScatter = F0 * envBrdf.x + envBrdf.y;
+
+    // 单次散射漏掉的比例
+    float Ems = 1.0 - (envBrdf.x + envBrdf.y);
+
+    vec3 F_avg = F0 + (1.0 - F0) / 21.0;
+
+    // 等比级数 Σ (F_avg·Ems)^n 的闭式解
+    terms.MultiScatter = Ems * terms.SingleScatter * F_avg /
+                         (1.0 - F_avg * Ems);
+
+    // 漫反射拿走镜面 (含补偿) 之后剩下的那份 —— 这样三项加起来恰好是
+    // 入射能量, 而不是各自独立地取一个"看着差不多"的系数
+    terms.Diffuse = diffuseColor *
+                    (1.0 - terms.SingleScatter - terms.MultiScatter);
+
+    return terms;
 }
 
 // ============================================================
@@ -526,18 +557,7 @@ void main()
     {
         const float NdotV = max(dot(N, V), 0.0);
 
-        // 环境项的菲涅尔用几何法线与视线的夹角, 而非某个具体半程向量 ——
-        // 环境光来自所有方向, 没有单一的半程向量可言。
-        //
-        // 用带粗糙度的变体: 粗糙表面在掠射角的反射不会像光滑表面那样
-        // 涨到 1。不修正的话粗糙金属的边缘会镶上一圈过亮的白边。
-        vec3 F_ambient = FresnelSchlickRoughness(NdotV, F0, roughness);
-
-        // ---- 漫反射项 ----
-        vec3 kD_ambient = (vec3(1.0) - F_ambient) * (1.0 - metallic);
-
         vec3 irradiance = texture(irradianceMap, N).rgb;
-        vec3 diffuseIbl = kD_ambient * irradiance * albedo;
 
         // ---- 镜面项 (split-sum) ----
         //
@@ -546,18 +566,30 @@ void main()
         // 反射方向按粗糙度选 mip。roughness 与 LOD 的映射必须与预滤波时
         // "粗糙度在各级之间线性铺开"严格互逆, 否则某一档粗糙度会取到
         // 邻近档的内容 —— 表现是粗糙度调节的手感不对, 而非明显的错误。
-        vec3  R        = reflect(-V, N);
-        float lod      = roughness * lighting.iblParams.z;
+        vec3  R           = reflect(-V, N);
+        float lod         = roughness * lighting.iblParams.z;
         vec3  prefiltered = textureLod(prefilteredMap, R, lod).rgb;
 
         vec2 envBrdf = texture(brdfLut, vec2(NdotV, roughness)).rg;
 
-        vec3 specularIbl = prefiltered * (F0 * envBrdf.x + envBrdf.y);
+        // ---- 三项能量一次分配 ----
+        //
+        // 菲涅尔直接用 F0 而不再做粗糙度修正: 掠射角的衰减已经包含在
+        // 查找表的 A、B 里了。再乘一次带粗糙度的 Schlick 等于把同一件事
+        // 算两遍, 结果是掠射角偏暗。
+        //
+        // 多次散射的补偿项按辐照度着色而非按预滤波贴图: 弹射多次之后
+        // 方向性早已散尽, 用近似均匀的辐照度比用有方向的反射更接近实际。
+        FEnergyTerms energy =
+            ComputeEnergyTerms(envBrdf, F0, albedo * (1.0 - metallic));
 
-        // 环境遮蔽同时作用于两项。严格说镜面该用单独的镜面遮蔽项,
+        vec3 iblColor = energy.SingleScatter * prefiltered +
+                        (energy.MultiScatter + energy.Diffuse) * irradiance;
+
+        // 环境遮蔽同时作用于三项。严格说镜面该用单独的镜面遮蔽项,
         // 但那需要额外的贴图; 共用 ao 是通行做法, 偏差主要出现在
         // 缝隙深处 —— 那里本来也几乎看不到反射。
-        ambient = (diffuseIbl + specularIbl) * ao * lighting.iblParams.y;
+        ambient = iblColor * ao * lighting.iblParams.y;
     }
     else
     {

@@ -117,6 +117,13 @@ struct FLaunchOptions
     /// 这是能用一行数字判定卷积对错的地方。
     bool ProbeIrradiance = false;
 
+    /// 白炉测试 —— 用各方向恒为 1 的合成环境替代 HDRI, 并关掉全部直接光
+    ///
+    /// 能量守恒唯一的客观判据: 反照率为 1 的表面在这个环境下必须原样反射
+    /// 回 1, 也就是物体应当完全消失在背景里。任何一处能量被吞掉或凭空多出,
+    /// 都会让它从背景里浮现。
+    bool Furnace = false;
+
     /// 材质阵列的边长; 0 表示不构建
     ///
     /// 横向扫粗糙度、纵向扫金属度的球体阵列 —— 验证 IBL 的标准场景。
@@ -302,6 +309,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --probe-irradiance 输出辐照度贴图六个面的中心值 (数值校验用)
 ///   --probe-brdf     输出 BRDF 查找表的采样网格 (数值校验用)
 ///   --material-grid N  构建 N×N 球体阵列 (横向粗糙度, 纵向金属度)
+///   --furnace        白炉测试: 合成均匀环境 + 关闭直接光
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -422,6 +430,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--material-grid") && (i + 1) < tokenCount)
         {
             options.MaterialGrid = ParseUInt32(tokens[++i], 0);
+        }
+        else if (WideEquals(arg, L"--furnace"))
+        {
+            options.Furnace = true;
         }
     }
 
@@ -884,6 +896,121 @@ static void BuildDemoScene(LScene* scene, FRenderContext* context,
 }
 
 // ============================================================================
+// BuildFurnaceEnvironment — 各方向辐射度恒为 1 的合成环境 (白炉)
+//
+// 白炉测试是能量守恒唯一的客观判据。把物体放进一个各向辐射度处处为 1 的
+// 环境里, 一个能量守恒、反照率为 1 的表面必须原样反射回 1 —— 也就是说
+// 物体应当**完全消失**在背景里, 无论粗糙度、金属度取什么值。
+//
+// 它之所以有力, 在于它把"看着差不多"变成了"逐像素相等": 任何一处能量
+// 被吞掉或凭空多出来, 都会让物体从背景里浮现出来。而这种偏差在真实
+// HDRI 下完全看不出 —— 环境本来就有明暗, 物体比背景暗一点毫不可疑。
+//
+// 尺寸取 64x32 就够: 环境处处相同, 再大也只是重复同一个数。
+// ============================================================================
+
+static FImageData BuildFurnaceEnvironment()
+{
+    constexpr UInt32 kWidth  = 64;
+    constexpr UInt32 kHeight = 32;
+
+    FImageData image;
+    image.Width          = kWidth;
+    image.Height         = kHeight;
+    image.Format         = EImageFormat::RGBA32F;
+    image.ColorSpace     = EImageColorSpace::Linear;
+    image.HasSourceAlpha = false;
+
+    const SizeType texelCount = static_cast<SizeType>(kWidth) * kHeight;
+
+    image.Pixels.SetSize(texelCount * 4 * sizeof(Float32));
+
+    Float32* texels = reinterpret_cast<Float32*>(image.Pixels.GetData());
+
+    for (SizeType i = 0; i < texelCount; ++i)
+    {
+        texels[i * 4 + 0] = 1.0f;
+        texels[i * 4 + 1] = 1.0f;
+        texels[i * 4 + 2] = 1.0f;
+        texels[i * 4 + 3] = 1.0f;
+    }
+
+    return image;
+}
+
+// ============================================================================
+// RunFurnaceChecks — 白炉下 IBL 各级预计算结果的数值自检
+//
+// 三条性质都是解析可知的, 不依赖任何具体环境:
+//   辐照度贴图存 E/π, 而 L=1 时 E = ∫cosθ dω = π —— 故应处处为 1
+//   预滤波贴图是环境按 GGX 加权的平均 —— 恒为 1 的环境平均后仍是 1
+//   BRDF 表的 A+B 是单次散射的方向反照率 —— 它小于 1 的那部分就是
+//     GGX 单次散射丢掉的能量, 也正是多次散射补偿要补回来的量
+// ============================================================================
+
+static void RunFurnaceChecks(const FEnvironmentMap& environmentMap,
+                             FRenderContext*        context)
+{
+    TArray<Float32> irradiance;
+    UInt32          faceSize = 0;
+
+    if (environmentMap.ReadbackIrradiance(context, irradiance, faceSize))
+    {
+        Float32 minValue = 1.0e30f;
+        Float32 maxValue = 0.0f;
+
+        const SizeType texelCount =
+            static_cast<SizeType>(faceSize) * faceSize * 6;
+
+        for (SizeType i = 0; i < texelCount; ++i)
+        {
+            for (SizeType channel = 0; channel < 3; ++channel)
+            {
+                const Float32 value = irradiance[i * 4 + channel];
+
+                if (value < minValue) { minValue = value; }
+                if (value > maxValue) { maxValue = value; }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[白炉] 辐照度贴图 min={} max={} (应处处为 1)",
+                 minValue, maxValue);
+    }
+
+    TArray<Float32> lut;
+    UInt32          lutSize = 0;
+
+    if (environmentMap.ReadbackBrdfLut(context, lut, lutSize))
+    {
+        // 沿粗糙度扫一列 (取正对视角 n·v≈1), 报出单次散射丢了多少能量
+        const UInt32 column = lutSize - 1;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[白炉] 单次散射 GGX 的方向反照率 (n·v≈1):");
+
+        for (UInt32 step = 0; step <= 4; ++step)
+        {
+            const UInt32 row = (lutSize - 1) * step / 4;
+
+            const SizeType index =
+                (static_cast<SizeType>(row) * lutSize + column) * 2;
+
+            const Float32 a = lut[index];
+            const Float32 b = lut[index + 1];
+
+            const Float32 roughness = (static_cast<Float32>(row) + 0.5f) /
+                                      static_cast<Float32>(lutSize);
+
+            LIMX_LOG(LogLaunch, Display,
+                     "         粗糙度 {} → A+B={} (损失 {}%)",
+                     roughness, a + b,
+                     static_cast<Int32>((1.0f - (a + b)) * 100.0f));
+        }
+    }
+}
+
+// ============================================================================
 // BuildMaterialGrid — 粗糙度 × 金属度 的球体阵列
 //
 // 这是验证 IBL 的标准场景, 理由是它把两个自由度摊平成一张图:
@@ -959,7 +1086,10 @@ static void BuildMaterialGrid(LScene* scene, FRenderContext* context,
             const Float32 metallic =
                 static_cast<Float32>(row) / lastIndex;
 
-            material->SetBaseColor(FVector4(0.9f, 0.9f, 0.9f, 1.0f));
+            // 基色取**恰好** 1.0 而非 0.9: 白炉测试的判据是"物体与背景
+            // 逐像素相等", 而反照率一旦小于 1, 物体本就该比背景暗 ——
+            // 那样就分不清暗下去的是反照率还是丢掉的能量了。
+            material->SetBaseColor(FVector4(1.0f, 1.0f, 1.0f, 1.0f));
             material->SetRoughness(roughness);
             material->SetMetallic(metallic);
 
@@ -1554,7 +1684,31 @@ int WINAPI wWinMain(
     // 描述符集就会指向已释放的图像。作用域必须覆盖整个渲染期。
     FEnvironmentMap environmentMap;
 
-    if (!launchOptions.HdriPath.IsEmpty())
+    if (launchOptions.Furnace)
+    {
+        // 直接光会叠加在 IBL 之上, 使"物体是否等于背景"不再成立
+        FLightManager::Get().ClearAllLights();
+
+        const FImageData furnace = BuildFurnaceEnvironment();
+
+        if (IsRHISuccess(environmentMap.BuildFromEquirect(&renderContext,
+                                                          furnace)))
+        {
+            renderer.SetEnvironmentMap(&environmentMap);
+            renderer.SetSkyIntensity(1.0f);
+            renderer.SetIblIntensity(1.0f);
+
+            RunFurnaceChecks(environmentMap, &renderContext);
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[白炉] 环境就绪 —— 各方向辐射度恒为 1, 直接光已关闭");
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error, "[白炉] 合成环境构建失败");
+        }
+    }
+    else if (!launchOptions.HdriPath.IsEmpty())
     {
         LoadEnvironmentMap(environmentMap, &renderContext, &renderer,
                            launchOptions);
