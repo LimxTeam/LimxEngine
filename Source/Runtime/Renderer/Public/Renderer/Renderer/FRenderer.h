@@ -88,6 +88,7 @@ class FShadowPass;
 class FDepthPrePass;
 class FSkyPass;
 class FPostProcessPass;
+class FEnvironmentMap;
 class FMaterial;
 
 // ============================================================================
@@ -289,17 +290,25 @@ public:
     // 环境光照
     // ====================================================================
 
-    /// 绑定环境立方体贴图给天空盒
+    /// 绑定环境贴图 — 同时驱动天空盒与 IBL 漫反射项
     ///
-    /// 传入无效句柄即解绑。切换关卡时**必须**先解绑再销毁贴图 ——
-    /// 否则天空 Pass 的描述符集里留着一个指向已释放图像的视图。
-    void SetEnvironmentMap(FRHITextureViewHandle cubeView,
-                           FRHISamplerHandle     sampler);
+    /// 传 nullptr 即解绑, 环境项退回常数环境光。切换关卡时**必须**先解绑
+    /// 再销毁贴图 —— 否则描述符集里留着指向已释放图像的视图。
+    ///
+    /// 接受整个对象而非若干句柄: 天空要环境贴图, 漫反射要辐照度贴图,
+    /// 镜面还会再要预滤波贴图与 BRDF 查找表。逐个传句柄的参数表会一直
+    /// 膨胀下去, 而且很容易出现"传了三个忘了第四个"的半绑定状态。
+    void SetEnvironmentMap(const FEnvironmentMap* environment);
 
     /// 设置天空强度的线性倍数
     void SetSkyIntensity(Float32 intensity);
 
     LIMX_NODISCARD Float32 GetSkyIntensity() const;
+
+    /// 设置 IBL 强度的线性倍数 —— 与天空强度分开, 便于单独配平
+    void SetIblIntensity(Float32 intensity);
+
+    LIMX_NODISCARD Float32 GetIblIntensity() const { return m_IblIntensity; }
 
     LIMX_NODISCARD bool HasEnvironmentMap() const;
 
@@ -335,6 +344,17 @@ private:
 
     /// 创建棋盘格纹理 + 采样器 + 纹理视图
     ERHIResult CreateTextureResources();
+
+    /// 创建 1x1 黑色立方体贴图 —— 没有环境贴图时的描述符占位
+    ///
+    /// 着色器里出现的描述符必须在管线绑定时有效, 靠 uniform 分支跳过采样
+    /// 并不能免除这一点。占位图取黑色而非白色: 万一开关判断写错, 黑色的
+    /// 表现是"环境光没了", 白色则是"整个场景发白" —— 前者更容易定位。
+    ERHIResult CreateFallbackCubeMap();
+
+    /// 把辐照度视图写进全部帧的光照描述符集
+    void UpdateIrradianceDescriptors(FRHITextureViewHandle irradianceView,
+                                     FRHISamplerHandle     sampler);
 
     /// 销毁纹理资源 (纹理 + 纹理视图 + 采样器)
     void DestroyTextureResources();
@@ -384,6 +404,14 @@ private:
     // ---- 纹理资源 (棋盘格) ----
     FRHITextureHandle                 m_Texture;
     FRHITextureViewHandle             m_TextureView;
+
+    // ---- IBL 占位资源 ----
+    FRHITextureHandle                 m_FallbackCubeTexture;
+    FRHITextureViewHandle             m_FallbackCubeView;
+    FRHISamplerHandle                 m_FallbackCubeSampler;
+
+    /// IBL 强度倍数 —— 与天空强度分开记, 两者的合适取值往往不同
+    Float32                           m_IblIntensity = 1.0f;
     FRHISamplerHandle                 m_Sampler;
 
     // ---- 本帧渲染视图 (非拥有 —— GPU 资源归 FRenderResourceManager) ----

@@ -69,6 +69,7 @@ layout(row_major, set = 2, binding = 0) uniform LightingUBO {
     mat4      cascadeViewProj[3];  // 各级联的视图投影矩阵
     vec4      cascadeSplits;         // xyz=各级外边界的径向距离
     vec4      shadowParams;          // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
+    vec4      iblParams;             // x=启用 IBL, y=IBL 强度倍数
 } lighting;
 
 // ── 阴影贴图数组 (set 2, binding 1) ──
@@ -78,6 +79,15 @@ layout(row_major, set = 2, binding = 0) uniform LightingUBO {
 // 是四个纹素线性插值后的**深度值**, 再与参考深度比较 —— 那等于在深度域
 // 里插值, 边缘会出现明显的阶梯。
 layout(set = 2, binding = 1) uniform sampler2DArrayShadow shadowMap;
+
+// ── 漫反射辐照度立方体贴图 (set 2, binding 2) ──
+//
+// 存的是"法线朝向 n 的表面从整个上半球收到的总辐照度", 即环境图与余弦瓣的
+// 卷积。着色时按法线查一次即可, 不必在这里做积分。
+//
+// 没有环境贴图时这里绑的是一张 1x1 黑图, 由 iblParams.x 决定是否采用 ——
+// 描述符必须始终有效, 靠分支跳过采样并不能免除这一点。
+layout(set = 2, binding = 2) uniform samplerCube irradianceMap;
 
 const int SHADOW_CASCADE_COUNT = 3;
 
@@ -475,9 +485,34 @@ void main()
     }
 
     // ---- 环境光 ----
-    vec3 ambient = lighting.ambientColor.xyz *
-                   lighting.ambientColor.w *
-                   albedo * ao;
+    //
+    // 常数环境光对每个朝向给出同样的值 —— 朝天的面与朝地的面收到一样多,
+    // 物体因此没有任何"被环境照亮"的层次。更要命的是金属: 它的 kD 为 0,
+    // 常数环境光乘上去等于零, 于是金属在没有直接光的方向上完全是黑的。
+    //
+    // 有辐照度贴图时改按法线查表。这里只处理漫反射项 —— 镜面的环境反射
+    // 需要预滤波贴图与 BRDF 查找表, 尚未接入, 因此金属此刻仍只有直接光的
+    // 高光。这一步先把"环境光有方向"这件事做对。
+    vec3 ambient;
+
+    if (lighting.iblParams.x > 0.5)
+    {
+        // 环境项的菲涅尔用几何法线与视线的夹角, 而非某个具体半程向量 ——
+        // 环境光来自所有方向, 没有单一的半程向量可言。
+        vec3  F_ambient  = FresnelSchlick(max(dot(N, V), 0.0), F0);
+        vec3  kD_ambient = (vec3(1.0) - F_ambient) * (1.0 - metallic);
+
+        vec3 irradiance = texture(irradianceMap, N).rgb
+                        * lighting.iblParams.y;
+
+        ambient = kD_ambient * irradiance * albedo * ao;
+    }
+    else
+    {
+        ambient = lighting.ambientColor.xyz *
+                  lighting.ambientColor.w *
+                  albedo * ao;
+    }
 
     // ---- 最终颜色 — 线性 HDR, 不在此处做色调映射 ----
     //

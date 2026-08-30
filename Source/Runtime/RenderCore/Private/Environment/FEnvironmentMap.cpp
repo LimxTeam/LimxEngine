@@ -4,16 +4,20 @@
  * 创建者: LimxTeam
  *
  * 功能描述:
- *   环境立方体贴图实现 — 上传等距柱状图、计算着色器转换、资源生命周期
+ *   环境立方体贴图实现 — 上传等距柱状图、两趟计算着色器、资源生命周期
  *
  * 设计哲学:
  *   转换用的资源在转换完成后立刻释放 — 暂存缓冲区、源纹理、计算管线、
- *   描述符集只在这一次 Dispatch 里有意义, 而源纹理是整套资源里最大的一块
+ *   描述符集只在那两次 Dispatch 里有意义, 而源纹理是整套资源里最大的一块
  *   (2K HDRI 的 RGBA32F 形态是 32 MB)。留着它就是白占显存。
  *
  *   六个面一次 Dispatch 而非六次 — 立方体贴图的层在 Vulkan 里就是数组层,
  *   分派网格的 z 维直接对应层索引。分六次不会更快, 只会多五次提交开销,
  *   还要额外考虑层间的同步。
+ *
+ *   两趟转换共用一个"建计算管线 → 分派 → 拆管线"的骨架 (FComputePass)。
+ *   它们的差别只有着色器、绑定的两张贴图与推送常量; 抄一遍只会让两处的
+ *   屏障逐渐走样 —— 而屏障写错的表现是间歇性的花屏, 极难复现。
  *
  * 依赖关系:
  *   内部: RenderCore/Environment/FEnvironmentMap.h,
@@ -35,7 +39,7 @@ LIMX_DEFINE_LOG_CATEGORY(LogEnvironment)
 namespace
 {
 
-/// 计算着色器的线程组边长 —— 必须与 equirect_to_cube.comp 的 local_size 一致
+/// 计算着色器的线程组边长 —— 必须与两个 .comp 的 local_size 一致
 constexpr UInt32 kThreadGroupSize = 8;
 
 /// 立方体贴图的面数
@@ -47,6 +51,24 @@ constexpr UInt32 kCubeFaceCount = 6;
 /// 上限 4096: 六个面的 RGBA16F 合计 768 MB, 已经超出任何合理预算。
 constexpr UInt32 kMinFaceSize = 16;
 constexpr UInt32 kMaxFaceSize = 4096;
+
+/// 半精度浮点能表示的最大有限值
+constexpr Float32 kHalfMaxValue = 65504.0f;
+
+/// 推送常量 —— 两个着色器共用同一块布局
+///
+/// 第二个字段在等距转换里没有意义 (会被忽略), 但两趟共用一个布局
+/// 意味着少一份管线布局、少一次"这次该填哪个结构"的判断。
+struct FConvertPushConstant
+{
+    UInt32  FaceSize       = 0;
+    Float32 SampleDelta    = 0.0f;
+    Float32 SourceMipLevel = 0.0f;
+    UInt32  Pad0           = 0;
+};
+
+static_assert(sizeof(FConvertPushConstant) == 16,
+              "FConvertPushConstant 必须为 16 字节以匹配着色器布局");
 
 /// 面边长向上取到线程组边长的整数倍
 UInt32 AlignFaceSize(UInt32 faceSize)
@@ -61,15 +83,291 @@ UInt32 AlignFaceSize(UInt32 faceSize)
     return faceSize + (kThreadGroupSize - remainder);
 }
 
-struct FConversionPushConstant
+
+/// 半精度浮点转单精度
+///
+/// 自己写而非调库: 引擎不用 CRT, 而这个转换本身只是位域重排 —— 指数偏置
+/// 从 15 换到 127, 尾数左移 13 位。非规格化数要单独处理: 它们的隐含位是 0
+/// 而非 1, 按常规公式解会得到一个大得离谱的值。
+Float32 HalfToFloat(UInt16 half)
 {
-    UInt32 FaceSize = 0;
-    UInt32 Pad0     = 0;
-    UInt32 Pad1     = 0;
-    UInt32 Pad2     = 0;
+    const UInt32 sign     = static_cast<UInt32>(half >> 15) & 0x1u;
+    const UInt32 exponent = static_cast<UInt32>(half >> 10) & 0x1Fu;
+    const UInt32 mantissa = static_cast<UInt32>(half) & 0x3FFu;
+
+    UInt32 bits = sign << 31;
+
+    if (exponent == 0)
+    {
+        if (mantissa != 0)
+        {
+            // 非规格化: 归一化到单精度的规格化区间。半精度最小非规格化数
+            // 是 2^-24, 单精度完全表示得下, 因此不会再次退化。
+            UInt32 shifted = mantissa;
+            UInt32 e       = 127 - 15 + 1;
+
+            while ((shifted & 0x400u) == 0)
+            {
+                shifted <<= 1;
+                --e;
+            }
+
+            shifted &= 0x3FFu;
+            bits |= (e << 23) | (shifted << 13);
+        }
+        // mantissa 为 0 时就是 ±0, bits 保持只有符号位
+    }
+    else if (exponent == 31)
+    {
+        // Inf / NaN —— 指数全 1 原样搬过去
+        bits |= (0xFFu << 23) | (mantissa << 13);
+    }
+    else
+    {
+        bits |= ((exponent - 15 + 127) << 23) | (mantissa << 13);
+    }
+
+    Float32 result = 0.0f;
+    Memory::MemCopy(&result, &bits, sizeof(Float32));
+
+    return result;
+}
+
+// ============================================================================
+// FComputePass — "一张采样贴图 + 一张存储贴图 + 一个推送常量"的计算通道
+// ============================================================================
+
+/// 两趟转换的共同骨架。构造即建管线, 析构即拆管线。
+class FComputePass
+{
+public:
+    FComputePass() = default;
+
+    ~FComputePass()
+    {
+        Release();
+    }
+
+    LIMX_NON_COPYABLE(FComputePass);
+    LIMX_NON_MOVABLE(FComputePass);
+
+    ERHIResult Create(IRHIDevice*           device,
+                      const AnsiChar*       shaderPath,
+                      const AnsiChar*       debugName,
+                      FRHITextureViewHandle sourceView,
+                      FRHISamplerHandle     sourceSampler,
+                      FRHITextureViewHandle targetStorageView)
+    {
+        m_Device = device;
+
+        FShaderManager& shaderManager = FShaderManager::Get();
+
+        if (!shaderManager.IsInitialized())
+        {
+            shaderManager.Initialize();
+        }
+
+        ERHIResult result = shaderManager.CreateShaderModule(
+            device, FString(shaderPath), EShaderStage::Compute, m_Shader);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHIDescriptorBinding bindings[2] = {};
+        bindings[0].Binding    = 0;
+        bindings[0].Type       = EDescriptorType::CombinedImageSampler;
+        bindings[0].Count      = 1;
+        bindings[0].StageFlags = EShaderStage::Compute;
+
+        bindings[1].Binding    = 1;
+        bindings[1].Type       = EDescriptorType::StorageImage;
+        bindings[1].Count      = 1;
+        bindings[1].StageFlags = EShaderStage::Compute;
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 2;
+        layoutDesc.DebugName    = debugName;
+
+        result = device->CreateDescSetLayout(layoutDesc, m_DescSetLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHIPushConstantRange pushRange = {};
+        pushRange.StageFlags = EShaderStage::Compute;
+        pushRange.Offset     = 0;
+        pushRange.Size       = sizeof(FConvertPushConstant);
+
+        FRHIPipelineLayoutDesc pipelineLayoutDesc = {};
+        pipelineLayoutDesc.SetLayouts             = &m_DescSetLayout;
+        pipelineLayoutDesc.SetLayoutCount         = 1;
+        pipelineLayoutDesc.PushConstantRanges     = &pushRange;
+        pipelineLayoutDesc.PushConstantRangeCount = 1;
+        pipelineLayoutDesc.DebugName              = debugName;
+
+        result = device->CreatePipelineLayout(pipelineLayoutDesc,
+                                              m_PipelineLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        result = device->AllocateDescriptorSet(m_DescSetLayout,
+                                               m_DescriptorSet);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHIDescriptorWrite writes[2] = {};
+        writes[0] = FRHIDescriptorWrite::CombinedImageSampler(
+            m_DescriptorSet, 0, sourceView, sourceSampler,
+            EImageLayout::ShaderReadOnly);
+
+        // 存储图像必须以 General 布局绑定 —— 它是唯一允许着色器写入的布局
+        writes[1].DescriptorSet = m_DescriptorSet;
+        writes[1].Binding       = 1;
+        writes[1].Type          = EDescriptorType::StorageImage;
+        writes[1].ImageView     = targetStorageView;
+        writes[1].ImageLayout   = EImageLayout::General;
+
+        device->UpdateDescriptorSets(writes, 2);
+
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Shader     = m_Shader;
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+        pipelineDesc.PipelineLayout           = m_PipelineLayout;
+        pipelineDesc.DebugName                = debugName;
+
+        return device->CreateComputePipeline(pipelineDesc, m_Pipeline);
+    }
+
+    /// 录制一次完整的转换: 布局转换 → 分派 → 转为着色器只读
+    void Dispatch(IRHICommandBuffer*          commandBuffer,
+                  FRHITextureHandle           targetTexture,
+                  UInt32                      faceSize,
+                  const FConvertPushConstant& pushConstant) const
+    {
+        commandBuffer->TransitionImageLayout(
+            targetTexture,
+            EImageLayout::Undefined,
+            EImageLayout::General,
+            EPipelineStageFlags::TopOfPipe,
+            EPipelineStageFlags::ComputeShader,
+            EAccessFlags::None,
+            EAccessFlags::ShaderWrite,
+            0, 1, 0, kCubeFaceCount);
+
+        commandBuffer->BindComputePipeline(m_Pipeline);
+
+        commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                         m_PipelineLayout, 0, m_DescriptorSet);
+
+        commandBuffer->PushConstants(m_PipelineLayout, EShaderStage::Compute,
+                                     0, sizeof(FConvertPushConstant),
+                                     &pushConstant);
+
+        const UInt32 groupCount = faceSize / kThreadGroupSize;
+
+        commandBuffer->Dispatch(groupCount, groupCount, kCubeFaceCount);
+
+        // 写完转为着色器只读 —— 这次转换同时充当"计算写"到"后续读"的屏障。
+        // 目标阶段同时包含计算与片段: 环境贴图接下来既要被辐照度卷积
+        // (计算) 读, 又要被天空盒 (片段) 读。
+        commandBuffer->TransitionImageLayout(
+            targetTexture,
+            EImageLayout::General,
+            EImageLayout::ShaderReadOnly,
+            EPipelineStageFlags::ComputeShader,
+            EPipelineStageFlags::ComputeShader |
+                EPipelineStageFlags::FragmentShader,
+            EAccessFlags::ShaderWrite,
+            EAccessFlags::ShaderRead,
+            0, 1, 0, kCubeFaceCount);
+    }
+
+    void Release()
+    {
+        if (m_Device == nullptr)
+        {
+            return;
+        }
+
+        if (m_Pipeline.IsValid())
+        {
+            m_Device->DestroyComputePipeline(m_Pipeline);
+        }
+
+        if (m_DescriptorSet.IsValid())
+        {
+            m_Device->FreeDescriptorSet(m_DescriptorSet);
+        }
+
+        if (m_PipelineLayout.IsValid())
+        {
+            m_Device->DestroyPipelineLayout(m_PipelineLayout);
+        }
+
+        if (m_DescSetLayout.IsValid())
+        {
+            m_Device->DestroyDescSetLayout(m_DescSetLayout);
+        }
+
+        if (m_Shader.IsValid())
+        {
+            m_Device->DestroyShader(m_Shader);
+        }
+
+        m_Device = nullptr;
+    }
+
+private:
+    IRHIDevice*               m_Device = nullptr;
+    FRHIShaderHandle          m_Shader;
+    FRHIDescSetLayoutHandle   m_DescSetLayout;
+    FRHIDescriptorSetHandle   m_DescriptorSet;
+    FRHIPipelineLayoutHandle  m_PipelineLayout;
+    FRHIComputePipelineHandle m_Pipeline;
 };
 
 } // namespace
+
+// ============================================================================
+// FCubeResource
+// ============================================================================
+
+void FCubeResource::Release(IRHIDevice* device)
+{
+    if (device == nullptr)
+    {
+        return;
+    }
+
+    if (SampleView.IsValid())
+    {
+        device->DestroyTextureView(SampleView);
+    }
+
+    if (StorageView.IsValid())
+    {
+        device->DestroyTextureView(StorageView);
+    }
+
+    if (Texture.IsValid())
+    {
+        device->DestroyTexture(Texture);
+    }
+
+    FaceSize = 0;
+}
 
 // ============================================================================
 // 生命周期
@@ -87,54 +385,21 @@ void FEnvironmentMap::Release()
         return;
     }
 
-    ReleaseConversionResources(m_Device);
+    ReleaseTransientResources(m_Device);
 
     if (m_Sampler.IsValid())
     {
         m_Device->DestroySampler(m_Sampler);
     }
 
-    if (m_CubeView.IsValid())
-    {
-        m_Device->DestroyTextureView(m_CubeView);
-    }
+    m_Irradiance.Release(m_Device);
+    m_Environment.Release(m_Device);
 
-    if (m_StorageView.IsValid())
-    {
-        m_Device->DestroyTextureView(m_StorageView);
-    }
-
-    if (m_CubeTexture.IsValid())
-    {
-        m_Device->DestroyTexture(m_CubeTexture);
-    }
-
-    m_FaceSize = 0;
-    m_Device   = nullptr;
+    m_Device = nullptr;
 }
 
-void FEnvironmentMap::ReleaseConversionResources(IRHIDevice* device)
+void FEnvironmentMap::ReleaseTransientResources(IRHIDevice* device)
 {
-    if (m_Pipeline.IsValid())
-    {
-        device->DestroyComputePipeline(m_Pipeline);
-    }
-
-    if (m_PipelineLayout.IsValid())
-    {
-        device->DestroyPipelineLayout(m_PipelineLayout);
-    }
-
-    if (m_DescSetLayout.IsValid())
-    {
-        device->DestroyDescSetLayout(m_DescSetLayout);
-    }
-
-    if (m_ComputeShader.IsValid())
-    {
-        device->DestroyShader(m_ComputeShader);
-    }
-
     if (m_EquirectSampler.IsValid())
     {
         device->DestroySampler(m_EquirectSampler);
@@ -154,28 +419,15 @@ void FEnvironmentMap::ReleaseConversionResources(IRHIDevice* device)
     {
         device->DestroyBuffer(m_StagingBuffer);
     }
-
-    // 描述符集必须显式归还池 —— 池是全局的, 每次换环境贴图都占一个而不还,
-    // 反复切换关卡后会耗尽。销毁布局并不会连带回收从池里分配出去的集。
-    if (m_DescriptorSet.IsValid())
-    {
-        device->FreeDescriptorSet(m_DescriptorSet);
-    }
-}
-
-SizeType FEnvironmentMap::GetMemoryBytes() const
-{
-    // RGBA16F = 8 字节/纹素
-    return static_cast<SizeType>(m_FaceSize) * m_FaceSize * kCubeFaceCount * 8;
 }
 
 // ============================================================================
 // BuildFromEquirect
 // ============================================================================
 
-ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext* context,
+ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext*   context,
                                               const FImageData& equirect,
-                                              UInt32 faceSize)
+                                              UInt32            faceSize)
 {
     if (context == nullptr || context->GetDevice() == nullptr)
     {
@@ -208,6 +460,8 @@ ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext* context,
 
     Release();
 
+    const Float64 beginTime = FPlatformTime::Seconds();
+
     m_Device = context->GetDevice();
 
     // ---- 决定面边长 ----
@@ -230,92 +484,72 @@ ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext* context,
 
     resolvedFaceSize = AlignFaceSize(resolvedFaceSize);
 
-    m_FaceSize = resolvedFaceSize;
+    // 环境贴图带完整 mip 链: 辐照度卷积要从其中一级采样 (见 ConvolveIrradiance),
+    // 镜面预滤波将来也要用到它
+    const UInt32 environmentMipLevels =
+        ComputeMipLevelCount(resolvedFaceSize, resolvedFaceSize);
 
-    // ---- 建资源 ----
-    ERHIResult result = UploadEquirect(context, equirect, m_EquirectTexture,
-                                       m_EquirectView, m_StagingBuffer);
+    // ---- 建资源并逐趟转换 ----
+    ERHIResult result = CreateSampler(m_Device, environmentMipLevels);
+
+    if (IsRHISuccess(result))
+    {
+        result = CreateCubeResource(m_Device, resolvedFaceSize,
+                                    environmentMipLevels,
+                                    "EnvironmentMap.Cube", m_Environment);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        // 辐照度贴图不需要 mip —— 它只按法线查一次, 没有缩小采样
+        result = CreateCubeResource(m_Device, kIrradianceFaceSize, 1,
+                                    "EnvironmentMap.Irradiance", m_Irradiance);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = UploadEquirect(context, equirect);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = ConvertEquirectToCube(context);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = GenerateCubeMips(context, m_Environment);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = ConvolveIrradiance(context);
+    }
 
     if (!IsRHISuccess(result))
     {
         Release();
         return result;
     }
-
-    result = CreateCubeResources(m_Device, m_FaceSize);
-
-    if (!IsRHISuccess(result))
-    {
-        Release();
-        return result;
-    }
-
-    result = CreateConversionPipeline(m_Device);
-
-    if (!IsRHISuccess(result))
-    {
-        Release();
-        return result;
-    }
-
-    // ---- 分派 ----
-    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
-
-    if (commandBuffer == nullptr)
-    {
-        Release();
-        return ERHIResult::ErrorUnknown;
-    }
-
-    // 立方体贴图转入 General —— 存储图像的写入必须在这个布局下进行
-    commandBuffer->TransitionImageLayout(
-        m_CubeTexture,
-        EImageLayout::Undefined,
-        EImageLayout::General,
-        EPipelineStageFlags::TopOfPipe,
-        EPipelineStageFlags::ComputeShader,
-        EAccessFlags::None,
-        EAccessFlags::ShaderWrite,
-        0, 1, 0, kCubeFaceCount);
-
-    commandBuffer->BindComputePipeline(m_Pipeline);
-
-    commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
-                                     m_PipelineLayout, 0, m_DescriptorSet);
-
-    FConversionPushConstant pushConstant;
-    pushConstant.FaceSize = m_FaceSize;
-
-    commandBuffer->PushConstants(m_PipelineLayout, EShaderStage::Compute,
-                                 0, sizeof(FConversionPushConstant),
-                                 &pushConstant);
-
-    const UInt32 groupCount = m_FaceSize / kThreadGroupSize;
-
-    commandBuffer->Dispatch(groupCount, groupCount, kCubeFaceCount);
-
-    // 写完转为着色器只读 —— 这次转换同时充当"计算写"到"片段读"的屏障
-    commandBuffer->TransitionImageLayout(
-        m_CubeTexture,
-        EImageLayout::General,
-        EImageLayout::ShaderReadOnly,
-        EPipelineStageFlags::ComputeShader,
-        EPipelineStageFlags::FragmentShader,
-        EAccessFlags::ShaderWrite,
-        EAccessFlags::ShaderRead,
-        0, 1, 0, kCubeFaceCount);
-
-    context->EndSingleTimeCommands(commandBuffer);
 
     // 转换资源到此为止 —— 源纹理是整套里最大的一块, 留着就是白占显存
-    ReleaseConversionResources(m_Device);
+    ReleaseTransientResources(m_Device);
+
+    m_EquirectTexture = FRHITextureHandle();
+    m_EquirectView    = FRHITextureViewHandle();
+    m_StagingBuffer   = FRHIBufferHandle();
+    m_EquirectSampler = FRHISamplerHandle();
 
     LIMX_LOG(LogEnvironment, Display,
-             "[EnvironmentMap] 立方体贴图生成完成: {}x{} x6, {} MB "
-             "(源图 {}x{})",
-             m_FaceSize, m_FaceSize,
+             "[EnvironmentMap] 生成完成: 环境 {}x{} ({} 级 mip) + 辐照度 {}x{}, "
+             "合计 {} MB (源图 {}x{}), 耗时 {} ms",
+             m_Environment.FaceSize, m_Environment.FaceSize,
+             m_Environment.MipLevels,
+             m_Irradiance.FaceSize, m_Irradiance.FaceSize,
              GetMemoryBytes() / (1024 * 1024),
-             equirect.Width, equirect.Height);
+             equirect.Width, equirect.Height,
+             static_cast<Int32>(
+                 (FPlatformTime::Seconds() - beginTime) * 1000.0));
 
     return ERHIResult::Success;
 }
@@ -324,11 +558,8 @@ ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext* context,
 // UploadEquirect
 // ============================================================================
 
-ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
-                                           const FImageData& equirect,
-                                           FRHITextureHandle& outTexture,
-                                           FRHITextureViewHandle& outView,
-                                           FRHIBufferHandle& outStaging)
+ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext*   context,
+                                           const FImageData& equirect)
 {
     IRHIDevice* device = context->GetDevice();
 
@@ -340,7 +571,7 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     stagingDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
     stagingDesc.DebugName   = "EnvironmentMap.Staging";
 
-    ERHIResult result = device->CreateBuffer(stagingDesc, outStaging);
+    ERHIResult result = device->CreateBuffer(stagingDesc, m_StagingBuffer);
 
     if (!IsRHISuccess(result))
     {
@@ -348,7 +579,7 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     }
 
     void* mapped = nullptr;
-    result       = device->MapBuffer(outStaging, &mapped);
+    result       = device->MapBuffer(m_StagingBuffer, &mapped);
 
     if (!IsRHISuccess(result) || mapped == nullptr)
     {
@@ -363,7 +594,49 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
         destination[i] = source[i];
     }
 
-    device->UnmapBuffer(outStaging);
+    device->UnmapBuffer(m_StagingBuffer);
+
+    // 立方体贴图是 RGBA16F, 超出半精度上限的值会被钳掉。
+    //
+    // 必须报出来: 真实 HDRI 的太阳盘常常冲到十万量级, 而它虽然只占几个
+    // 像素, 携带的能量却可能是全图的大半 —— 实测这类图上区区七个像素被钳,
+    // 朝阳方向的辐照度就少了三成。而这个损失在画面上只表现为"环境光有点暗",
+    // 静默发生时几乎不可能被发现。
+    const Float32* texels =
+        reinterpret_cast<const Float32*>(equirect.Pixels.GetData());
+
+    const SizeType componentCount = byteSize / sizeof(Float32);
+
+    SizeType clampedCount = 0;
+    Float32  maxValue     = 0.0f;
+
+    for (SizeType i = 0; i < componentCount; i += 4)
+    {
+        for (SizeType channel = 0; channel < 3; ++channel)
+        {
+            const Float32 value = texels[i + channel];
+
+            if (value > maxValue)
+            {
+                maxValue = value;
+            }
+
+            if (value > kHalfMaxValue)
+            {
+                ++clampedCount;
+                break;
+            }
+        }
+    }
+
+    if (clampedCount > 0)
+    {
+        LIMX_LOG(LogEnvironment, Warning,
+                 "[EnvironmentMap] {} 个像素超出半精度上限 ({}), 峰值 {} —— "
+                 "这部分能量会被钳掉, 朝该方向的辐照度将偏低",
+                 clampedCount, static_cast<Int32>(kHalfMaxValue),
+                 static_cast<Int32>(maxValue));
+    }
 
     FRHITextureDesc textureDesc = {};
     textureDesc.Type          = ETextureType::Texture2D;
@@ -379,7 +652,7 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     textureDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
     textureDesc.DebugName     = "EnvironmentMap.Equirect";
 
-    result = device->CreateTexture(textureDesc, outTexture);
+    result = device->CreateTexture(textureDesc, m_EquirectTexture);
 
     if (!IsRHISuccess(result))
     {
@@ -394,7 +667,7 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     }
 
     commandBuffer->TransitionImageLayout(
-        outTexture,
+        m_EquirectTexture,
         EImageLayout::Undefined,
         EImageLayout::TransferDst,
         EPipelineStageFlags::TopOfPipe,
@@ -412,12 +685,12 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     region.TextureOffset     = { 0, 0, 0 };
     region.TextureExtent     = { equirect.Width, equirect.Height, 1 };
 
-    commandBuffer->CopyBufferToTexture(outStaging, outTexture,
+    commandBuffer->CopyBufferToTexture(m_StagingBuffer, m_EquirectTexture,
                                        EImageLayout::TransferDst, region);
 
     // 目标是计算着色器而非片段着色器 —— 转换发生在 Dispatch 里
     commandBuffer->TransitionImageLayout(
-        outTexture,
+        m_EquirectTexture,
         EImageLayout::TransferDst,
         EImageLayout::ShaderReadOnly,
         EPipelineStageFlags::Transfer,
@@ -428,7 +701,7 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     context->EndSingleTimeCommands(commandBuffer);
 
     FRHITextureViewDesc viewDesc = {};
-    viewDesc.Texture         = outTexture;
+    viewDesc.Texture         = m_EquirectTexture;
     viewDesc.ViewType        = ETextureType::Texture2D;
     viewDesc.Format          = EPixelFormat::RGBA32_SFLOAT;
     viewDesc.BaseMipLevel    = 0;
@@ -436,90 +709,7 @@ ERHIResult FEnvironmentMap::UploadEquirect(FRenderContext* context,
     viewDesc.BaseArrayLayer  = 0;
     viewDesc.ArrayLayerCount = 1;
 
-    return device->CreateTextureView(viewDesc, outView);
-}
-
-// ============================================================================
-// CreateCubeResources
-// ============================================================================
-
-ERHIResult FEnvironmentMap::CreateCubeResources(IRHIDevice* device,
-                                                UInt32 faceSize)
-{
-    FRHITextureDesc cubeDesc = {};
-    cubeDesc.Type          = ETextureType::TextureCube;
-    cubeDesc.Format        = EPixelFormat::RGBA16_SFLOAT;
-    cubeDesc.Extent.Width  = faceSize;
-    cubeDesc.Extent.Height = faceSize;
-    cubeDesc.Extent.Depth  = 1;
-    cubeDesc.MipLevels     = 1;
-    cubeDesc.ArrayLayers   = kCubeFaceCount;
-    cubeDesc.Usage         = static_cast<ETextureUsage>(
-        static_cast<UInt32>(ETextureUsage::Sampled) |
-        static_cast<UInt32>(ETextureUsage::Storage));
-    cubeDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
-    cubeDesc.DebugName     = "EnvironmentMap.Cube";
-
-    ERHIResult result = device->CreateTexture(cubeDesc, m_CubeTexture);
-
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    // 采样视图 —— 立方体类型, 六层一并覆盖
-    FRHITextureViewDesc cubeViewDesc = {};
-    cubeViewDesc.Texture         = m_CubeTexture;
-    cubeViewDesc.ViewType        = ETextureType::TextureCube;
-    cubeViewDesc.Format          = EPixelFormat::RGBA16_SFLOAT;
-    cubeViewDesc.BaseMipLevel    = 0;
-    cubeViewDesc.MipLevelCount   = 1;
-    cubeViewDesc.BaseArrayLayer  = 0;
-    cubeViewDesc.ArrayLayerCount = kCubeFaceCount;
-
-    result = device->CreateTextureView(cubeViewDesc, m_CubeView);
-
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    // 存储视图 —— 2D 数组类型, 供计算着色器逐纹素写入
-    FRHITextureViewDesc storageViewDesc = cubeViewDesc;
-    storageViewDesc.ViewType            = ETextureType::Texture2DArray;
-
-    result = device->CreateTextureView(storageViewDesc, m_StorageView);
-
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    // 采样器: 线性 + 钳位。立方体贴图的跨面过滤由硬件负责,
-    // 寻址模式只在极少数实现上影响接缝, 钳位是最保守的选择。
-    FRHISamplerDesc samplerDesc  = FRHISamplerDesc::LinearClamp();
-    samplerDesc.IsAnisotropyEnabled = false;
-    samplerDesc.MaxLod              = 1.0f;
-
-    return device->CreateSampler(samplerDesc, m_Sampler);
-}
-
-// ============================================================================
-// CreateConversionPipeline
-// ============================================================================
-
-ERHIResult FEnvironmentMap::CreateConversionPipeline(IRHIDevice* device)
-{
-    FShaderManager& shaderManager = FShaderManager::Get();
-
-    if (!shaderManager.IsInitialized())
-    {
-        shaderManager.Initialize();
-    }
-
-    ERHIResult result = shaderManager.CreateShaderModule(
-        device, FString("Builtin/equirect_to_cube.comp"),
-        EShaderStage::Compute, m_ComputeShader);
+    result = device->CreateTextureView(viewDesc, m_EquirectView);
 
     if (!IsRHISuccess(result))
     {
@@ -531,94 +721,407 @@ ERHIResult FEnvironmentMap::CreateConversionPipeline(IRHIDevice* device)
     // u 必须 Repeat 而非 Clamp: 等距柱状图在 ±180° 处首尾相接,
     // 钳位会让接缝处的双线性插值取到边缘像素的复制, 表现为天空中
     // 一条竖直的亮暗不连续线。v 方向则必须钳位 —— 天顶之上没有内容。
-    FRHISamplerDesc equirectSamplerDesc;
-    equirectSamplerDesc.MinFilter           = EFilter::Linear;
-    equirectSamplerDesc.MagFilter           = EFilter::Linear;
-    equirectSamplerDesc.MipmapMode          = ESamplerMipmapMode::Nearest;
-    equirectSamplerDesc.AddressModeU        = ESamplerAddressMode::Repeat;
-    equirectSamplerDesc.AddressModeV        = ESamplerAddressMode::ClampToEdge;
-    equirectSamplerDesc.AddressModeW        = ESamplerAddressMode::ClampToEdge;
-    equirectSamplerDesc.IsAnisotropyEnabled = false;
-    equirectSamplerDesc.MaxLod              = 1.0f;
+    FRHISamplerDesc samplerDesc;
+    samplerDesc.MinFilter           = EFilter::Linear;
+    samplerDesc.MagFilter           = EFilter::Linear;
+    samplerDesc.MipmapMode          = ESamplerMipmapMode::Nearest;
+    samplerDesc.AddressModeU        = ESamplerAddressMode::Repeat;
+    samplerDesc.AddressModeV        = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.AddressModeW        = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.IsAnisotropyEnabled = false;
+    samplerDesc.MaxLod              = 1.0f;
 
-    result = device->CreateSampler(equirectSamplerDesc, m_EquirectSampler);
+    return device->CreateSampler(samplerDesc, m_EquirectSampler);
+}
 
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
+// ============================================================================
+// 资源创建
+// ============================================================================
 
-    FRHIDescriptorBinding bindings[2] = {};
-    bindings[0].Binding    = 0;
-    bindings[0].Type       = EDescriptorType::CombinedImageSampler;
-    bindings[0].Count      = 1;
-    bindings[0].StageFlags = EShaderStage::Compute;
+ERHIResult FEnvironmentMap::CreateCubeResource(IRHIDevice*     device,
+                                               UInt32          faceSize,
+                                               UInt32          mipLevels,
+                                               const AnsiChar* debugName,
+                                               FCubeResource&  outResource)
+{
+    outResource.FaceSize  = faceSize;
+    outResource.MipLevels = (mipLevels == 0) ? 1u : mipLevels;
 
-    bindings[1].Binding    = 1;
-    bindings[1].Type       = EDescriptorType::StorageImage;
-    bindings[1].Count      = 1;
-    bindings[1].StageFlags = EShaderStage::Compute;
+    FRHITextureDesc cubeDesc = {};
+    cubeDesc.Type          = ETextureType::TextureCube;
+    cubeDesc.Format        = EPixelFormat::RGBA16_SFLOAT;
+    cubeDesc.Extent.Width  = faceSize;
+    cubeDesc.Extent.Height = faceSize;
+    cubeDesc.Extent.Depth  = 1;
+    cubeDesc.MipLevels     = outResource.MipLevels;
+    cubeDesc.ArrayLayers   = kCubeFaceCount;
+    // TransferSrc/Dst 有两个用途: 逐级 blit 生成 mip 链, 以及把贴图读回
+    // 内存做数值校验 —— 卷积算错在画面上只表现为"环境光好像有点不对",
+    // 唯一可靠的判据是取回数据逐面比对
+    cubeDesc.Usage         = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::Storage) |
+        static_cast<UInt32>(ETextureUsage::TransferSrc) |
+        static_cast<UInt32>(ETextureUsage::TransferDst));
+    cubeDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
+    cubeDesc.DebugName     = debugName;
 
-    FRHIDescSetLayoutDesc layoutDesc = {};
-    layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 2;
-    layoutDesc.DebugName    = "EnvironmentMap.Conversion";
-
-    result = device->CreateDescSetLayout(layoutDesc, m_DescSetLayout);
-
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    FRHIPushConstantRange pushRange = {};
-    pushRange.StageFlags = EShaderStage::Compute;
-    pushRange.Offset     = 0;
-    pushRange.Size       = sizeof(FConversionPushConstant);
-
-    FRHIPipelineLayoutDesc pipelineLayoutDesc = {};
-    pipelineLayoutDesc.SetLayouts             = &m_DescSetLayout;
-    pipelineLayoutDesc.SetLayoutCount         = 1;
-    pipelineLayoutDesc.PushConstantRanges     = &pushRange;
-    pipelineLayoutDesc.PushConstantRangeCount = 1;
-    pipelineLayoutDesc.DebugName              = "EnvironmentMap.Conversion";
-
-    result = device->CreatePipelineLayout(pipelineLayoutDesc, m_PipelineLayout);
+    ERHIResult result = device->CreateTexture(cubeDesc, outResource.Texture);
 
     if (!IsRHISuccess(result))
     {
         return result;
     }
 
-    result = device->AllocateDescriptorSet(m_DescSetLayout, m_DescriptorSet);
+    // 采样视图 —— 立方体类型, 六层一并覆盖
+    FRHITextureViewDesc cubeViewDesc = {};
+    cubeViewDesc.Texture         = outResource.Texture;
+    cubeViewDesc.ViewType        = ETextureType::TextureCube;
+    cubeViewDesc.Format          = EPixelFormat::RGBA16_SFLOAT;
+    cubeViewDesc.BaseMipLevel    = 0;
+    cubeViewDesc.MipLevelCount   = outResource.MipLevels;
+    cubeViewDesc.BaseArrayLayer  = 0;
+    cubeViewDesc.ArrayLayerCount = kCubeFaceCount;
+
+    result = device->CreateTextureView(cubeViewDesc, outResource.SampleView);
 
     if (!IsRHISuccess(result))
     {
         return result;
     }
 
-    FRHIDescriptorWrite writes[2] = {};
-    writes[0] = FRHIDescriptorWrite::CombinedImageSampler(
-        m_DescriptorSet, 0, m_EquirectView, m_EquirectSampler,
-        EImageLayout::ShaderReadOnly);
+    // 存储视图 —— 2D 数组类型, 只覆盖 mip 0。
+    // 存储图像不能是多级视图: 着色器里的 image2DArray 没有 LOD 概念。
+    FRHITextureViewDesc storageViewDesc = cubeViewDesc;
+    storageViewDesc.ViewType            = ETextureType::Texture2DArray;
+    storageViewDesc.MipLevelCount       = 1;
 
-    // 存储图像必须以 General 布局绑定 —— 它是唯一允许着色器写入的布局
-    writes[1].DescriptorSet = m_DescriptorSet;
-    writes[1].Binding       = 1;
-    writes[1].Type          = EDescriptorType::StorageImage;
-    writes[1].ImageView     = m_StorageView;
-    writes[1].ImageLayout   = EImageLayout::General;
+    return device->CreateTextureView(storageViewDesc, outResource.StorageView);
+}
 
-    device->UpdateDescriptorSets(writes, 2);
+ERHIResult FEnvironmentMap::CreateSampler(IRHIDevice* device, UInt32 mipLevels)
+{
+    // 线性 + 钳位。立方体贴图的跨面过滤由硬件负责, 寻址模式只在极少数
+    // 实现上影响接缝, 钳位是最保守的选择。
+    FRHISamplerDesc samplerDesc     = FRHISamplerDesc::LinearClamp();
+    samplerDesc.IsAnisotropyEnabled = false;
 
-    FRHIComputePipelineDesc pipelineDesc = {};
-    pipelineDesc.ComputeShader.Shader     = m_ComputeShader;
-    pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
-    pipelineDesc.ComputeShader.EntryPoint = "main";
-    pipelineDesc.PipelineLayout           = m_PipelineLayout;
-    pipelineDesc.DebugName                = "EnvironmentMap.EquirectToCube";
+    // MaxLod 必须覆盖整条 mip 链 —— 卷积要显式采样中间某一级, 而采样器
+    // 会把请求的 LOD 钳到 [MinLod, MaxLod]。留在 1.0 的话请求 mip 3 会
+    // 被悄悄钳成 mip 1, 结果依旧偏低而且完全看不出原因。
+    samplerDesc.MaxLod = static_cast<Float32>(mipLevels);
 
-    return device->CreateComputePipeline(pipelineDesc, m_Pipeline);
+    return device->CreateSampler(samplerDesc, m_Sampler);
+}
+
+// ============================================================================
+// GenerateCubeMips — 逐级 blit
+// ============================================================================
+
+ERHIResult FEnvironmentMap::GenerateCubeMips(FRenderContext* context,
+                                             FCubeResource&  resource)
+{
+    if (resource.MipLevels <= 1)
+    {
+        return ERHIResult::Success;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    // 进来时整张图是 ShaderReadOnly (上一趟 Dispatch 留下的)。
+    // mip 0 转为 blit 源, 其余各级转为 blit 目标。
+    commandBuffer->TransitionImageLayout(
+        resource.Texture,
+        EImageLayout::ShaderReadOnly,
+        EImageLayout::TransferSrc,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::ShaderRead,
+        EAccessFlags::TransferRead,
+        0, 1, 0, kCubeFaceCount);
+
+    commandBuffer->TransitionImageLayout(
+        resource.Texture,
+        EImageLayout::Undefined,
+        EImageLayout::TransferDst,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::None,
+        EAccessFlags::TransferWrite,
+        1, resource.MipLevels - 1, 0, kCubeFaceCount);
+
+    Int32 mipSize = static_cast<Int32>(resource.FaceSize);
+
+    for (UInt32 level = 1; level < resource.MipLevels; ++level)
+    {
+        const Int32 nextSize = (mipSize > 1) ? (mipSize / 2) : 1;
+
+        // 六个面一次 blit —— 它们是同一图像的六个数组层
+        FRHITextureBlitRegion blit = {};
+        blit.SrcMipLevel   = level - 1;
+        blit.SrcBaseLayer  = 0;
+        blit.SrcLayerCount = kCubeFaceCount;
+        blit.SrcOffsetMin  = { 0, 0, 0 };
+        blit.SrcOffsetMax  = { mipSize, mipSize, 1 };
+        blit.DstMipLevel   = level;
+        blit.DstBaseLayer  = 0;
+        blit.DstLayerCount = kCubeFaceCount;
+        blit.DstOffsetMin  = { 0, 0, 0 };
+        blit.DstOffsetMax  = { nextSize, nextSize, 1 };
+
+        commandBuffer->BlitTexture(resource.Texture, EImageLayout::TransferSrc,
+                                   resource.Texture, EImageLayout::TransferDst,
+                                   blit, EFilter::Linear);
+
+        // 本级写完后转为下一级的源。逐级转换而非整体转换, 是因为同一时刻
+        // 不同 mip 处于不同布局。
+        commandBuffer->TransitionImageLayout(
+            resource.Texture,
+            EImageLayout::TransferDst,
+            EImageLayout::TransferSrc,
+            EPipelineStageFlags::Transfer,
+            EPipelineStageFlags::Transfer,
+            EAccessFlags::TransferWrite,
+            EAccessFlags::TransferRead,
+            level, 1, 0, kCubeFaceCount);
+
+        mipSize = nextSize;
+    }
+
+    // 全部各级此刻都是 TransferSrc, 一并转回着色器只读
+    commandBuffer->TransitionImageLayout(
+        resource.Texture,
+        EImageLayout::TransferSrc,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::Transfer,
+        EPipelineStageFlags::ComputeShader |
+            EPipelineStageFlags::FragmentShader,
+        EAccessFlags::TransferRead,
+        EAccessFlags::ShaderRead,
+        0, resource.MipLevels, 0, kCubeFaceCount);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    return ERHIResult::Success;
+}
+
+// ============================================================================
+// 两趟转换
+// ============================================================================
+
+ERHIResult FEnvironmentMap::ConvertEquirectToCube(FRenderContext* context)
+{
+    FComputePass pass;
+
+    ERHIResult result = pass.Create(
+        m_Device, "Builtin/equirect_to_cube.comp",
+        "EnvironmentMap.EquirectToCube",
+        m_EquirectView, m_EquirectSampler, m_Environment.StorageView);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    FConvertPushConstant pushConstant;
+    pushConstant.FaceSize = m_Environment.FaceSize;
+
+    pass.Dispatch(commandBuffer, m_Environment.Texture,
+                  m_Environment.FaceSize, pushConstant);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    return ERHIResult::Success;
+}
+
+ERHIResult FEnvironmentMap::ConvolveIrradiance(FRenderContext* context)
+{
+    FComputePass pass;
+
+    // 源是刚生成的环境贴图 —— 它此刻已是 ShaderReadOnly, 且上一次提交
+    // 已由 EndSingleTimeCommands 等待完成, 因此不需要额外的跨提交同步
+    ERHIResult result = pass.Create(
+        m_Device, "Builtin/irradiance_convolve.comp",
+        "EnvironmentMap.IrradianceConvolve",
+        m_Environment.SampleView, m_Sampler, m_Irradiance.StorageView);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    FConvertPushConstant pushConstant;
+    pushConstant.FaceSize    = m_Irradiance.FaceSize;
+    pushConstant.SampleDelta = kIrradianceSampleDelta;
+
+    // 选一级 mip, 使其单个纹素的张角约等于求积步长。
+    //
+    // 一个面覆盖 90 度, 边长 S 的面每纹素张角约 (π/2)/S。令它等于步长,
+    // 得目标边长 S* = (π/2)/delta。
+    //
+    // 取**离 S* 最近**的一级, 而不是第一个不超过 S* 的: mip 边长按 2 的
+    // 幂跳变, "第一个不超过"会在 S* 略小于某一级时一路跳到它的一半, 平白
+    // 多模糊一倍。相邻两级的几何中点是 S*·√2, 以它为界即可取到最近的一级。
+    //
+    // 过高的 mip 会在样本之间留下空隙 (太阳被整个跳过), 过低的 mip 则把
+    // 本该有方向性的天空压平 —— 后者的表现是"环境光偏灰、朝向差异变小"。
+    const Float32 targetFaceSize = FMath::kHalfPi / kIrradianceSampleDelta;
+
+    // √2 —— 相邻两级 mip 边长的几何中点
+    constexpr Float32 kMipMidpointRatio = 1.41421356f;
+
+    const Float32 mipThreshold = targetFaceSize * kMipMidpointRatio;
+
+    UInt32 sourceMip = 0;
+
+    while (sourceMip + 1 < m_Environment.MipLevels &&
+           static_cast<Float32>(m_Environment.FaceSize >> sourceMip) >
+               mipThreshold)
+    {
+        ++sourceMip;
+    }
+
+    pushConstant.SourceMipLevel = static_cast<Float32>(sourceMip);
+
+    LIMX_LOG(LogEnvironment, Log,
+             "[EnvironmentMap] 辐照度卷积从 mip {} 采样 (边长 {}, 目标 {})",
+             sourceMip, m_Environment.FaceSize >> sourceMip,
+             static_cast<Int32>(targetFaceSize));
+
+    pass.Dispatch(commandBuffer, m_Irradiance.Texture,
+                  m_Irradiance.FaceSize, pushConstant);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    return ERHIResult::Success;
+}
+
+// ============================================================================
+// ReadbackIrradiance
+// ============================================================================
+
+bool FEnvironmentMap::ReadbackIrradiance(FRenderContext*  context,
+                                         TArray<Float32>& outPixels,
+                                         UInt32&          outFaceSize) const
+{
+    outPixels.Clear();
+    outFaceSize = 0;
+
+    if (context == nullptr || m_Device == nullptr || !m_Irradiance.IsValid())
+    {
+        return false;
+    }
+
+    IRHIDevice* device = context->GetDevice();
+
+    const UInt32   faceSize   = m_Irradiance.FaceSize;
+    const SizeType texelCount =
+        static_cast<SizeType>(faceSize) * faceSize * kCubeFaceCount;
+
+    // RGBA16F = 8 字节/纹素
+    const SizeType byteSize = texelCount * 8;
+
+    FRHIBufferDesc readbackDesc = {};
+    readbackDesc.Size        = byteSize;
+    readbackDesc.Usage       = EBufferUsage::TransferDst;
+    readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    readbackDesc.DebugName   = "EnvironmentMap.IrradianceReadback";
+
+    FRHIBufferHandle readback;
+
+    if (!IsRHISuccess(device->CreateBuffer(readbackDesc, readback)))
+    {
+        return false;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        device->DestroyBuffer(readback);
+        return false;
+    }
+
+    commandBuffer->TransitionImageLayout(
+        m_Irradiance.Texture,
+        EImageLayout::ShaderReadOnly,
+        EImageLayout::TransferSrc,
+        EPipelineStageFlags::FragmentShader,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::ShaderRead,
+        EAccessFlags::TransferRead,
+        0, 1, 0, kCubeFaceCount);
+
+    // 六个面一次拷完 —— 它们在内存里就是连续的数组层
+    FRHIBufferTextureCopyRegion region = {};
+    region.BufferOffset      = 0;
+    region.BufferRowLength   = 0;
+    region.BufferImageHeight = 0;
+    region.MipLevel          = 0;
+    region.BaseLayer         = 0;
+    region.LayerCount        = kCubeFaceCount;
+    region.TextureOffset     = { 0, 0, 0 };
+    region.TextureExtent     = { faceSize, faceSize, 1 };
+
+    commandBuffer->CopyTextureToBuffer(m_Irradiance.Texture,
+                                       EImageLayout::TransferSrc,
+                                       readback, region);
+
+    commandBuffer->TransitionImageLayout(
+        m_Irradiance.Texture,
+        EImageLayout::TransferSrc,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::Transfer,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::TransferRead,
+        EAccessFlags::ShaderRead,
+        0, 1, 0, kCubeFaceCount);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    void* mapped = nullptr;
+
+    if (!IsRHISuccess(device->MapBuffer(readback, &mapped)) ||
+        mapped == nullptr)
+    {
+        device->DestroyBuffer(readback);
+        return false;
+    }
+
+    const UInt16* source = static_cast<const UInt16*>(mapped);
+
+    outPixels.SetSize(texelCount * 4);
+
+    for (SizeType i = 0; i < texelCount * 4; ++i)
+    {
+        outPixels[i] = HalfToFloat(source[i]);
+    }
+
+    device->UnmapBuffer(readback);
+    device->DestroyBuffer(readback);
+
+    outFaceSize = faceSize;
+
+    return true;
 }
 
 } // namespace Limx

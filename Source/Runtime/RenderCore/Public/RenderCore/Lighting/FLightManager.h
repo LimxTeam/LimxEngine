@@ -140,6 +140,25 @@ public:
     LIMX_NODISCARD bool IsShadowEnabled() const { return m_IsShadowEnabled; }
 
     // ====================================================================
+    // 基于图像的光照 (IBL)
+    // ====================================================================
+
+    /// 启用 IBL 并设置强度倍数
+    ///
+    /// 启用后片段着色器的环境项改用辐照度贴图, 常数环境光不再参与 ——
+    /// 两者相加会让环境光被计两次, 表现为开启 IBL 后场景整体偏亮偏灰。
+    void EnableIbl(Float32 intensity)
+    {
+        m_IsIblEnabled = true;
+        m_IblIntensity = intensity;
+    }
+
+    /// 关闭 IBL — 环境项退回常数环境光
+    void DisableIbl() { m_IsIblEnabled = false; }
+
+    LIMX_NODISCARD bool IsIblEnabled() const { return m_IsIblEnabled; }
+
+    // ====================================================================
     // GPU 资源访问器 (供集成者使用)
     // ====================================================================
 
@@ -173,6 +192,10 @@ private:
     /// 主方向光的级联阴影数据 —— 随光照 UBO 一同上传
     FCascadedShadowInfo m_ShadowInfo;
     bool                m_IsShadowEnabled = false;
+
+    /// IBL 开关与强度 —— 随光照 UBO 一同上传
+    bool                m_IsIblEnabled = false;
+    Float32             m_IblIntensity = 1.0f;
 
     /// RHI 设备 (非拥有指针)
     IRHIDevice*                 m_Device = nullptr;

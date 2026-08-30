@@ -67,6 +67,7 @@
 #include "Renderer/RenderPass/FPassManager.h"
 #include "Renderer/RenderPass/FShadowPass.h"
 #include "Renderer/RenderPass/FSkyPass.h"
+#include "RenderCore/Environment/FEnvironmentMap.h"
 #include "Renderer/RenderPass/FPostProcessPass.h"
 #include "Renderer/RenderPass/FForwardPass.h"
 #include "Renderer/RenderPass/FDepthPrePass.h"
@@ -231,6 +232,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] 阴影光源 UBO 创建失败");
+        return result;
+    }
+
+    // IBL 占位图必须在光照描述符集之前建好 —— 后者的 binding 2 要写它
+    result = CreateFallbackCubeMap();
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[Renderer] IBL 占位立方体贴图创建失败");
         return result;
     }
 
@@ -518,15 +527,82 @@ Float32 FRenderer::GetExposure() const
 // 环境光照
 // ============================================================================
 
-void FRenderer::SetEnvironmentMap(FRHITextureViewHandle cubeView,
-                                  FRHISamplerHandle     sampler)
+void FRenderer::SetEnvironmentMap(const FEnvironmentMap* environment)
 {
-    if (!m_SkyPass || m_Context == nullptr)
+    if (m_Context == nullptr)
     {
         return;
     }
 
-    m_SkyPass->SetEnvironmentMap(m_Context->GetDevice(), cubeView, sampler);
+    IRHIDevice* device = m_Context->GetDevice();
+
+    if (device == nullptr)
+    {
+        return;
+    }
+
+    const bool hasEnvironment = (environment != nullptr) &&
+                                environment->IsValid();
+
+    if (m_SkyPass)
+    {
+        m_SkyPass->SetEnvironmentMap(
+            device,
+            hasEnvironment ? environment->GetCubeView()
+                           : FRHITextureViewHandle(),
+            hasEnvironment ? environment->GetSampler() : FRHISamplerHandle());
+    }
+
+    // 描述符集在多帧之间共享, 而正在执行的帧可能仍在采样旧的辐照度贴图。
+    // 换关卡本就要停顿, 这里等一次 GPU 空闲比引入一套延迟更新简单得多。
+    device->WaitIdle();
+
+    if (hasEnvironment)
+    {
+        UpdateIrradianceDescriptors(environment->GetIrradianceView(),
+                                    environment->GetSampler());
+
+        FLightManager::Get().EnableIbl(m_IblIntensity);
+    }
+    else
+    {
+        // 退回占位图。不能只关开关就了事 —— 描述符里若留着已释放的视图,
+        // 下一次销毁那张图像时验证层会指出它仍被描述符集引用。
+        UpdateIrradianceDescriptors(m_FallbackCubeView, m_FallbackCubeSampler);
+
+        FLightManager::Get().DisableIbl();
+    }
+}
+
+void FRenderer::UpdateIrradianceDescriptors(
+    FRHITextureViewHandle irradianceView,
+    FRHISamplerHandle     sampler)
+{
+    IRHIDevice* device = m_Context->GetDevice();
+
+    if (device == nullptr || !irradianceView.IsValid() || !sampler.IsValid())
+    {
+        return;
+    }
+
+    for (SizeType i = 0; i < m_LightDescriptorSets.GetSize(); ++i)
+    {
+        FRHIDescriptorWrite write = FRHIDescriptorWrite::CombinedImageSampler(
+            m_LightDescriptorSets[i], 2, irradianceView, sampler,
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(&write, 1);
+    }
+}
+
+void FRenderer::SetIblIntensity(Float32 intensity)
+{
+    m_IblIntensity = intensity;
+
+    if (FLightManager::Get().IsIblEnabled())
+    {
+        FLightManager::Get().EnableIbl(intensity);
+    }
 }
 
 void FRenderer::SetSkyIntensity(Float32 intensity)
@@ -545,6 +621,93 @@ Float32 FRenderer::GetSkyIntensity() const
 bool FRenderer::HasEnvironmentMap() const
 {
     return m_SkyPass && m_SkyPass->HasEnvironmentMap();
+}
+
+// ============================================================================
+// CreateFallbackCubeMap — 1x1 黑色立方体贴图
+// ============================================================================
+
+ERHIResult FRenderer::CreateFallbackCubeMap()
+{
+    IRHIDevice* device = m_Context->GetDevice();
+
+    FRHITextureDesc cubeDesc = {};
+    cubeDesc.Type          = ETextureType::TextureCube;
+    cubeDesc.Format        = EPixelFormat::RGBA16_SFLOAT;
+    cubeDesc.Extent.Width  = 1;
+    cubeDesc.Extent.Height = 1;
+    cubeDesc.Extent.Depth  = 1;
+    cubeDesc.MipLevels     = 1;
+    cubeDesc.ArrayLayers   = 6;
+    cubeDesc.Usage         = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::TransferDst));
+    cubeDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
+    cubeDesc.DebugName     = "Renderer.FallbackCube";
+
+    ERHIResult result = device->CreateTexture(cubeDesc, m_FallbackCubeTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // 清成黑色。新建图像的内容是未定义的, 不清就等于绑了一张随机噪声 ——
+    // 那样"没有环境贴图"时物体会被一层随机颜色照亮。
+    IRHICommandBuffer* commandBuffer = m_Context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    commandBuffer->TransitionImageLayout(
+        m_FallbackCubeTexture,
+        EImageLayout::Undefined,
+        EImageLayout::TransferDst,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::None,
+        EAccessFlags::TransferWrite,
+        0, 1, 0, 6);
+
+    commandBuffer->ClearColorImage(m_FallbackCubeTexture,
+                                   EImageLayout::TransferDst,
+                                   FLinearColor(0.0f, 0.0f, 0.0f, 1.0f));
+
+    commandBuffer->TransitionImageLayout(
+        m_FallbackCubeTexture,
+        EImageLayout::TransferDst,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::Transfer,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::TransferWrite,
+        EAccessFlags::ShaderRead,
+        0, 1, 0, 6);
+
+    m_Context->EndSingleTimeCommands(commandBuffer);
+
+    FRHITextureViewDesc viewDesc = {};
+    viewDesc.Texture         = m_FallbackCubeTexture;
+    viewDesc.ViewType        = ETextureType::TextureCube;
+    viewDesc.Format          = EPixelFormat::RGBA16_SFLOAT;
+    viewDesc.BaseMipLevel    = 0;
+    viewDesc.MipLevelCount   = 1;
+    viewDesc.BaseArrayLayer  = 0;
+    viewDesc.ArrayLayerCount = 6;
+
+    result = device->CreateTextureView(viewDesc, m_FallbackCubeView);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHISamplerDesc samplerDesc     = FRHISamplerDesc::LinearClamp();
+    samplerDesc.IsAnisotropyEnabled = false;
+    samplerDesc.MaxLod              = 1.0f;
+
+    return device->CreateSampler(samplerDesc, m_FallbackCubeSampler);
 }
 
 // ============================================================================
@@ -827,6 +990,10 @@ void FRenderer::DestroyTextureResources()
     device->DestroySampler(m_Sampler);
     device->DestroyTextureView(m_TextureView);
     device->DestroyTexture(m_Texture);
+
+    device->DestroySampler(m_FallbackCubeSampler);
+    device->DestroyTextureView(m_FallbackCubeView);
+    device->DestroyTexture(m_FallbackCubeTexture);
 }
 
 // ============================================================================
@@ -1014,11 +1181,15 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             return result;
         }
 
-        // set 2 binding 0 = 光照 UBO, binding 1 = 阴影贴图
+        // set 2 binding 0 = 光照 UBO, binding 1 = 阴影贴图,
+        //       binding 2 = 漫反射辐照度立方体贴图
         //
         // 阴影贴图在整个运行期都是同一张纹理, 因此只需在这里写一次;
         // 内容每帧被阴影 Pass 重写, 但描述符指向的对象不变。
-        FRHIDescriptorWrite writes[2];
+        //
+        // 辐照度贴图先写占位图。着色器里出现的描述符必须在管线绑定时有效,
+        // 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
+        FRHIDescriptorWrite writes[3];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1034,7 +1205,14 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_ShadowPass->GetShadowSampler(),
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(writes, 2);
+        writes[2] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet,
+            2,
+            m_FallbackCubeView,
+            m_FallbackCubeSampler,
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(writes, 3);
 
         m_LightDescriptorSets.Add(descSet);
     }

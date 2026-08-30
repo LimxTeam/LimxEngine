@@ -94,6 +94,13 @@ struct FLaunchOptions
     /// 天空强度的线性倍数 —— HDRI 的绝对量级因拍摄标定而异
     Float32 SkyIntensity = 1.0f;
 
+    /// IBL 强度的线性倍数 —— 与天空强度分开, 便于单独配平
+    ///
+    /// 两者的合适取值往往不同: 天空是直接看到的背景, 亮度要与实际观感
+    /// 一致; 而环境光是照亮物体的间接光, 常常需要压一压才不至于把
+    /// 直接光的层次冲掉。
+    Float32 IblIntensity = 1.0f;
+
     /// 相机朝向覆盖 (弧度) —— 用于可复现的截屏对照
     ///
     /// 默认相机会响应键鼠, 而任何"改了渲染再截一张对比"的验证都要求
@@ -102,6 +109,13 @@ struct FLaunchOptions
     bool    OverrideCameraRotation = false;
     Float32 CameraYaw   = 0.0f;
     Float32 CameraPitch = 0.0f;
+
+    /// 是否输出辐照度贴图六个面的中心值
+    ///
+    /// 卷积算错在画面上只表现为"环境光好像有点不对"。而六个面中心值
+    /// 对应六个正交法线的辐照度, 与源图各方向的平均亮度直接可比 ——
+    /// 这是能用一行数字判定卷积对错的地方。
+    bool ProbeIrradiance = false;
 
     /// 截屏输出路径 (.ppm); 为空时不截屏
     ///
@@ -269,9 +283,11 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --reload-test    关卡切换自检: 加载 → 卸载 → 再加载, 报告显存回落
 ///   --hdri P         加载 Radiance .hdr 作为环境贴图与天空盒
 ///   --sky-intensity S 天空强度的线性倍数 (默认 1.0)
+///   --ibl-intensity S 环境光照强度的线性倍数 (默认 1.0)
 ///   --screenshot P   末帧截屏写入 P (二进制 PPM, P6)
 ///   --camera-yaw R   固定相机偏航角 (弧度)
 ///   --camera-pitch R 固定相机俯仰角 (弧度)
+///   --probe-irradiance 输出辐照度贴图六个面的中心值 (数值校验用)
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -363,6 +379,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.SkyIntensity = ParseFloat32(tokens[++i], 1.0f);
         }
+        else if (WideEquals(arg, L"--ibl-intensity") && (i + 1) < tokenCount)
+        {
+            options.IblIntensity = ParseFloat32(tokens[++i], 1.0f);
+        }
         else if (WideEquals(arg, L"--screenshot") && (i + 1) < tokenCount)
         {
             options.ScreenshotPath = WideToString(tokens[++i]);
@@ -376,6 +396,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.CameraPitch = ParseFloat32(tokens[++i], 0.0f);
             options.OverrideCameraRotation = true;
+        }
+        else if (WideEquals(arg, L"--probe-irradiance"))
+        {
+            options.ProbeIrradiance = true;
         }
     }
 
@@ -653,14 +677,51 @@ static bool LoadEnvironmentMap(FEnvironmentMap& environmentMap,
         return false;
     }
 
-    renderer->SetEnvironmentMap(environmentMap.GetCubeView(),
-                                environmentMap.GetSampler());
+    if (options.ProbeIrradiance)
+    {
+        TArray<Float32> irradiance;
+        UInt32          faceSize = 0;
+
+        if (environmentMap.ReadbackIrradiance(context, irradiance, faceSize))
+        {
+            // 六个面的中心纹素 —— 分别对应 +X/-X/+Y/-Y/+Z/-Z 六个法线
+            static const AnsiChar* kFaceNames[6] =
+            { "+X", "-X", "+Y(上)", "-Y(下)", "+Z", "-Z" };
+
+            const SizeType faceTexels =
+                static_cast<SizeType>(faceSize) * faceSize;
+
+            const SizeType centerIndex =
+                static_cast<SizeType>(faceSize / 2) * faceSize + faceSize / 2;
+
+            for (UInt32 face = 0; face < 6; ++face)
+            {
+                const SizeType base = (face * faceTexels + centerIndex) * 4;
+
+                LIMX_LOG(LogLaunch, Display,
+                         "[辐照度] {} 面中心 = ({}, {}, {})",
+                         kFaceNames[face],
+                         irradiance[base + 0],
+                         irradiance[base + 1],
+                         irradiance[base + 2]);
+            }
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Warning, "[Launch] 辐照度回读失败");
+        }
+    }
+
+    renderer->SetEnvironmentMap(&environmentMap);
     renderer->SetSkyIntensity(options.SkyIntensity);
+    renderer->SetIblIntensity(options.IblIntensity);
 
     LIMX_LOG(LogLaunch, Display,
-             "[Launch] 环境贴图就绪: {} ({}x{} → 立方体 {}, 强度 {}), 耗时 {} ms",
+             "[Launch] 环境贴图就绪: {} ({}x{} → 立方体 {}, "
+             "天空强度 {}, IBL 强度 {}), 总耗时 {} ms",
              options.HdriPath.GetCStr(), image.Width, image.Height,
              environmentMap.GetFaceSize(), options.SkyIntensity,
+             options.IblIntensity,
              static_cast<Int32>(
                  (FPlatformTime::Seconds() - beginTime) * 1000.0));
 
@@ -1416,7 +1477,7 @@ int WINAPI wWinMain(
         renderContext.GetDevice()->WaitIdle();
     }
 
-    renderer.SetEnvironmentMap(FRHITextureViewHandle(), FRHISamplerHandle());
+    renderer.SetEnvironmentMap(nullptr);
     environmentMap.Release();
     screenshotCapture.Release(renderContext.GetDevice());
 

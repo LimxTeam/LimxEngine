@@ -1,0 +1,140 @@
+#version 450
+
+// ============================================================
+// 漫反射辐照度卷积 — 环境立方体贴图 → 辐照度立方体贴图
+//
+// 解决的是什么:
+//   此前的环境光是一个常数 `ambientColor * ambientIntensity`。它对每个
+//   表面、每个朝向都给出同样的值 —— 于是朝天的面与朝地的面收到一样多的
+//   环境光, 物体因此没有任何"被环境照亮"的层次, 看着像贴了一层雾。
+//   更要命的是金属: 金属的 kD 为 0, 常数环境光乘上去等于零, 于是金属在
+//   没有直接光的方向上完全是黑的。
+//
+//   辐照度贴图存的是"法线朝向 n 的表面, 从整个上半球收到的总辐照度":
+//     E(n) = ∫_Ω L(ω) (n·ω) dω
+//   着色时按法线查一次表即可, 不必在片段着色器里做积分。
+//
+// 为什么可以做成一张很小的贴图:
+//   E(n) 是原始环境图与余弦瓣的卷积。余弦瓣极宽 (半角 90°), 卷积结果
+//   本身就极其平滑 —— 32x32 的面已经远超它的有效频率。存大了只是浪费
+//   显存与带宽, 换不来任何可见差别。
+//
+// 采样策略:
+//   在切空间按 (φ, θ) 均匀步进。每个样本的立体角权重是 sinθ dθ dφ,
+//   投影余弦是 cosθ, 因此被积项是 L * cosθ * sinθ。漏掉 sinθ 是这段
+//   代码最经典的错误: 结果会明显偏亮, 而且天顶方向权重被高估 ——
+//   表现为"环境光偏白且偏冷", 看着像色温不对而非积分写错。
+//
+// 为什么必须从**低一级的 mip** 采样:
+//   点采样只在样本落到的那个方向上取值, 样本之间的能量被完全跳过。对
+//   平滑的天空无所谓, 对太阳则是灾难 —— 实测这张 HDRI 里太阳只占
+//   0.00056 立体角却携带 73% 的总能量, 而 0.025 的步长每个样本代表
+//   约 0.0004 立体角。也就是说太阳只值一个多样本: 大多数纹素的求积
+//   完全踩空, 少数踩中的又爆出一个尖峰。
+//
+//   结果是辐照度系统性偏低 (实测朝阳方向差了近五倍), 而且看不出是错的 ——
+//   辐照度本来就平滑, 少了太阳只表现为"环境光有点暗"。
+//
+//   把源换成边长约等于 (π/2)/sampleDelta 的那一级 mip, 一个纹素恰好对应
+//   一个样本的覆盖范围: mip 是逐级盒式平均出来的, 太阳的能量已经被摊进
+//   那些纹素里, 于是采样点无论落在哪都能带上它应有的一份。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube environmentMap;
+
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray irradianceFaces;
+
+layout(push_constant) uniform Params {
+    uint  faceSize;
+    float sampleDelta;    // 弧度步长, 越小越准也越慢
+    float sourceMipLevel; // 从环境贴图的哪一级采样
+    uint  _pad0;
+} params;
+
+const float kPi    = 3.14159265358979323846;
+const float kTwoPi = 6.28318530717958647692;
+const float kHalfPi = 1.57079632679489661923;
+
+// 与 equirect_to_cube.comp 完全相同的面方向约定 —— 两者必须一致,
+// 否则辐照度贴图相对环境贴图整体旋转, 而这种错误在平滑的辐照度上
+// 几乎看不出来, 只会让光照方向莫名其妙地偏
+vec3 FaceDirection(uint face, vec2 uv)
+{
+    if (face == 0u) { return vec3(  1.0, -uv.y, -uv.x); }  // +X
+    if (face == 1u) { return vec3( -1.0, -uv.y,  uv.x); }  // -X
+    if (face == 2u) { return vec3( uv.x,   1.0,  uv.y); }  // +Y
+    if (face == 3u) { return vec3( uv.x,  -1.0, -uv.y); }  // -Y
+    if (face == 4u) { return vec3( uv.x, -uv.y,   1.0); }  // +Z
+    return vec3(-uv.x, -uv.y, -1.0);                       // -Z
+}
+
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+
+    if (id.x >= params.faceSize || id.y >= params.faceSize)
+    {
+        return;
+    }
+
+    const vec2 uv = ((vec2(id.xy) + 0.5) / float(params.faceSize)) * 2.0 - 1.0;
+
+    const vec3 normal = normalize(FaceDirection(id.z, uv));
+
+    // 构造切空间。参考向量必须避开与法线平行的情形 —— 平行时叉积为零,
+    // 归一化得到 NaN, 而 NaN 会顺着积分传遍整个纹素, 表现为几个黑点。
+    vec3 up = vec3(0.0, 1.0, 0.0);
+
+    if (abs(normal.y) > 0.999)
+    {
+        up = vec3(0.0, 0.0, 1.0);
+    }
+
+    const vec3 right   = normalize(cross(up, normal));
+    const vec3 forward = cross(normal, right);
+
+    vec3  irradiance = vec3(0.0);
+    float sampleCount = 0.0;
+
+    const float delta = max(params.sampleDelta, 0.001);
+
+    for (float phi = 0.0; phi < kTwoPi; phi += delta)
+    {
+        const float sinPhi = sin(phi);
+        const float cosPhi = cos(phi);
+
+        for (float theta = 0.0; theta < kHalfPi; theta += delta)
+        {
+            const float sinTheta = sin(theta);
+            const float cosTheta = cos(theta);
+
+            // 切空间方向 → 世界方向
+            const vec3 tangentSample =
+                vec3(sinTheta * cosPhi, sinTheta * sinPhi, cosTheta);
+
+            const vec3 sampleDirection =
+                tangentSample.x * right +
+                tangentSample.y * forward +
+                tangentSample.z * normal;
+
+            // cosθ 是投影余弦, sinθ 是球面坐标下的立体角雅可比 ——
+            // 两个都不能少
+            irradiance += textureLod(environmentMap, sampleDirection,
+                                     params.sourceMipLevel).rgb
+                        * cosTheta * sinTheta;
+
+            sampleCount += 1.0;
+        }
+    }
+
+    // π 来自把黎曼和还原为积分: 步长均匀取样时,
+    // ∫∫ cosθ sinθ dθ dφ = π, 而我们除以的是样本数而非该积分值
+    if (sampleCount > 0.0)
+    {
+        irradiance = kPi * irradiance / sampleCount;
+    }
+
+    imageStore(irradianceFaces, ivec3(id), vec4(irradiance, 1.0));
+}

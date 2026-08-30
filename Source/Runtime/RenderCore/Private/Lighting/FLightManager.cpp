@@ -96,12 +96,13 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     // ---- 创建描述符集布局 ----
     //   set 2, binding 0 — FLightingUBO
     //   set 2, binding 1 — 阴影贴图 (深度纹理 + 比较采样器)
+    //   set 2, binding 2 — 漫反射辐照度立方体贴图
     //
     // 阴影贴图放在 set 2 而非 set 0: set 0 的描述符集也会被阴影 Pass 自己
     // 绑定 (它需要光源矩阵), 把正在写入的阴影贴图放进去会形成"同一帧内
     // 既作为附件写入又作为纹理读取"的冲突。set 2 只有前向 Pass 绑定,
     // 天然避开这个问题。
-    FRHIDescriptorBinding bindings[2] = {};
+    FRHIDescriptorBinding bindings[3] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -113,9 +114,19 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[1].Count      = 1;
     bindings[1].StageFlags = EShaderStage::Fragment;
 
+    // binding 2 — 漫反射辐照度立方体贴图
+    //
+    // 即使场景没有环境贴图, 这个绑定也必须写入一个有效的视图:
+    // 着色器里出现的描述符必须在管线绑定时有效, 靠 uniform 分支跳过采样
+    // 并不能免除这一点。因此渲染器会准备一张 1x1 的黑色立方体贴图兜底。
+    bindings[2].Binding    = 2;
+    bindings[2].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[2].Count      = 1;
+    bindings[2].StageFlags = EShaderStage::Fragment;
+
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 2;
+    layoutDesc.BindingCount = 3;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -352,6 +363,9 @@ void FLightManager::UploadLightData(
     uboData.ShadowNormalBias  = m_ShadowInfo.NormalBias;
     uboData.ShadowMapSize     = m_ShadowInfo.ShadowMapSize;
     uboData.ShadowEnabled     = m_IsShadowEnabled ? 1.0f : 0.0f;
+
+    uboData.IblEnabled   = m_IsIblEnabled ? 1.0f : 0.0f;
+    uboData.IblIntensity = m_IblIntensity;
 
     // 映射 UBO 并写入
     void* mappedPtr = nullptr;

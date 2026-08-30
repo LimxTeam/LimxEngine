@@ -223,14 +223,26 @@ struct FLightingUBO
     Float32 ShadowNormalBias  = 0.05f;
     Float32 ShadowMapSize     = 2048.0f;
     Float32 ShadowEnabled     = 0.0f;
+
+    // vec4: x=是否启用 IBL(0/1), y=IBL 强度倍数, z/w=保留
+    //
+    // 需要一个显式开关而非"辐照度贴图是否为黑"来判断: 没有环境贴图时
+    // 描述符上绑的是一张 1x1 的黑色占位图, 采样它得到的确实是零 ——
+    // 但那样常数环境光也一并被乘没了, 场景会整个暗下去。开关让着色器
+    // 能在"用 IBL"与"用常数环境光"之间选择, 而不是把两者相加或相乘。
+    Float32 IblEnabled   = 0.0f;
+    Float32 IblIntensity = 1.0f;
+    Float32 IblPad0      = 0.0f;
+    Float32 IblPad1      = 0.0f;
 };
 
 // 编译时验证 FLightingUBO 大小
 // 16 × 80 + 3 × 16 = 1280 + 48 = 1328 字节 (光源 + 计数 + 相机 + 环境光)
 // + mat4×3 级联矩阵 192 + vec4 切分 16 + vec4 阴影参数 16 = 1552 字节
-// std140 要求数组元素与结构体尾部都对齐到 16 字节, 1552 已是 16 的倍数
-static_assert(sizeof(FLightingUBO) == 1552,
-    "FLightingUBO 必须为 1552 字节 (std140 对齐)");
+// + vec4 IBL 参数 16 = 1568 字节
+// std140 要求数组元素与结构体尾部都对齐到 16 字节, 1568 已是 16 的倍数
+static_assert(sizeof(FLightingUBO) == 1568,
+    "FLightingUBO 必须为 1568 字节 (std140 对齐)");
 
 // ============================================================================
 // FLight — CPU 侧光源对象
