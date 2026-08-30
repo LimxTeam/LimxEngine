@@ -1715,8 +1715,15 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("配置验证失败"));
             }
 
-            if strict && !result.warnings.is_empty() {
-                return Err(anyhow::anyhow!("严格模式：存在警告"));
+            // --strict 只对非建议类警告失败 —— 见 ValidationWarning::is_advisory
+            let blocking = result
+                .warnings
+                .iter()
+                .filter(|w| !w.is_advisory())
+                .count();
+
+            if strict && blocking > 0 {
+                return Err(anyhow::anyhow!("严格模式：存在 {} 条警告", blocking));
             }
         }
 

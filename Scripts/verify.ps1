@@ -260,8 +260,21 @@ Invoke-Step '零 STL / 零 CRT / 无裸 new-delete 检查' {
     .\Binaries\Tools\lbt.exe check --source-dir Source
 }
 
+# --strict 必须与 ci.yml 保持一致。
+#
+# 此前本地不带 --strict 而 CI 带, 于是本地 16 步全绿而 CI 的第二步会直接
+# 失败 —— 这类分歧在真正触发 CI 之前完全看不见。凡是两边都要跑的命令,
+# 参数就必须逐字相同。
 Invoke-Step '模块配置校验' {
-    .\Binaries\Tools\lbt.exe validate -s Source
+    .\Binaries\Tools\lbt.exe validate -s Source --strict
+}
+
+# 校验本脚本与 ci.yml 没有分歧 —— 不需要 GPU, 也不需要网络。
+#
+# 放在这里而不是只在 CI 里跑: 分歧是在本地改动时产生的, 越早报越好。
+# 等到 CI 触发才发现, 一个来回要几分钟。
+Invoke-Step 'CI 等价性' {
+    powershell -NoProfile -ExecutionPolicy Bypass -File Scripts/ci-parity.ps1
 }
 
 # ------------------------------------------------------------

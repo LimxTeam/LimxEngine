@@ -145,8 +145,21 @@ jobs:
       - name: 模块配置校验
         run: .\Binaries\Tools\lbt.exe validate -s Source --strict
 
-      - name: 全量构建
-        run: .\Binaries\Tools\lbt.exe build -s Source -c development --rebuild
+      # verify.ps1 与本文件跑同一件事时参数必须逐字相同。
+      #
+      # Day 1 实测发现两处分歧 (validate 的 --strict、build 的 --skip-shaders),
+      # 两处都会让"本地全绿而 CI 失败"。这种分歧在真正触发 CI 之前看不见,
+      # 所以把它变成一条本地就能跑的检查。
+      - name: CI 等价性
+        run: pwsh Scripts/ci-parity.ps1
+
+      # 命令必须与 verify.ps1 逐字相同 —— Scripts/ci-parity.ps1 会校验这一点。
+      #
+      # --skip-shaders: 着色器由 shaders 作业单独编译与校验, 这里再编一遍
+      # 只是重复。engine 作业的产物因此不含 SPIR-V, gpu-checks 会同时下载
+      # shaders 作业的产物。
+      - name: 构建
+        run: .\Binaries\Tools\lbt.exe build -s Source -c development --skip-shaders
 
       # 退出码非 0 即判定失败, 无需解析输出文本
       - name: Core 单元测试
@@ -165,9 +178,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: limx-engine-build
-          path: |
-            Binaries/Development/Win64/
-            Binaries/Shaders/
+          path: Binaries/Development/Win64/
           retention-days: 3
 
       - name: 上传失败日志
@@ -207,6 +218,15 @@ jobs:
       - name: 严格校验
         run: .\Binaries\Tools\lsc.exe validate -s Shaders --vulkan-version 1.4 --strict
 
+      # gpu-checks 要跑真实引擎, 而引擎需要编译好的 SPIR-V。
+      # engine 作业用 --skip-shaders 构建, 所以着色器只能从这里来。
+      - name: 上传着色器
+        uses: actions/upload-artifact@v4
+        with:
+          name: limx-shaders
+          path: Binaries/Shaders/
+          retention-days: 3
+
   # ==========================================================
   # 需 GPU 层
   # ==========================================================
@@ -227,7 +247,7 @@ jobs:
   gpu-checks:
     name: GPU 自检 (需真实显卡)
     runs-on: [self-hosted, windows, gpu]
-    needs: engine
+    needs: [engine, shaders]
     # 没有 self-hosted GPU 运行器时, 该作业排队但不阻塞其它作业;
     # 手动触发或打了 gpu 标签的分支才尝试运行。
     if: >-
@@ -244,11 +264,17 @@ jobs:
           install_runtime: true
           cache: true
 
-      - name: 下载构建产物
+      - name: 下载引擎产物
         uses: actions/download-artifact@v4
         with:
           name: limx-engine-build
-          path: Binaries
+          path: Binaries/Development/Win64
+
+      - name: 下载着色器
+        uses: actions/download-artifact@v4
+        with:
+          name: limx-shaders
+          path: Binaries/Shaders
 
       # 显存回收自检 + IBL 白炉自检 + 资产导入回归哨兵
       - name: GPU 自检

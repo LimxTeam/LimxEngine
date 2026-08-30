@@ -118,6 +118,15 @@ impl std::fmt::Display for ValidationError {
 }
 
 /// 验证警告
+///
+/// 分两级, 由 is_advisory() 区分:
+///
+///   警告   —— 大概率是配置错误 (依赖为空、没有源文件、模块无人依赖)
+///   建议   —— 可选的改进 (加个 PCH)
+///
+/// --strict 只对前者失败。不分级的话, 每一条"建议加个 PCH"都会变成硬性
+/// 要求, 于是要么给每个模块都加上 PCH, 要么整个 --strict 不能用 —— 而
+/// 后者正是 CI 与本地验证脚本此前的分歧所在。
 #[derive(Debug)]
 pub enum ValidationWarning {
     /// 空依赖列表
@@ -130,6 +139,13 @@ pub enum ValidationWarning {
     NoSourceFiles { module: String },
     /// 建议优化
     Suggestion { module: String, message: String },
+}
+
+impl ValidationWarning {
+    /// 是否只是建议 (--strict 不因它失败)
+    pub fn is_advisory(&self) -> bool {
+        matches!(self, Self::MissingPch { .. } | Self::Suggestion { .. })
+    }
 }
 
 impl std::fmt::Display for ValidationWarning {
@@ -298,6 +314,15 @@ impl ModuleValidator {
         }
 
         for module in modules {
+            // 可执行文件按定义就是叶子 —— 没有任何东西会依赖一个 exe。
+            //
+            // 这里原先不分模块类型, 于是每个测试程序和 Launch 都被报成
+            // "未使用"。在 --strict 下这直接让 CI 的模块校验步骤失败, 而
+            // 那五条警告一条都不是真问题。
+            if matches!(module.config.module.r#type, ModuleType::Executable) {
+                continue;
+            }
+
             // 层级 0 的模块作为基础模块，不警告
             if module.layer > 0 && !used_modules.contains(&module.name) {
                 result.add_warning(ValidationWarning::UnusedModule {
