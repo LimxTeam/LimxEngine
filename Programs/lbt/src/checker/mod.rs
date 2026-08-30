@@ -445,7 +445,15 @@ impl LimxChecker {
 
         for (line_idx, line) in lines.iter().enumerate() {
             let line_num = line_idx + 1;
-            let trimmed = line.trim();
+
+            // 先剥 BOM 再 trim。
+            //
+            // str::trim 按 Unicode White_Space 判定, 而 U+FEFF 不在其中,
+            // 于是带 BOM 的文件第一行 trim 完仍以 BOM 开头, 下面的
+            // starts_with("/*") 失配 —— 块注释状态永远进不去, 整段文件头
+            // 注释就被当成代码扫。症状是文件头里凡提到 std:: 之类的散文
+            // 全部报错, 而同一份内容去掉 BOM 就干净。
+            let trimmed = line.trim_start_matches('\u{FEFF}').trim();
 
             // NOLINT 行内抑制 — 支持 // NOLINT 和 // NOLINTNEXTLINE
             if trimmed.contains("// NOLINT") {

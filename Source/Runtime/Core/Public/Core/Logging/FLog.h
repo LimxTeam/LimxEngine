@@ -67,17 +67,10 @@ extern "C"
 #endif
 
 // CRT 输出前向声明
-#if LIMX_COMPILER_MSVC
-#pragma warning(push)
-#pragma warning(disable: 4273)
-#endif
 extern "C"
 {
     int puts(const char* str);
 }
-#if LIMX_COMPILER_MSVC
-#pragma warning(pop)
-#endif
 
 namespace Limx
 {

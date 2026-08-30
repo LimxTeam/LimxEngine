@@ -42,14 +42,11 @@
 // ============================================================================
 // CRT 内存函数前向声明 — 无需 #include <cstring>
 // 编译器 (MSVC/Clang/GCC) 识别这些声明后自动内联优化
-// 注意: 当第三方库 (如 Vulkan SDK) 间接引入 CRT 头文件时，这些声明可能
-//       因缺少 __declspec(dllimport) 而触发 C4273，此处安全地抑制该警告。
+//
+// 这四个函数在 UCRT 里都声明为编译器内建, 不带 dllimport, 因此不需要
+// LIMX_CRT_IMPORT。第三方库把真 CRT 头文件拉进同一个翻译单元时, 两边
+// 的链接属性本就一致。
 // ============================================================================
-
-#if LIMX_COMPILER_MSVC
-#pragma warning(push)
-#pragma warning(disable: 4273) // dll 链接不一致 — CRT 头文件使用 dllimport
-#endif
 
 extern "C"
 {
@@ -83,9 +80,6 @@ extern "C"
 }
 #endif
 
-#if LIMX_COMPILER_MSVC
-#pragma warning(pop)
-#endif
 
 // ============================================================================
 // Placement new 操作符前向声明 — 无需 #include <new>

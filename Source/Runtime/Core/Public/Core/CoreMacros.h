@@ -346,3 +346,28 @@ inline constexpr Limx::SizeType kCacheLineSize = 64;
 
 /// 缓存行对齐
 #define LIMX_CACHE_LINE_ALIGNED LIMX_ALIGNAS(64)
+
+// ============================================================================
+// LIMX_CRT_IMPORT — 与 CRT 声明保持一致的链接属性
+// ============================================================================
+//
+// 本工程不包含 CRT 头文件, 少数几个 CRT 函数由我们自己前向声明。问题是
+// 第三方库 (Vulkan SDK、stb) 会间接把真正的 CRT 头文件拉进同一个翻译
+// 单元, 于是同一个函数被声明两次 —— 一次带 dllimport, 一次不带, MSVC
+// 报 C4273 "inconsistent dll linkage"。
+//
+// UCRT 里绝大多数字符串函数 (strlen、strcmp、strstr、strchr) 声明时不带
+// dllimport, 因为编译器把它们当内建处理; 只有少数带 _ACRTIMP, 例如
+// strncmp。所以这里不是给所有声明一律加, 而是哪个带就给哪个加。
+//
+// _ACRTIMP 的条件是 `!defined _CORECRT_BUILD && defined _DLL`, 我们照抄:
+// 用 /MD 链接动态 CRT 时为 dllimport, 静态 CRT (/MT) 时为空。
+//
+// 为什么不继续用 #pragma warning(disable: 4273): 那是把不一致藏起来,
+// 而这里是把它消除。压制还有个副作用 —— 同一段区域里真正的链接不一致
+// 也会被一并吞掉。
+#if LIMX_COMPILER_MSVC && defined(_DLL)
+    #define LIMX_CRT_IMPORT __declspec(dllimport)
+#else
+    #define LIMX_CRT_IMPORT
+#endif

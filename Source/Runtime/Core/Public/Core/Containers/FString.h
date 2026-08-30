@@ -43,27 +43,24 @@
 
 // ============================================================================
 // CRT 字符串函数前向声明 — 无需 #include <cstring>
-// 注意: 当第三方库 (如 Vulkan SDK) 间接引入 CRT 头文件时，这些声明可能
-//       因签名差异而触发 C4273/C2556，此处安全地抑制相关警告。
+//
+// 链接属性必须与 UCRT 的声明逐个对上, 否则第三方库把真 CRT 头文件拉进
+// 同一个翻译单元时会报 C4273。UCRT 里 strlen/strcmp/strstr/strchr 声明
+// 时不带 dllimport (编译器按内建处理), 只有 strncmp 带 _ACRTIMP ——
+// 所以 LIMX_CRT_IMPORT 只加在 strncmp 上。
+//
+// 加错地方一样会报 C4273, 方向相反而已, 因此这里是编译期能验证的。
 // ============================================================================
-
-#if LIMX_COMPILER_MSVC
-#pragma warning(push)
-#pragma warning(disable: 4273) // dll 链接不一致 — CRT 头文件使用 dllimport
-#endif
 
 extern "C"
 {
     Limx::SizeType strlen(const char* str);
     int strcmp(const char* str1, const char* str2);
-    int strncmp(const char* str1, const char* str2, Limx::SizeType count);
+    LIMX_CRT_IMPORT int strncmp(const char* str1, const char* str2,
+                                Limx::SizeType count);
     const char* strstr(const char* haystack, const char* needle);
     const char* strchr(const char* str, int character);
 }
-
-#if LIMX_COMPILER_MSVC
-#pragma warning(pop)
-#endif
 
 namespace Limx
 {

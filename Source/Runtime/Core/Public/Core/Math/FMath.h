@@ -39,10 +39,6 @@
 // MSVC 编译器识别这些声明后自动优化为内建指令
 // ============================================================================
 
-#if LIMX_COMPILER_MSVC
-#pragma warning(push)
-#pragma warning(disable: 4273)
-#endif
 
 extern "C"
 {
@@ -83,9 +79,6 @@ extern "C"
     float fabsf(float x);
 }
 
-#if LIMX_COMPILER_MSVC
-#pragma warning(pop)
-#endif
 
 namespace Limx
 {

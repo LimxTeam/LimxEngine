@@ -38,17 +38,10 @@
 #include "Core/CoreMacros.h"
 #include "Core/Memory/MemoryOps.h"
 
-#if LIMX_COMPILER_MSVC
-#pragma warning(push)
-#pragma warning(disable: 4273)
-#endif
 extern "C"
 {
     Limx::SizeType strlen(const char* str);
 }
-#if LIMX_COMPILER_MSVC
-#pragma warning(pop)
-#endif
 
 namespace Limx
 {

@@ -34,10 +34,6 @@
 
 // Windows CSPRNG 前向声明 (bcrypt.h 不属于 windows.h，始终需要前向声明)
 #if LIMX_PLATFORM_WINDOWS
-#if LIMX_COMPILER_MSVC
-#pragma warning(push)
-#pragma warning(disable: 4273)
-#endif
 extern "C"
 {
     // NTSTATUS BCryptGenRandom(void* hAlgorithm, unsigned char* pbBuffer,
@@ -45,9 +41,6 @@ extern "C"
     long __stdcall BCryptGenRandom(void*, unsigned char*, unsigned long,
                                     unsigned long);
 }
-#if LIMX_COMPILER_MSVC
-#pragma warning(pop)
-#endif
 #endif
 
 namespace Limx
