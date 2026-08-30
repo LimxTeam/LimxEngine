@@ -491,6 +491,92 @@ fn main() -> Result<()> {
 
             let compiler = ShaderCompiler::new()?;
 
+            // 目录: 逐个验证其中的着色器。
+            //
+            // 此前只接受单个文件, 而 compile-all 的同名参数收的是目录 ——
+            // 同一个工具里两种语义。传目录时 read_to_string 会以
+            // "Access is denied" (os error 5) 失败, CI 的着色器作业因此
+            // 一直是红的, 而错误信息完全指不到真正的原因。
+            if source.is_dir() {
+                let ext_list: Vec<&str> = vec![
+                    "vert", "frag", "comp", "geom", "tesc", "tese",
+                ];
+
+                let shaders =
+                    discover_shaders_with_extensions(&source, &ext_list, true)?;
+
+                if shaders.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "目录 {} 下没有找到着色器",
+                        source.display()
+                    ));
+                }
+
+                let mut failed = 0usize;
+                let mut warned = 0usize;
+
+                for path in &shaders {
+                    let source_code = std::fs::read_to_string(path)?;
+                    let stage = ShaderStage::from_extension(
+                        path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+                    );
+                    let shader = ShaderSource {
+                        code: source_code,
+                        file_path: Some(path.clone()),
+                        stage,
+                    };
+                    let mut options = CompileOptions::new();
+                    options.target_environment = vulkan_version
+                        .parse()
+                        .map_err(|e: String| anyhow::anyhow!(e))?;
+
+                    match compiler.compile(&shader, &options) {
+                        Ok(result) => {
+                            if result.warnings.is_empty() {
+                                println!("  ✓ {}", path.display());
+                            } else {
+                                warned += result.warnings.len();
+                                println!(
+                                    "  ⚠ {} — {} 条警告",
+                                    path.display(),
+                                    result.warnings.len()
+                                );
+                                for w in &result.warnings {
+                                    println!("      {}", w);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            println!("  ✗ {}", path.display());
+                            println!("      {}", e);
+                        }
+                    }
+                }
+
+                println!();
+                println!(
+                    "  验证完成: {} 个着色器, {} 个失败, {} 条警告",
+                    shaders.len(),
+                    failed,
+                    warned
+                );
+
+                // 编译失败一律致命; 警告只在 --strict 下致命。
+                if failed > 0 {
+                    return Err(anyhow::anyhow!("{} 个着色器验证失败", failed));
+                }
+
+                if strict && warned > 0 {
+                    return Err(anyhow::anyhow!(
+                        "严格模式下验证失败: {} 条警告",
+                        warned
+                    ));
+                }
+
+                return Ok(());
+            }
+
             let is_spirv = source
                 .extension()
                 .map(|e| e == "spv" || e == "spirv")

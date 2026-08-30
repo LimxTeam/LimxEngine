@@ -203,6 +203,15 @@ Invoke-Step '编译 SPIR-V (Vulkan 1.4)' {
     .\Binaries\Tools\lsc.exe compile-all -s Shaders -o Binaries/Shaders --vulkan-version 1.4 -O
 }
 
+# 严格校验 —— 编译通过不等于没有警告。
+#
+# 这一步此前只在 ci.yml 里有, 本地从不执行, 而它的参数用法本身就是错的
+# (validate 当时只接受单个文件, 传目录直接 os error 5)。CI 的着色器作业
+# 因此一直是红的, 而本地十七步全绿 —— 没人会去看一个长期红着的 CI。
+Invoke-Step '着色器严格校验' {
+    .\Binaries\Tools\lsc.exe validate -s Shaders --vulkan-version 1.4 --strict
+}
+
 # 引擎的 FMatrix 是行主序; GLSL 默认按列主序解读 uniform 里的 mat, 不加
 # row_major 等于把矩阵整体转置。后果是所有顶点被变换到裁剪体外 —— 画面只剩
 # 清屏色, 而校验层与编译器都不会报错。这一步把该约定变成可检查的规则。

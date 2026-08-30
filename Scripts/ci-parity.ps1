@@ -52,6 +52,10 @@ function Get-ToolCommands {
         # 统一分隔符与前后缀, 使两个文件的写法可比
         if ($line -notmatch 'Binaries[\\/](Tools|Development)') { continue }
 
+        # YAML 的 path: / name: / key: 不是命令 —— 它们同样带 Binaries 路径。
+        # 不排掉的话产物上传下载会被当成"CI 独有的命令"报出来。
+        if ($line -match '^\s*(path|name|key)\s*:') { continue }
+
         $text = $line.Trim()
 
         # 去掉 YAML 的 "run: " 前缀与 PowerShell 的前导点斜杠
@@ -127,10 +131,44 @@ foreach ($c in $ciCmds) {
     }
 }
 
-if ($mismatches.Count -eq 0) {
+# ------------------------------------------------------------
+# CI 独有的命令
+#
+# 上面只比对两边都有的命令。但"CI 跑了而 verify 没跑"同样危险 —— 那部分
+# 在本地永远不会被执行, 出问题只能等 CI 告诉你。
+#
+# 实测踩过: ci.yml 有 `lsc validate -s Shaders --strict` 而 verify.ps1 只有
+# compile-all。那条命令因为参数用法就是错的 (validate 当时只接受单个文件,
+# 传目录直接 os error 5), CI 的着色器作业一直是红的, 而本地十七步全绿。
+# ------------------------------------------------------------
+
+$onlyInCi = @()
+
+foreach ($c in $ciCmds) {
+    $k = Get-CommandKey $c
+    if (-not $k) { continue }
+
+    # 这些是 CI 环境独有的, 本地不适用
+    if ($k -match 'verify\.ps1|ci-parity\.ps1') { continue }
+
+    if (-not $verifyMap.ContainsKey($k)) {
+        $onlyInCi += $c
+    }
+}
+
+if ($mismatches.Count -eq 0 -and $onlyInCi.Count -eq 0) {
     Write-Host "  两边共有的 $($verifyMap.Count) 条工具命令参数一致" -ForegroundColor Green
     Write-Host ''
     exit 0
+}
+
+if ($onlyInCi.Count -gt 0) {
+    Write-Host "  $($onlyInCi.Count) 条命令只在 ci.yml 里出现, 本地从不执行:" -ForegroundColor Red
+    Write-Host ''
+    foreach ($c in $onlyInCi) {
+        Write-Host "    $c" -ForegroundColor Yellow
+    }
+    Write-Host ''
 }
 
 Write-Host "  发现 $($mismatches.Count) 处分歧:" -ForegroundColor Red
