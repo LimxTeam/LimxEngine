@@ -1,4 +1,4 @@
-/*******************************************************************************
+﻿/*******************************************************************************
  * 文件: GltfLoaderTests.cpp
  * 创建时间: 2026-08-29
  * 创建者: LimxTeam
@@ -192,6 +192,110 @@ FString MakeTriangleGltf(const FString& bufferUri)
     builder.Append("}]}");
 
     return builder.ToString();
+}
+
+
+/// 构造一个含 primitiveCount 个图元的 glTF
+///
+/// 每个图元共用同一份三角形数据 (同样的 accessor), 但各自指向不同的
+/// 材质 —— 材质 p 的 baseColorFactor.R = p / 255。这样一来:
+///
+///   顶点/索引数应为 3 * primitiveCount, 图元 p 的索引应为 {0,1,2} + 3p;
+///   子网格 p 的 IndexOffset 应为 3p, MaterialIndex 应为 p。
+///
+/// 后一条是关键: 装配被并行化之后, 图元完成的先后顺序不再固定, 而渲染
+/// 时按子网格顺序绑定材质 —— 顺序一乱, 画面上就是满场的材质错位, 而
+/// 顶点数、三角形数这些统计量全都对得上, 看不出任何异常。
+FString MakeMultiPrimitiveGltf(SizeType primitiveCount)
+{
+    FStringBuilder builder(8192);
+
+    builder.Append("{\"asset\":{\"version\":\"2.0\",\"generator\":\"LimxTest\"},");
+    builder.Append("\"scene\":0,\"scenes\":[{\"nodes\":[0]}],");
+    builder.Append("\"nodes\":[{\"mesh\":0,\"name\":\"MultiNode\"}],");
+    builder.Append("\"meshes\":[{\"name\":\"Multi\",\"primitives\":[");
+
+    for (SizeType p = 0; p < primitiveCount; ++p)
+    {
+        if (p > 0)
+        {
+            builder.Append(",");
+        }
+
+        builder.Append("{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},");
+        builder.Append("\"indices\":2,\"material\":");
+        builder.AppendInt(static_cast<Int64>(p));
+        builder.Append("}");
+    }
+
+    builder.Append("]}],\"materials\":[");
+
+    for (SizeType p = 0; p < primitiveCount; ++p)
+    {
+        if (p > 0)
+        {
+            builder.Append(",");
+        }
+
+        builder.Append("{\"name\":\"Mat");
+        builder.AppendInt(static_cast<Int64>(p));
+        builder.Append("\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[");
+        builder.AppendFloat(static_cast<Float64>(p) / 255.0, 6);
+        builder.Append(",0.0,0.0,1.0]}}");
+    }
+
+    builder.Append("],\"accessors\":[");
+    builder.Append("{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    builder.Append("{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    builder.Append("{\"bufferView\":2,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],");
+    builder.Append("\"bufferViews\":[");
+    builder.Append("{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},");
+    builder.Append("{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36},");
+    builder.Append("{\"buffer\":0,\"byteOffset\":72,\"byteLength\":6}],");
+    builder.Append("\"buffers\":[{\"byteLength\":80,\"uri\":\"");
+    builder.Append(MakeDataUri(kTightBufferBase64));
+    builder.Append("\"}]}");
+
+    return builder.ToString();
+}
+
+/// 检查一份多图元解析结果是否处处自洽
+///
+/// 断言宏引用的是 LIMX_TEST 生成的 limxTestContext 形参, 因此在 helper
+/// 里用就得把它显式传进来, 并在函数内保持同名。
+void CheckMultiPrimitive(FTestContext& limxTestContext,
+                         const FMeshData& mesh, SizeType primitiveCount)
+{
+    LIMX_EXPECT_EQ(mesh.GetVertexCount(), primitiveCount * 3);
+    LIMX_EXPECT_EQ(mesh.GetIndexCount(), primitiveCount * 3);
+    LIMX_EXPECT_EQ(mesh.SubMeshes.GetSize(), primitiveCount);
+
+    if (mesh.SubMeshes.GetSize() != primitiveCount)
+    {
+        return;
+    }
+
+    for (SizeType p = 0; p < primitiveCount; ++p)
+    {
+        const FSubMesh& subMesh = mesh.SubMeshes[p];
+
+        // 子网格必须仍按图元顺序排列
+        LIMX_EXPECT_EQ(subMesh.MaterialIndex, static_cast<Int32>(p));
+        LIMX_EXPECT_EQ(subMesh.IndexOffset, static_cast<UInt32>(p * 3));
+        LIMX_EXPECT_EQ(subMesh.IndexCount, UInt32(3));
+
+        // 索引必须按各自图元的顶点基址整体平移
+        for (SizeType i = 0; i < 3; ++i)
+        {
+            LIMX_EXPECT_EQ(mesh.Indices[p * 3 + i],
+                           static_cast<UInt32>(p * 3 + i));
+        }
+
+        // 顶点坐标应逐图元重复 —— 读错缓冲区偏移在这里立刻暴露
+        LIMX_EXPECT_NEAR(mesh.Vertices[p * 3 + 0].Position.X, 0.0f, kTolerance);
+        LIMX_EXPECT_NEAR(mesh.Vertices[p * 3 + 1].Position.X, 1.0f, kTolerance);
+        LIMX_EXPECT_NEAR(mesh.Vertices[p * 3 + 2].Position.Y, 1.0f, kTolerance);
+    }
 }
 
 } // namespace
@@ -898,4 +1002,116 @@ LIMX_TEST(GltfLoader, ResetClearsPreviousScene)
     LIMX_EXPECT_EQ(scene.Meshes.GetSize(), SizeType(1));
     LIMX_EXPECT_EQ(scene.Materials.GetSize(), SizeType(1));
     LIMX_EXPECT_EQ(scene.Nodes.GetSize(), SizeType(1));
+}
+
+
+// ============================================================================
+// 多图元装配 — 串行与并行两条分支
+//
+// FGltfLoader::ParseMeshes 按图元总数选路: 少于 kParallelPrimitiveThreshold
+// (32) 走串行, 否则建任务图并行装配。两条分支必须给出完全一致的结果,
+// 而线上唯一的 glTF 内容 (Sponza, 103 个图元) 只覆盖得到并行那条。
+// ============================================================================
+
+LIMX_TEST(GltfLoader, AssemblesFewPrimitivesSerially)
+{
+    // 4 个图元 —— 远低于阈值, 必定走串行分支
+    const FString json = MakeMultiPrimitiveGltf(4);
+
+    FAssetScene scene;
+    const FAssetLoadResult result = ParseGltf(json, scene);
+
+    LIMX_REQUIRE_TRUE(result.Succeeded);
+    LIMX_REQUIRE_EQ(scene.Meshes.GetSize(), SizeType(1));
+
+    CheckMultiPrimitive(limxTestContext, scene.Meshes[0], 4);
+}
+
+LIMX_TEST(GltfLoader, AssemblesManyPrimitivesInParallel)
+{
+    // 64 个图元 —— 高于阈值, 必定走并行分支
+    const FString json = MakeMultiPrimitiveGltf(64);
+
+    FAssetScene scene;
+    const FAssetLoadResult result = ParseGltf(json, scene);
+
+    LIMX_REQUIRE_TRUE(result.Succeeded);
+    LIMX_REQUIRE_EQ(scene.Meshes.GetSize(), SizeType(1));
+
+    CheckMultiPrimitive(limxTestContext, scene.Meshes[0], 64);
+}
+
+LIMX_TEST(GltfLoader, SerialAndParallelAgreeExactly)
+{
+    // 跨过阈值的两侧各取一个规模, 逐字节比对两条分支的产物。
+    //
+    // 上面两个用例各自检查"结果是否自洽", 这一个检查的是"两条分支是否
+    // 给出同一个答案" —— 前者能同时被两条分支上同一个错误骗过 (比如两
+    // 边都把材质下标算错), 后者不会。
+    const SizeType serialCount   = 31;   // 阈值 32 之下一格
+    const SizeType parallelCount = 32;   // 恰好触发并行
+
+    FAssetScene serialScene;
+    FAssetScene parallelScene;
+
+    LIMX_REQUIRE_TRUE(
+        ParseGltf(MakeMultiPrimitiveGltf(serialCount), serialScene).Succeeded);
+    LIMX_REQUIRE_TRUE(
+        ParseGltf(MakeMultiPrimitiveGltf(parallelCount), parallelScene).Succeeded);
+
+    LIMX_REQUIRE_EQ(serialScene.Meshes.GetSize(), SizeType(1));
+    LIMX_REQUIRE_EQ(parallelScene.Meshes.GetSize(), SizeType(1));
+
+    const FMeshData& serialMesh   = serialScene.Meshes[0];
+    const FMeshData& parallelMesh = parallelScene.Meshes[0];
+
+    // 先把规模钉死再逐项比对 —— 否则子网格少了一个时下面会越界, 用例
+    // 以崩溃收场, 同一个二进制里排在后面的用例就全都跑不到了。
+    LIMX_REQUIRE_EQ(serialMesh.SubMeshes.GetSize(), serialCount);
+    LIMX_REQUIRE_EQ(parallelMesh.SubMeshes.GetSize(), parallelCount);
+
+    // 并行那份多一个图元, 前 31 个图元的数据必须完全相同
+    const SizeType commonVertices = serialCount * 3;
+
+    LIMX_REQUIRE_TRUE(parallelMesh.GetVertexCount() >= commonVertices);
+
+    for (SizeType i = 0; i < commonVertices; ++i)
+    {
+        LIMX_EXPECT_EQ(serialMesh.Indices[i], parallelMesh.Indices[i]);
+
+        LIMX_EXPECT_NEAR(serialMesh.Vertices[i].Position.X,
+                         parallelMesh.Vertices[i].Position.X, kTolerance);
+        LIMX_EXPECT_NEAR(serialMesh.Vertices[i].Position.Y,
+                         parallelMesh.Vertices[i].Position.Y, kTolerance);
+        LIMX_EXPECT_NEAR(serialMesh.Vertices[i].Normal.Z,
+                         parallelMesh.Vertices[i].Normal.Z, kTolerance);
+    }
+
+    for (SizeType p = 0; p < serialCount; ++p)
+    {
+        LIMX_EXPECT_EQ(serialMesh.SubMeshes[p].MaterialIndex,
+                       parallelMesh.SubMeshes[p].MaterialIndex);
+        LIMX_EXPECT_EQ(serialMesh.SubMeshes[p].IndexOffset,
+                       parallelMesh.SubMeshes[p].IndexOffset);
+    }
+}
+
+LIMX_TEST(GltfLoader, ParallelAssemblyIsStableAcrossRuns)
+{
+    // 并行装配的正确性不能只测一次 —— 顺序错乱是竞态, 而竞态在单次运行
+    // 里有很大概率不发作。重复 20 次, 每次都要求完全一致的结果。
+    constexpr SizeType kPrimitives = 48;
+    constexpr SizeType kRuns       = 20;
+
+    const FString json = MakeMultiPrimitiveGltf(kPrimitives);
+
+    for (SizeType run = 0; run < kRuns; ++run)
+    {
+        FAssetScene scene;
+
+        LIMX_REQUIRE_TRUE(ParseGltf(json, scene).Succeeded);
+        LIMX_REQUIRE_EQ(scene.Meshes.GetSize(), SizeType(1));
+
+        CheckMultiPrimitive(limxTestContext, scene.Meshes[0], kPrimitives);
+    }
 }

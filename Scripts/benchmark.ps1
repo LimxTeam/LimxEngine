@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # benchmark.ps1 — 渲染吞吐基准
 #
 # 在同一份可执行文件上跑四种配置，量化视锥剔除与状态排序各自的收益。
@@ -13,8 +13,12 @@
 #   powershell Scripts/benchmark.ps1                  # 默认 60×60，300 帧
 #   powershell Scripts/benchmark.ps1 -Grid 80         # 更大规模
 #   powershell Scripts/benchmark.ps1 -Frames 600      # 更长采样
+#   powershell Scripts/benchmark.ps1 -SkipImport      # 只跑渲染那半段
 #
-# 退出码: 0 全部完成 | 1 存在运行失败
+# 脚本分两段: 前半段量渲染吞吐 (逐帧), 后半段量资产导入 (一次性)。
+# 后者是回归哨兵 —— 导入耗时超出预算就以 1 退出。
+#
+# 退出码: 0 全部完成 | 1 存在运行失败或导入超预算
 # ============================================================
 
 [CmdletBinding()]
@@ -24,7 +28,17 @@ param(
     [int]$Warmup = 60,
 
     # 环境贴图路径 —— 缺失时自动跳过 IBL 那一项
-    [string]$HdriPath = 'Content/HDRI/bloem_train_track_clear_2k.hdr'
+    [string]$HdriPath = 'Content/HDRI/bloem_train_track_clear_2k.hdr',
+
+    # ---- 导入基准 ----
+    [string]$ImportScene = 'Content/Sponza/Sponza.gltf',
+    [int]$ImportRuns     = 5,
+    [switch]$SkipImport,
+
+    # 导入耗时预算 (ms)。0 表示只报告不判定。
+    #
+    # 默认值是基线的三倍 —— 见下方 $ImportBaseline 的说明。
+    [double]$ImportBudgetMs = 0
 )
 
 $ErrorActionPreference = 'Continue'
@@ -129,17 +143,140 @@ Write-Host ('=' * 78)
 $Results | Format-Table -AutoSize
 
 # 以基线为分母给出加速比 —— 绝对毫秒数依赖具体硬件, 比值才是可迁移的结论
-if ($Results.Count -eq 4 -and $Results[0].平均耗时ms -gt 0) {
+#
+# 条数不写死: 加了第五个配置 (IBL) 之后这里曾经还写着 -eq 4, 结果只要
+# HDRI 存在整段加速比就静悄悄不打印了。
+if ($Results.Count -ge 2 -and $Results[0].平均耗时ms -gt 0) {
     $baseline = $Results[0].平均耗时ms
 
     Write-Host '  相对基线的加速比:'
-    foreach ($row in $Results[1..3]) {
+    foreach ($row in $Results[1..($Results.Count - 1)]) {
         if ($row.平均耗时ms -gt 0) {
             $speedup = [math]::Round($baseline / $row.平均耗时ms, 2)
             Write-Host "    $($row.配置): ${speedup}x"
         }
     }
     Write-Host ''
+}
+
+# ============================================================
+#  第二段 — 资产导入基准 (回归哨兵)
+# ============================================================
+#
+# 为什么要单独量导入: 它是一次性成本, 不出现在任何逐帧数字里, 因此
+# 逐帧基准再绿也盖不住它的退化。第四周把 Sponza 的导入从 1.9 s 压到
+# 0.84 s, 而其中最大的一笔 (图元装配 283 ms → 26 ms) 是一个反复
+# Reserve 导致的重分配问题 —— 那类退化极容易被无意改回去, 且不会
+# 让任何测试变红。所以给它一个能盯住的数字。
+
+if (-not $SkipImport) {
+
+    if (-not (Test-Path $ImportScene)) {
+        Write-Host ''
+        Write-Host "  跳过导入基准 — 未找到 $ImportScene" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host ('=' * 78)
+        Write-Host "  资产导入基准  ($ImportScene, $ImportRuns 次取中位数)"
+        Write-Host ('=' * 78)
+
+        $importRows = @()
+
+        for ($i = 1; $i -le $ImportRuns; $i++) {
+            # 两次运行之间必须留间隔。
+            #
+            # 这不是保守起见: 背靠背跑的时候, 上一次进程的退出 (释放几百
+            # MiB 显存、销毁设备) 会与下一次的启动重叠, 把上传那一项从
+            # 100 ms 推到 1000 ms 以上。这个假象在第四周骗过两次, 每次
+            # 都得出了"某项优化引起退化"的错误结论。
+            if ($i -gt 1) { Start-Sleep -Seconds 5 }
+
+            Remove-Item $Log -ErrorAction SilentlyContinue
+
+            $p = Start-Process -FilePath $Exe -PassThru -ArgumentList `
+                "--scene $ImportScene --frames 3 --warmup 1"
+            $p.WaitForExit(300000) | Out-Null
+
+            if (-not $p.HasExited) {
+                $p.Kill()
+                Write-Host "    第 $i 次: 超时" -ForegroundColor Red
+                $Failed = $true
+                continue
+            }
+
+            if (-not (Test-Path $Log)) {
+                Write-Host "    第 $i 次: 未产生日志" -ForegroundColor Red
+                $Failed = $true
+                continue
+            }
+
+            $totalLine = (Select-String -Path $Log -Pattern '资产导入完成').Line
+            $partLine  = (Select-String -Path $Log -Pattern '分项 — 解析').Line
+
+            if (-not $totalLine -or -not $partLine) {
+                Write-Host "    第 $i 次: 日志中没有导入结果" -ForegroundColor Red
+                $Failed = $true
+                continue
+            }
+
+            $importRows += [PSCustomObject]@{
+                总计 = if ($totalLine -match '耗时 ([\d.]+) ms')     { [double]$Matches[1] } else { 0 }
+                解析 = if ($partLine  -match '解析 ([\d.]+) ms')     { [double]$Matches[1] } else { 0 }
+                解码 = if ($partLine  -match '纹理解码 ([\d.]+) ms') { [double]$Matches[1] } else { 0 }
+                上传 = if ($partLine  -match '纹理上传 ([\d.]+) ms') { [double]$Matches[1] } else { 0 }
+            }
+
+            Write-Host ("    第 {0} 次: 总 {1,7:N1} ms | 解析 {2,6:N1} | 解码 {3,6:N1} | 上传 {4,6:N1}" -f `
+                $i, $importRows[-1].总计, $importRows[-1].解析,
+                $importRows[-1].解码, $importRows[-1].上传)
+        }
+
+        if ($importRows.Count -eq 0) {
+            Write-Host '  导入基准无有效样本' -ForegroundColor Red
+            $Failed = $true
+        }
+        else {
+            # 取中位数而非平均: 偶发的一次调度抖动能把平均值拉高几百毫秒,
+            # 而中位数不受单个离群点影响。
+            function Get-Median([double[]]$Values) {
+                $sorted = $Values | Sort-Object
+                return $sorted[[int]([math]::Floor($sorted.Count / 2))]
+            }
+
+            $medTotal  = Get-Median ($importRows.总计)
+            $medParse  = Get-Median ($importRows.解析)
+            $medDecode = Get-Median ($importRows.解码)
+            $medUpload = Get-Median ($importRows.上传)
+
+            Write-Host ''
+            Write-Host ("  中位数: 总 {0:N1} ms | 解析 {1:N1} | 解码 {2:N1} | 上传 {3:N1}" -f `
+                $medTotal, $medParse, $medDecode, $medUpload) -ForegroundColor Green
+
+            # ---- 判定 ----
+            #
+            # 基线是 2026-08-30 在一台 16 逻辑核的 Windows 机器上测得的
+            # 中位数。绝对毫秒随硬件浮动, 所以预算取三倍而非一倍 —— 目标
+            # 是抓住"数量级退化" (那次 Reserve 问题是 8 倍), 而不是在慢
+            # 一点的机器上误报。机器差异更大时用 -ImportBudgetMs 覆盖,
+            # 传 0 则只报告不判定。
+            $ImportBaseline = 840.0
+
+            $budget = if ($ImportBudgetMs -gt 0) { $ImportBudgetMs }
+                      else { $ImportBaseline * 3.0 }
+
+            if ($medTotal -gt $budget) {
+                Write-Host ("  导入超出预算: {0:N1} ms > {1:N1} ms" -f $medTotal, $budget) `
+                    -ForegroundColor Red
+                Write-Host '  (若这台机器本就慢于基线, 用 -ImportBudgetMs 调整预算)'
+                $Failed = $true
+            }
+            else {
+                Write-Host ("  预算 {0:N1} ms — 通过" -f $budget) -ForegroundColor Green
+            }
+        }
+
+        Write-Host ''
+    }
 }
 
 if ($Failed) { exit 1 }
