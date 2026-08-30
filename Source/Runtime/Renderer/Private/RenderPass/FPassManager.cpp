@@ -133,6 +133,9 @@ ERHIResult FPassManager::SetupAll(const FPassSetupInfo& info)
     setupDesc.SharedDepthTextureView = m_SharedDepthTextureView;
     setupDesc.SharedColorTexture     = m_SharedColorTexture;
     setupDesc.SharedColorTextureView = m_SharedColorTextureView;
+    setupDesc.SharedColorFormat      = kSharedColorFormat;
+    setupDesc.SharedDepthFormat      = kSharedDepthFormat;
+    setupDesc.ViewProjSetLayout      = info.ViewProjSetLayout;
 
     for (SizeType i = 0; i < m_Passes.GetSize(); ++i)
     {
@@ -301,7 +304,7 @@ ERHIResult FPassManager::CreateSharedColor(IRHIDevice* device,
 {
     FRHITextureDesc colorDesc = {};
     colorDesc.Type          = ETextureType::Texture2D;
-    colorDesc.Format        = EPixelFormat::RGBA16_SFLOAT;
+    colorDesc.Format        = kSharedColorFormat;
     colorDesc.Extent        = { extent.Width, extent.Height, 1 };
     colorDesc.MipLevels     = 1;
     colorDesc.ArrayLayers   = 1;
@@ -325,7 +328,7 @@ ERHIResult FPassManager::CreateSharedColor(IRHIDevice* device,
     FRHITextureViewDesc viewDesc = {};
     viewDesc.Texture         = m_SharedColorTexture;
     viewDesc.ViewType        = ETextureType::Texture2D;
-    viewDesc.Format          = EPixelFormat::RGBA16_SFLOAT;
+    viewDesc.Format          = kSharedColorFormat;
     viewDesc.BaseMipLevel    = 0;
     viewDesc.MipLevelCount   = 1;
     viewDesc.BaseArrayLayer  = 0;
@@ -374,7 +377,7 @@ ERHIResult FPassManager::CreateSharedDepth(IRHIDevice* device,
     // 创建深度纹理 — D32_SFLOAT, 交换链尺寸, 深度附件 + 采样用途
     FRHITextureDesc depthDesc = FRHITextureDesc::DepthStencil(
         extent.Width, extent.Height,
-        EPixelFormat::D32_SFLOAT,
+        kSharedDepthFormat,
         ESampleCount::Count1);
     depthDesc.DebugName = "SharedDepthBuffer";
 
@@ -391,7 +394,7 @@ ERHIResult FPassManager::CreateSharedDepth(IRHIDevice* device,
     FRHITextureViewDesc viewDesc = {};
     viewDesc.Texture         = m_SharedDepthTexture;
     viewDesc.ViewType        = ETextureType::Texture2D;
-    viewDesc.Format          = EPixelFormat::D32_SFLOAT;
+    viewDesc.Format          = kSharedDepthFormat;
     viewDesc.BaseMipLevel    = 0;
     viewDesc.MipLevelCount   = 1;
     viewDesc.BaseArrayLayer  = 0;

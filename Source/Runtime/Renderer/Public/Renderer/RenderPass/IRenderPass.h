@@ -83,6 +83,20 @@ struct FPassSetupDesc
     /// FForwardPass 画进它 (而非直接画进交换链), FPostProcessPass 采样它。
     FRHITextureHandle        SharedColorTexture;
     FRHITextureViewHandle    SharedColorTextureView;
+
+    /// 共享颜色/深度目标的像素格式
+    ///
+    /// 由 FPassManager 一处给出而非各 Pass 各自写死: 附件格式必须与实际
+    /// 纹理完全一致, 而"改了纹理格式却漏改某个 Pass 的附件描述"这种错误
+    /// 只在创建 Framebuffer 时才暴露, 报的还是"附件不兼容"这种无指向的话。
+    EPixelFormat             SharedColorFormat   = EPixelFormat::Unknown;
+    EPixelFormat             SharedDepthFormat   = EPixelFormat::Unknown;
+
+    /// set 0 (view/proj) 的描述符集布局
+    ///
+    /// 自建管线布局的 Pass 需要它来共享场景的 set 0 —— Vulkan 按布局
+    /// **对象**判定描述符集兼容性, 结构相同但对象不同并不算兼容。
+    FRHIDescSetLayoutHandle  ViewProjSetLayout;
 };
 
 // ============================================================================

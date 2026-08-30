@@ -36,6 +36,7 @@
 // ============================================================
 
 #include "Renderer/RenderPass/FForwardPass.h"
+#include "Renderer/RenderPass/FPassManager.h"
 #include "RenderCore/Shaders/FShaderManager.h"
 
 namespace Limx
@@ -124,12 +125,8 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
     // 清除值 — 颜色 (深蓝灰 Limx 品牌色) + 深度 (最大值 1.0)
     // ================================================================
 
-    FRHIClearColorValue clearColor = {};
-    clearColor.R = 0.01f;
-    clearColor.G = 0.01f;
-    clearColor.B = 0.02f;
-    clearColor.A = 1.0f;
-
+    // 颜色与深度都由更早的 Pass 清过 (天空 Pass 清颜色, 深度预通道清深度),
+    // 本 Pass 两个附件都是 LoadOp=Load, 因此不需要任何清除值。
     FRHIClearDepthStencilValue clearDepth = {};
     clearDepth.Depth   = 1.0f;
     clearDepth.Stencil = 0;
@@ -144,8 +141,8 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
     beginInfo.Framebuffer       = m_Framebuffers[0];
     beginInfo.RenderAreaOffset  = { 0, 0 };
     beginInfo.RenderAreaExtent  = context.SwapchainExtent;
-    beginInfo.ClearColors       = &clearColor;
-    beginInfo.ClearColorCount   = 1;
+    beginInfo.ClearColors       = nullptr;
+    beginInfo.ClearColorCount   = 0;
     beginInfo.ClearDepthStencil = &clearDepth;
 
     commandBuffer->BeginRenderPass(beginInfo);
@@ -457,19 +454,24 @@ ERHIResult FForwardPass::CreateRenderPass(IRHIDevice*  device,
 
     FRHIAttachmentDesc attachments[2] = {};
 
-    attachments[0].Format         = EPixelFormat::RGBA16_SFLOAT;
+    // LoadOp=Load 而非 Clear: 天空 Pass (Order 150) 已经清过屏并画好了
+    // 天空。这里再清一次会把天空整片抹掉。
+    //
+    // 相应地 InitialLayout 必须是 ColorAttachment —— 天空 Pass 把它停在
+    // 这个布局上, 声明成 Undefined 等于告诉驱动"内容可以丢弃"。
+    attachments[0].Format         = kSharedColorFormat;
     attachments[0].Samples        = ESampleCount::Count1;
-    attachments[0].LoadOp         = ELoadOp::Clear;
+    attachments[0].LoadOp         = ELoadOp::Load;
     attachments[0].StoreOp        = EStoreOp::Store;
     attachments[0].StencilLoadOp  = ELoadOp::DontCare;
     attachments[0].StencilStoreOp = EStoreOp::DontCare;
-    attachments[0].InitialLayout  = EImageLayout::Undefined;
+    attachments[0].InitialLayout  = EImageLayout::ColorAttachment;
     attachments[0].FinalLayout    = EImageLayout::ShaderReadOnly;
 
     // 附件 1: 深度附件 — 使用 FDepthPrePass 写入的深度数据 (LoadOp=Load)
     // InitialLayout=DepthStencilAttachment (prepass 后深度缓冲的布局)
     // FinalLayout=DepthStencilAttachment (保持)
-    attachments[1].Format         = EPixelFormat::D32_SFLOAT;
+    attachments[1].Format         = kSharedDepthFormat;
     attachments[1].Samples        = ESampleCount::Count1;
     attachments[1].LoadOp         = ELoadOp::Load;
     attachments[1].StoreOp        = EStoreOp::DontCare;

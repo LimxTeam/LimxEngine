@@ -1,0 +1,83 @@
+#version 450
+
+// ============================================================
+// 等距柱状投影 → 立方体贴图
+//
+// 为什么要转:
+//   等距柱状图 (equirectangular) 用一张 2:1 的矩形存整个球面, 采样时
+//   要做 atan/acos。这本身不贵, 但它有两个绕不开的问题:
+//     1. 两极附近的像素被极度拉伸 —— 同样的立体角在赤道占几个像素,
+//        在极点占一整行。用它做辐照度卷积, 极区的样本权重会被严重高估。
+//     2. u 方向在 ±180° 处接缝, 硬件的各向异性过滤与 mip 选择在接缝上
+//        会跨越整张图, 表现为天顶附近一条明显的竖线。
+//   立方体贴图的六个面各自是一张普通的透视投影图, 上述两点都不存在,
+//   而且硬件原生支持跨面过滤。
+//
+// 方向约定:
+//   层序为 +X, -X, +Y, -Y, +Z, -Z (Vulkan 立方体面选择表的顺序)。
+//   面内 uv 的 v 轴向下 —— 这是立方体贴图规范, 与"图像行号向下"一致,
+//   写反的表现是每个面上下颠倒, 而天空整体看着仍然"像是对的"。
+//
+// 线程组 8x8: 面边长总是 2 的幂 (通常 512/1024), 能被 8 整除,
+// 因此不需要边界判断以外的特殊处理。
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D equirectMap;
+
+// 立方体贴图以 2D 数组视图写入 —— GLSL 的 imageCube 只能整面写,
+// 而 image2DArray 允许按 (x, y, layer) 逐纹素定位, 与 Dispatch 的
+// 三维网格一一对应。底层是同一张图像。
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray cubeFaces;
+
+layout(push_constant) uniform Params {
+    uint faceSize;   // 每个面的边长
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} params;
+
+const float kPi    = 3.14159265358979323846;
+const float kTwoPi = 6.28318530717958647692;
+
+// 由面索引与面内坐标求世界方向 (未归一化)
+//
+// uv ∈ [-1, 1], u 向右, v 向下
+vec3 FaceDirection(uint face, vec2 uv)
+{
+    if (face == 0u) { return vec3(  1.0, -uv.y, -uv.x); }  // +X
+    if (face == 1u) { return vec3( -1.0, -uv.y,  uv.x); }  // -X
+    if (face == 2u) { return vec3( uv.x,   1.0,  uv.y); }  // +Y
+    if (face == 3u) { return vec3( uv.x,  -1.0, -uv.y); }  // -Y
+    if (face == 4u) { return vec3( uv.x, -uv.y,   1.0); }  // +Z
+    return vec3(-uv.x, -uv.y, -1.0);                       // -Z
+}
+
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+
+    if (id.x >= params.faceSize || id.y >= params.faceSize)
+    {
+        return;
+    }
+
+    // 取纹素中心而非左上角 —— 用左上角会让整个面偏移半个纹素,
+    // 六个面的接缝处因此错开一条缝
+    const vec2 uv = ((vec2(id.xy) + 0.5) / float(params.faceSize)) * 2.0 - 1.0;
+
+    const vec3 dir = normalize(FaceDirection(id.z, uv));
+
+    // 方向 → 球面角 → 等距柱状 uv
+    //
+    // atan(z, x) 的 x 轴对应 u = 0.5 (图像中心), 这是 HDRI 的惯例朝向。
+    // acos(y) 让 y=+1 (天顶) 落在 v=0, 即图像顶行 —— 与解码器输出的
+    // "第一行是图像顶行"一致。
+    const float u = atan(dir.z, dir.x) / kTwoPi + 0.5;
+    const float v = acos(clamp(dir.y, -1.0, 1.0)) / kPi;
+
+    const vec4 color = textureLod(equirectMap, vec2(u, v), 0.0);
+
+    imageStore(cubeFaces, ivec3(id), color);
+}

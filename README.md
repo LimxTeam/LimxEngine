@@ -132,6 +132,9 @@ LimxLaunch.exe --grid 60 --frames 300
 
 # 对照开关
 LimxLaunch.exe --grid 60 --frames 300 --no-cull --no-sort
+
+# HDR 环境贴图 + 天空盒，固定机位截屏
+LimxLaunch.exe --hdri Content/HDRI/sky.hdr --camera-pitch -0.35                --frames 30 --screenshot shot.ppm
 ```
 
 | 参数 | 说明 |
@@ -145,6 +148,10 @@ LimxLaunch.exe --grid 60 --frames 300 --no-cull --no-sort
 | `--warmup <N>` | 计入统计前跳过的预热帧数（默认 60） |
 | `--no-cull` / `--no-sort` | 关闭视锥剔除 / 状态排序 |
 | `--reload-test` | 关卡切换自检：加载 → 卸载 → 再加载，报告显存回落 |
+| `--hdri <路径>` | 加载 Radiance `.hdr` 作为环境贴图与天空盒 |
+| `--sky-intensity <倍数>` | 天空强度的线性倍数（默认 1.0） |
+| `--camera-yaw <弧度>` / `--camera-pitch <弧度>` | 固定相机朝向，用于可复现的截屏对照 |
+| `--screenshot <路径>` | 末帧截屏写入二进制 PPM（P6） |
 
 ### 目录结构
 

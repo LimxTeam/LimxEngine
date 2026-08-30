@@ -73,6 +73,16 @@ enum class EImageFormat : UInt8
 
     /// 四通道 16 位
     RGBA16 = 8,
+
+    /// 三通道 32 位浮点
+    RGB32F = 9,
+
+    /// 四通道 32 位浮点
+    ///
+    /// HDR 环境贴图解码后的格式。用浮点而非归一化整数是必需的 ——
+    /// HDR 的意义就在于亮度可以远超 1.0 (太阳能到几千), 归一化格式
+    /// 在解码阶段就把这部分截断了, 之后的辐照度卷积也就无从谈起。
+    RGBA32F = 10,
 };
 
 /// 该格式的通道数
@@ -85,11 +95,22 @@ LIMX_NODISCARD inline UInt32 GetImageChannelCount(EImageFormat format)
         case EImageFormat::RG8:
         case EImageFormat::RG16:   return 2;
         case EImageFormat::RGB8:
-        case EImageFormat::RGB16:  return 3;
+        case EImageFormat::RGB16:
+        case EImageFormat::RGB32F: return 3;
         case EImageFormat::RGBA8:
-        case EImageFormat::RGBA16: return 4;
+        case EImageFormat::RGBA16:
+        case EImageFormat::RGBA32F: return 4;
         default:                   return 0;
     }
+}
+
+/// 该格式是否为浮点
+///
+/// 单独判定而非靠"每通道 4 字节"推断: 将来若加入 32 位整数格式,
+/// 字节数相同但语义完全不同, 靠字节数推断会静默走错分支。
+LIMX_NODISCARD inline bool IsImageFormatFloat(EImageFormat format)
+{
+    return format == EImageFormat::RGB32F || format == EImageFormat::RGBA32F;
 }
 
 /// 该格式每通道的字节数
@@ -105,6 +126,8 @@ LIMX_NODISCARD inline UInt32 GetImageBytesPerChannel(EImageFormat format)
         case EImageFormat::RG16:
         case EImageFormat::RGB16:
         case EImageFormat::RGBA16: return 2;
+        case EImageFormat::RGB32F:
+        case EImageFormat::RGBA32F: return 4;
         default:                   return 0;
     }
 }

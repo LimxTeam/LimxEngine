@@ -30,6 +30,7 @@
 #pragma once
 
 #include "AssetPipeline/FPngDecoder.h"
+#include "AssetPipeline/FHdrDecoder.h"
 #include "AssetPipeline/FJpegDecoder.h"
 
 namespace Limx
@@ -41,6 +42,7 @@ enum class EImageFileFormat : UInt8
     Unknown = 0,
     Png     = 1,
     Jpeg    = 2,
+    Hdr     = 3,
 };
 
 /// 图像解码统一入口 — 全静态接口

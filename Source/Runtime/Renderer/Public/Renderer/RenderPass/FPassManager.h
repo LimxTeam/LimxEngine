@@ -52,6 +52,16 @@ namespace Limx
 {
 
 // ============================================================================
+/// 共享 HDR 颜色目标的格式
+///
+/// 集中一处而非各 Pass 各自写死 —— 附件格式必须与实际纹理逐位一致,
+/// 漏改一处的报错是"附件不兼容", 完全指不到是哪个格式对不上。
+inline constexpr EPixelFormat kSharedColorFormat = EPixelFormat::RGBA16_SFLOAT;
+
+/// 共享深度目标的格式
+inline constexpr EPixelFormat kSharedDepthFormat = EPixelFormat::D32_SFLOAT;
+
+// ============================================================================
 // FPassSetupInfo — SetupAll 调用时由外部提供的全局初始化信息
 // ============================================================================
 
@@ -74,6 +84,9 @@ struct FPassSetupInfo
 
     /// 管线布局句柄 (含 set 0 + Push Constant)
     FRHIPipelineLayoutHandle PipelineLayout;
+
+    /// set 0 (view/proj) 的描述符集布局 —— 供自建管线布局的 Pass 复用
+    FRHIDescSetLayoutHandle  ViewProjSetLayout;
 };
 
 // ============================================================================

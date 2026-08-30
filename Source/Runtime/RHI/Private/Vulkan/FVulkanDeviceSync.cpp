@@ -422,8 +422,12 @@ ERHIResult FVulkanDevice::CreateSwapchain(
     createInfo.imageColorSpace  = selectedFormat.colorSpace;
     createInfo.imageExtent      = extent;
     createInfo.imageArrayLayers = 1;
+    // TRANSFER_SRC 用于截屏与画面回读 —— 没有它就无法把最终画面拷出显存,
+    // 而"最终画面到底长什么样"是渲染改动唯一的客观验收依据。
+    // 这三个用途在所有实现上都是交换链的必备能力, 不需要查询支持位。
     createInfo.imageUsage       =
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
     // 队列共享模式
     UInt32 queueFamilyIndices[2] =

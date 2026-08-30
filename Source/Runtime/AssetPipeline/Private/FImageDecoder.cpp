@@ -34,6 +34,11 @@ EImageFileFormat FImageDecoder::DetectFormat(const UInt8* data, SizeType length)
         return EImageFileFormat::Jpeg;
     }
 
+    if (FHdrDecoder::IsHdr(data, length))
+    {
+        return EImageFileFormat::Hdr;
+    }
+
     return EImageFileFormat::Unknown;
 }
 
@@ -48,6 +53,9 @@ FImageDecodeResult FImageDecoder::Decode(const UInt8* data, SizeType length,
 
         case EImageFileFormat::Jpeg:
             return FJpegDecoder::Decode(data, length, outImage, options);
+
+        case EImageFileFormat::Hdr:
+            return FHdrDecoder::Decode(data, length, outImage, options);
 
         default:
             break;

@@ -86,6 +86,7 @@ class FPassManager;
 class FForwardPass;
 class FShadowPass;
 class FDepthPrePass;
+class FSkyPass;
 class FPostProcessPass;
 class FMaterial;
 
@@ -284,6 +285,24 @@ public:
 
     LIMX_NODISCARD Float32 GetExposure() const;
 
+    // ====================================================================
+    // 环境光照
+    // ====================================================================
+
+    /// 绑定环境立方体贴图给天空盒
+    ///
+    /// 传入无效句柄即解绑。切换关卡时**必须**先解绑再销毁贴图 ——
+    /// 否则天空 Pass 的描述符集里留着一个指向已释放图像的视图。
+    void SetEnvironmentMap(FRHITextureViewHandle cubeView,
+                           FRHISamplerHandle     sampler);
+
+    /// 设置天空强度的线性倍数
+    void SetSkyIntensity(Float32 intensity);
+
+    LIMX_NODISCARD Float32 GetSkyIntensity() const;
+
+    LIMX_NODISCARD bool HasEnvironmentMap() const;
+
     /// 设置场景世界包围盒 — 阴影正交视锥据此拟合
     ///
     /// 由 FSceneManager 在收集批次时顺带算出。给得过大浪费阴影贴图精度,
@@ -355,6 +374,7 @@ private:
     TUniquePtr<FPassManager>          m_PassManager;
     TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
+    TUniquePtr<FSkyPass>              m_SkyPass;
     TUniquePtr<FForwardPass>          m_ForwardPass;
     TUniquePtr<FPostProcessPass>      m_PostProcessPass;
 

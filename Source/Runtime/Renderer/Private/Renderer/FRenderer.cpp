@@ -66,6 +66,7 @@
 #include "RenderCore/Lighting/FLight.h"
 #include "Renderer/RenderPass/FPassManager.h"
 #include "Renderer/RenderPass/FShadowPass.h"
+#include "Renderer/RenderPass/FSkyPass.h"
 #include "Renderer/RenderPass/FPostProcessPass.h"
 #include "Renderer/RenderPass/FForwardPass.h"
 #include "Renderer/RenderPass/FDepthPrePass.h"
@@ -191,12 +192,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     // 初始化 Pass 系统 —— 阴影 Pass 的 Order 最小, 先于深度预 Pass 执行
     m_ShadowPass   = MakeUnique<FShadowPass>();
     m_DepthPrePass = MakeUnique<FDepthPrePass>();
+    m_SkyPass      = MakeUnique<FSkyPass>();
     m_ForwardPass  = MakeUnique<FForwardPass>();
     m_PostProcessPass = MakeUnique<FPostProcessPass>();
     m_PassManager  = MakeUnique<FPassManager>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
+    m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
     m_PassManager->RegisterPass(m_PostProcessPass.Get());
 
@@ -210,6 +213,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     setupInfo.SwapchainExtent     = m_Context->GetSwapchainExtent();
     setupInfo.SwapchainImageCount = imageCount;
     setupInfo.PipelineLayout      = m_PipelineLayout;
+    setupInfo.ViewProjSetLayout   = m_DescSetLayout;
 
     result = m_PassManager->SetupAll(setupInfo);
     if (!IsRHISuccess(result))
@@ -270,8 +274,11 @@ void FRenderer::Shutdown()
         m_PassManager->ShutdownAll(device);
     }
     m_PassManager.Reset();
+    m_PostProcessPass.Reset();
     m_ForwardPass.Reset();
+    m_SkyPass.Reset();
     m_DepthPrePass.Reset();
+    m_ShadowPass.Reset();
 
     // 2. 销毁管线布局
     if (device != nullptr)
@@ -505,6 +512,39 @@ void FRenderer::SetExposure(Float32 exposure)
 Float32 FRenderer::GetExposure() const
 {
     return m_PostProcessPass ? m_PostProcessPass->GetExposure() : 1.0f;
+}
+
+// ============================================================================
+// 环境光照
+// ============================================================================
+
+void FRenderer::SetEnvironmentMap(FRHITextureViewHandle cubeView,
+                                  FRHISamplerHandle     sampler)
+{
+    if (!m_SkyPass || m_Context == nullptr)
+    {
+        return;
+    }
+
+    m_SkyPass->SetEnvironmentMap(m_Context->GetDevice(), cubeView, sampler);
+}
+
+void FRenderer::SetSkyIntensity(Float32 intensity)
+{
+    if (m_SkyPass)
+    {
+        m_SkyPass->SetIntensity(intensity);
+    }
+}
+
+Float32 FRenderer::GetSkyIntensity() const
+{
+    return m_SkyPass ? m_SkyPass->GetIntensity() : 1.0f;
+}
+
+bool FRenderer::HasEnvironmentMap() const
+{
+    return m_SkyPass && m_SkyPass->HasEnvironmentMap();
 }
 
 // ============================================================================

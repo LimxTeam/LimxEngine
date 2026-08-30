@@ -44,6 +44,8 @@
 #include "Launch/LaunchMinimal.h"
 #include "RenderCore/Material/FMaterialManager.h"
 #include "Engine/Rendering/FSceneLoader.h"
+#include "RenderCore/Environment/FEnvironmentMap.h"
+#include "AssetPipeline/FImageDecoder.h"
 
 namespace Limx
 {
@@ -85,6 +87,27 @@ struct FLaunchOptions
 
     /// 相机是否置于场景内部 —— 建筑内景必须开启, 否则只看得到外墙
     bool CameraInside = false;
+
+    /// 环境 HDRI 路径 (.hdr); 为空时不加载天空盒
+    FString HdriPath;
+
+    /// 天空强度的线性倍数 —— HDRI 的绝对量级因拍摄标定而异
+    Float32 SkyIntensity = 1.0f;
+
+    /// 相机朝向覆盖 (弧度) —— 用于可复现的截屏对照
+    ///
+    /// 默认相机会响应键鼠, 而任何"改了渲染再截一张对比"的验证都要求
+    /// 两次截屏的机位逐位相同。有了这两个开关, 天空朝向、白炉测试这类
+    /// 判断才有可复现的依据。
+    bool    OverrideCameraRotation = false;
+    Float32 CameraYaw   = 0.0f;
+    Float32 CameraPitch = 0.0f;
+
+    /// 截屏输出路径 (.ppm); 为空时不截屏
+    ///
+    /// 渲染改动的验收最终要落到画面上。没有一条把画面拷出显存的通路,
+    /// "天空朝向对不对""色调映射有没有偏"这类问题就只能靠肉眼隔着屏幕猜。
+    FString ScreenshotPath;
 
     /// 关卡切换自检 —— 加载 → 卸载 → 再加载, 逐步报告显存
     ///
@@ -141,7 +164,7 @@ FString WideToString(const WideChar* text)
     return result;
 }
 
-/// 宽字符串转单精度浮点 — 只支持 "整数[.小数]" 形式
+/// 宽字符串转单精度浮点 — 支持 "[+-]整数[.小数]" 形式
 Float32 ParseFloat32(const WideChar* text, Float32 fallback)
 {
     if (text == nullptr || *text == L'\0')
@@ -154,7 +177,28 @@ Float32 ParseFloat32(const WideChar* text, Float32 fallback)
     Float32 fractionScale = 1.0f;
     bool    seenDot      = false;
 
-    for (const WideChar* cursor = text; *cursor != L'\0'; ++cursor)
+    // 负号必须支持: 俯仰角、偏移量这类参数天然可以为负, 而漏掉它的失败方式
+    // 是"悄悄退回默认值" —— 命令行看着写对了, 行为却是默认的, 排查时极易
+    // 怀疑到功能本身而非参数解析上。
+    Float32         sign  = 1.0f;
+    const WideChar* start = text;
+
+    if (*start == L'-')
+    {
+        sign = -1.0f;
+        ++start;
+    }
+    else if (*start == L'+')
+    {
+        ++start;
+    }
+
+    if (*start == L'\0')
+    {
+        return fallback;
+    }
+
+    for (const WideChar* cursor = start; *cursor != L'\0'; ++cursor)
     {
         if (*cursor == L'.')
         {
@@ -184,7 +228,7 @@ Float32 ParseFloat32(const WideChar* text, Float32 fallback)
         }
     }
 
-    return integerPart + fractionPart;
+    return sign * (integerPart + fractionPart);
 }
 
 /// 宽字符串相等比较
@@ -223,6 +267,11 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --no-textures    不加载纹理, 只保留材质常量
 ///   --camera-inside  相机置于场景内部 (建筑内景用)
 ///   --reload-test    关卡切换自检: 加载 → 卸载 → 再加载, 报告显存回落
+///   --hdri P         加载 Radiance .hdr 作为环境贴图与天空盒
+///   --sky-intensity S 天空强度的线性倍数 (默认 1.0)
+///   --screenshot P   末帧截屏写入 P (二进制 PPM, P6)
+///   --camera-yaw R   固定相机偏航角 (弧度)
+///   --camera-pitch R 固定相机俯仰角 (弧度)
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -306,9 +355,316 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.ReloadTest = true;
         }
+        else if (WideEquals(arg, L"--hdri") && (i + 1) < tokenCount)
+        {
+            options.HdriPath = WideToString(tokens[++i]);
+        }
+        else if (WideEquals(arg, L"--sky-intensity") && (i + 1) < tokenCount)
+        {
+            options.SkyIntensity = ParseFloat32(tokens[++i], 1.0f);
+        }
+        else if (WideEquals(arg, L"--screenshot") && (i + 1) < tokenCount)
+        {
+            options.ScreenshotPath = WideToString(tokens[++i]);
+        }
+        else if (WideEquals(arg, L"--camera-yaw") && (i + 1) < tokenCount)
+        {
+            options.CameraYaw = ParseFloat32(tokens[++i], 0.0f);
+            options.OverrideCameraRotation = true;
+        }
+        else if (WideEquals(arg, L"--camera-pitch") && (i + 1) < tokenCount)
+        {
+            options.CameraPitch = ParseFloat32(tokens[++i], 0.0f);
+            options.OverrideCameraRotation = true;
+        }
     }
 
     return options;
+}
+
+// ============================================================================
+// FScreenshotCapture — 把最后呈现的画面拷回内存并写成 PPM
+//
+// 拷贝必须录进**当前帧的**命令缓冲区, 而不能在帧外另起一个一次性提交:
+// 交换链图像只在"取得 (acquire) 到呈现 (present)"这段窗口内归应用所有,
+// 帧外去转换它的布局是明确的规范违例 —— 验证层会指出"该图像尚未被取得"。
+// 因此这里分成两步: 帧内录制拷贝命令, 帧后等 GPU 空闲再读缓冲区。
+//
+// 写 PPM 而非 PNG: 渲染验收要的是"画面到底是什么颜色", PPM 是逐字节无损、
+// 无压缩、格式说明只有三行的容器 —— 引入压缩编码器只会在验收链条上多一个
+// 可能出错的环节。需要 PNG 时用任意工具转一次即可。
+// ============================================================================
+
+class FScreenshotCapture
+{
+public:
+    /// 请求在下一帧结束时截屏
+    ///
+    /// @return 是否成功准备好回读缓冲区
+    bool Request(FRenderContext* context)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr)
+        {
+            return false;
+        }
+
+        m_Extent = context->GetSwapchainExtent();
+        m_Format = context->GetSwapchainFormat();
+
+        if (m_Extent.Width == 0 || m_Extent.Height == 0)
+        {
+            return false;
+        }
+
+        const SizeType byteSize =
+            static_cast<SizeType>(m_Extent.Width) * m_Extent.Height * 4;
+
+        FRHIBufferDesc readbackDesc = {};
+        readbackDesc.Size        = byteSize;
+        readbackDesc.Usage       = EBufferUsage::TransferDst;
+        readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        readbackDesc.DebugName   = "Screenshot.Readback";
+
+        if (!IsRHISuccess(device->CreateBuffer(readbackDesc, m_Readback)))
+        {
+            LIMX_LOG(LogLaunch, Warning,
+                     "[Launch] 截屏失败: 回读缓冲区创建失败");
+            return false;
+        }
+
+        m_IsPending = true;
+        return true;
+    }
+
+    /// 在帧内录制拷贝命令 —— 由 FRenderer 的场景后回调调用
+    void RecordCopy(FRenderContext* context)
+    {
+        if (!m_IsPending)
+        {
+            return;
+        }
+
+        IRHICommandBuffer* commandBuffer = context->GetCurrentCommandBuffer();
+        IRHIDevice*        device        = context->GetDevice();
+
+        if (commandBuffer == nullptr || device == nullptr)
+        {
+            return;
+        }
+
+        const FRHITextureHandle image = device->GetSwapchainImage(
+            context->GetSwapchain(), context->GetCurrentImageIndex());
+
+        if (!image.IsValid())
+        {
+            return;
+        }
+
+        // 后处理 Pass 把交换链图像停在 PresentSrc。转为传输源拷出后必须
+        // 转回去 —— 呈现要求图像处于 PresentSrc。
+        commandBuffer->TransitionImageLayout(
+            image,
+            EImageLayout::PresentSrc,
+            EImageLayout::TransferSrc,
+            EPipelineStageFlags::ColorAttachmentOutput,
+            EPipelineStageFlags::Transfer,
+            EAccessFlags::ColorAttachmentWrite,
+            EAccessFlags::TransferRead);
+
+        FRHIBufferTextureCopyRegion region = {};
+        region.BufferOffset      = 0;
+        region.BufferRowLength   = 0;
+        region.BufferImageHeight = 0;
+        region.MipLevel          = 0;
+        region.BaseLayer         = 0;
+        region.LayerCount        = 1;
+        region.TextureOffset     = { 0, 0, 0 };
+        region.TextureExtent     = { m_Extent.Width, m_Extent.Height, 1 };
+
+        commandBuffer->CopyTextureToBuffer(image, EImageLayout::TransferSrc,
+                                           m_Readback, region);
+
+        commandBuffer->TransitionImageLayout(
+            image,
+            EImageLayout::TransferSrc,
+            EImageLayout::PresentSrc,
+            EPipelineStageFlags::Transfer,
+            EPipelineStageFlags::BottomOfPipe,
+            EAccessFlags::TransferRead,
+            EAccessFlags::None);
+
+        m_IsPending  = false;
+        m_IsRecorded = true;
+    }
+
+    /// 等 GPU 空闲后读出缓冲区并写文件
+    bool WriteFile(FRenderContext* context, const FString& path)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr || !m_IsRecorded || !m_Readback.IsValid())
+        {
+            LIMX_LOG(LogLaunch, Warning, "[Launch] 截屏失败: 拷贝未录制");
+            Release(device);
+            return false;
+        }
+
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (!IsRHISuccess(device->MapBuffer(m_Readback, &mapped)) ||
+            mapped == nullptr)
+        {
+            LIMX_LOG(LogLaunch, Warning,
+                     "[Launch] 截屏失败: 回读缓冲区映射失败");
+            Release(device);
+            return false;
+        }
+
+        const UInt8*   source     = static_cast<const UInt8*>(mapped);
+        const SizeType pixelCount =
+            static_cast<SizeType>(m_Extent.Width) * m_Extent.Height;
+
+        const FString header = StringFormat("P6\n{} {}\n255\n",
+                                            m_Extent.Width, m_Extent.Height);
+
+        TArray<UInt8> file;
+        file.Reserve(header.GetLength() + pixelCount * 3);
+
+        for (SizeType i = 0; i < header.GetLength(); ++i)
+        {
+            file.Add(static_cast<UInt8>(header[i]));
+        }
+
+        // 交换链常见格式是 BGRA, PPM 要求 RGB —— 通道序在这里显式换。
+        // 写反的表现是"天是橙的、地是蓝的", 看着像色调映射出了问题。
+        const bool isBgra = (m_Format == EPixelFormat::BGRA8_UNORM) ||
+                            (m_Format == EPixelFormat::BGRA8_SRGB);
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            const UInt8* texel = source + i * 4;
+
+            file.Add(isBgra ? texel[2] : texel[0]);
+            file.Add(texel[1]);
+            file.Add(isBgra ? texel[0] : texel[2]);
+        }
+
+        device->UnmapBuffer(m_Readback);
+        Release(device);
+
+        const bool written = FPlatformFile::WriteAllBytes(path, file.GetData(),
+                                                          file.GetSize());
+
+        if (written)
+        {
+            LIMX_LOG(LogLaunch, Display,
+                     "[Launch] 截屏已写入: {} ({}x{})",
+                     path.GetCStr(), m_Extent.Width, m_Extent.Height);
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Warning,
+                     "[Launch] 截屏写入失败: {}", path.GetCStr());
+        }
+
+        return written;
+    }
+
+    void Release(IRHIDevice* device)
+    {
+        if (device != nullptr && m_Readback.IsValid())
+        {
+            device->DestroyBuffer(m_Readback);
+        }
+
+        m_IsPending  = false;
+        m_IsRecorded = false;
+    }
+
+private:
+    FRHIBufferHandle m_Readback;
+    FRHIExtent2D     m_Extent     = {};
+    EPixelFormat     m_Format     = EPixelFormat::Unknown;
+    bool             m_IsPending  = false;
+    bool             m_IsRecorded = false;
+};
+
+// ============================================================================
+// LoadEnvironmentMap — 解码 HDRI 并转换为环境立方体贴图
+//
+// 失败时只警告不中断: 天空盒是可选的, 缺了它场景照常渲染 (背景为清屏色)。
+// 把"HDRI 路径写错"升级成启动失败, 只会让排查变难。
+// ============================================================================
+
+static bool LoadEnvironmentMap(FEnvironmentMap& environmentMap,
+                               FRenderContext*  context,
+                               FRenderer*       renderer,
+                               const FLaunchOptions& options)
+{
+    const Float64 beginTime = FPlatformTime::Seconds();
+
+    // 关闭 16 位降级 —— 它只对整数格式有意义, 但显式关掉能表明意图:
+    // 这条路径上的任何精度损失都是不可接受的
+    FImageDecodeOptions decodeOptions;
+    decodeOptions.ForceFourChannels       = true;
+    decodeOptions.ReduceSixteenBitToEight = false;
+
+    FImageData               image;
+    const FImageDecodeResult decodeResult =
+        FImageDecoder::DecodeFile(options.HdriPath, image, decodeOptions);
+
+    if (!decodeResult.Succeeded)
+    {
+        LIMX_LOG(LogLaunch, Warning,
+                 "[Launch] HDRI 解码失败 ({}): {}",
+                 options.HdriPath.GetCStr(),
+                 decodeResult.ErrorMessage.GetCStr());
+        return false;
+    }
+
+    for (SizeType i = 0; i < decodeResult.Warnings.GetSize(); ++i)
+    {
+        LIMX_LOG(LogLaunch, Warning,
+                 "[Launch] HDRI 警告: {}",
+                 decodeResult.Warnings[i].GetCStr());
+    }
+
+    // 等距柱状图的宽高比应为 2:1。偏离时仍然继续 —— 转换本身只依赖
+    // 球面角映射, 比例不对只会让某些方向的采样密度不均, 而非解不出来。
+    if (image.Width != image.Height * 2)
+    {
+        LIMX_LOG(LogLaunch, Warning,
+                 "[Launch] HDRI 宽高比不是 2:1 ({}x{}), 天空可能变形",
+                 image.Width, image.Height);
+    }
+
+    const ERHIResult buildResult =
+        environmentMap.BuildFromEquirect(context, image);
+
+    if (!IsRHISuccess(buildResult))
+    {
+        LIMX_LOG(LogLaunch, Warning,
+                 "[Launch] 立方体贴图转换失败: {}",
+                 static_cast<Int32>(buildResult));
+        return false;
+    }
+
+    renderer->SetEnvironmentMap(environmentMap.GetCubeView(),
+                                environmentMap.GetSampler());
+    renderer->SetSkyIntensity(options.SkyIntensity);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Launch] 环境贴图就绪: {} ({}x{} → 立方体 {}, 强度 {}), 耗时 {} ms",
+             options.HdriPath.GetCStr(), image.Width, image.Height,
+             environmentMap.GetFaceSize(), options.SkyIntensity,
+             static_cast<Int32>(
+                 (FPlatformTime::Seconds() - beginTime) * 1000.0));
+
+    return true;
 }
 
 // ============================================================================
@@ -920,6 +1276,41 @@ int WINAPI wWinMain(
         BuildDemoScene(scene, &renderContext, &renderer);
     }
 
+    // 4d2. 截屏通路 —— 拷贝命令必须录进帧内 (交换链图像只在帧内归应用所有)
+    FScreenshotCapture screenshotCapture;
+
+    if (!launchOptions.ScreenshotPath.IsEmpty())
+    {
+        renderer.SetPostSceneRenderCallback(
+            [&screenshotCapture, &renderContext]()
+            {
+                screenshotCapture.RecordCopy(&renderContext);
+            });
+    }
+
+    // 4e. 相机朝向覆盖 —— 放在场景构建之后, 免得被场景导入的取景逻辑改回去
+    if (launchOptions.OverrideCameraRotation)
+    {
+        renderer.GetCamera().SetRotation(launchOptions.CameraYaw,
+                                         launchOptions.CameraPitch);
+
+        LIMX_LOG(LogLaunch, Log,
+                 "[Launch] 相机朝向已固定: yaw={} pitch={}",
+                 launchOptions.CameraYaw, launchOptions.CameraPitch);
+    }
+
+    // 4f. 环境贴图 — 必须在渲染器初始化之后 (天空 Pass 的描述符集才存在)
+    //
+    // 声明在主循环之外: 它拥有立方体贴图的显存, 一旦析构天空 Pass 的
+    // 描述符集就会指向已释放的图像。作用域必须覆盖整个渲染期。
+    FEnvironmentMap environmentMap;
+
+    if (!launchOptions.HdriPath.IsEmpty())
+    {
+        LoadEnvironmentMap(environmentMap, &renderContext, &renderer,
+                           launchOptions);
+    }
+
     // 4d. 场景开始播放 — 驱动所有节点和 Trait 的 OnBegin()
     scene->OnBegin();
 
@@ -967,6 +1358,19 @@ int WINAPI wWinMain(
                          static_cast<UInt64>(launchOptions.FrameLimit))
         {
             LogBenchmarkReport(launchOptions, renderer);
+
+            // 截屏: 再渲一帧, 这一帧的命令缓冲区里带上拷贝命令
+            if (!launchOptions.ScreenshotPath.IsEmpty() &&
+                screenshotCapture.Request(&renderContext))
+            {
+                scene->Tick(0.0f);
+                FSceneManager::Get().SyncScene(scene, 0.0f);
+                renderer.RenderFrame();
+
+                screenshotCapture.WriteFile(&renderContext,
+                                            launchOptions.ScreenshotPath);
+            }
+
             break;
         }
     }
@@ -998,7 +1402,25 @@ int WINAPI wWinMain(
     // 6c. 关闭渲染桥接
     FSceneManager::Get().Shutdown();
 
-    // 6d. 关闭渲染器和 GPU 资源
+    // 6d. 释放环境贴图 —— 必须在渲染器与上下文关闭之前显式做
+    //
+    // 靠析构顺序在这里是不够的: environmentMap 是 main 的局部变量, 它的
+    // 析构发生在函数末尾, 那时 renderContext.Shutdown() 早已销毁了设备,
+    // 释放纹理会踩到已析构的对象。先解绑再释放, 顺序与创建严格相反。
+    //
+    // WaitIdle 必须在释放之前: 最后几帧的命令缓冲区可能仍在执行, 而它们
+    // 引用着这里的采样器与图像。渲染器的 Shutdown 里也有一次 WaitIdle,
+    // 但那已经晚了。
+    if (renderContext.GetDevice() != nullptr)
+    {
+        renderContext.GetDevice()->WaitIdle();
+    }
+
+    renderer.SetEnvironmentMap(FRHITextureViewHandle(), FRHISamplerHandle());
+    environmentMap.Release();
+    screenshotCapture.Release(renderContext.GetDevice());
+
+    // 6e. 关闭渲染器和 GPU 资源
     renderer.Shutdown();
     renderContext.Shutdown();
     window.Destroy();
