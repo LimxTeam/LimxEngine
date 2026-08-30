@@ -321,12 +321,30 @@ Invoke-Step 'AssetTests' {
 
 # 引擎层测试逐套件跑 —— 与 ci.yml 保持一致。
 #
-# CI 那边拆开是因为作业日志读不到, 而步骤成败是公开的; 本地拆开则是为了
-# 两边命令逐字相同 (Scripts/ci-parity.ps1 会校验)。
-foreach ($suite in @('BlendMode', 'CascadeSplit', 'GeometryWinding',
-                     'LSpatialTrait', 'TranslucentSort')) {
-    Invoke-Step "引擎层测试 · $suite" ([scriptblock]::Create(
-        ".\Binaries\Development\Win64\LimxEngineTests.exe --suite $suite"))
+# CI 那边拆开是因为作业日志需要 admin 权限才能读, 而步骤成败是公开的;
+# 本地拆开则是为了两边命令逐字相同。
+#
+# 展开写而不是 foreach 循环: 循环里命令行是 "--suite $suite", 文本上与
+# ci.yml 的 "--suite BlendMode" 对不上, ci-parity.ps1 会把五条都报成
+# "CI 独有"。这条检查抓到过我自己 —— 它就该抓得到。
+Invoke-Step '引擎层测试 · BlendMode' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite BlendMode
+}
+
+Invoke-Step '引擎层测试 · CascadeSplit' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite CascadeSplit
+}
+
+Invoke-Step '引擎层测试 · GeometryWinding' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite GeometryWinding
+}
+
+Invoke-Step '引擎层测试 · LSpatialTrait' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite LSpatialTrait
+}
+
+Invoke-Step '引擎层测试 · TranslucentSort' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite TranslucentSort
 }
 
 # 显存回收自检 —— 需要真实 GPU, 因此放在单元测试之后单独一步。
