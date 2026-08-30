@@ -41,14 +41,37 @@ ERHIResult FParallelRecorder::Initialize(IRHIDevice* device,
         return ERHIResult::ErrorInvalidParameter;
     }
 
-    // 线程数为 0 表示按硬件来。
+    // 线程数为 0 表示自动选。
     //
-    // 减 1 是把主线程算进去 —— 主线程也参与录制 (FJobExecutor 的
-    // ParallelFor 会让调用线程一起干活), 所以工作线程数应比核心数少一。
+    // **不是**取硬件并发数。实测 (60x60 网格, 918 可见批次, 三个 Pass):
+    //
+    //     内联       14.66 ms
+    //      4 线程    10.31 ms   最优
+    //      8 线程    12.33 ms
+    //     16 线程    19.15 ms   比不并行还慢 30%
+    //
+    // 段数在这三档下分别是 16/19/19 (受 kMinBatchesPerSegment 约束),
+    // 也就是说差别不在段数, 在线程数本身。
+    //
+    // 原因在当前任务图的实现: 就绪队列由单个互斥量保护, 十几个线程抢
+    // 十几个短任务时, 时间花在锁上而不是录制上; 而每帧三个 Pass 各要
+    // 一轮唤醒与休眠, 60 fps 下就是每秒 180 轮。
+    //
+    // 所以 4 是**当前实现**的性质, 不是工作负载的性质。任务图换成工作
+    // 窃取队列之后这个上限应当重新测量。--record-threads 保留就是为了
+    // 在别的硬件与负载上重测。
+    constexpr UInt32 kAutoThreadCap = 4;
+
     if (threadCount == 0)
     {
         const UInt32 hardware = FThread::HardwareConcurrency();
+
         threadCount = (hardware > 1) ? hardware : 1;
+
+        if (threadCount > kAutoThreadCap)
+        {
+            threadCount = kAutoThreadCap;
+        }
     }
 
     if (threadCount > kMaxThreads)
@@ -61,46 +84,19 @@ ERHIResult FParallelRecorder::Initialize(IRHIDevice* device,
     m_FramesInFlight = framesInFlight;
     m_FrameIndex     = 0;
 
-    // 槽位总数 = 线程数 x 每线程段数, 每个槽位自带命令池
-    const UInt32 slotCount = threadCount * kSegmentsPerThread;
-
     m_Slots.Clear();
-    m_Slots.SetSize(slotCount);
 
-    for (UInt32 s = 0; s < slotCount; ++s)
+    // 先建一批 —— 够前向 Pass 用。阴影 Pass 的三个级联会让本帧的槽位需求
+    // 变成四倍, 那时 EnsureSlots 按需补。
+    //
+    // 不一次性建足最坏情况的量: 槽位数取决于本帧有多少个通道要并行录制,
+    // 而那是运行时才知道的。按需扩容之后, 槽位只增不减, 稳态下不再分配。
+    const ERHIResult slotResult =
+        EnsureSlots(static_cast<SizeType>(threadCount) * kSegmentsPerThread);
+
+    if (slotResult != ERHIResult::Success)
     {
-        FSegmentResources& res = m_Slots[s];
-
-        for (UInt32 f = 0; f < framesInFlight; ++f)
-        {
-            const ERHIResult poolResult = device->CreateCommandPool(
-                EQueueType::Graphics, res.Pools[f]);
-
-            if (poolResult != ERHIResult::Success)
-            {
-                LIMX_LOG(LogParallelRecorder, Error,
-                         "[并行录制] 槽位 {} 帧 {} 的命令池创建失败", s, f);
-                return poolResult;
-            }
-
-            const ERHIResult bufferResult = device->AllocateCommandBuffer(
-                res.Pools[f], ECommandBufferLevel::Secondary,
-                res.Handles[f]);
-
-            if (bufferResult != ERHIResult::Success)
-            {
-                LIMX_LOG(LogParallelRecorder, Error,
-                         "[并行录制] 槽位 {} 帧 {} 的次级缓冲区分配失败", s, f);
-                return bufferResult;
-            }
-
-            res.Buffers[f] = CreateRHICommandBuffer(device, res.Handles[f]);
-
-            if (!res.Buffers[f])
-            {
-                return ERHIResult::ErrorUnknown;
-            }
-        }
+        return slotResult;
     }
 
     // 串行尾段的资源 —— 独立的池, 只由主线程使用
@@ -135,10 +131,67 @@ ERHIResult FParallelRecorder::Initialize(IRHIDevice* device,
     m_Graph.Initialize((threadCount > 1) ? (threadCount - 1) : 1);
 
     LIMX_LOG(LogParallelRecorder, Display,
-             "[并行录制] 已就绪 — {} 线程 / {} 段槽位 / {} 帧 "
-             "= {} 个命令池 (一段一池)",
-             threadCount, slotCount, framesInFlight,
-             (slotCount + 1) * framesInFlight);
+             "[并行录制] 已就绪 — {} 线程 / {} 段槽位 / {} 帧 (一段一池)",
+             threadCount, m_Slots.GetSize(), framesInFlight);
+
+    return ERHIResult::Success;
+}
+
+ERHIResult FParallelRecorder::EnsureSlots(SizeType count)
+{
+    if (m_Device == nullptr)
+    {
+        return ERHIResult::ErrorInvalidParameter;
+    }
+
+    if (count <= m_Slots.GetSize())
+    {
+        return ERHIResult::Success;
+    }
+
+    const SizeType oldSize = m_Slots.GetSize();
+
+    m_Slots.SetSize(count);
+
+    for (SizeType s = oldSize; s < count; ++s)
+    {
+        FSegmentResources& res = m_Slots[s];
+
+        for (UInt32 f = 0; f < m_FramesInFlight; ++f)
+        {
+            const ERHIResult poolResult = m_Device->CreateCommandPool(
+                EQueueType::Graphics, res.Pools[f]);
+
+            if (poolResult != ERHIResult::Success)
+            {
+                LIMX_LOG(LogParallelRecorder, Error,
+                         "[并行录制] 槽位 {} 帧 {} 的命令池创建失败", s, f);
+                return poolResult;
+            }
+
+            const ERHIResult bufferResult = m_Device->AllocateCommandBuffer(
+                res.Pools[f], ECommandBufferLevel::Secondary,
+                res.Handles[f]);
+
+            if (bufferResult != ERHIResult::Success)
+            {
+                LIMX_LOG(LogParallelRecorder, Error,
+                         "[并行录制] 槽位 {} 帧 {} 的次级缓冲区分配失败", s, f);
+                return bufferResult;
+            }
+
+            res.Buffers[f] = CreateRHICommandBuffer(m_Device, res.Handles[f]);
+
+            if (!res.Buffers[f])
+            {
+                return ERHIResult::ErrorUnknown;
+            }
+        }
+    }
+
+    LIMX_LOG(LogParallelRecorder, Display,
+             "[并行录制] 槽位扩容 {} → {} (每槽 {} 帧各一个命令池)",
+             oldSize, count, m_FramesInFlight);
 
     return ERHIResult::Success;
 }
@@ -220,16 +273,20 @@ void FParallelRecorder::BeginFrame(UInt32 frameIndex)
 
     m_Device->ResetCommandPool(m_TailPools[m_FrameIndex]);
 
-    m_ActiveSegments = 0;
+    m_NextSlot           = 0;
+    m_RecordMilliseconds = 0.0;
     m_Segments.Clear();
 }
 
-void FParallelRecorder::ExecuteInto(IRHICommandBuffer* primary)
+void FParallelRecorder::ExecuteInto(IRHICommandBuffer*    primary,
+                                    const FRecorderBatch& batch)
 {
-    if (primary == nullptr || m_ActiveSegments == 0)
+    if (primary == nullptr || batch.IsEmpty())
     {
         return;
     }
+
+    LIMX_ASSERT(batch.First + batch.Count <= m_Segments.GetSize());
 
     // 按段号顺序执行。
     //
@@ -242,7 +299,7 @@ void FParallelRecorder::ExecuteInto(IRHICommandBuffer* primary)
 
     SizeType written = 0;
 
-    for (SizeType i = 0; i < m_ActiveSegments; ++i)
+    for (SizeType i = 0; i < batch.Count; ++i)
     {
         if (written >= kMaxInline)
         {
@@ -250,7 +307,7 @@ void FParallelRecorder::ExecuteInto(IRHICommandBuffer* primary)
             written = 0;
         }
 
-        handles[written] = m_Segments[i].Handle;
+        handles[written] = m_Segments[batch.First + i].Handle;
         ++written;
     }
 

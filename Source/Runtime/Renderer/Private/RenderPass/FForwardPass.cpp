@@ -414,7 +414,7 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
         inheritance.Subpass     = 0;
         inheritance.Framebuffer = m_Framebuffers[0];
 
-        m_Recorder->RecordSegmented(
+        FRecorderBatch batch = m_Recorder->RecordSegmented(
             opaqueCount, inheritance,
             [this, &context](IRHICommandBuffer* segmentBuffer,
                              SizeType begin, SizeType end)
@@ -433,10 +433,11 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
                 {
                     RecordCommonState(tailBuffer, context);
                     RecordTranslucent(tailBuffer, context);
-                });
+                },
+                batch);
         }
 
-        m_Recorder->ExecuteInto(commandBuffer);
+        m_Recorder->ExecuteInto(commandBuffer, batch);
     }
     else
     {

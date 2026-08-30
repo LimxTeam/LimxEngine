@@ -226,6 +226,11 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     if (m_ParallelRecording && m_Recorder.IsInitialized())
     {
         m_ForwardPass->SetRecorder(&m_Recorder);
+
+        // 阴影 Pass 才是 CPU 的大头 —— 逐 Pass 实测 8.17 ms 录制 / 0.66 ms
+        // GPU, 占整帧 55%。三级级联乘以全部投射体, 而前向只有 2.48 ms。
+        m_ShadowPass->SetRecorder(&m_Recorder);
+        m_DepthPrePass->SetRecorder(&m_Recorder);
     }
     m_PassManager->RegisterPass(m_PostProcessPass.Get());
 

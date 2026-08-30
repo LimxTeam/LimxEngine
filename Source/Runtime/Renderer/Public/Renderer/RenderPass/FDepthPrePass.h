@@ -46,6 +46,7 @@
 #pragma once
 
 #include "Renderer/RenderPass/IRenderPass.h"
+#include "Renderer/Recording/FParallelRecorder.h"
 
 namespace Limx
 {
@@ -76,6 +77,9 @@ public:
 
     ERHIResult Setup(const FPassSetupDesc& desc) override;
 
+    /// 设置并行录制器 (可空 = 走内联路径)
+    void SetRecorder(FParallelRecorder* recorder) { m_Recorder = recorder; }
+
     void Execute(IRHICommandBuffer*       commandBuffer,
                  const FRenderPassContext& context) override;
 
@@ -93,6 +97,20 @@ public:
     void Shutdown(IRHIDevice* device) override;
 
 private:
+    /// 录制公共状态 — 视口、裁剪、set 0
+    void RecordCommonState(IRHICommandBuffer*        commandBuffer,
+                           const FRenderPassContext& context);
+
+    /// 录制 [begin, end) 区间的深度绘制
+    void RecordRange(IRHICommandBuffer*        commandBuffer,
+                     const FRenderPassContext& context,
+                     SizeType                  begin,
+                     SizeType                  end);
+
+    /// 并行录制器 — 空则走内联路径
+    FParallelRecorder* m_Recorder = nullptr;
+
+
     // ====================================================================
     // 内部构建方法
     // ====================================================================

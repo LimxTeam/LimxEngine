@@ -110,33 +110,16 @@ ERHIResult FDepthPrePass::Setup(const FPassSetupDesc& desc)
 // Execute — 录制深度渲染命令 + 插入管线屏障
 // ============================================================================
 
-void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
-                             const FRenderPassContext& context)
+// ============================================================================
+// 录制辅助 — 内联路径与并行路径共用
+//
+// 与前向、阴影两个 Pass 同一模式: 次级命令缓冲区不继承任何绑定状态,
+// 公共状态每段各设一次; 绘制代码只有一份, 逐像素比对才检验得了并行本身。
+// ============================================================================
+
+void FDepthPrePass::RecordCommonState(IRHICommandBuffer*        commandBuffer,
+                                       const FRenderPassContext& context)
 {
-    commandBuffer->BeginDebugLabel("DepthPrePass", 1.0f, 0.8f, 0.2f);
-
-    // ================================================================
-    // 清除深度值 — 最大深度 1.0
-    // ================================================================
-
-    FRHIClearDepthStencilValue clearDepth = {};
-    clearDepth.Depth   = 1.0f;
-    clearDepth.Stencil = 0;
-
-    // ================================================================
-    // 开始深度渲染通道 (仅深度附件，无颜色)
-    // ================================================================
-
-    FRHIRenderPassBeginInfo beginInfo = {};
-    beginInfo.RenderPass        = m_DepthRenderPass;
-    beginInfo.Framebuffer       = m_DepthFramebuffer;
-    beginInfo.RenderAreaOffset  = { 0, 0 };
-    beginInfo.RenderAreaExtent  = context.SwapchainExtent;
-    beginInfo.ClearColors       = nullptr;
-    beginInfo.ClearColorCount   = 0;
-    beginInfo.ClearDepthStencil = &clearDepth;
-
-    commandBuffer->BeginRenderPass(beginInfo);
 
     // ================================================================
     // 绑定 depth-only 管线 + 设置动态状态
@@ -180,6 +163,13 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
     // (仅写入深度，不执行片段着色)
     // ================================================================
 
+}
+
+void FDepthPrePass::RecordRange(IRHICommandBuffer*        commandBuffer,
+                                 const FRenderPassContext& context,
+                                 SizeType                  begin,
+                                 SizeType                  end)
+{
     if (context.RenderObjects != nullptr)
     {
         // 材质集必须绑定 —— Masked 材质要在这里做与前向 Pass **完全相同**的
@@ -195,7 +185,7 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
         FRHIBufferHandle boundIndexBuffer;
         EIndexType       boundIndexType = EIndexType::UInt32;
 
-        for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
+        for (SizeType i = begin; i < end; ++i)
         {
             const FRenderObject& obj = (*context.RenderObjects)[i];
 
@@ -256,6 +246,70 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
                 0
             );
         }
+    }
+
+}
+
+void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
+                             const FRenderPassContext& context)
+{
+    commandBuffer->BeginDebugLabel("DepthPrePass", 1.0f, 0.8f, 0.2f);
+
+    // ================================================================
+    // 清除深度值 — 最大深度 1.0
+    // ================================================================
+
+    FRHIClearDepthStencilValue clearDepth = {};
+    clearDepth.Depth   = 1.0f;
+    clearDepth.Stencil = 0;
+
+    // ================================================================
+    // 开始深度渲染通道 (仅深度附件，无颜色)
+    // ================================================================
+
+    FRHIRenderPassBeginInfo beginInfo = {};
+    beginInfo.RenderPass        = m_DepthRenderPass;
+    beginInfo.Framebuffer       = m_DepthFramebuffer;
+    beginInfo.RenderAreaOffset  = { 0, 0 };
+    beginInfo.RenderAreaExtent  = context.SwapchainExtent;
+    beginInfo.ClearColors       = nullptr;
+    beginInfo.ClearColorCount   = 0;
+    beginInfo.ClearDepthStencil = &clearDepth;
+
+    // 并行录制时通道内容必须来自次级缓冲区
+    const bool useParallel =
+        (m_Recorder != nullptr) && m_Recorder->IsInitialized();
+
+    beginInfo.UseSecondaryCommandBuffers = useParallel;
+
+    commandBuffer->BeginRenderPass(beginInfo);
+
+    const SizeType objectCount =
+        (context.RenderObjects != nullptr) ? context.RenderObjects->GetSize()
+                                           : 0;
+
+    if (useParallel)
+    {
+        FRHICommandBufferInheritance inheritance;
+        inheritance.RenderPass  = m_DepthRenderPass;
+        inheritance.Subpass     = 0;
+        inheritance.Framebuffer = m_DepthFramebuffer;
+
+        const FRecorderBatch batch = m_Recorder->RecordSegmented(
+            objectCount, inheritance,
+            [this, &context](IRHICommandBuffer* segmentBuffer,
+                             SizeType begin, SizeType end)
+            {
+                RecordCommonState(segmentBuffer, context);
+                RecordRange(segmentBuffer, context, begin, end);
+            });
+
+        m_Recorder->ExecuteInto(commandBuffer, batch);
+    }
+    else
+    {
+        RecordCommonState(commandBuffer, context);
+        RecordRange(commandBuffer, context, 0, objectCount);
     }
 
     commandBuffer->EndRenderPass();

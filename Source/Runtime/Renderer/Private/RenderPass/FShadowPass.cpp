@@ -671,45 +671,18 @@ void FShadowPass::UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex)
 // Execute — 从光源视角绘制场景深度
 // ============================================================================
 
-void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
-                           const FRenderPassContext& context)
+// ============================================================================
+// 录制辅助 — 内联路径与并行路径共用
+//
+// 与前向 Pass 同理: 次级命令缓冲区不继承主缓冲区的任何绑定状态, 视口与
+// 描述符集必须每段各设一次; 共用同一份绘制代码而不是抄两遍, 逐像素比对
+// 失败时才分得清是并行的问题还是抄漏了一行。
+// ============================================================================
+
+void FShadowPass::RecordCascadeState(IRHICommandBuffer*        commandBuffer,
+                                      const FRenderPassContext& context,
+                                      UInt32                    cascade)
 {
-    commandBuffer->BeginDebugLabel("ShadowPass", 0.9f, 0.9f, 0.3f);
-
-    // 没有有效光源时也要走一遍通道, 只清不画。
-    //
-    // 直觉上"没有阴影就直接返回"是对的, 但阴影贴图的描述符始终指向这张
-    // 深度图, 而片段着色器里那句 sampler2DArrayShadow 只要出现在代码里,
-    // Vulkan 就要求它在绘制时处于 SHADER_READ_ONLY 布局 —— 着色器有没有
-    // 真的去采样并不重要。直接返回会让它停在 UNDEFINED, 验证层立刻报错。
-    //
-    // 清成深度 1.0 恰好也是正确的语义: 比较采样用 LessOrEqual, 参考深度
-    // 永远 ≤1.0, 于是处处判为无遮挡。
-    const bool hasCasters = m_HasValidLight;
-
-    // 逐级各走一遍完整的渲染通道。
-    //
-    // 没有用几何着色器或 multiview 一次写多层: 前者在移动端支持参差,
-    // 后者要求所有层共享同一套绘制调用 —— 而级联的意义恰恰在于每级
-    // 可以剔除掉不影响它的物体。三次通道换来的是各级独立可优化。
-    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
-    {
-
-    FRHIClearDepthStencilValue clearDepth = {};
-    clearDepth.Depth   = 1.0f;
-    clearDepth.Stencil = 0;
-
-    FRHIRenderPassBeginInfo beginInfo = {};
-    beginInfo.RenderPass        = m_RenderPass;
-    beginInfo.Framebuffer       = m_CascadeFramebuffers[cascade];
-    beginInfo.RenderAreaOffset  = { 0, 0 };
-    beginInfo.RenderAreaExtent  = { kShadowMapSize, kShadowMapSize };
-    beginInfo.ClearColors       = nullptr;
-    beginInfo.ClearColorCount   = 0;
-    beginInfo.ClearDepthStencil = &clearDepth;
-
-    commandBuffer->BeginRenderPass(beginInfo);
-
     FRHIViewport viewport = {};
     viewport.X        = 0.0f;
     viewport.Y        = 0.0f;
@@ -742,21 +715,20 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
             nullptr,
             0);
     }
+}
 
-    // 用**未经相机剔除**的投射体列表 —— 相机背后的物体照样会把影子投进画面。
-    // 半透明不在其中: 把它们画进深度图会让玻璃在地面上留下一块实心黑影。
-    //
-    // 改按本级的光源视锥再剔一次: 每级只覆盖一小段视锥, 绝大多数投射体
-    // 与它无关。不剔的话, 最近那一级也要画完整个场景, 而它实际只影响
-    // 脚下几米。
-    const FFrustum cascadeFrustum =
-        FFrustum::FromViewProjection(m_CascadeViewProj[cascade]);
+void FShadowPass::RecordCasterRange(IRHICommandBuffer*           commandBuffer,
+                                     const FRenderPassContext&    context,
+                                     const FFrustum&              cascadeFrustum,
+                                     const TArray<FRenderObject>* casters,
+                                     SizeType                     begin,
+                                     SizeType                     end)
+{
+    if (casters == nullptr)
+    {
+        return;
+    }
 
-    const TArray<FRenderObject>* casters =
-        (context.ShadowCasterObjects != nullptr) ? context.ShadowCasterObjects
-                                                 : context.RenderObjects;
-
-    if (hasCasters && casters != nullptr)
     {
         FRHIGraphicsPipelineHandle boundPipeline;
         FRHIDescriptorSetHandle    boundMaterial;
@@ -764,7 +736,7 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
         FRHIBufferHandle           boundIndexBuffer;
         EIndexType                 boundIndexType = EIndexType::UInt32;
 
-        for (SizeType i = 0; i < casters->GetSize(); ++i)
+        for (SizeType i = begin; i < end; ++i)
         {
             const FRenderObject& obj = (*casters)[i];
 
@@ -828,6 +800,97 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
             commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
                                        0, 0);
         }
+    }
+
+}
+
+void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
+                           const FRenderPassContext& context)
+{
+    commandBuffer->BeginDebugLabel("ShadowPass", 0.9f, 0.9f, 0.3f);
+
+    // 没有有效光源时也要走一遍通道, 只清不画。
+    //
+    // 直觉上"没有阴影就直接返回"是对的, 但阴影贴图的描述符始终指向这张
+    // 深度图, 而片段着色器里那句 sampler2DArrayShadow 只要出现在代码里,
+    // Vulkan 就要求它在绘制时处于 SHADER_READ_ONLY 布局 —— 着色器有没有
+    // 真的去采样并不重要。直接返回会让它停在 UNDEFINED, 验证层立刻报错。
+    //
+    // 清成深度 1.0 恰好也是正确的语义: 比较采样用 LessOrEqual, 参考深度
+    // 永远 ≤1.0, 于是处处判为无遮挡。
+    const bool hasCasters = m_HasValidLight;
+
+    // 逐级各走一遍完整的渲染通道。
+    //
+    // 没有用几何着色器或 multiview 一次写多层: 前者在移动端支持参差,
+    // 后者要求所有层共享同一套绘制调用 —— 而级联的意义恰恰在于每级
+    // 可以剔除掉不影响它的物体。三次通道换来的是各级独立可优化。
+    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
+    {
+
+    FRHIClearDepthStencilValue clearDepth = {};
+    clearDepth.Depth   = 1.0f;
+    clearDepth.Stencil = 0;
+
+    FRHIRenderPassBeginInfo beginInfo = {};
+    beginInfo.RenderPass        = m_RenderPass;
+    beginInfo.Framebuffer       = m_CascadeFramebuffers[cascade];
+    beginInfo.RenderAreaOffset  = { 0, 0 };
+    beginInfo.RenderAreaExtent  = { kShadowMapSize, kShadowMapSize };
+    beginInfo.ClearColors       = nullptr;
+    beginInfo.ClearColorCount   = 0;
+    beginInfo.ClearDepthStencil = &clearDepth;
+
+    // 并行录制时通道内容必须来自次级缓冲区 —— 与前向 Pass 同一约束
+    const bool useParallel =
+        (m_Recorder != nullptr) && m_Recorder->IsInitialized();
+
+    beginInfo.UseSecondaryCommandBuffers = useParallel;
+
+    commandBuffer->BeginRenderPass(beginInfo);
+
+    // 用**未经相机剔除**的投射体列表 —— 相机背后的物体照样会把影子投进画面。
+    // 半透明不在其中: 把它们画进深度图会让玻璃在地面上留下一块实心黑影。
+    //
+    // 改按本级的光源视锥再剔一次: 每级只覆盖一小段视锥, 绝大多数投射体
+    // 与它无关。不剔的话, 最近那一级也要画完整个场景, 而它实际只影响
+    // 脚下几米。
+    const FFrustum cascadeFrustum =
+        FFrustum::FromViewProjection(m_CascadeViewProj[cascade]);
+
+    const TArray<FRenderObject>* casters =
+        (context.ShadowCasterObjects != nullptr) ? context.ShadowCasterObjects
+                                                 : context.RenderObjects;
+
+    const SizeType casterCount =
+        (hasCasters && casters != nullptr) ? casters->GetSize() : 0;
+
+    if (useParallel)
+    {
+        FRHICommandBufferInheritance inheritance;
+        inheritance.RenderPass  = m_RenderPass;
+        inheritance.Subpass     = 0;
+        inheritance.Framebuffer = m_CascadeFramebuffers[cascade];
+
+        // 每级各自一批 —— 三级用的是三组不同的槽位, 因为前两级的次级
+        // 缓冲区此刻已经被 vkCmdExecuteCommands 引用, 不能重写。
+        const FRecorderBatch batch = m_Recorder->RecordSegmented(
+            casterCount, inheritance,
+            [this, &context, &cascadeFrustum, casters, cascade](
+                IRHICommandBuffer* segmentBuffer, SizeType begin, SizeType end)
+            {
+                RecordCascadeState(segmentBuffer, context, cascade);
+                RecordCasterRange(segmentBuffer, context, cascadeFrustum,
+                                  casters, begin, end);
+            });
+
+        m_Recorder->ExecuteInto(commandBuffer, batch);
+    }
+    else
+    {
+        RecordCascadeState(commandBuffer, context, cascade);
+        RecordCasterRange(commandBuffer, context, cascadeFrustum,
+                          casters, 0, casterCount);
     }
 
     commandBuffer->EndRenderPass();

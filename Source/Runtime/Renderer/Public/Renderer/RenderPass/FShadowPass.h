@@ -45,6 +45,7 @@
 #pragma once
 
 #include "Renderer/RenderPass/IRenderPass.h"
+#include "Renderer/Recording/FParallelRecorder.h"
 
 namespace Limx
 {
@@ -88,6 +89,9 @@ public:
     }
 
     ERHIResult Setup(const FPassSetupDesc& desc) override;
+
+    /// 设置并行录制器 (可空 = 走内联路径)
+    void SetRecorder(FParallelRecorder* recorder) { m_Recorder = recorder; }
 
     void Execute(IRHICommandBuffer*        commandBuffer,
                  const FRenderPassContext& context) override;
@@ -207,6 +211,23 @@ public:
     void UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex);
 
 private:
+    /// 录制本级的公共状态 — 视口、裁剪、光源矩阵描述符集
+    void RecordCascadeState(IRHICommandBuffer*        commandBuffer,
+                            const FRenderPassContext& context,
+                            UInt32                    cascade);
+
+    /// 录制投射体的 [begin, end) 区间 (含本级视锥剔除)
+    void RecordCasterRange(IRHICommandBuffer*           commandBuffer,
+                           const FRenderPassContext&    context,
+                           const FFrustum&              cascadeFrustum,
+                           const TArray<FRenderObject>* casters,
+                           SizeType                     begin,
+                           SizeType                     end);
+
+    /// 并行录制器 — 空则走内联路径
+    FParallelRecorder* m_Recorder = nullptr;
+
+
     ERHIResult CreateShadowMap(IRHIDevice* device);
     ERHIResult CreateShadowRenderPass(IRHIDevice* device);
     ERHIResult CreateFramebuffers(IRHIDevice* device);

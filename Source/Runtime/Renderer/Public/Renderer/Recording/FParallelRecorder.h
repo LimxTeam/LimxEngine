@@ -79,6 +79,26 @@ struct FRecorderSegment
 };
 
 // ============================================================================
+// FRecorderBatch — 一次 RecordSegmented 产生的段范围
+// ============================================================================
+
+/// 指向录制器内部段列表的一个区间
+///
+/// 一帧里可以有多批 —— 阴影 Pass 的每个级联各是一个独立渲染通道, 各自
+/// 录制、各自执行。批与批之间的槽位不能复用: 被 vkCmdExecuteCommands
+/// 引用过的次级缓冲区, 在主缓冲区执行完之前重写是未定义行为。
+struct FRecorderBatch
+{
+    /// 在段列表中的起始下标
+    SizeType First = 0;
+
+    /// 段数 (0 表示这一批什么都没录)
+    SizeType Count = 0;
+
+    LIMX_NODISCARD bool IsEmpty() const { return Count == 0; }
+};
+
+// ============================================================================
 // FParallelRecorder
 // ============================================================================
 
@@ -100,11 +120,28 @@ public:
     /// 支持的最大在飞帧数
     static constexpr UInt32 kMaxFramesInFlight = 4;
 
-    /// 每线程每帧预分配几个次级缓冲区
+    /// 段数上限 = 线程数 x 这个值
     ///
-    /// 段数上限 = 线程数 x 这个值。取 4 是权衡: 太小则负载不均, 太大则
-    /// 每段的固定开销 (Begin/End 各一次系统调用) 开始显著。
+    /// 只是上限 —— 实际段数还要受 kMinBatchesPerSegment 约束, 见下。
     static constexpr UInt32 kSegmentsPerThread = 4;
+
+    /// 每段至少要有多少个批次
+    ///
+    /// 段数由工作量决定而不是线程数。每段的固定开销是一次 BeginSecondary、
+    /// 一次 End、以及重录一遍公共状态 (视口、裁剪、描述符集) —— 段小到
+    /// 十几个批次时这些开销会压过并行收益。
+    ///
+    /// 实测 (60x60 网格, 918 可见批次, 三个 Pass 各切一次):
+    ///
+    ///     内联              15.12 ms
+    ///     16 段 (每段 57)   10.50 ms   最优
+    ///     32 段 (每段 29)   12.33 ms
+    ///     64 段 (每段 14)   21.34 ms   比内联还慢 40%
+    ///
+    /// 取 48 使 918 个批次切成 19 段, 落在最优区间。这条约束同时修掉一个
+    /// 更要紧的问题: 默认线程数取硬件并发数 (常见 16), 不加约束时默认
+    /// 配置正好落在最差的那一端, 而这种事不会报错, 只会让人以为并行没用。
+    static constexpr SizeType kMinBatchesPerSegment = 48;
 
     FParallelRecorder() = default;
     ~FParallelRecorder() = default;
@@ -147,11 +184,12 @@ public:
     ///             它拿到的是各自独立的次级命令缓冲区, 因此内部不需要
     ///             任何加锁 —— 但它读到的一切必须是只读的。
     ///
-    /// @return 实际产生的段数
+    /// @return 本批的段范围
     template<typename BodyType>
-    SizeType RecordSegmented(SizeType                            batchCount,
-                             const FRHICommandBufferInheritance& inheritance,
-                             BodyType&&                          body);
+    FRecorderBatch RecordSegmented(
+        SizeType                            batchCount,
+        const FRHICommandBufferInheritance& inheritance,
+        BodyType&&                          body);
 
     /// 在并行各段之后追加一个串行录制的尾段
     ///
@@ -163,10 +201,12 @@ public:
     /// 里不能再直接录任何绘制命令。
     template<typename BodyType>
     void RecordTail(const FRHICommandBufferInheritance& inheritance,
-                    BodyType&&                          body);
+                    BodyType&&                          body,
+                    FRecorderBatch&                     batch);
 
-    /// 把本帧录好的各段按段号顺序执行进主缓冲区
-    void ExecuteInto(IRHICommandBuffer* primary);
+    /// 把一批段按段号顺序执行进主缓冲区
+    void ExecuteInto(IRHICommandBuffer*    primary,
+                     const FRecorderBatch& batch);
 
     // ========================================================================
     // 统计
@@ -178,8 +218,8 @@ public:
         return m_RecordMilliseconds;
     }
 
-    /// 上一帧实际使用的段数
-    LIMX_NODISCARD SizeType GetSegmentCount() const { return m_ActiveSegments; }
+    /// 本帧累计使用的段数 (跨全部批次)
+    LIMX_NODISCARD SizeType GetSegmentCount() const { return m_Segments.GetSize(); }
 
 private:
     /// 每个段一套资源
@@ -203,13 +243,25 @@ private:
 
     TArray<FRecorderSegment> m_Segments;
 
-    /// 串行尾段的资源 — 独立于各线程的池, 由主线程使用
+    /// 串行尾段的资源 — 独立于各槽位的池, 由主线程使用
+    ///
+    /// 一帧只有一个尾段: 目前只有前向 Pass 的半透明需要它。若将来有第二
+    /// 处需要, 尾段也要跟着按批分配。
     FRHICommandPoolHandle         m_TailPools[kMaxFramesInFlight];
     FRHICommandBufferHandle       m_TailHandles[kMaxFramesInFlight];
     TUniquePtr<IRHICommandBuffer> m_TailBuffers[kMaxFramesInFlight];
 
-    SizeType m_ActiveSegments     = 0;
+    /// 本帧已分配到第几个槽位
+    ///
+    /// 逐帧从 0 开始。同一帧内的多批必须占不同槽位 —— 见 FRecorderBatch
+    /// 的说明。
+    SizeType m_NextSlot = 0;
+
+    /// 本帧累计录制耗时 (跨全部批次)
     Float64  m_RecordMilliseconds = 0.0;
+
+    /// 按需扩容槽位, 保证至少有 count 个可用
+    ERHIResult EnsureSlots(SizeType count);
 
     /// 常驻任务图
     ///
