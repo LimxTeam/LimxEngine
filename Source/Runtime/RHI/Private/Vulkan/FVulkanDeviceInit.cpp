@@ -883,7 +883,11 @@ ERHIResult FVulkanDevice::CreateDescriptorPool()
 
     VkDescriptorPoolCreateInfo createInfo = {};
     createInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    createInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    // UPDATE_AFTER_BIND_BIT 是 bindless 纹理表要用的 —— 场景加载时逐张
+    // 注册贴图, 而那时描述符集可能已经被绑过。没有这个标志时, 布局里
+    // 声明了 UPDATE_AFTER_BIND 的集根本分配不出来。
+    createInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+                             | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     createInfo.maxSets       = 8192;
     createInfo.poolSizeCount = 11;
     createInfo.pPoolSizes    = poolSizes;

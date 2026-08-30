@@ -296,11 +296,15 @@ ERHIResult FVulkanDevice::CreateDescSetLayout(
 {
     constexpr UInt32 kMaxBindings = 32;
     VkDescriptorSetLayoutBinding bindings[kMaxBindings];
+    VkDescriptorBindingFlags     bindingFlags[kMaxBindings];
+
     UInt32 bindingCount = desc.BindingCount;
     if (bindingCount > kMaxBindings)
     {
         bindingCount = kMaxBindings;
     }
+
+    bool anyFlags = false;
 
     for (UInt32 i = 0; i < bindingCount; ++i)
     {
@@ -312,12 +316,56 @@ ERHIResult FVulkanDevice::CreateDescSetLayout(
         dst.descriptorCount    = src.Count;
         dst.stageFlags         = ToVkShaderStageFlags(src.StageFlags);
         dst.pImmutableSamplers = nullptr;
+
+        VkDescriptorBindingFlags flags = 0;
+
+        if (src.PartiallyBound)
+        {
+            flags |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        }
+
+        if (src.UpdateAfterBind)
+        {
+            flags |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+        }
+
+        bindingFlags[i] = flags;
+
+        anyFlags = anyFlags || (flags != 0);
     }
 
     VkDescriptorSetLayoutCreateInfo createInfo = {};
     createInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     createInfo.bindingCount = bindingCount;
     createInfo.pBindings    = bindings;
+
+    // 只在真的用到标志时才挂扩展结构。
+    //
+    // 无条件挂也能工作 (全零标志等价于不挂), 但那会让每一个普通描述符集
+    // 布局都走 descriptorIndexing 的路径, 在不支持该扩展的设备上直接失败。
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
+
+    if (anyFlags)
+    {
+        flagsInfo.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        flagsInfo.bindingCount  = bindingCount;
+        flagsInfo.pBindingFlags = bindingFlags;
+
+        createInfo.pNext = &flagsInfo;
+
+        // UPDATE_AFTER_BIND 要求集本身也声明对应的创建标志
+        for (UInt32 i = 0; i < bindingCount; ++i)
+        {
+            if ((bindingFlags[i]
+                 & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) != 0)
+            {
+                createInfo.flags |=
+                    VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+                break;
+            }
+        }
+    }
 
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     VkResult vkResult = vkCreateDescriptorSetLayout(m_Device, &createInfo,

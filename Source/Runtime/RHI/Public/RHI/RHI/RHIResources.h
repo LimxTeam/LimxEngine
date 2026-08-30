@@ -592,6 +592,23 @@ struct FRHIDescriptorBinding
 
     // 可见的着色器阶段
     EShaderStage StageFlags = EShaderStage::All;
+
+    /// 允许数组中存在未写入的槽位 (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT)
+    ///
+    /// bindless 的大纹理数组必然是稀疏的 —— 声明 1024 个槽位而场景只用了
+    /// 69 个。不置这个标志时 Vulkan 要求每个槽位都被写过, 否则绘制时报
+    /// "descriptor not valid"。
+    ///
+    /// 它只是允许"没写", 不是允许"读到没写的"。着色器仍然不能索引到未写
+    /// 的槽位 —— 那是未定义行为, 而且验证层不一定抓得到, 因为索引是运行时
+    /// 计算的。材质里的纹理下标必须保证有效, 缺贴图时指向占位纹理而非 -1。
+    bool PartiallyBound = false;
+
+    /// 描述符可在绑定后更新 (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT)
+    ///
+    /// 允许在命令缓冲区已经绑定该集之后再写入其中的描述符。纹理表随场景
+    /// 加载增长时需要它 —— 否则每加一张贴图就要等 GPU 空闲。
+    bool UpdateAfterBind = false;
 };
 
 // ============================================================================
