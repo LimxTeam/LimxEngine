@@ -116,36 +116,19 @@ ERHIResult FForwardPass::Setup(const FPassSetupDesc& desc)
 // Execute — 录制前向渲染命令 (等价于 FRenderer::RecordCommands)
 // ============================================================================
 
-void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
-                            const FRenderPassContext& context)
+// ============================================================================
+// 录制辅助 — 内联路径与并行路径共用
+//
+// 三段各自独立, 是因为并行录制要求每个次级命令缓冲区都自成一体: 次级
+// 缓冲区不继承主缓冲区的任何绑定状态, 视口、描述符集必须每段各设一次。
+//
+// 共用同一份代码而不是抄两遍 —— 抄两遍的话, 逐像素比对失败时分不清是
+// 并行本身的问题还是某处漏抄了一行。
+// ============================================================================
+
+void FForwardPass::RecordCommonState(IRHICommandBuffer*        commandBuffer,
+                                      const FRenderPassContext& context)
 {
-    commandBuffer->BeginDebugLabel("ForwardPass", 0.2f, 0.8f, 1.0f);
-
-    // ================================================================
-    // 清除值 — 颜色 (深蓝灰 Limx 品牌色) + 深度 (最大值 1.0)
-    // ================================================================
-
-    // 颜色与深度都由更早的 Pass 清过 (天空 Pass 清颜色, 深度预通道清深度),
-    // 本 Pass 两个附件都是 LoadOp=Load, 因此不需要任何清除值。
-    FRHIClearDepthStencilValue clearDepth = {};
-    clearDepth.Depth   = 1.0f;
-    clearDepth.Stencil = 0;
-
-    // ================================================================
-    // 开始渲染通道
-    // ================================================================
-
-    FRHIRenderPassBeginInfo beginInfo = {};
-    beginInfo.RenderPass        = m_RenderPass;
-    // HDR 目标只有一张, 因此只有一个 Framebuffer —— 与交换链图像下标无关
-    beginInfo.Framebuffer       = m_Framebuffers[0];
-    beginInfo.RenderAreaOffset  = { 0, 0 };
-    beginInfo.RenderAreaExtent  = context.SwapchainExtent;
-    beginInfo.ClearColors       = nullptr;
-    beginInfo.ClearColorCount   = 0;
-    beginInfo.ClearDepthStencil = &clearDepth;
-
-    commandBuffer->BeginRenderPass(beginInfo);
 
     // ================================================================
     // 设置动态 Viewport/Scissor
@@ -203,6 +186,13 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
     // 遍历所有渲染物体: 绑定材质 → BindVBO/IBO → Push Model → DrawIndexed
     // ================================================================
 
+}
+
+void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
+                                      const FRenderPassContext& context,
+                                      SizeType                  begin,
+                                      SizeType                  end)
+{
     if (context.RenderObjects != nullptr)
     {
         // 记录上一次绑定的状态 —— 批次列表已按材质/网格排序, 相邻批次
@@ -214,7 +204,7 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
         FRHIBufferHandle        boundIndexBuffer;
         EIndexType              boundIndexType = EIndexType::UInt32;
 
-        for (SizeType i = 0; i < context.RenderObjects->GetSize(); ++i)
+        for (SizeType i = begin; i < end; ++i)
         {
             const FRenderObject& obj = (*context.RenderObjects)[i];
 
@@ -293,6 +283,11 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
     //
     // 列表已由 FSceneManager 按到相机的距离由远及近排序 —— 这里只负责按序
     // 提交, 不再做任何重排。
+}
+
+void FForwardPass::RecordTranslucent(IRHICommandBuffer*        commandBuffer,
+                                      const FRenderPassContext& context)
+{
     if (context.TranslucentObjects != nullptr &&
         context.TranslucentObjects->GetSize() > 0)
     {
@@ -362,6 +357,92 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
             commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
                                        0, 0);
         }
+    }
+
+}
+
+void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
+                            const FRenderPassContext& context)
+{
+    commandBuffer->BeginDebugLabel("ForwardPass", 0.2f, 0.8f, 1.0f);
+
+    // ================================================================
+    // 清除值 — 颜色 (深蓝灰 Limx 品牌色) + 深度 (最大值 1.0)
+    // ================================================================
+
+    // 颜色与深度都由更早的 Pass 清过 (天空 Pass 清颜色, 深度预通道清深度),
+    // 本 Pass 两个附件都是 LoadOp=Load, 因此不需要任何清除值。
+    FRHIClearDepthStencilValue clearDepth = {};
+    clearDepth.Depth   = 1.0f;
+    clearDepth.Stencil = 0;
+
+    // ================================================================
+    // 开始渲染通道
+    // ================================================================
+
+    FRHIRenderPassBeginInfo beginInfo = {};
+    beginInfo.RenderPass        = m_RenderPass;
+    // HDR 目标只有一张, 因此只有一个 Framebuffer —— 与交换链图像下标无关
+    beginInfo.Framebuffer       = m_Framebuffers[0];
+    beginInfo.RenderAreaOffset  = { 0, 0 };
+    beginInfo.RenderAreaExtent  = context.SwapchainExtent;
+    beginInfo.ClearColors       = nullptr;
+    beginInfo.ClearColorCount   = 0;
+    beginInfo.ClearDepthStencil = &clearDepth;
+
+    // 并行录制时通道内容必须来自次级命令缓冲区。
+    //
+    // 这不是可选优化: 声明为 INLINE 的通道里调用 vkCmdExecuteCommands 是
+    // 非法的, 反过来声明为 SECONDARY 的通道里直接录绘制命令也是非法的。
+    // 因此一旦走并行路径, 视口与描述符集也必须进次级缓冲区。
+    const bool useParallel =
+        (m_Recorder != nullptr) && m_Recorder->IsInitialized();
+
+    beginInfo.UseSecondaryCommandBuffers = useParallel;
+
+    commandBuffer->BeginRenderPass(beginInfo);
+
+    const SizeType opaqueCount =
+        (context.RenderObjects != nullptr)
+            ? context.RenderObjects->GetSize()
+            : 0;
+
+    if (useParallel)
+    {
+        FRHICommandBufferInheritance inheritance;
+        inheritance.RenderPass  = m_RenderPass;
+        inheritance.Subpass     = 0;
+        inheritance.Framebuffer = m_Framebuffers[0];
+
+        m_Recorder->RecordSegmented(
+            opaqueCount, inheritance,
+            [this, &context](IRHICommandBuffer* segmentBuffer,
+                             SizeType begin, SizeType end)
+            {
+                RecordCommonState(segmentBuffer, context);
+                RecordOpaqueRange(segmentBuffer, context, begin, end);
+            });
+
+        // 半透明走串行尾段 —— 它按到相机的距离由远及近绘制, 不切段。
+        if (context.TranslucentObjects != nullptr &&
+            context.TranslucentObjects->GetSize() > 0)
+        {
+            m_Recorder->RecordTail(
+                inheritance,
+                [this, &context](IRHICommandBuffer* tailBuffer)
+                {
+                    RecordCommonState(tailBuffer, context);
+                    RecordTranslucent(tailBuffer, context);
+                });
+        }
+
+        m_Recorder->ExecuteInto(commandBuffer);
+    }
+    else
+    {
+        RecordCommonState(commandBuffer, context);
+        RecordOpaqueRange(commandBuffer, context, 0, opaqueCount);
+        RecordTranslucent(commandBuffer, context);
     }
 
     commandBuffer->EndRenderPass();

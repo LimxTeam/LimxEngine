@@ -46,6 +46,7 @@
 #pragma once
 
 #include "Renderer/RenderPass/IRenderPass.h"
+#include "Renderer/Recording/FParallelRecorder.h"
 
 namespace Limx
 {
@@ -76,6 +77,11 @@ public:
 
     ERHIResult Setup(const FPassSetupDesc& desc) override;
 
+    /// 设置并行录制器 (可空 = 走内联路径)
+    ///
+    /// 两条路径共用同一份绘制代码, 因此可以逐像素比对。
+    void SetRecorder(FParallelRecorder* recorder) { m_Recorder = recorder; }
+
     void Execute(IRHICommandBuffer*       commandBuffer,
                  const FRenderPassContext& context) override;
 
@@ -93,6 +99,26 @@ public:
     void Shutdown(IRHIDevice* device) override;
 
 private:
+    /// 录制公共状态 — 视口、裁剪、set 0、set 2
+    ///
+    /// 次级命令缓冲区不继承主缓冲区的任何绑定状态, 因此每段都要设一遍。
+    void RecordCommonState(IRHICommandBuffer*        commandBuffer,
+                           const FRenderPassContext& context);
+
+    /// 录制不透明批次的 [begin, end) 区间
+    void RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
+                           const FRenderPassContext& context,
+                           SizeType                  begin,
+                           SizeType                  end);
+
+    /// 录制半透明批次 (全部, 顺序敏感)
+    void RecordTranslucent(IRHICommandBuffer*        commandBuffer,
+                           const FRenderPassContext& context);
+
+    /// 并行录制器 — 空则走内联路径
+    FParallelRecorder* m_Recorder = nullptr;
+
+
     // ====================================================================
     // 内部构建方法
     // ====================================================================

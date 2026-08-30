@@ -61,12 +61,15 @@ ERHIResult FParallelRecorder::Initialize(IRHIDevice* device,
     m_FramesInFlight = framesInFlight;
     m_FrameIndex     = 0;
 
-    m_Threads.Clear();
-    m_Threads.SetSize(threadCount);
+    // 槽位总数 = 线程数 x 每线程段数, 每个槽位自带命令池
+    const UInt32 slotCount = threadCount * kSegmentsPerThread;
 
-    for (UInt32 t = 0; t < threadCount; ++t)
+    m_Slots.Clear();
+    m_Slots.SetSize(slotCount);
+
+    for (UInt32 s = 0; s < slotCount; ++s)
     {
-        FThreadResources& res = m_Threads[t];
+        FSegmentResources& res = m_Slots[s];
 
         for (UInt32 f = 0; f < framesInFlight; ++f)
         {
@@ -76,34 +79,55 @@ ERHIResult FParallelRecorder::Initialize(IRHIDevice* device,
             if (poolResult != ERHIResult::Success)
             {
                 LIMX_LOG(LogParallelRecorder, Error,
-                         "[并行录制] 线程 {} 帧 {} 的命令池创建失败", t, f);
+                         "[并行录制] 槽位 {} 帧 {} 的命令池创建失败", s, f);
                 return poolResult;
             }
 
-            for (UInt32 s = 0; s < kSegmentsPerThread; ++s)
+            const ERHIResult bufferResult = device->AllocateCommandBuffer(
+                res.Pools[f], ECommandBufferLevel::Secondary,
+                res.Handles[f]);
+
+            if (bufferResult != ERHIResult::Success)
             {
-                const ERHIResult bufferResult =
-                    device->AllocateCommandBuffer(
-                        res.Pools[f],
-                        ECommandBufferLevel::Secondary,
-                        res.Handles[f][s]);
-
-                if (bufferResult != ERHIResult::Success)
-                {
-                    LIMX_LOG(LogParallelRecorder, Error,
-                             "[并行录制] 线程 {} 帧 {} 段 {} 的次级缓冲区分配失败",
-                             t, f, s);
-                    return bufferResult;
-                }
-
-                res.Buffers[f][s] =
-                    CreateRHICommandBuffer(device, res.Handles[f][s]);
-
-                if (!res.Buffers[f][s])
-                {
-                    return ERHIResult::ErrorUnknown;
-                }
+                LIMX_LOG(LogParallelRecorder, Error,
+                         "[并行录制] 槽位 {} 帧 {} 的次级缓冲区分配失败", s, f);
+                return bufferResult;
             }
+
+            res.Buffers[f] = CreateRHICommandBuffer(device, res.Handles[f]);
+
+            if (!res.Buffers[f])
+            {
+                return ERHIResult::ErrorUnknown;
+            }
+        }
+    }
+
+    // 串行尾段的资源 —— 独立的池, 只由主线程使用
+    for (UInt32 f = 0; f < framesInFlight; ++f)
+    {
+        const ERHIResult poolResult = device->CreateCommandPool(
+            EQueueType::Graphics, m_TailPools[f]);
+
+        if (poolResult != ERHIResult::Success)
+        {
+            return poolResult;
+        }
+
+        const ERHIResult bufferResult = device->AllocateCommandBuffer(
+            m_TailPools[f], ECommandBufferLevel::Secondary,
+            m_TailHandles[f]);
+
+        if (bufferResult != ERHIResult::Success)
+        {
+            return bufferResult;
+        }
+
+        m_TailBuffers[f] = CreateRHICommandBuffer(device, m_TailHandles[f]);
+
+        if (!m_TailBuffers[f])
+        {
+            return ERHIResult::ErrorUnknown;
         }
     }
 
@@ -111,10 +135,10 @@ ERHIResult FParallelRecorder::Initialize(IRHIDevice* device,
     m_Graph.Initialize((threadCount > 1) ? (threadCount - 1) : 1);
 
     LIMX_LOG(LogParallelRecorder, Display,
-             "[并行录制] 已就绪 — {} 个录制线程 x {} 帧 x {} 段 "
-             "= {} 个次级缓冲区",
-             threadCount, framesInFlight, kSegmentsPerThread,
-             threadCount * framesInFlight * kSegmentsPerThread);
+             "[并行录制] 已就绪 — {} 线程 / {} 段槽位 / {} 帧 "
+             "= {} 个命令池 (一段一池)",
+             threadCount, slotCount, framesInFlight,
+             (slotCount + 1) * framesInFlight);
 
     return ERHIResult::Success;
 }
@@ -127,24 +151,21 @@ void FParallelRecorder::Shutdown(IRHIDevice* device)
     if (device == nullptr)
     {
         m_Device = nullptr;
-        m_Threads.Clear();
+        m_Slots.Clear();
         return;
     }
 
-    for (SizeType t = 0; t < m_Threads.GetSize(); ++t)
+    for (SizeType s = 0; s < m_Slots.GetSize(); ++s)
     {
-        FThreadResources& res = m_Threads[t];
+        FSegmentResources& res = m_Slots[s];
 
         for (UInt32 f = 0; f < m_FramesInFlight; ++f)
         {
-            for (UInt32 s = 0; s < kSegmentsPerThread; ++s)
-            {
-                res.Buffers[f][s].Reset();
+            res.Buffers[f].Reset();
 
-                if (res.Handles[f][s].IsValid())
-                {
-                    device->FreeCommandBuffer(res.Handles[f][s]);
-                }
+            if (res.Handles[f].IsValid())
+            {
+                device->FreeCommandBuffer(res.Handles[f]);
             }
 
             if (res.Pools[f].IsValid())
@@ -154,7 +175,22 @@ void FParallelRecorder::Shutdown(IRHIDevice* device)
         }
     }
 
-    m_Threads.Clear();
+    for (UInt32 f = 0; f < m_FramesInFlight; ++f)
+    {
+        m_TailBuffers[f].Reset();
+
+        if (m_TailHandles[f].IsValid())
+        {
+            device->FreeCommandBuffer(m_TailHandles[f]);
+        }
+
+        if (m_TailPools[f].IsValid())
+        {
+            device->DestroyCommandPool(m_TailPools[f]);
+        }
+    }
+
+    m_Slots.Clear();
     m_Segments.Clear();
     m_Device = nullptr;
 }
@@ -177,12 +213,15 @@ void FParallelRecorder::BeginFrame(UInt32 frameIndex)
     // 重置池而非逐个重置缓冲区: 前者一次调用回收整池, 后者每个缓冲区
     // 一次。按帧分池的意义正在于此 —— 本帧的池此刻一定不再被 GPU 读取
     // (在飞帧数保证了这一点), 可以整体回收。
-    for (SizeType t = 0; t < m_Threads.GetSize(); ++t)
+    for (SizeType s = 0; s < m_Slots.GetSize(); ++s)
     {
-        m_Device->ResetCommandPool(m_Threads[t].Pools[m_FrameIndex]);
+        m_Device->ResetCommandPool(m_Slots[s].Pools[m_FrameIndex]);
     }
 
+    m_Device->ResetCommandPool(m_TailPools[m_FrameIndex]);
+
     m_ActiveSegments = 0;
+    m_Segments.Clear();
 }
 
 void FParallelRecorder::ExecuteInto(IRHICommandBuffer* primary)

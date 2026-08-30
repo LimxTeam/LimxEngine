@@ -22,6 +22,13 @@ SizeType FParallelRecorder::RecordSegmented(
     const FRHICommandBufferInheritance& inheritance,
     BodyType&&                          body)
 {
+    // 先清空再判早退。
+    //
+    // 反过来的话, 不透明批次为 0 的那一帧会带着上一帧的段列表进入
+    // RecordTail, 而 ExecuteInto 按 m_ActiveSegments 从下标 0 数 ——
+    // 于是执行到的是上一帧的缓冲区。这种错误只在"某一帧恰好没有不透明
+    // 物体"时出现, 平时完全看不到。
+    m_Segments.Clear();
     m_ActiveSegments     = 0;
     m_RecordMilliseconds = 0.0;
 
@@ -49,7 +56,6 @@ SizeType FParallelRecorder::RecordSegmented(
         return 0;
     }
 
-    m_Segments.Clear();
     m_Segments.Reserve(segmentCount);
 
     const SizeType baseSize  = batchCount / segmentCount;
@@ -63,19 +69,15 @@ SizeType FParallelRecorder::RecordSegmented(
         // segmentCount-1 个批次, 正好抵消掉切段的意义。
         const SizeType size = baseSize + ((s < remainder) ? 1 : 0);
 
-        // 段与线程静态绑定: 第 s 段固定用第 (s % 线程数) 个线程的池。
+        // 第 s 段用第 s 个槽位 —— 一段一个命令池。
         //
-        // 不按"运行时哪个线程领到这一段"来选池 —— 那样两个线程可能同时
-        // 碰到同一个命令池, 而 Vulkan 要求命令池外部同步。
-        const UInt32 thread = static_cast<UInt32>(s % m_ThreadCount);
-        const UInt32 slot   = static_cast<UInt32>(s / m_ThreadCount);
-
+        // 不能按线程分池: 静态绑定的是段与池而不是段与线程, 共享同一个
+        // 池的多个段完全可能被调度器同时派给不同线程。验证层抓到过。
         FRecorderSegment segment;
         segment.Begin         = cursor;
         segment.End           = cursor + size;
-        segment.CommandBuffer =
-            m_Threads[thread].Buffers[m_FrameIndex][slot].Get();
-        segment.Handle        = m_Threads[thread].Handles[m_FrameIndex][slot];
+        segment.CommandBuffer = m_Slots[s].Buffers[m_FrameIndex].Get();
+        segment.Handle        = m_Slots[s].Handles[m_FrameIndex];
 
         m_Segments.Add(segment);
 
@@ -122,6 +124,43 @@ SizeType FParallelRecorder::RecordSegmented(
     m_RecordMilliseconds = (FPlatformTime::Seconds() - begin) * 1000.0;
 
     return segmentCount;
+}
+
+template<typename BodyType>
+void FParallelRecorder::RecordTail(
+    const FRHICommandBufferInheritance& inheritance,
+    BodyType&&                          body)
+{
+    if (m_Device == nullptr)
+    {
+        return;
+    }
+
+    IRHICommandBuffer* commandBuffer = m_TailBuffers[m_FrameIndex].Get();
+
+    if (commandBuffer == nullptr)
+    {
+        return;
+    }
+
+    if (commandBuffer->BeginSecondary(inheritance) != ERHIResult::Success)
+    {
+        return;
+    }
+
+    body(commandBuffer);
+
+    commandBuffer->End();
+
+    FRecorderSegment segment;
+    segment.Begin         = 0;
+    segment.End           = 0;
+    segment.CommandBuffer = commandBuffer;
+    segment.Handle        = m_TailHandles[m_FrameIndex];
+
+    m_Segments.Add(segment);
+
+    ++m_ActiveSegments;
 }
 
 } // namespace Limx

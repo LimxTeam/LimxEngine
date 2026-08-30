@@ -110,6 +110,20 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     // GPU 计时器 —— 硬件不支持时会自行停用, 不影响后续初始化
     m_GpuProfiler.Initialize(device);
 
+    // 并行命令录制器
+    if (m_ParallelRecording)
+    {
+        const ERHIResult recorderResult =
+            m_Recorder.Initialize(device, frameCount, m_RecordThreadCount);
+
+        if (recorderResult != ERHIResult::Success)
+        {
+            LIMX_LOG(LogRenderer, Warning,
+                     "[Renderer] 并行录制器初始化失败, 退回内联录制");
+            m_ParallelRecording = false;
+        }
+    }
+
     // 初始化相机 — 位于 (0, 2.5, -5)，俰视场景中心，45° FOV
     FRHIExtent2D initExtent = m_Context->GetSwapchainExtent();
     Float32 initAspect = static_cast<Float32>(initExtent.Width) /
@@ -205,6 +219,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
+
+    // 前向 Pass 是目前唯一批次数足以受益于并行录制的通道 —— 阴影与深度
+    // 预通道的绘制命令更简单, 且它们各自的批次列表就是前向的子集。
+    // 等 Day 9 的 GPU 驱动剔除落地, 这几条路径会一起重排。
+    if (m_ParallelRecording && m_Recorder.IsInitialized())
+    {
+        m_ForwardPass->SetRecorder(&m_Recorder);
+    }
     m_PassManager->RegisterPass(m_PostProcessPass.Get());
 
     FRHISwapchainHandle swapchain  = m_Context->GetSwapchain();
@@ -288,6 +310,7 @@ void FRenderer::Shutdown()
     }
 
     m_GpuProfiler.Shutdown(device);
+    m_Recorder.Shutdown(device);
 
     // 1. 关闭 Pass 系统 (内部销毁共享深度和帧缓冲)
     if (m_PassManager)
@@ -376,7 +399,11 @@ void FRenderer::RenderFrame()
     FInputManager::Get().BeginFrame();
 
     // 开始帧
+    const Float64 acquireBegin = FPlatformTime::Seconds();
+
     ERHIResult result = m_Context->BeginFrame();
+
+    const Float64 acquireEnd = FPlatformTime::Seconds();
     if (result == ERHIResult::ErrorOutOfDate ||
         result == ERHIResult::SuboptimalSwapchain)
     {
@@ -392,6 +419,8 @@ void FRenderer::RenderFrame()
     UInt32 frameIndex = m_Context->GetCurrentFrameIndex();
     UpdateUniformBuffer(frameIndex);
 
+    const Float64 updateBegin = acquireEnd;
+
     // GPU 计时开帧 —— 必须在任何 RenderPass 之外, 因为要重置查询池
     {
         IRHICommandBuffer* timingBuffer =
@@ -401,6 +430,11 @@ void FRenderer::RenderFrame()
         {
             m_GpuProfiler.BeginFrame(timingBuffer, m_GpuFrameNumber);
         }
+    }
+
+    if (m_ParallelRecording && m_Recorder.IsInitialized())
+    {
+        m_Recorder.BeginFrame(frameIndex);
     }
 
     // 每帧上传材质脏数据
@@ -486,6 +520,8 @@ void FRenderer::RenderFrame()
     // 每帧上传光照 UBO (含当前相机位置)
     FLightManager::Get().UploadLightData(frameIndex, m_Camera.GetPosition());
 
+    const Float64 recordBegin = FPlatformTime::Seconds();
+
     // 通过 PassManager 按顺序录制全部 Pass 命令
     IRHICommandBuffer* commandBuffer =
         m_Context->GetCurrentCommandBuffer();
@@ -534,8 +570,37 @@ void FRenderer::RenderFrame()
 
     ++m_GpuFrameNumber;
 
+    const Float64 presentBegin = FPlatformTime::Seconds();
+
     // 结束帧 (提交 + 呈现)
     result = m_Context->EndFrame();
+
+    // ---- CPU 分项 ----
+    //
+    // 指数滑动平均, 系数 0.05 —— 单帧分项被调度抖动主导, 而这些数字是
+    // 用来判断"该优化哪一段"的, 需要趋势而非瞬时值。
+    {
+        const Float64 now = FPlatformTime::Seconds();
+
+        constexpr Float64 kAlpha = 0.05;
+
+        const Float64 acquireMs = (acquireEnd - acquireBegin) * 1000.0;
+        const Float64 updateMs  = (recordBegin - updateBegin) * 1000.0;
+        const Float64 recordMs  = (presentBegin - recordBegin) * 1000.0;
+        const Float64 presentMs = (now - presentBegin) * 1000.0;
+        const Float64 totalMs   = (now - acquireBegin) * 1000.0;
+
+        m_CpuTiming.AcquireMs =
+            m_CpuTiming.AcquireMs * (1.0 - kAlpha) + acquireMs * kAlpha;
+        m_CpuTiming.UpdateMs =
+            m_CpuTiming.UpdateMs * (1.0 - kAlpha) + updateMs * kAlpha;
+        m_CpuTiming.RecordMs =
+            m_CpuTiming.RecordMs * (1.0 - kAlpha) + recordMs * kAlpha;
+        m_CpuTiming.PresentMs =
+            m_CpuTiming.PresentMs * (1.0 - kAlpha) + presentMs * kAlpha;
+        m_CpuTiming.TotalMs =
+            m_CpuTiming.TotalMs * (1.0 - kAlpha) + totalMs * kAlpha;
+    }
     if (result == ERHIResult::ErrorOutOfDate ||
         result == ERHIResult::SuboptimalSwapchain)
     {

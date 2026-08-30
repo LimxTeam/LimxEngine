@@ -175,6 +175,18 @@ public:
     void ExecuteAll(IRHICommandBuffer*     commandBuffer,
                     const FPassExecuteInfo& info);
 
+    /// 第 index 个 Pass 的 CPU 录制耗时 (毫秒)
+    LIMX_NODISCARD Float64 GetPassCpuMilliseconds(SizeType index) const
+    {
+        return (index < kMaxTrackedPasses) ? m_PassCpuMs[index] : 0.0;
+    }
+
+    /// 第 index 个 Pass 的名称
+    LIMX_NODISCARD const AnsiChar* GetPassName(SizeType index) const
+    {
+        return (index < m_Passes.GetSize()) ? m_Passes[index]->GetName() : "?";
+    }
+
     /// 交换链重建后重建尺寸相关资源
     /// 1. 重建共享深度缓冲区
     /// 2. 调用所有 Pass 的 OnResize()
@@ -239,6 +251,10 @@ private:
 
     /// 已注册的 Pass 列表 (非拥有指针，按 Order 升序排列)
     TArray<IRenderPass*>  m_Passes;
+
+    /// 逐 Pass 的 CPU 录制耗时 (毫秒, 指数滑动平均)
+    static constexpr SizeType kMaxTrackedPasses = 16;
+    Float64 m_PassCpuMs[kMaxTrackedPasses] = {};
 
     /// 共享深度纹理 — 所有 Pass 共用 (D32_SFLOAT, 随交换链尺寸变化)
     FRHITextureHandle     m_SharedDepthTexture;

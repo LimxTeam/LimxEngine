@@ -76,6 +76,7 @@
 #include "RenderCore/Geometry/FGeometryGenerator.h"
 #include "RenderCore/Material/FMaterial.h"
 #include "RenderCore/Profiling/FGpuProfiler.h"
+#include "Renderer/Recording/FParallelRecorder.h"
 
 namespace Limx
 {
@@ -254,6 +255,49 @@ public:
         return m_GpuProfiler;
     }
 
+    /// CPU 帧内分项耗时 (毫秒)
+    ///
+    /// 并行录制只能改善 Record 那一项。Day 2 实测它只占整帧 24%, 因此
+    /// 把线程数从 1 加到 16 对帧时几乎没有影响 —— 这张表就是为了让
+    /// "优化了一个只占两成的环节"这种事在动手之前就能看见。
+    struct FCpuFrameTiming
+    {
+        /// 等待上一帧的栅栏 + 获取交换链图像
+        Float64 AcquireMs = 0.0;
+
+        /// UBO 更新、材质与光照数据上传
+        Float64 UpdateMs = 0.0;
+
+        /// 全部 Pass 的命令录制 (含并行录制器内部)
+        Float64 RecordMs = 0.0;
+
+        /// 提交 + 呈现
+        Float64 PresentMs = 0.0;
+
+        /// 整帧
+        Float64 TotalMs = 0.0;
+    };
+
+    LIMX_NODISCARD const FCpuFrameTiming& GetCpuFrameTiming() const
+    {
+        return m_CpuTiming;
+    }
+
+    /// 并行命令录制器
+    LIMX_NODISCARD const FParallelRecorder& GetRecorder() const
+    {
+        return m_Recorder;
+    }
+
+    /// 设置录制线程数 (0 = 按硬件并发数, 1 = 单段)
+    ///
+    /// 必须在 Initialize 之前调用 —— 命令池与次级缓冲区在那时一次性建好,
+    /// 运行中改线程数意味着重建全部资源, 而那要等 GPU 空闲。
+    void SetRecordThreadCount(UInt32 count) { m_RecordThreadCount = count; }
+
+    /// 是否启用并行录制 (false = 走内联路径, 用于逐像素对照)
+    void SetParallelRecording(bool enabled) { m_ParallelRecording = enabled; }
+
     /// 获取渲染上下文 (供外部子系统初始化使用)
     LIMX_NODISCARD FRenderContext* GetRenderContext() { return m_Context; }
 
@@ -415,6 +459,24 @@ private:
     /// 归渲染器所有而非 PassManager: 查询池的生命周期与设备绑定, 而
     /// PassManager 在交换链重建时会重建自己的资源。
     FGpuProfiler                      m_GpuProfiler;
+
+    /// 并行命令录制器
+    FParallelRecorder                 m_Recorder;
+
+    /// CPU 分项耗时 (指数滑动平均, 系数 0.05)
+    ///
+    /// 用滑动平均而非单帧快照: 单帧的分项会被偶发调度抖动主导, 而这些
+    /// 数字是用来判断"该优化哪一段"的, 需要的是趋势不是瞬时值。
+    FCpuFrameTiming                   m_CpuTiming;
+
+    /// 录制线程数 (0 = 按硬件)
+    UInt32                            m_RecordThreadCount = 0;
+
+    /// 是否启用并行录制
+    ///
+    /// 关掉时前向 Pass 走内联路径, 两条路径共用同一份绘制代码, 因此
+    /// 输出应当逐像素相同 —— 这正是 Day 2 的核心验收。
+    bool                              m_ParallelRecording = true;
 
     /// 单调递增的帧号 — 决定计时器用哪个环形槽位
     ///

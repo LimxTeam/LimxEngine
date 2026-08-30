@@ -17,9 +17,16 @@
  *     执行。这使多线程的输出与单线程逐像素相同, 也使"并行有没有改变
  *     画面"成为一个可以逐像素回答的问题, 而不是靠眼看。
  *
- *   段与线程静态绑定 — 第 s 段固定用第 (s % 线程数) 个线程的命令池。
- *     不按运行时哪个线程领到这一段来选池: 那样两个线程可能同时碰到同一
- *     个池, 正是要避免的事。
+ *   一段一个命令池 — 不是"一线程一个"。这一点是被验证层纠正过来的:
+ *     最初按线程分池, 理由是"第 s 段固定用第 (s % 线程数) 个线程的池,
+ *     所以每个池只被一个线程碰"。这个推理错在静态绑定的是**段与池**,
+ *     而不是段与线程 —— 16 线程 4 段/线程共 64 段时, 段 0/16/32/48 共用
+ *     同一个池, 而调度器完全可能把它们同时派给四个不同的工作线程。
+ *     验证层的原话是 "VkCommandPool is simultaneously used in current
+ *     thread A and thread B"。
+ *
+ *     一段一个池之后, 两个段不可能共享池, 正确性不再依赖对调度行为的
+ *     任何假设。池本身很便宜, 这个代价买的是"不需要推理"。
  *
  *   段数多于线程数 — 绘制批次的开销差异很大 (一个 30 万三角形的网格与
  *     一个 200 三角形的网格可能在同一批里), 段多一些才能让先做完的线程
@@ -146,6 +153,18 @@ public:
                              const FRHICommandBufferInheritance& inheritance,
                              BodyType&&                          body);
 
+    /// 在并行各段之后追加一个串行录制的尾段
+    ///
+    /// 用于顺序敏感、不能切段的部分 —— 典型是半透明: 它按到相机的距离
+    /// 由远及近绘制, 切段之后段内顺序虽然还对, 但每段各自重置绑定状态
+    /// 并不改变结果, 真正的问题是它本来就不该被拆开推理。
+    ///
+    /// 尾段仍然是次级缓冲区 —— 通道以 secondary 模式开始之后, 主缓冲区
+    /// 里不能再直接录任何绘制命令。
+    template<typename BodyType>
+    void RecordTail(const FRHICommandBufferInheritance& inheritance,
+                    BodyType&&                          body);
+
     /// 把本帧录好的各段按段号顺序执行进主缓冲区
     void ExecuteInto(IRHICommandBuffer* primary);
 
@@ -163,19 +182,15 @@ public:
     LIMX_NODISCARD SizeType GetSegmentCount() const { return m_ActiveSegments; }
 
 private:
-    /// 每个线程一套资源
+    /// 每个段一套资源
     ///
-    /// 命令池必须逐线程独立 —— 这是 Vulkan 的外部同步要求, 不是性能优化。
-    /// 再按帧分开是为了避免重置正在被 GPU 读取的那一帧的池。
-    struct FThreadResources
+    /// 命令池必须与命令缓冲区一一对应 —— 这是 Vulkan 的外部同步要求,
+    /// 不是性能优化。按帧再分开是为了避免重置正在被 GPU 读取的那一帧。
+    struct FSegmentResources
     {
-        FRHICommandPoolHandle Pools[kMaxFramesInFlight];
-
-        FRHICommandBufferHandle
-            Handles[kMaxFramesInFlight][kSegmentsPerThread];
-
-        TUniquePtr<IRHICommandBuffer>
-            Buffers[kMaxFramesInFlight][kSegmentsPerThread];
+        FRHICommandPoolHandle         Pools[kMaxFramesInFlight];
+        FRHICommandBufferHandle       Handles[kMaxFramesInFlight];
+        TUniquePtr<IRHICommandBuffer> Buffers[kMaxFramesInFlight];
     };
 
     IRHIDevice* m_Device         = nullptr;
@@ -183,8 +198,15 @@ private:
     UInt32      m_FramesInFlight = 0;
     UInt32      m_FrameIndex     = 0;
 
-    TArray<FThreadResources> m_Threads;
+    /// 段槽位 — 共 线程数 x kSegmentsPerThread 个
+    TArray<FSegmentResources> m_Slots;
+
     TArray<FRecorderSegment> m_Segments;
+
+    /// 串行尾段的资源 — 独立于各线程的池, 由主线程使用
+    FRHICommandPoolHandle         m_TailPools[kMaxFramesInFlight];
+    FRHICommandBufferHandle       m_TailHandles[kMaxFramesInFlight];
+    TUniquePtr<IRHICommandBuffer> m_TailBuffers[kMaxFramesInFlight];
 
     SizeType m_ActiveSegments     = 0;
     Float64  m_RecordMilliseconds = 0.0;

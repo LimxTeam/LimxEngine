@@ -319,8 +319,14 @@ Invoke-Step 'AssetTests' {
     .\Binaries\Development\Win64\LimxAssetTests.exe
 }
 
-Invoke-Step 'EngineTests' {
-    .\Binaries\Development\Win64\LimxEngineTests.exe
+# 引擎层测试逐套件跑 —— 与 ci.yml 保持一致。
+#
+# CI 那边拆开是因为作业日志读不到, 而步骤成败是公开的; 本地拆开则是为了
+# 两边命令逐字相同 (Scripts/ci-parity.ps1 会校验)。
+foreach ($suite in @('BlendMode', 'CascadeSplit', 'GeometryWinding',
+                     'LSpatialTrait', 'TranslucentSort')) {
+    Invoke-Step "引擎层测试 · $suite" ([scriptblock]::Create(
+        ".\Binaries\Development\Win64\LimxEngineTests.exe --suite $suite"))
 }
 
 # 显存回收自检 —— 需要真实 GPU, 因此放在单元测试之后单独一步。

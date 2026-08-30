@@ -46,6 +46,7 @@
 #include "Engine/Rendering/FSceneLoader.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
 #include "RenderCore/Profiling/FGpuProfiler.h"
+#include "Renderer/RenderPass/FPassManager.h"
 #include "AssetPipeline/FImageDecoder.h"
 
 namespace Limx
@@ -76,6 +77,15 @@ struct FLaunchOptions
 
     bool EnableCulling = true;
     bool EnableSorting = true;
+
+    /// 并行命令录制的线程数 (0 = 按硬件并发数)
+    UInt32 RecordThreads = 0;
+
+    /// 是否启用并行命令录制
+    ///
+    /// 关掉时前向 Pass 走内联路径。两条路径共用同一份绘制代码, 因此
+    /// 输出应当逐像素相同 —— 这是并行录制唯一有意义的验收方式。
+    bool ParallelRecording = true;
 
     /// 待导入的资产路径; 为空时使用内置场景
     FString ScenePath;
@@ -376,6 +386,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--no-cull"))
         {
             options.EnableCulling = false;
+        }
+        else if (WideEquals(arg, L"--record-threads") && (i + 1) < tokenCount)
+        {
+            options.RecordThreads = ParseUInt32(tokens[++i], 0);
+        }
+        else if (WideEquals(arg, L"--no-parallel-record"))
+        {
+            options.ParallelRecording = false;
         }
         else if (WideEquals(arg, L"--no-sort"))
         {
@@ -1721,6 +1739,56 @@ static void LogBenchmarkReport(const FLaunchOptions& options,
              frameStats.AverageFrameMs, frameStats.WorstFrameMs,
              frameStats.AverageFps, frameStats.TotalFrames);
 
+    // ---- CPU 分项 ----
+    {
+        const FRenderer::FCpuFrameTiming& cpu = renderer.GetCpuFrameTiming();
+
+        LIMX_LOG(LogLaunch, Log,
+                 "[基准] CPU 分项 — 取图 {} ms | 更新 {} ms | 录制 {} ms "
+                 "| 呈现 {} ms | 合计 {} ms",
+                 cpu.AcquireMs, cpu.UpdateMs, cpu.RecordMs,
+                 cpu.PresentMs, cpu.TotalMs);
+    }
+
+    // ---- 逐 Pass CPU 录制耗时 ----
+    {
+        FPassManager* passes =
+            const_cast<FRenderer&>(renderer).GetPassManager();
+
+        if (passes != nullptr)
+        {
+            for (SizeType i = 0; i < passes->GetPassCount(); ++i)
+            {
+                LIMX_LOG(LogLaunch, Log,
+                         "[基准] CPU Pass {} — 录制 {} ms",
+                         passes->GetPassName(i),
+                         passes->GetPassCpuMilliseconds(i));
+            }
+        }
+    }
+
+    // ---- CPU 侧录制耗时 ----
+    //
+    // 并行录制只能改善"录制"这一段。它占整帧的比例决定了这条路的收益
+    // 上限 —— 比例很小的话, 线程数加到多少都不会有明显变化。
+    {
+        const FParallelRecorder& recorder = renderer.GetRecorder();
+
+        if (recorder.IsInitialized())
+        {
+            LIMX_LOG(LogLaunch, Log,
+                     "[基准] 命令录制: {} ms | {} 段 | {} 线程 "
+                     "| 占 CPU 帧时 {}%",
+                     recorder.GetRecordMilliseconds(),
+                     recorder.GetSegmentCount(),
+                     recorder.GetThreadCount(),
+                     (frameStats.AverageFrameMs > 0.0)
+                         ? (recorder.GetRecordMilliseconds()
+                            / frameStats.AverageFrameMs * 100.0)
+                         : 0.0);
+        }
+    }
+
     // ---- 逐 Pass GPU 计时 ----
     //
     // 这里报的是最后一次成功回读的那一帧, 不是平均值 —— 平均需要跨帧
@@ -1925,6 +1993,11 @@ int WINAPI wWinMain(
     // ================================================================
 
     FRenderer renderer;
+    // 录制配置必须在 Initialize 之前 —— 命令池与次级缓冲区在那时一次性
+    // 建好, 运行中改线程数意味着重建全部资源并等 GPU 空闲。
+    renderer.SetRecordThreadCount(launchOptions.RecordThreads);
+    renderer.SetParallelRecording(launchOptions.ParallelRecording);
+
     result = renderer.Initialize(&window, &renderContext);
     if (!IsRHISuccess(result))
     {

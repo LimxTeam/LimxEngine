@@ -192,7 +192,26 @@ void FPassManager::ExecuteAll(IRHICommandBuffer*     commandBuffer,
             info.Profiler->BeginScope(commandBuffer, m_Passes[i]->GetName());
         }
 
+        // CPU 侧的录制耗时也要逐 Pass 记。
+        //
+        // GPU 计时回答"这个 Pass 在显卡上多久", CPU 计时回答"录制它的
+        // 命令花了主线程多久" —— 两者可以差一个数量级。Day 2 实测整帧
+        // CPU 14.8 ms 里录制占 14.3 ms, 而 GPU 整帧只有 1.15 ms, 所以
+        // 真正该问的是"哪个 Pass 的**录制**最贵", 而不是哪个 Pass 最耗 GPU。
+        const Float64 passBegin = FPlatformTime::Seconds();
+
         m_Passes[i]->Execute(commandBuffer, context);
+
+        if (i < kMaxTrackedPasses)
+        {
+            constexpr Float64 kAlpha = 0.05;
+
+            const Float64 elapsed =
+                (FPlatformTime::Seconds() - passBegin) * 1000.0;
+
+            m_PassCpuMs[i] =
+                m_PassCpuMs[i] * (1.0 - kAlpha) + elapsed * kAlpha;
+        }
 
         if (info.Profiler != nullptr)
         {

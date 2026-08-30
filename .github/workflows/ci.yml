@@ -171,8 +171,28 @@ jobs:
       - name: 资产管线单元测试
         run: .\Binaries\Development\Win64\LimxAssetTests.exe
 
-      - name: 引擎层单元测试
-        run: .\Binaries\Development\Win64\LimxEngineTests.exe
+      # 引擎层测试逐套件跑。
+      #
+      # 不是为了好看: 作业日志需要仓库 admin 权限才能读, 而**步骤的成败
+      # 是公开可查的**。拆成逐套件之后, 哪个套件失败可以直接从步骤名看出来,
+      # 不必等人去翻日志。
+      #
+      # 这条路是被逼出来的 —— 该测试在本地和干净克隆里都通过, 只在 CI 上
+      # 失败, 而失败原因看不到。
+      - name: 引擎层测试 · BlendMode
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite BlendMode
+
+      - name: 引擎层测试 · CascadeSplit
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite CascadeSplit
+
+      - name: 引擎层测试 · GeometryWinding
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite GeometryWinding
+
+      - name: 引擎层测试 · LSpatialTrait
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite LSpatialTrait
+
+      - name: 引擎层测试 · TranslucentSort
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite TranslucentSort
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
