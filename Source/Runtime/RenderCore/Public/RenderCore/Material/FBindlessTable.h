@@ -194,6 +194,22 @@ private:
 
     UInt32 m_TextureCount = 0;
 
+    /// 已注册的 (视图, 采样器) 对 — 用于去重
+    ///
+    /// 25 个材质 x 5 个槽位 = 125 次注册, 而实际只有 69 张不同的贴图。
+    /// 不去重的话同一张图会占掉多个槽位, 而且同一份数据在描述符里出现
+    /// 多次 —— 表满得更快, 且看统计数字时会误以为场景用了更多贴图。
+    ///
+    /// 线性查找而非哈希: 一百多项、只在加载时调用, O(n^2) 是一万多次
+    /// 句柄比较, 可以忽略; 换来的是不必为句柄对设计哈希。
+    struct FTextureKey
+    {
+        FRHITextureViewHandle View;
+        FRHISamplerHandle     Sampler;
+    };
+
+    TArray<FTextureKey> m_TextureKeys;
+
     TArray<FBindlessMaterial> m_Materials;
 };
 

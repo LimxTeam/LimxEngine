@@ -410,9 +410,17 @@ void FSceneManager::MeasureBatches()
         return;
     }
 
-    // 首个批次必然要绑定一次材质与网格, 因此计数从 1 起
+    // 首个批次必然要绑定一次网格, 因此计数从 1 起
+    m_Stats.MeshSwitchCount = 1;
+
+    // 材质下标的变化次数同样从 1 起 (第一个批次算一次"变化")
     m_Stats.MaterialSwitchCount = 1;
-    m_Stats.MeshSwitchCount     = 1;
+
+    // 材质描述符集的绑定次数 —— bindless 下恒为 0。
+    //
+    // 不是"约等于 0"或"很少": set 1 在每个次级命令缓冲区的开头绑一次,
+    // 那属于 Pass 的公共状态, 不计入逐 draw 的绑定。
+    m_Stats.MaterialBindCount = 0;
 
     for (SizeType i = 0; i < m_SceneRenderObjects.GetSize(); ++i)
     {
@@ -427,8 +435,7 @@ void FSceneManager::MeasureBatches()
 
         const FRenderObject& previous = m_SceneRenderObjects[i - 1];
 
-        if (object.MaterialDescriptorSet.Packed !=
-            previous.MaterialDescriptorSet.Packed)
+        if (object.BindlessMaterialIndex != previous.BindlessMaterialIndex)
         {
             ++m_Stats.MaterialSwitchCount;
         }

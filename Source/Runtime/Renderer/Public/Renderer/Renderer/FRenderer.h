@@ -75,6 +75,7 @@
 #include "ApplicationCore/Input/FInputManager.h"
 #include "RenderCore/Geometry/FGeometryGenerator.h"
 #include "RenderCore/Material/FMaterial.h"
+#include "RenderCore/Material/FBindlessTable.h"
 #include "RenderCore/Profiling/FGpuProfiler.h"
 #include "Renderer/Recording/FParallelRecorder.h"
 
@@ -104,6 +105,16 @@ struct FViewProjUBO
     FMatrix Proj;
 };
 
+/// 这是扇出最大的 GPU 结构 — 四个着色器 (pbr.vert / depth_only.vert /
+/// triangle.vert / sky.vert) 加上 FRenderer 与 FShadowPass 的六处
+/// sizeof() 都依赖它。
+///
+/// 在中间加字段会让 Proj 错位, 在末尾加字段会让 C++ 侧六处缓冲区与
+/// 描述符 range 自动跟着变大, 而着色器不会 —— 两种都不报错。
+static_assert(sizeof(FViewProjUBO) == 128,
+              "FViewProjUBO 必须是 128 字节 (两个 mat4) — "
+              "与四个顶点着色器的 ViewProjUBO 块一致");
+
 // ============================================================================
 // FModelPushConstant — 逐物体 Model 矩阵 Push Constant 数据 (64 bytes)
 // ============================================================================
@@ -111,7 +122,24 @@ struct FViewProjUBO
 struct FModelPushConstant
 {
     FMatrix Model;
+
+    /// 材质在 bindless 表里的下标
+    ///
+    /// 顶点着色器用不到, 但 push constant 的布局在整条管线上是共享的 ——
+    /// pbr.vert 与 pbr.frag 必须声明出同样的结构, 否则偏移对不上。
+    UInt32  MaterialIndex = 0;
 };
+
+/// push constant 的大小必须与三个顶点着色器里的声明一致。
+///
+/// 加字段而不超过 128 字节上限时, vkCreatePipelineLayout 不会报错, 多出
+/// 的字节被静默推进去而着色器只读前面那些 —— 无声无息。这条断言是唯一
+/// 会在编译期拦住它的东西。
+///
+/// 改这个数之前先改 pbr.vert / depth_only.vert / triangle.vert。
+static_assert(sizeof(FModelPushConstant) == 68,
+              "FModelPushConstant 必须是 68 字节 (mat4 + uint) — "
+              "与 pbr.vert / depth_only.vert 的 push_constant 块一致");
 
 // ============================================================================
 // FRenderObject — 一次绘制批次 (渲染视图, 非资源所有者)
@@ -164,6 +192,12 @@ struct FRenderObject
 
     /// set 1 材质描述符集 — 由 FMaterialManager 分配
     FRHIDescriptorSetHandle MaterialDescriptorSet;
+
+    /// 材质在 bindless 表里的下标
+    ///
+    /// 走 bindless 路径时随 push constant 传给着色器, 逐 draw 不再绑定
+    /// 描述符集。走旧路径时不使用。
+    UInt32 BindlessMaterialIndex = 0;
 
     /// 调试名称
     const AnsiChar*  DebugName      = "Unnamed";
@@ -281,6 +315,14 @@ public:
     LIMX_NODISCARD const FCpuFrameTiming& GetCpuFrameTiming() const
     {
         return m_CpuTiming;
+    }
+
+    /// bindless 材质表
+    LIMX_NODISCARD FBindlessTable& GetBindlessTable() { return m_BindlessTable; }
+
+    LIMX_NODISCARD const FBindlessTable& GetBindlessTable() const
+    {
+        return m_BindlessTable;
     }
 
     /// 并行命令录制器
@@ -462,6 +504,9 @@ private:
 
     /// 并行命令录制器
     FParallelRecorder                 m_Recorder;
+
+    /// bindless 材质与纹理表 (set 1)
+    FBindlessTable                    m_BindlessTable;
 
     /// CPU 分项耗时 (指数滑动平均, 系数 0.05)
     ///

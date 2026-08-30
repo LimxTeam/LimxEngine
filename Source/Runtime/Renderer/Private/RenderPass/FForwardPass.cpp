@@ -183,6 +183,21 @@ void FForwardPass::RecordCommonState(IRHICommandBuffer*        commandBuffer,
     );
 
     // ================================================================
+    // 绑定描述符集 (set 1 — bindless 材质表, 全场景共享)
+    // ================================================================
+    //
+    // 每段只绑这一次。逐 draw 的材质切换靠 push constant 里的下标,
+    // 不再有描述符集绑定。
+    commandBuffer->BindDescriptorSet(
+        EPipelineBindPoint::Graphics,
+        context.PipelineLayout,
+        1,
+        context.BindlessDescriptorSet,
+        nullptr,
+        0
+    );
+
+    // ================================================================
     // 遍历所有渲染物体: 绑定材质 → BindVBO/IBO → Push Model → DrawIndexed
     // ================================================================
 
@@ -219,20 +234,11 @@ void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
                 boundPipeline = pipeline;
             }
 
-            // 绑定 set 1 — 材质描述符集 (逐材质)
-            if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
-            {
-                commandBuffer->BindDescriptorSet(
-                    EPipelineBindPoint::Graphics,
-                    context.PipelineLayout,
-                    1,
-                    obj.MaterialDescriptorSet,
-                    nullptr,
-                    0
-                );
-
-                boundMaterial = obj.MaterialDescriptorSet;
-            }
+            // set 1 已在本段开头绑过一次 (bindless 全局表), 逐 draw 不再绑。
+            //
+            // 这正是 bindless 的意义: 材质切换从"绑一次描述符集"降级为
+            // "push constant 里换一个整数"。GPU 驱动渲染更进一步 ——
+            // 间接绘制根本没有逐 draw 绑描述符集这回事。
 
             if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
             {
@@ -253,11 +259,12 @@ void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
             }
 
             FModelPushConstant pushData;
-            pushData.Model = obj.Transform.ToMatrix();
+            pushData.Model         = obj.Transform.ToMatrix();
+            pushData.MaterialIndex = obj.BindlessMaterialIndex;
 
             commandBuffer->PushConstants(
                 context.PipelineLayout,
-                EShaderStage::Vertex,
+                EShaderStage::Vertex | EShaderStage::Fragment,
                 0,
                 sizeof(FModelPushConstant),
                 &pushData
@@ -314,19 +321,11 @@ void FForwardPass::RecordTranslucent(IRHICommandBuffer*        commandBuffer,
                 boundPipeline = pipeline;
             }
 
-            if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
-            {
-                commandBuffer->BindDescriptorSet(
-                    EPipelineBindPoint::Graphics,
-                    context.PipelineLayout,
-                    1,
-                    obj.MaterialDescriptorSet,
-                    nullptr,
-                    0
-                );
-
-                boundMaterial = obj.MaterialDescriptorSet;
-            }
+            // set 1 已在本段开头绑过一次 (bindless 全局表), 逐 draw 不再绑。
+            //
+            // 这正是 bindless 的意义: 材质切换从"绑一次描述符集"降级为
+            // "push constant 里换一个整数"。GPU 驱动渲染更进一步 ——
+            // 间接绘制根本没有逐 draw 绑描述符集这回事。
 
             if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
             {
@@ -344,11 +343,12 @@ void FForwardPass::RecordTranslucent(IRHICommandBuffer*        commandBuffer,
             }
 
             FModelPushConstant pushData;
-            pushData.Model = obj.Transform.ToMatrix();
+            pushData.Model         = obj.Transform.ToMatrix();
+            pushData.MaterialIndex = obj.BindlessMaterialIndex;
 
             commandBuffer->PushConstants(
                 context.PipelineLayout,
-                EShaderStage::Vertex,
+                EShaderStage::Vertex | EShaderStage::Fragment,
                 0,
                 sizeof(FModelPushConstant),
                 &pushData

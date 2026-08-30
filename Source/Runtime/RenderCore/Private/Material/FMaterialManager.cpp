@@ -36,6 +36,7 @@
 // ============================================================
 
 #include "RenderCore/Material/FMaterialManager.h"
+#include "RenderCore/Material/FBindlessTable.h"
 
 namespace Limx
 {
@@ -292,24 +293,45 @@ FMaterial* FMaterialManager::CreateDefaultMaterial(const AnsiChar* debugName)
 // UploadDirtyMaterials — 批量刷新所有脏材质和脏实例
 // ============================================================================
 
-void FMaterialManager::UploadDirtyMaterials()
+void FMaterialManager::UploadDirtyMaterials(FBindlessTable* bindless)
 {
     // 刷新所有脏材质
     for (SizeType i = 0; i < m_Materials.GetSize(); ++i)
     {
-        if (m_Materials[i]->IsDirty())
+        const bool wasDirty = m_Materials[i]->IsDirty();
+
+        if (wasDirty)
         {
             m_Materials[i]->Flush();
+        }
+
+        // bindless 注册。
+        //
+        // 未注册的一律注册; 已注册的只在脏了之后重新写一遍。前者保证
+        // 新建的材质一定进表, 后者保证参数改动能生效, 而下标始终不变。
+        if (bindless != nullptr &&
+            (wasDirty || !m_Materials[i]->IsBindlessRegistered()))
+        {
+            m_Materials[i]->RegisterBindless(*bindless);
         }
     }
 
     // 刷新所有脏材质实例
     for (SizeType i = 0; i < m_MaterialInstances.GetSize(); ++i)
     {
-        if (m_MaterialInstances[i]->IsDirty())
+        const bool wasDirty = m_MaterialInstances[i]->IsDirty();
+
+        if (wasDirty)
         {
             m_MaterialInstances[i]->Flush();
         }
+
+        // 材质实例暂不进 bindless 表。
+        //
+        // FMaterialInstance 是与 FMaterial 平行的独立类 (不是派生), 而且
+        // 目前没有任何使用者 —— 场景加载走的是 FMaterial。等它真的被用起来
+        // 时再接, 现在接等于给一条没人走的路写代码。
+        (void)wasDirty;
     }
 }
 

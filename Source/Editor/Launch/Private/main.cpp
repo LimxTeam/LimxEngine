@@ -1732,7 +1732,9 @@ static void LogBenchmarkReport(const FLaunchOptions& options,
              sceneStats.BatchCount, sceneStats.CulledCount,
              sceneStats.VisibleCount, sceneStats.VisibleTriangles);
     LIMX_LOG(LogLaunch, Log,
-             "[基准] 状态切换: 材质 {} 次 | 网格 {} 次",
+             "[基准] 状态切换: 材质描述符集绑定 {} 次 | 材质下标变化 {} 次 "
+             "| 网格 {} 次",
+             sceneStats.MaterialBindCount,
              sceneStats.MaterialSwitchCount, sceneStats.MeshSwitchCount);
     LIMX_LOG(LogLaunch, Log,
              "[基准] 帧耗时: 平均 {} ms | 最差 {} ms | 平均帧率 {} | 总帧数 {}",

@@ -167,6 +167,7 @@ void FBindlessTable::Shutdown(IRHIDevice* device)
     }
 
     m_Materials.Clear();
+    m_TextureKeys.Clear();
     m_TextureCount = 0;
     m_Device       = nullptr;
 }
@@ -183,6 +184,16 @@ UInt32 FBindlessTable::RegisterTexture(FRHITextureViewHandle view,
         return kPlaceholderTexture;
     }
 
+    // 去重 —— 同一张贴图被多个材质引用是常态
+    for (SizeType i = 0; i < m_TextureKeys.GetSize(); ++i)
+    {
+        if (m_TextureKeys[i].View.Packed == view.Packed &&
+            m_TextureKeys[i].Sampler.Packed == sampler.Packed)
+        {
+            return static_cast<UInt32>(i);
+        }
+    }
+
     if (m_TextureCount >= kMaxTextures)
     {
         // 表满时退回占位纹理而不是返回无效值。
@@ -196,6 +207,11 @@ UInt32 FBindlessTable::RegisterTexture(FRHITextureViewHandle view,
 
     const UInt32 index = m_TextureCount;
     ++m_TextureCount;
+
+    FTextureKey key;
+    key.View    = view;
+    key.Sampler = sampler;
+    m_TextureKeys.Add(key);
 
     // 每一帧的描述符集都要写一遍 —— 它们指向同一张纹理, 但描述符集本身
     // 不能跨帧共享。
@@ -247,6 +263,12 @@ void FBindlessTable::Reset()
 
     // 纹理计数保留 0 号占位 —— 它在 Initialize 时写入, 关卡切换不该动它。
     m_TextureCount = 1;
+
+    // 去重表同样只留占位那一项
+    while (m_TextureKeys.GetSize() > 1)
+    {
+        m_TextureKeys.RemoveAt(m_TextureKeys.GetSize() - 1);
+    }
 }
 
 // ============================================================================

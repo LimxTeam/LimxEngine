@@ -207,6 +207,12 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         object.WorldBounds           = TransformBounds(mesh->Bounds,
                                                        worldTransform);
         object.MaterialDescriptorSet = material->GetDescriptorSet();
+
+        // bindless 下标 —— 材质在首次被收集时注册进全局表。
+        //
+        // 放在收集阶段而不是材质创建时: 材质可以在没有渲染器的情况下
+        // 存在 (比如资产导入还没建 GPU 资源), 而 bindless 表属于渲染器。
+        object.BindlessMaterialIndex = material->GetBindlessIndex();
         object.BlendMode             = material->GetParams().GetBlendMode();
         object.IsDoubleSided         = material->IsDoubleSided();
         object.DebugName             = debugName;
@@ -245,6 +251,12 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
             section.Bounds.IsValid() ? section.Bounds : mesh->Bounds,
             worldTransform);
         object.MaterialDescriptorSet = material->GetDescriptorSet();
+
+        // bindless 下标 —— 材质在首次被收集时注册进全局表。
+        //
+        // 放在收集阶段而不是材质创建时: 材质可以在没有渲染器的情况下
+        // 存在 (比如资产导入还没建 GPU 资源), 而 bindless 表属于渲染器。
+        object.BindlessMaterialIndex = material->GetBindlessIndex();
         object.BlendMode             = material->GetParams().GetBlendMode();
         object.IsDoubleSided         = material->IsDoubleSided();
         object.DebugName             = section.Name.IsEmpty()

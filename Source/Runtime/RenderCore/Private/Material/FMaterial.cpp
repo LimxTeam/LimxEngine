@@ -41,6 +41,7 @@
 // ============================================================
 
 #include "RenderCore/Material/FMaterial.h"
+#include "RenderCore/Material/FBindlessTable.h"
 #include "RenderCore/Resources/FRenderResourceManager.h"
 
 namespace Limx
@@ -385,6 +386,61 @@ void FMaterial::UpdateDescriptorSet()
     }
 
     m_Device->UpdateDescriptorSets(writes, 6u);
+}
+
+// ============================================================================
+// bindless 注册
+// ============================================================================
+
+void FMaterial::RegisterBindless(FBindlessTable& table)
+{
+    if (!table.IsInitialized())
+    {
+        return;
+    }
+
+    FBindlessMaterial data;
+
+    data.BaseColor     = m_Params.BaseColor;
+    data.Metallic      = m_Params.Metallic;
+    data.Roughness     = m_Params.Roughness;
+    data.AO            = m_Params.AO;
+    data.NormalScale   = m_Params.NormalScale;
+    data.EmissiveColor = m_Params.EmissiveColor;
+    data.AlphaCutoff   = m_Params.AlphaCutoff;
+    data.TextureFlags  = m_Params.TextureFlags;
+    data.BlendMode     = m_Params.BlendMode;
+
+    // 五个槽位逐个注册。
+    //
+    // m_TextureViews 在未绑定时已经回落到默认白纹理 (见 SetTexture),
+    // 所以这里拿到的句柄总是有效的 —— 下标也就总是有效的, 着色器不必
+    // 判断。这个不变量是 bindless 能安全工作的前提。
+    UInt32* const indices[kMaterialTextureSlotCount] =
+    {
+        &data.AlbedoIndex,
+        &data.NormalIndex,
+        &data.MetallicRoughnessIndex,
+        &data.OcclusionIndex,
+        &data.EmissiveIndex,
+    };
+
+    for (UInt32 slot = 0; slot < kMaterialTextureSlotCount; ++slot)
+    {
+        *indices[slot] =
+            table.RegisterTexture(m_TextureViews[slot], m_Samplers[slot]);
+    }
+
+    if (m_BindlessRegistered)
+    {
+        // 已注册过就只更新内容 —— 下标必须保持不变
+        table.UpdateMaterial(m_BindlessIndex, data);
+    }
+    else
+    {
+        m_BindlessIndex      = table.RegisterMaterial(data);
+        m_BindlessRegistered = true;
+    }
 }
 
 } // namespace Limx

@@ -146,6 +146,9 @@ struct FRenderPassContext
     /// set 2 光照描述符集 — 含 FLightingUBO (binding 0)
     /// 由 FPassManager::ExecuteAll 从帧数据中取出并填入
     FRHIDescriptorSetHandle LightingDescriptorSet;
+
+    /// set 1 — bindless 材质表 (全场景共享, 每帧一份)
+    FRHIDescriptorSetHandle BindlessDescriptorSet;
 };
 
 // ============================================================================

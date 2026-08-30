@@ -178,6 +178,7 @@ void FPassManager::ExecuteAll(IRHICommandBuffer*     commandBuffer,
     context.ViewProjDescriptorSet  = info.ViewProjDescriptorSet;
     context.PipelineLayout         = info.PipelineLayout;
     context.LightingDescriptorSet  = info.LightingDescriptorSet;
+    context.BindlessDescriptorSet  = info.BindlessDescriptorSet;
     context.SharedDepthTexture     = m_SharedDepthTexture;
     context.SharedDepthTextureView = m_SharedDepthTextureView;
 

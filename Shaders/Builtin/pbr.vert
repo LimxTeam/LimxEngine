@@ -34,8 +34,13 @@ layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
 } ubo;
 
 // ── Push Constant: 逐物体 Model 矩阵 ──
+// push constant 里多了材质下标。
+//
+// 顶点着色器用不到它, 但 push constant 的布局在整条管线上是共享的 ——
+// 片段着色器要读, 这里就必须声明出同样的布局, 否则偏移对不上。
 layout(row_major, push_constant) uniform PushConstants {
     mat4 model;
+    uint materialIndex;
 } pc;
 
 // ── 顶点着色器输出 → 片段着色器输入 ──

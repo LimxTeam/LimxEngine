@@ -162,7 +162,11 @@ public:
     /// 批量刷新所有已脏材质和材质实例的 GPU 数据
     ///
     /// 应在每帧开始录制命令之前调用（BeginFrame 之后、RecordCommands 之前）
-    void UploadDirtyMaterials();
+    /// 批量刷新脏材质, 并把它们注册进 bindless 表
+    ///
+    /// @param bindless 可空 —— 为空时只刷新, 不注册 (用于还没有渲染器的
+    ///                 场合, 比如纯资产处理)
+    void UploadDirtyMaterials(class FBindlessTable* bindless = nullptr);
 
     // ========================================================================
     // 访问器

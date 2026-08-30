@@ -158,6 +158,15 @@ void FDepthPrePass::RecordCommonState(IRHICommandBuffer*        commandBuffer,
         0
     );
 
+    // set 1 = bindless 材质表 —— Masked 材质的 alpha 测试要读 albedo
+    commandBuffer->BindDescriptorSet(
+        EPipelineBindPoint::Graphics,
+        context.PipelineLayout,
+        1,
+        context.BindlessDescriptorSet,
+        nullptr,
+        0);
+
     // ================================================================
     // 遍历所有渲染物体: BindVBO/IBO → Push Model → DrawIndexed
     // (仅写入深度，不执行片段着色)
@@ -198,19 +207,11 @@ void FDepthPrePass::RecordRange(IRHICommandBuffer*        commandBuffer,
                 boundPipeline = pipeline;
             }
 
-            if (obj.MaterialDescriptorSet.Packed != boundMaterial.Packed)
-            {
-                commandBuffer->BindDescriptorSet(
-                    EPipelineBindPoint::Graphics,
-                    context.PipelineLayout,
-                    1,
-                    obj.MaterialDescriptorSet,
-                    nullptr,
-                    0
-                );
-
-                boundMaterial = obj.MaterialDescriptorSet;
-            }
+            // set 1 已在本段开头绑过一次 (bindless 全局表), 逐 draw 不再绑。
+            //
+            // 这正是 bindless 的意义: 材质切换从"绑一次描述符集"降级为
+            // "push constant 里换一个整数"。GPU 驱动渲染更进一步 ——
+            // 间接绘制根本没有逐 draw 绑描述符集这回事。
 
             if (obj.VertexBuffer.Packed != boundVertexBuffer.Packed)
             {
@@ -228,11 +229,12 @@ void FDepthPrePass::RecordRange(IRHICommandBuffer*        commandBuffer,
             }
 
             FModelPushConstant pushData;
-            pushData.Model = obj.Transform.ToMatrix();
+            pushData.Model         = obj.Transform.ToMatrix();
+            pushData.MaterialIndex = obj.BindlessMaterialIndex;
 
             commandBuffer->PushConstants(
                 context.PipelineLayout,
-                EShaderStage::Vertex,
+                EShaderStage::Vertex | EShaderStage::Fragment,
                 0,
                 sizeof(FModelPushConstant),
                 &pushData

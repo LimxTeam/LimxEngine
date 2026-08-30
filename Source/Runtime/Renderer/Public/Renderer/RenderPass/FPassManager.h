@@ -123,6 +123,9 @@ struct FPassExecuteInfo
     /// set 2 光照描述符集 — 含 FLightingUBO (对应当前 FrameIndex)
     FRHIDescriptorSetHandle LightingDescriptorSet;
 
+    /// set 1 — bindless 材质表 (对应当前 FrameIndex)
+    FRHIDescriptorSetHandle BindlessDescriptorSet;
+
     /// GPU 计时器 (可空)
     ///
     /// 非空时 ExecuteAll 会把每个 Pass 包进一个计时作用域。放在这里而不是

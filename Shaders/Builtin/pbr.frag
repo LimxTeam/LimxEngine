@@ -1,5 +1,11 @@
 #version 450
 
+// 非一致索引 —— 目前材质下标来自 push constant, 在一次绘制内是一致的,
+// 严格说不需要这个限定符。但等 GPU 驱动渲染落地之后, 下标会来自实例
+// 数据, 那时同一次绘制里不同的图元会取不同的材质 —— 届时它是必需的。
+// 现在就写上, 免得那时改着色器又要重新验一遍画面。
+#extension GL_EXT_nonuniform_qualifier : require
+
 // ============================================================
 // PBR 片段着色器 — Cook-Torrance 微表面 BRDF + 多光源
 //
@@ -21,6 +27,13 @@
 // ============================================================
 
 // ── 片段着色器输入 (来自顶点着色器) ──
+// 与 pbr.vert 里的声明必须逐字段一致 —— push constant 的布局在整条管线上
+// 是共享的, 两边不一致时偏移会错开。
+layout(row_major, push_constant) uniform PushConstants {
+    mat4 model;
+    uint materialIndex;
+} pc;
+
 layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragWorldNormal;
 layout(location = 2) in vec3 fragColor;
@@ -28,25 +41,59 @@ layout(location = 3) in vec2 fragTexCoord;
 layout(location = 4) in vec4 fragWorldTangent;   // xyz = 切线, w = 手性 (±1)
 
 // ── 材质参数 (set 1, binding 0) — 必须匹配 FMaterialParams std140 布局 ──
-layout(set = 1, binding = 0) uniform MaterialUBO {
-    vec4  BaseColor;
-    float Metallic;
+// ── 材质表 (set 1) ──
+//
+// 字段顺序与 C++ 侧 FBindlessMaterial 逐字段对应, 共 80 字节。std430 下
+// vec4 按 16 对齐、标量按 4 —— 两个 vec4 各自起于 16 的倍数, 中间的标量
+// 凑满一组。改动顺序前先算对齐: 错位的表现是"材质参数整体串了一位",
+// 画面上像是材质配错而不像 bug。
+//
+// C++ 侧有 static_assert 钉住 80 字节, 但那只保证 C++ 这一边 —— 两边的
+// 字段顺序是否一致仍然只能靠人对。
+struct MaterialData {
+    vec4  BaseColor;                //  0
+    float Metallic;                 // 16
     float Roughness;
     float AO;
     float NormalScale;
-    vec4  EmissiveColor;
-    float AlphaCutoff;
+    vec4  EmissiveColor;            // 32
+    float AlphaCutoff;              // 48
     uint  TextureFlags;
     uint  BlendMode;
-    float _Padding;
-} material;
+    uint  AlbedoIndex;
+    uint  NormalIndex;              // 64
+    uint  MetallicRoughnessIndex;
+    uint  OcclusionIndex;
+    uint  EmissiveIndex;
+};                                  // 80
 
-// ── 材质贴图 (set 1, binding 1~5) ──
-layout(set = 1, binding = 1) uniform sampler2D materialAlbedoMap;
-layout(set = 1, binding = 2) uniform sampler2D materialNormalMap;
-layout(set = 1, binding = 3) uniform sampler2D materialMetallicRoughnessMap;
-layout(set = 1, binding = 4) uniform sampler2D materialOcclusionMap;
-layout(set = 1, binding = 5) uniform sampler2D materialEmissiveMap;
+layout(std430, set = 1, binding = 0) readonly buffer MaterialBuffer {
+    MaterialData materials[];
+};
+
+// 全局纹理表。
+//
+// 数组大小必须与 C++ 侧 FBindlessTable::kMaxTextures 一致。用固定大小而
+// 非无界数组 (sampler2D[]), 是为了不依赖 runtimeDescriptorArray 特性 ——
+// 少一项特性要求就少一类"这台机器上跑不起来"。
+//
+// 数组是稀疏的: 声明 1024 槽而场景只用几十个。未写入的槽位不能被索引,
+// 所以缺贴图的材质在 C++ 侧就被指向 0 号占位纹理, 着色器这里不做任何
+// 有效性判断 —— 判断一旦漏写就是随机读显存。
+layout(set = 1, binding = 1) uniform sampler2D bindlessTextures[1024];
+
+// 本次绘制的材质。
+//
+// 全局变量而非 main 里的局部量: 下面若干个辅助函数直接引用 material,
+// 改成局部量要给每个函数加参数。GLSL 的全局变量是逐调用存储, 语义上
+// 与局部量一致。
+MaterialData material;
+
+// 采样全局表里的第 index 张贴图
+vec4 SampleBindless(uint index, vec2 uv)
+{
+    return texture(bindlessTextures[nonuniformEXT(index)], uv);
+}
 
 // ── 光源数据结构 (std140, 80 bytes per light) ──
 struct LightData {
@@ -302,7 +349,8 @@ vec3 ApplyNormalMap(vec3 baseNormal)
         return baseNormal;
     }
 
-    vec3 tangentNormal = texture(materialNormalMap, fragTexCoord).xyz * 2.0 - 1.0;
+    vec3 tangentNormal =
+        SampleBindless(material.NormalIndex, fragTexCoord).xyz * 2.0 - 1.0;
     tangentNormal.xy *= max(material.NormalScale, 0.0);
     tangentNormal.z = sqrt(max(0.0, 1.0 - dot(tangentNormal.xy, tangentNormal.xy)));
 
@@ -438,11 +486,18 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
 // ============================================================
 void main()
 {
+    // 取本次绘制的材质。
+    //
+    // 必须在任何使用 material 的代码之前 —— 它是全局变量, 未赋值时内容
+    // 未定义。放在 main 的第一行而不是散在各处, 是因为一旦漏赋值, 表现
+    // 是整个物体的材质参数全是垃圾, 而不是某一项不对。
+    material = materials[pc.materialIndex];
+
     // ---- 表面参数 (set 1 材质系统) ----
     vec4 baseColor = material.BaseColor;
     if ((material.TextureFlags & TEX_ALBEDO) != 0u)
     {
-        baseColor *= texture(materialAlbedoMap, fragTexCoord);
+        baseColor *= SampleBindless(material.AlbedoIndex, fragTexCoord);
     }
 
     if (material.BlendMode == BLEND_MASKED && baseColor.a < material.AlphaCutoff)
@@ -456,7 +511,8 @@ void main()
     float roughness = clamp(material.Roughness, 0.04, 1.0);
     if ((material.TextureFlags & TEX_METALLIC_ROUGHNESS) != 0u)
     {
-        vec4 mr = texture(materialMetallicRoughnessMap, fragTexCoord);
+        vec4 mr =
+            SampleBindless(material.MetallicRoughnessIndex, fragTexCoord);
         roughness = clamp(roughness * mr.g, 0.04, 1.0);
         metallic  = clamp(metallic * mr.b, 0.0, 1.0);
     }
@@ -464,13 +520,13 @@ void main()
     float ao = clamp(material.AO, 0.0, 1.0);
     if ((material.TextureFlags & TEX_OCCLUSION) != 0u)
     {
-        ao *= texture(materialOcclusionMap, fragTexCoord).r;
+        ao *= SampleBindless(material.OcclusionIndex, fragTexCoord).r;
     }
 
     vec3 emissive = material.EmissiveColor.rgb;
     if ((material.TextureFlags & TEX_EMISSIVE) != 0u)
     {
-        emissive *= texture(materialEmissiveMap, fragTexCoord).rgb;
+        emissive *= SampleBindless(material.EmissiveIndex, fragTexCoord).rgb;
     }
 
     // ---- 世界空间法线 (归一化) ----

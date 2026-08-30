@@ -22,8 +22,11 @@ layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
 } ubo;
 
 // ── Push Constant: 逐物体 Model 矩阵 ──
+// 与 pbr.vert 逐字段一致 —— push constant 的布局在整条管线上共享,
+// 而深度预通道、阴影通道、前向通道用的是同一个 m_PipelineLayout。
 layout(row_major, push_constant) uniform PushConstants {
     mat4 model;
+    uint materialIndex;
 } pc;
 
 layout(location = 0) out vec2 fragTexCoord;

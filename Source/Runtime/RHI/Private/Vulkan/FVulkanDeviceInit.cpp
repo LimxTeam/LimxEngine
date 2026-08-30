@@ -790,6 +790,29 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
         m_DeviceFeatures12.timelineSemaphore;
     features12.descriptorIndexing =
         m_DeviceFeatures12.descriptorIndexing;
+
+    // descriptorIndexing 只是个汇总标志 —— 它表示"设备支持描述符索引的
+    // 最小特性集", 但启用它**不会**自动启用任何一个具体子特性。下面这
+    // 几项 bindless 都要用到, 必须各自开。
+    //
+    // 一律照抄设备实际支持的值 (m_DeviceFeatures12 是查询结果): 请求任一
+    // 不支持的特性会让 vkCreateDevice 直接返回 FEATURE_NOT_PRESENT, 整个
+    // 设备创建失败。设备不支持时这里传 FALSE, 而 FBindlessTable 会在创建
+    // 布局时失败并退回旧路径。
+    features12.descriptorBindingPartiallyBound =
+        m_DeviceFeatures12.descriptorBindingPartiallyBound;
+    features12.descriptorBindingSampledImageUpdateAfterBind =
+        m_DeviceFeatures12.descriptorBindingSampledImageUpdateAfterBind;
+    features12.descriptorBindingStorageBufferUpdateAfterBind =
+        m_DeviceFeatures12.descriptorBindingStorageBufferUpdateAfterBind;
+    features12.descriptorBindingVariableDescriptorCount =
+        m_DeviceFeatures12.descriptorBindingVariableDescriptorCount;
+    features12.shaderSampledImageArrayNonUniformIndexing =
+        m_DeviceFeatures12.shaderSampledImageArrayNonUniformIndexing;
+    features12.shaderStorageBufferArrayNonUniformIndexing =
+        m_DeviceFeatures12.shaderStorageBufferArrayNonUniformIndexing;
+    features12.runtimeDescriptorArray =
+        m_DeviceFeatures12.runtimeDescriptorArray;
     features12.bufferDeviceAddress =
         m_DeviceFeatures12.bufferDeviceAddress;
     features12.scalarBlockLayout =
@@ -798,6 +821,16 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
         m_DeviceFeatures12.hostQueryReset;
     features12.separateDepthStencilLayouts =
         m_DeviceFeatures12.separateDepthStencilLayouts;
+
+    // bindless 三项关键子特性 —— 缺任何一项 FBindlessTable 都建不起来
+    LIMX_LOG(LogRHI, Display,
+        "[Vulkan] bindless 子特性 — PartiallyBound:{} "
+        "SampledImageUpdateAfterBind:{} NonUniformIndexing:{}",
+        m_DeviceFeatures12.descriptorBindingPartiallyBound != VK_FALSE,
+        m_DeviceFeatures12.descriptorBindingSampledImageUpdateAfterBind
+            != VK_FALSE,
+        m_DeviceFeatures12.shaderSampledImageArrayNonUniformIndexing
+            != VK_FALSE);
 
     // Vulkan 1.3 特性 (Dynamic Rendering / Sync2) — 已在设备选择阶段
     // 校验 dynamicRendering/synchronization2 必须存在

@@ -363,6 +363,27 @@ private:
     /// 将所有描述符绑定 (UBO + 5 个纹理槽位) 写入 m_DescriptorSet
     void UpdateDescriptorSet();
 
+public:
+    /// 把本材质注册进 bindless 表, 记下分配到的下标
+    ///
+    /// 幂等: 已注册过就只更新表里的那一项, 下标不变。下标变动会让已经录进
+    /// 命令缓冲区的 push constant 指向错误的材质。
+    void RegisterBindless(class FBindlessTable& table);
+
+    /// bindless 表里的下标 (未注册时为 0, 即默认材质)
+    LIMX_NODISCARD UInt32 GetBindlessIndex() const { return m_BindlessIndex; }
+
+    LIMX_NODISCARD bool IsBindlessRegistered() const
+    {
+        return m_BindlessRegistered;
+    }
+
+private:
+    /// bindless 表下标
+    UInt32 m_BindlessIndex     = 0;
+    bool   m_BindlessRegistered = false;
+
+
     // ========================================================================
     // 成员
     // ========================================================================

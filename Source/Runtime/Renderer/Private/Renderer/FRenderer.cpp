@@ -177,6 +177,20 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     }
 
     // 初始化光照系统 (set 2)
+    // bindless 表 —— 必须在 FMaterialManager 之后, 占位纹理来自它
+    {
+        const ERHIResult bindlessResult = m_BindlessTable.Initialize(
+            device, frameCount,
+            FMaterialManager::Get().GetDefaultTextureView(),
+            FMaterialManager::Get().GetDefaultSampler());
+
+        if (!IsRHISuccess(bindlessResult))
+        {
+            LIMX_LOG(LogRenderer, Error, "[Renderer] bindless 表初始化失败");
+            return bindlessResult;
+        }
+    }
+
     result = FLightManager::Get().Initialize(device, frameCount);
     if (!IsRHISuccess(result))
     {
@@ -316,6 +330,7 @@ void FRenderer::Shutdown()
 
     m_GpuProfiler.Shutdown(device);
     m_Recorder.Shutdown(device);
+    m_BindlessTable.Shutdown(device);
 
     // 1. 关闭 Pass 系统 (内部销毁共享深度和帧缓冲)
     if (m_PassManager)
@@ -442,8 +457,11 @@ void FRenderer::RenderFrame()
         m_Recorder.BeginFrame(frameIndex);
     }
 
+    // 材质表每帧整体上传 —— 见 FBindlessTable::Upload 的说明
+    m_BindlessTable.Upload(frameIndex);
+
     // 每帧上传材质脏数据
-    FMaterialManager::Get().UploadDirtyMaterials();
+    FMaterialManager::Get().UploadDirtyMaterials(&m_BindlessTable);
 
     // ---- 阴影: 拟合光源视锥 → 写回矩阵 → 更新光源 UBO ----
     //
@@ -545,6 +563,7 @@ void FRenderer::RenderFrame()
         execInfo.ViewProjDescriptorSet = m_DescriptorSets[frameIndex];
         execInfo.PipelineLayout        = m_PipelineLayout;
         execInfo.LightingDescriptorSet = m_LightDescriptorSets[frameIndex];
+        execInfo.BindlessDescriptorSet = m_BindlessTable.GetDescriptorSet(frameIndex);
         execInfo.Profiler              = &m_GpuProfiler;
 
         m_PassManager->ExecuteAll(commandBuffer, execInfo);
@@ -1334,18 +1353,28 @@ ERHIResult FRenderer::CreatePipelineLayout()
 
     // Push Constant: 逐物体 Model 矩阵 (mat4 = 64 bytes, 顶点着色器可见)
     FRHIPushConstantRange pushConstantRange = {};
-    pushConstantRange.StageFlags = EShaderStage::Vertex;
+
+    // 片段着色器要读材质下标, 因此可见阶段必须包含它。
+    //
+    // 只写 Vertex 的话着色器编译能过 (SPIR-V 里就是声明了一块 push
+    // constant), 但绘制时片段阶段读到的是未定义内容 —— 表现为材质随机,
+    // 而验证层会报 push constant 范围与着色器声明不符。
+    pushConstantRange.StageFlags = EShaderStage::Vertex | EShaderStage::Fragment;
     pushConstantRange.Offset     = 0;
     pushConstantRange.Size       = sizeof(FModelPushConstant);
 
     // 3 套描述符集布局:
     //   set 0 = m_DescSetLayout       (ViewProj UBO + 棋盘格纹理)
-    //   set 1 = FMaterialManager 布局  (材质 UBO + 5 个纹理采样器)
+    //   set 1 = bindless 表           (材质 SSBO + 全局纹理数组)
     //   set 2 = FLightManager 布局    (光照 UBO)
+    //
+    // set 1 从"每材质一个描述符集"换成了一个全局集: 绘制时只绑一次,
+    // 材质靠 push constant 里的下标区分。这是 GPU 驱动渲染的前提 ——
+    // 间接绘制没有"逐 draw 绑描述符集"这回事。
     FRHIDescSetLayoutHandle setLayouts[3] =
     {
         m_DescSetLayout,
-        FMaterialManager::Get().GetDescSetLayout(),
+        m_BindlessTable.GetLayout(),
         FLightManager::Get().GetDescSetLayout()
     };
 
