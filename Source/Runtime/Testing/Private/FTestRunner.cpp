@@ -462,6 +462,14 @@ Int32 FTestRunner::Main(Int32 argc, AnsiChar** argv)
 
     const FTestRunSummary summary = RunAll(options);
 
+    // 零用例要给出原因, 否则只看到一个 1 会以为是断言失败。
+    if (summary.TotalTests == 0)
+    {
+        WriteLine("");
+        WriteLine("错误: 没有任何用例被执行 — 过滤器写错了, 还是套件改名了?");
+        WriteLine("      用 --list 看当前注册了哪些套件。");
+    }
+
     return summary.IsSuccess() ? 0 : 1;
 }
 

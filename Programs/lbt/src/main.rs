@@ -533,7 +533,15 @@ fn main() -> Result<()> {
             // 拦住过任何东西, 整套规则在 CI 里只是装饰。
             //
             // 警告与提示仍然不致命: 它们是建议, 不是约定。
-            if err_count > 0 {
+            // 源码规则的 Error 与模块配置的 Error 都要让进程非零退出。
+            //
+            // 原先只看 err_count (源码规则那一半), 而 config_result 只被用来
+            // 选打印分支 —— 于是"重复的模块名"之类的配置错误打印出 ❌ 却
+            // 退出 0。verify.ps1 紧接着跑的 validate --strict 恰好也能抓到
+            // 这一类, 所以整条流水线没漏; 但单独跑 lbt check 的人会被骗,
+            // 而这个子命令的名字正是在邀请人单独跑它。
+            if err_count > 0 || !config_result.is_valid()
+            {
                 std::process::exit(1);
             }
         }
@@ -1422,6 +1430,19 @@ fn main() -> Result<()> {
                         println!("  ... 还有 {} 条", diags.len() - 20);
                     }
                 }
+            }
+
+            // 构建失败必须以非零退出。
+            //
+            // scheduler.execute() 把失败包在 Ok(BuildResult{success:false})
+            // 里返回 —— 失败是一个 Ok 值, 所以上面的 ? 永远不会触发, 而这个
+            // 分支原先直接落到函数末尾的 Ok(())。
+            //
+            // 后果远不止"这一步没报错": verify.ps1 与 ci.yml 都按退出码判定,
+            // 构建失败之后那九步单元测试会跑**上一次成功构建留下的旧可执行
+            // 文件**并全部通过。一棵编译不过的树可以拿到满屏绿色。
+            if !build_result.success {
+                std::process::exit(1);
             }
         }
 

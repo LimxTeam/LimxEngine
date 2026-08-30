@@ -95,7 +95,17 @@ struct FTestRunSummary
     Float64 ElapsedSeconds = 0.0;
 
     /// 是否全部通过 — 跳过不算失败
-    LIMX_NODISCARD bool IsSuccess() const { return FailedTests == 0; }
+    ///
+    /// 一个用例都没跑到**不算通过**。零个用例意味着零个失败, 于是"没有
+    /// 失败"这个条件恒真 —— 而过滤器打错字、套件被改名、静态注册被链接器
+    /// 丢掉, 全都表现为零个用例。
+    ///
+    /// 这不是假想: ci.yml 与 verify.ps1 各有五步按字面名字过滤套件。把
+    /// BlendMode 改个名字, 那一步照样绿, 而它什么都没测。
+    LIMX_NODISCARD bool IsSuccess() const
+    {
+        return FailedTests == 0 && TotalTests > 0;
+    }
 };
 
 // ============================================================================

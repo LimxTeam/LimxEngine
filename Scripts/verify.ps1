@@ -93,10 +93,29 @@ function Invoke-Step {
     Write-Host ''
     Write-Host "[$Script:StepIndex] $Name" -ForegroundColor Cyan
 
+    # 先清空 —— $LASTEXITCODE 只由本机可执行文件写入, 不清空的话读到的
+    # 可能是**上一步**留下的值。
+    #
+    # 而"清空之后仍然是 null"恰恰意味着这一步根本没有跑起来任何程序:
+    # 可执行文件不存在时 PowerShell 抛的是非终止错误, 在
+    # $ErrorActionPreference='Continue' 下被 2>&1 吞进 $output, 而
+    # $LASTEXITCODE 一动不动。
+    #
+    # 实测: 把本脚本放进一个完全没有 Binaries/ 目录的树里跑 -SkipTools,
+    # 十六步全绿、退出 0。而 Binaries/ 是 gitignore 的 —— 也就是说任何
+    # 新克隆或 git clean 之后的树都会这样。
+    $global:LASTEXITCODE = $null
+
     $output = & $Action 2>&1
     $exitCode = $LASTEXITCODE
 
-    if ($null -eq $exitCode) { $exitCode = 0 }
+    if ($null -eq $exitCode)
+    {
+        Write-Host '    失败 (命令未执行 — 可执行文件缺失?)' -ForegroundColor Red
+        $output | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" }
+        $Script:Failures += $Name
+        return
+    }
 
     if ($exitCode -ne 0) {
         Write-Host "    失败 (退出码 $exitCode)" -ForegroundColor Red
@@ -131,9 +150,29 @@ function Invoke-Engine {
     $stdout = Join-Path $env:TEMP 'limx_verify_stdout.txt'
     $stderr = Join-Path $env:TEMP 'limx_verify_stderr.txt'
 
+    # 可执行文件不存在时 Start-Process 抛非终止错误, $process 留在 $null,
+    # 于是 $process.ExitCode 也是 $null —— 回填给 $LASTEXITCODE 之后就成了
+    # "未设置", 而 Invoke-Step 曾把未设置当成 0。
+    #
+    # 这是上面那个 GUI 子系统 bug 的残留分支: -Wait -PassThru 解决了"不等待",
+    # 没有解决"根本没启动"。
+    if (-not (Test-Path $EngineExe))
+    {
+        Write-Host "    引擎可执行文件不存在: $EngineExe" -ForegroundColor Red
+        $global:LASTEXITCODE = 127
+        return
+    }
+
     $process = Start-Process -FilePath $EngineExe -ArgumentList $Arguments `
         -WorkingDirectory $RootDir -Wait -PassThru -NoNewWindow `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+    if ($null -eq $process)
+    {
+        Write-Host '    进程未能启动' -ForegroundColor Red
+        $global:LASTEXITCODE = 127
+        return
+    }
 
     foreach ($file in @($stdout, $stderr)) {
         if (Test-Path $file) {
