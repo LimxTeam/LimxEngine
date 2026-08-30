@@ -179,6 +179,14 @@ jobs:
       #
       # 这条路是被逼出来的 —— 该测试在本地和干净克隆里都通过, 只在 CI 上
       # 失败, 而失败原因看不到。
+      # 启动探针 —— 只列举用例, 不执行任何断言。
+      #
+      # 用来区分两种完全不同的失败: 进程根本起不来 (加载失败、静态初始化
+      # 崩溃), 还是某条断言真的不成立。BlendMode 那几条是纯枚举往返, 不
+      # 可能因机器不同而失败, 所以更像是前者 —— 而它恰好是第一个步骤。
+      - name: 引擎层测试 · 启动探针
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --list
+
       - name: 引擎层测试 · BlendMode
         run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite BlendMode
 

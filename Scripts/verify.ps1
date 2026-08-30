@@ -327,6 +327,11 @@ Invoke-Step 'AssetTests' {
 # 展开写而不是 foreach 循环: 循环里命令行是 "--suite $suite", 文本上与
 # ci.yml 的 "--suite BlendMode" 对不上, ci-parity.ps1 会把五条都报成
 # "CI 独有"。这条检查抓到过我自己 —— 它就该抓得到。
+# 启动探针 —— 与 ci.yml 保持一致, 见那边的说明
+Invoke-Step '引擎层测试 · 启动探针' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --list
+}
+
 Invoke-Step '引擎层测试 · BlendMode' {
     .\Binaries\Development\Win64\LimxEngineTests.exe --suite BlendMode
 }
