@@ -352,9 +352,19 @@ private:
     /// 表现是"环境光没了", 白色则是"整个场景发白" —— 前者更容易定位。
     ERHIResult CreateFallbackCubeMap();
 
-    /// 把辐照度视图写进全部帧的光照描述符集
-    void UpdateIrradianceDescriptors(FRHITextureViewHandle irradianceView,
-                                     FRHISamplerHandle     sampler);
+    /// 创建 1x1 黑色 2D 纹理 —— 没有环境贴图时 BRDF 查找表的描述符占位
+    ERHIResult CreateFallbackLut();
+
+    /// 把 IBL 的三张贴图写进全部帧的光照描述符集
+    ///
+    /// 三张一起写而非分别写: 它们要么全部来自同一个环境贴图, 要么全部是
+    /// 占位图。分开写会允许出现"辐照度是新的、预滤波还是旧的"这种半绑定
+    /// 状态, 而那种状态渲染出来只是颜色略微不对, 极难察觉。
+    void UpdateIblDescriptors(FRHITextureViewHandle irradianceView,
+                              FRHITextureViewHandle prefilteredView,
+                              FRHITextureViewHandle brdfLutView,
+                              FRHISamplerHandle     cubeSampler,
+                              FRHISamplerHandle     lutSampler);
 
     /// 销毁纹理资源 (纹理 + 纹理视图 + 采样器)
     void DestroyTextureResources();
@@ -409,6 +419,9 @@ private:
     FRHITextureHandle                 m_FallbackCubeTexture;
     FRHITextureViewHandle             m_FallbackCubeView;
     FRHISamplerHandle                 m_FallbackCubeSampler;
+
+    FRHITextureHandle                 m_FallbackLutTexture;
+    FRHITextureViewHandle             m_FallbackLutView;
 
     /// IBL 强度倍数 —— 与天空强度分开记, 两者的合适取值往往不同
     Float32                           m_IblIntensity = 1.0f;

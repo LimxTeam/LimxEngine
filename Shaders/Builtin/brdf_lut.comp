@@ -1,0 +1,102 @@
+#version 450
+
+// ============================================================
+// 环境 BRDF 查找表 — split-sum 近似的后一半
+//
+// 存的是什么:
+//   ∫ f(l,v) (n·l) dl 在把菲涅尔按 Schlick 展开后可以写成
+//     F0 · A + B
+//   其中 A、B 只依赖 (n·v, roughness) 两个标量 —— 与环境、与 F0 都无关。
+//   因此它是一张**与场景无关的常量表**: 同一份数据对任何 HDRI、任何材质
+//   都成立, 算一次即可。
+//
+//   R 通道 = A (F0 的系数), G 通道 = B (常数偏置)。
+//
+// 为什么必须自己算而不能查经验公式:
+//   A、B 的形状取决于所用的几何遮蔽项与重要性采样分布。换一套 G 或换一种
+//   采样, 表就不一样。用别处抄来的表配自己的 GGX, 掠射角处会差出十几个
+//   百分点 —— 表现为物体边缘的反射偏弱或偏强, 而这看着完全像是菲涅尔
+//   参数没调好。
+//
+// 边界处理:
+//   n·v 取 0 时 G_Vis 的分母为零。表的第一列因此从半个纹素处起算
+//   (与所有纹素一致地取中心), 天然避开了 0。
+// ============================================================
+
+#include "ibl_common.h"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D brdfLut;
+
+layout(push_constant) uniform Params {
+    uint  faceSize;         // 查找表边长
+    float sampleDelta;      // 本着色器不用
+    float sourceMipLevel;   // 本着色器不用
+    float roughness;        // 本着色器不用 (粗糙度是纵轴)
+    uint  sourceFaceSize;   // 本着色器不用
+    uint  sampleCount;
+    uint  _pad0;
+    uint  _pad1;
+} params;
+
+vec2 IntegrateBrdf(float NdotV, float roughness, uint sampleCount)
+{
+    // 把问题放到切空间: N 固定为 +Z, V 落在 XZ 平面内。
+    // 各向同性 BRDF 与方位角无关, 因此这样不损失一般性。
+    const vec3 V = vec3(sqrt(max(1.0 - NdotV * NdotV, 0.0)), 0.0, NdotV);
+    const vec3 N = vec3(0.0, 0.0, 1.0);
+
+    float scale = 0.0;
+    float bias  = 0.0;
+
+    for (uint i = 0u; i < sampleCount; ++i)
+    {
+        const vec2 Xi = Hammersley(i, sampleCount);
+        const vec3 H  = ImportanceSampleGGX(Xi, N, roughness);
+        const vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+
+        const float NdotL = max(L.z, 0.0);
+
+        if (NdotL <= 0.0)
+        {
+            continue;
+        }
+
+        const float NdotH = max(H.z, 0.0);
+        const float VdotH = max(dot(V, H), 0.0);
+
+        const float G = GeometrySmithIbl(NdotV, NdotL, roughness);
+
+        // 重要性采样的 pdf 与被积项里的 D、NdotL 约掉后剩下这一项
+        const float visibility = (G * VdotH) / max(NdotH * NdotV, 1e-7);
+
+        // Schlick 菲涅尔按 F0 展开: F = F0·(1-Fc) + Fc
+        const float Fc = pow(1.0 - VdotH, 5.0);
+
+        scale += (1.0 - Fc) * visibility;
+        bias  += Fc * visibility;
+    }
+
+    return vec2(scale, bias) / float(sampleCount);
+}
+
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+
+    if (id.x >= params.faceSize || id.y >= params.faceSize)
+    {
+        return;
+    }
+
+    // 取纹素中心 —— 也顺带让第一列的 n·v 不为零
+    const vec2 coordinate = (vec2(id) + 0.5) / float(params.faceSize);
+
+    const float NdotV     = coordinate.x;
+    const float roughness = coordinate.y;
+
+    const vec2 result = IntegrateBrdf(NdotV, roughness, params.sampleCount);
+
+    imageStore(brdfLut, ivec2(id), vec4(result, 0.0, 1.0));
+}

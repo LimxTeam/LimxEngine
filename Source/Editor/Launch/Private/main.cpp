@@ -117,6 +117,18 @@ struct FLaunchOptions
     /// 这是能用一行数字判定卷积对错的地方。
     bool ProbeIrradiance = false;
 
+    /// 材质阵列的边长; 0 表示不构建
+    ///
+    /// 横向扫粗糙度、纵向扫金属度的球体阵列 —— 验证 IBL 的标准场景。
+    UInt32 MaterialGrid = 0;
+
+    /// 是否输出 BRDF 查找表的采样网格
+    ///
+    /// 这张表有一条硬性质可以自查: F0=1 时 A+B 应当 ≤1 且在低粗糙度下
+    /// 接近 1 —— 入射能量既不被凭空放大也不被吞掉。数值一取回来就能验,
+    /// 不必等到画面上看出金属偏暗。
+    bool ProbeBrdf = false;
+
     /// 截屏输出路径 (.ppm); 为空时不截屏
     ///
     /// 渲染改动的验收最终要落到画面上。没有一条把画面拷出显存的通路,
@@ -288,6 +300,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --camera-yaw R   固定相机偏航角 (弧度)
 ///   --camera-pitch R 固定相机俯仰角 (弧度)
 ///   --probe-irradiance 输出辐照度贴图六个面的中心值 (数值校验用)
+///   --probe-brdf     输出 BRDF 查找表的采样网格 (数值校验用)
+///   --material-grid N  构建 N×N 球体阵列 (横向粗糙度, 纵向金属度)
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -400,6 +414,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--probe-irradiance"))
         {
             options.ProbeIrradiance = true;
+        }
+        else if (WideEquals(arg, L"--probe-brdf"))
+        {
+            options.ProbeBrdf = true;
+        }
+        else if (WideEquals(arg, L"--material-grid") && (i + 1) < tokenCount)
+        {
+            options.MaterialGrid = ParseUInt32(tokens[++i], 0);
         }
     }
 
@@ -712,6 +734,58 @@ static bool LoadEnvironmentMap(FEnvironmentMap& environmentMap,
         }
     }
 
+    if (options.ProbeBrdf)
+    {
+        TArray<Float32> lut;
+        UInt32          size = 0;
+
+        if (environmentMap.ReadbackBrdfLut(context, lut, size))
+        {
+            // 5x5 网格 —— 足以看出表的整体形状与边界行为,
+            // 又少到能直接与参考实现逐个对照
+            constexpr UInt32 kSteps = 5;
+
+            Float32 worstSum = 0.0f;
+
+            for (UInt32 ry = 0; ry < kSteps; ++ry)
+            {
+                for (UInt32 rx = 0; rx < kSteps; ++rx)
+                {
+                    const UInt32 x = (size - 1) * rx / (kSteps - 1);
+                    const UInt32 y = (size - 1) * ry / (kSteps - 1);
+
+                    const SizeType index =
+                        (static_cast<SizeType>(y) * size + x) * 2;
+
+                    const Float32 a = lut[index];
+                    const Float32 b = lut[index + 1];
+
+                    // 纹素中心的坐标 —— 与着色器里的取法一致
+                    const Float32 nDotV     = (static_cast<Float32>(x) + 0.5f) /
+                                              static_cast<Float32>(size);
+                    const Float32 roughness = (static_cast<Float32>(y) + 0.5f) /
+                                              static_cast<Float32>(size);
+
+                    LIMX_LOG(LogLaunch, Display,
+                             "[BRDF] NdotV={} rough={} → A={} B={} A+B={}",
+                             nDotV, roughness, a, b, a + b);
+
+                    if (a + b > worstSum)
+                    {
+                        worstSum = a + b;
+                    }
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[BRDF] 网格内 A+B 的最大值 = {} (必须 <= 1)", worstSum);
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Warning, "[Launch] BRDF 查找表回读失败");
+        }
+    }
+
     renderer->SetEnvironmentMap(&environmentMap);
     renderer->SetSkyIntensity(options.SkyIntensity);
     renderer->SetIblIntensity(options.IblIntensity);
@@ -807,6 +881,115 @@ static void BuildDemoScene(LScene* scene, FRenderContext* context,
     LIMX_LOG(LogLaunch, Log,
              "[Launch] LScene 构建完成 — {} 个节点",
              scene->GetNodeCount());
+}
+
+// ============================================================================
+// BuildMaterialGrid — 粗糙度 × 金属度 的球体阵列
+//
+// 这是验证 IBL 的标准场景, 理由是它把两个自由度摊平成一张图:
+//   横向扫粗糙度 —— 预滤波的每一级 mip 都会被看到。级间映射错位、某一级
+//     根本没写、mip 选取偏一档, 都会在这一行上表现为某个位置突然跳变。
+//   纵向扫金属度 —— 顶行是纯电介质 (只有微弱边缘反射), 底行是纯金属
+//     (漫反射为零, 全靠镜面环境项)。金属那一行是否有内容, 直接判定
+//     镜面 IBL 到底接没接上。
+//
+// 用统一的白色基色而非彩色: 反射的颜色应当来自环境, 基色一花, 就分不清
+// 看到的是环境的颜色还是材质自己的颜色。
+// ============================================================================
+
+static void BuildMaterialGrid(LScene* scene, FRenderContext* context,
+                              FRenderer* renderer, UInt32 gridSize)
+{
+    LIMX_CHECK(scene != nullptr);
+    LIMX_CHECK(context != nullptr);
+    LIMX_CHECK(renderer != nullptr);
+
+    if (gridSize < 2)
+    {
+        gridSize = 2;
+    }
+
+    FRenderResourceManager& resources = context->GetResourceManager();
+
+    FMeshData sphereMesh = FGeometryGenerator::GenerateSphere(0.45f, 48, 24);
+
+    // 生成器把经纬度映射成了色相 —— 那是演示场景的观感取向, 放在这里
+    // 会毁掉整个用意: 反射的颜色应当来自环境, 顶点色一花, 就分不清看到的
+    // 是环境的颜色还是网格自带的颜色。这里统一压成白色。
+    for (SizeType i = 0; i < sphereMesh.Vertices.GetSize(); ++i)
+    {
+        sphereMesh.Vertices[i].Color = FVector4(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    const FMeshResourceHandle meshHandle =
+        resources.CreateMesh(sphereMesh, FName("MaterialGridSphere"));
+
+    if (!meshHandle.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 材质阵列网格上传失败");
+        return;
+    }
+
+    constexpr Float32 kSpacing = 1.15f;
+
+    const Float32 halfSpan =
+        static_cast<Float32>(gridSize - 1) * kSpacing * 0.5f;
+
+    const Float32 lastIndex = static_cast<Float32>(gridSize - 1);
+
+    for (UInt32 row = 0; row < gridSize; ++row)
+    {
+        for (UInt32 column = 0; column < gridSize; ++column)
+        {
+            FMaterial* material =
+                FMaterialManager::Get().CreateMaterial("GridMaterial");
+
+            if (material == nullptr)
+            {
+                LIMX_LOG(LogLaunch, Error, "[Launch] 材质阵列材质创建失败");
+                return;
+            }
+
+            // 粗糙度不取到 0: 完全光滑的表面反射的是未经滤波的环境贴图,
+            // 一个像素就能映出太阳, 结果是一片刺眼的白点 —— 那考的是
+            // 色调映射而非预滤波。0.05 起步已经足够看清最光滑那一档。
+            const Float32 roughness =
+                0.05f + 0.95f * static_cast<Float32>(column) / lastIndex;
+
+            const Float32 metallic =
+                static_cast<Float32>(row) / lastIndex;
+
+            material->SetBaseColor(FVector4(0.9f, 0.9f, 0.9f, 1.0f));
+            material->SetRoughness(roughness);
+            material->SetMetallic(metallic);
+
+            FTransform nodeTransform;
+            nodeTransform.Translation = FVector3(
+                static_cast<Float32>(column) * kSpacing - halfSpan,
+                halfSpan - static_cast<Float32>(row) * kSpacing,
+                0.0f);
+
+            LNode* node =
+                scene->SpawnNode<LNode>(FName("GridNode"), nodeTransform);
+
+            LMeshTrait* meshTrait = node->AddTrait<LMeshTrait>(FName("Mesh"));
+            meshTrait->SetMesh(&resources, meshHandle);
+            meshTrait->SetMaterial(material);
+            meshTrait->SetVisible(true);
+        }
+    }
+
+    // 交出创建时的所有权 —— 每个节点都已各自加过引用
+    resources.ReleaseMeshReference(meshHandle);
+
+    // 正对阵列中心 —— 阵列铺在 XY 平面上, 相机沿 -Z 看过去
+    renderer->GetCamera().SetPosition(
+        FVector3(0.0f, 0.0f, halfSpan * 2.4f + 1.5f));
+    renderer->GetCamera().SetRotation(0.0f, 0.0f);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Launch] 材质阵列已构建 — {}x{} (横向粗糙度, 纵向金属度)",
+             gridSize, gridSize);
 }
 
 // ============================================================================
@@ -1326,6 +1509,11 @@ int WINAPI wWinMain(
                      "[Launch] 资产导入失败, 回退到内置演示场景");
             BuildDemoScene(scene, &renderContext, &renderer);
         }
+    }
+    else if (launchOptions.MaterialGrid > 0)
+    {
+        BuildMaterialGrid(scene, &renderContext, &renderer,
+                          launchOptions.MaterialGrid);
     }
     else if (launchOptions.GridSize > 0)
     {

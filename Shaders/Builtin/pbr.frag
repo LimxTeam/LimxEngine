@@ -69,7 +69,7 @@ layout(row_major, set = 2, binding = 0) uniform LightingUBO {
     mat4      cascadeViewProj[3];  // 各级联的视图投影矩阵
     vec4      cascadeSplits;         // xyz=各级外边界的径向距离
     vec4      shadowParams;          // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
-    vec4      iblParams;             // x=启用 IBL, y=IBL 强度倍数
+    vec4      iblParams;             // x=启用 IBL, y=强度, z=预滤波最高 mip
 } lighting;
 
 // ── 阴影贴图数组 (set 2, binding 1) ──
@@ -88,6 +88,18 @@ layout(set = 2, binding = 1) uniform sampler2DArrayShadow shadowMap;
 // 没有环境贴图时这里绑的是一张 1x1 黑图, 由 iblParams.x 决定是否采用 ——
 // 描述符必须始终有效, 靠分支跳过采样并不能免除这一点。
 layout(set = 2, binding = 2) uniform samplerCube irradianceMap;
+
+// ── 镜面预滤波立方体贴图 (set 2, binding 3) ──
+//
+// mip 级对应粗糙度: 0 是完全光滑, 最后一级最粗糙。采样时用
+// roughness * iblParams.z 换算 LOD, 硬件的三线性过滤负责级间插值。
+layout(set = 2, binding = 3) uniform samplerCube prefilteredMap;
+
+// ── 环境 BRDF 查找表 (set 2, binding 4) ──
+//
+// R = F0 的系数, G = 常数偏置。它与环境、与材质都无关, 只依赖
+// (n·v, 粗糙度) —— 因此是一张算一次就能一直用的常量表。
+layout(set = 2, binding = 4) uniform sampler2D brdfLut;
 
 const int SHADOW_CASCADE_COUNT = 3;
 
@@ -151,6 +163,21 @@ float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
 vec3 FresnelSchlick(float cosTheta, vec3 F0)
 {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// 带粗糙度修正的菲涅尔 —— 只用于环境项
+//
+// 标准 Schlick 在掠射角一律涨到 1, 那是完全光滑表面的行为。粗糙表面的
+// 微平面朝向各异, 掠射角下真正对齐到镜面方向的比例低得多, 反射因此
+// 达不到 1。不修正的话粗糙金属边缘会镶一圈过亮的白边。
+//
+// max(1-roughness, F0) 是 Sébastien Lagarde 给出的近似: 粗糙度越高,
+// 掠射角的上限越低, 而下限始终不低于 F0 本身。
+vec3 FresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
+{
+    vec3 ceiling = max(vec3(1.0 - roughness), F0);
+
+    return F0 + (ceiling - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
 // ============================================================
@@ -497,15 +524,40 @@ void main()
 
     if (lighting.iblParams.x > 0.5)
     {
+        const float NdotV = max(dot(N, V), 0.0);
+
         // 环境项的菲涅尔用几何法线与视线的夹角, 而非某个具体半程向量 ——
         // 环境光来自所有方向, 没有单一的半程向量可言。
-        vec3  F_ambient  = FresnelSchlick(max(dot(N, V), 0.0), F0);
-        vec3  kD_ambient = (vec3(1.0) - F_ambient) * (1.0 - metallic);
+        //
+        // 用带粗糙度的变体: 粗糙表面在掠射角的反射不会像光滑表面那样
+        // 涨到 1。不修正的话粗糙金属的边缘会镶上一圈过亮的白边。
+        vec3 F_ambient = FresnelSchlickRoughness(NdotV, F0, roughness);
 
-        vec3 irradiance = texture(irradianceMap, N).rgb
-                        * lighting.iblParams.y;
+        // ---- 漫反射项 ----
+        vec3 kD_ambient = (vec3(1.0) - F_ambient) * (1.0 - metallic);
 
-        ambient = kD_ambient * irradiance * albedo * ao;
+        vec3 irradiance = texture(irradianceMap, N).rgb;
+        vec3 diffuseIbl = kD_ambient * irradiance * albedo;
+
+        // ---- 镜面项 (split-sum) ----
+        //
+        //   ∫ L·f·(n·l) dl ≈ [预滤波贴图] · [F0·A + B]
+        //
+        // 反射方向按粗糙度选 mip。roughness 与 LOD 的映射必须与预滤波时
+        // "粗糙度在各级之间线性铺开"严格互逆, 否则某一档粗糙度会取到
+        // 邻近档的内容 —— 表现是粗糙度调节的手感不对, 而非明显的错误。
+        vec3  R        = reflect(-V, N);
+        float lod      = roughness * lighting.iblParams.z;
+        vec3  prefiltered = textureLod(prefilteredMap, R, lod).rgb;
+
+        vec2 envBrdf = texture(brdfLut, vec2(NdotV, roughness)).rg;
+
+        vec3 specularIbl = prefiltered * (F0 * envBrdf.x + envBrdf.y);
+
+        // 环境遮蔽同时作用于两项。严格说镜面该用单独的镜面遮蔽项,
+        // 但那需要额外的贴图; 共用 ao 是通行做法, 偏差主要出现在
+        // 缝隙深处 —— 那里本来也几乎看不到反射。
+        ambient = (diffuseIbl + specularIbl) * ao * lighting.iblParams.y;
     }
     else
     {

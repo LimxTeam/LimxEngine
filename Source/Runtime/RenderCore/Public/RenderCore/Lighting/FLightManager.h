@@ -147,16 +147,22 @@ public:
     ///
     /// 启用后片段着色器的环境项改用辐照度贴图, 常数环境光不再参与 ——
     /// 两者相加会让环境光被计两次, 表现为开启 IBL 后场景整体偏亮偏灰。
-    void EnableIbl(Float32 intensity)
+    void EnableIbl(Float32 intensity, Float32 prefilteredMaxLod)
     {
-        m_IsIblEnabled = true;
-        m_IblIntensity = intensity;
+        m_IsIblEnabled        = true;
+        m_IblIntensity        = intensity;
+        m_IblPrefilteredMaxLod = prefilteredMaxLod;
     }
 
     /// 关闭 IBL — 环境项退回常数环境光
     void DisableIbl() { m_IsIblEnabled = false; }
 
     LIMX_NODISCARD bool IsIblEnabled() const { return m_IsIblEnabled; }
+
+    LIMX_NODISCARD Float32 GetIblPrefilteredMaxLod() const
+    {
+        return m_IblPrefilteredMaxLod;
+    }
 
     // ====================================================================
     // GPU 资源访问器 (供集成者使用)
@@ -193,9 +199,10 @@ private:
     FCascadedShadowInfo m_ShadowInfo;
     bool                m_IsShadowEnabled = false;
 
-    /// IBL 开关与强度 —— 随光照 UBO 一同上传
-    bool                m_IsIblEnabled = false;
-    Float32             m_IblIntensity = 1.0f;
+    /// IBL 开关、强度与预滤波 LOD 上限 —— 随光照 UBO 一同上传
+    bool                m_IsIblEnabled         = false;
+    Float32             m_IblIntensity         = 1.0f;
+    Float32             m_IblPrefilteredMaxLod = 0.0f;
 
     /// RHI 设备 (非拥有指针)
     IRHIDevice*                 m_Device = nullptr;

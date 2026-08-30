@@ -55,20 +55,25 @@ constexpr UInt32 kMaxFaceSize = 4096;
 /// 半精度浮点能表示的最大有限值
 constexpr Float32 kHalfMaxValue = 65504.0f;
 
-/// 推送常量 —— 两个着色器共用同一块布局
+/// 推送常量 —— 四个着色器共用同一块布局
 ///
-/// 第二个字段在等距转换里没有意义 (会被忽略), 但两趟共用一个布局
-/// 意味着少一份管线布局、少一次"这次该填哪个结构"的判断。
+/// 每个着色器只用其中几个字段, 其余原样忽略。共用一块布局意味着只需一份
+/// 管线布局定义, 也省掉了"这一趟该填哪个结构"的判断 —— 而那正是最容易
+/// 出错的地方: 填错了不会报错, 只会算出一张看着差不多的贴图。
 struct FConvertPushConstant
 {
     UInt32  FaceSize       = 0;
     Float32 SampleDelta    = 0.0f;
     Float32 SourceMipLevel = 0.0f;
+    Float32 Roughness      = 0.0f;
+    UInt32  SourceFaceSize = 0;
+    UInt32  SampleCount    = 0;
     UInt32  Pad0           = 0;
+    UInt32  Pad1           = 0;
 };
 
-static_assert(sizeof(FConvertPushConstant) == 16,
-              "FConvertPushConstant 必须为 16 字节以匹配着色器布局");
+static_assert(sizeof(FConvertPushConstant) == 32,
+              "FConvertPushConstant 必须为 32 字节以匹配着色器布局");
 
 /// 面边长向上取到线程组边长的整数倍
 UInt32 AlignFaceSize(UInt32 faceSize)
@@ -151,14 +156,21 @@ public:
     LIMX_NON_COPYABLE(FComputePass);
     LIMX_NON_MOVABLE(FComputePass);
 
-    ERHIResult Create(IRHIDevice*           device,
-                      const AnsiChar*       shaderPath,
-                      const AnsiChar*       debugName,
-                      FRHITextureViewHandle sourceView,
-                      FRHISamplerHandle     sourceSampler,
-                      FRHITextureViewHandle targetStorageView)
+    /// @param sourceView   源贴图视图; 无效表示本趟不需要输入 (BRDF 查找表)
+    /// @param storageViews 输出存储视图数组 —— 每个视图分配一个描述符集
+    ///
+    /// 逐视图一个描述符集而非逐视图重建管线: 预滤波要逐级 mip 写入, 六级
+    /// 之间只有绑定的存储视图与粗糙度不同, 管线与布局完全一样。
+    ERHIResult Create(IRHIDevice*                  device,
+                      const AnsiChar*              shaderPath,
+                      const AnsiChar*              debugName,
+                      FRHITextureViewHandle        sourceView,
+                      FRHISamplerHandle            sourceSampler,
+                      const FRHITextureViewHandle* storageViews,
+                      UInt32                       storageViewCount)
     {
-        m_Device = device;
+        m_Device    = device;
+        m_HasSource = sourceView.IsValid();
 
         FShaderManager& shaderManager = FShaderManager::Get();
 
@@ -175,20 +187,30 @@ public:
             return result;
         }
 
+        // 没有输入贴图时 binding 0 整个不出现。绑定号不必连续, 而声明一个
+        // 着色器根本没用到的描述符会让验证层抱怨"布局与着色器不匹配"。
         FRHIDescriptorBinding bindings[2] = {};
-        bindings[0].Binding    = 0;
-        bindings[0].Type       = EDescriptorType::CombinedImageSampler;
-        bindings[0].Count      = 1;
-        bindings[0].StageFlags = EShaderStage::Compute;
+        UInt32                bindingCount = 0;
 
-        bindings[1].Binding    = 1;
-        bindings[1].Type       = EDescriptorType::StorageImage;
-        bindings[1].Count      = 1;
-        bindings[1].StageFlags = EShaderStage::Compute;
+        if (m_HasSource)
+        {
+            bindings[bindingCount].Binding    = 0;
+            bindings[bindingCount].Type       =
+                EDescriptorType::CombinedImageSampler;
+            bindings[bindingCount].Count      = 1;
+            bindings[bindingCount].StageFlags = EShaderStage::Compute;
+            ++bindingCount;
+        }
+
+        bindings[bindingCount].Binding    = 1;
+        bindings[bindingCount].Type       = EDescriptorType::StorageImage;
+        bindings[bindingCount].Count      = 1;
+        bindings[bindingCount].StageFlags = EShaderStage::Compute;
+        ++bindingCount;
 
         FRHIDescSetLayoutDesc layoutDesc = {};
         layoutDesc.Bindings     = bindings;
-        layoutDesc.BindingCount = 2;
+        layoutDesc.BindingCount = bindingCount;
         layoutDesc.DebugName    = debugName;
 
         result = device->CreateDescSetLayout(layoutDesc, m_DescSetLayout);
@@ -218,27 +240,44 @@ public:
             return result;
         }
 
-        result = device->AllocateDescriptorSet(m_DescSetLayout,
-                                               m_DescriptorSet);
+        m_DescriptorSets.Reserve(storageViewCount);
 
-        if (!IsRHISuccess(result))
+        for (UInt32 i = 0; i < storageViewCount; ++i)
         {
-            return result;
+            FRHIDescriptorSetHandle descriptorSet;
+
+            result = device->AllocateDescriptorSet(m_DescSetLayout,
+                                                   descriptorSet);
+
+            if (!IsRHISuccess(result))
+            {
+                return result;
+            }
+
+            FRHIDescriptorWrite writes[2] = {};
+            UInt32              writeCount = 0;
+
+            if (m_HasSource)
+            {
+                writes[writeCount] =
+                    FRHIDescriptorWrite::CombinedImageSampler(
+                        descriptorSet, 0, sourceView, sourceSampler,
+                        EImageLayout::ShaderReadOnly);
+                ++writeCount;
+            }
+
+            // 存储图像必须以 General 布局绑定 —— 它是唯一允许着色器写入的
+            writes[writeCount].DescriptorSet = descriptorSet;
+            writes[writeCount].Binding       = 1;
+            writes[writeCount].Type          = EDescriptorType::StorageImage;
+            writes[writeCount].ImageView     = storageViews[i];
+            writes[writeCount].ImageLayout   = EImageLayout::General;
+            ++writeCount;
+
+            device->UpdateDescriptorSets(writes, writeCount);
+
+            m_DescriptorSets.Add(descriptorSet);
         }
-
-        FRHIDescriptorWrite writes[2] = {};
-        writes[0] = FRHIDescriptorWrite::CombinedImageSampler(
-            m_DescriptorSet, 0, sourceView, sourceSampler,
-            EImageLayout::ShaderReadOnly);
-
-        // 存储图像必须以 General 布局绑定 —— 它是唯一允许着色器写入的布局
-        writes[1].DescriptorSet = m_DescriptorSet;
-        writes[1].Binding       = 1;
-        writes[1].Type          = EDescriptorType::StorageImage;
-        writes[1].ImageView     = targetStorageView;
-        writes[1].ImageLayout   = EImageLayout::General;
-
-        device->UpdateDescriptorSets(writes, 2);
 
         FRHIComputePipelineDesc pipelineDesc = {};
         pipelineDesc.ComputeShader.Shader     = m_Shader;
@@ -250,48 +289,33 @@ public:
         return device->CreateComputePipeline(pipelineDesc, m_Pipeline);
     }
 
-    /// 录制一次完整的转换: 布局转换 → 分派 → 转为着色器只读
+    /// 录制一次分派 —— **不含**任何布局转换
+    ///
+    /// 转换留给调用方: 一次写一级 mip 与一次写整张贴图, 需要的屏障范围
+    /// 完全不同, 塞进这里只会变成一堆参数和分支。
     void Dispatch(IRHICommandBuffer*          commandBuffer,
-                  FRHITextureHandle           targetTexture,
-                  UInt32                      faceSize,
+                  UInt32                      setIndex,
+                  UInt32                      groupCountX,
+                  UInt32                      groupCountY,
+                  UInt32                      groupCountZ,
                   const FConvertPushConstant& pushConstant) const
     {
-        commandBuffer->TransitionImageLayout(
-            targetTexture,
-            EImageLayout::Undefined,
-            EImageLayout::General,
-            EPipelineStageFlags::TopOfPipe,
-            EPipelineStageFlags::ComputeShader,
-            EAccessFlags::None,
-            EAccessFlags::ShaderWrite,
-            0, 1, 0, kCubeFaceCount);
+        if (setIndex >= m_DescriptorSets.GetSize())
+        {
+            return;
+        }
 
         commandBuffer->BindComputePipeline(m_Pipeline);
 
         commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
-                                         m_PipelineLayout, 0, m_DescriptorSet);
+                                         m_PipelineLayout, 0,
+                                         m_DescriptorSets[setIndex]);
 
         commandBuffer->PushConstants(m_PipelineLayout, EShaderStage::Compute,
                                      0, sizeof(FConvertPushConstant),
                                      &pushConstant);
 
-        const UInt32 groupCount = faceSize / kThreadGroupSize;
-
-        commandBuffer->Dispatch(groupCount, groupCount, kCubeFaceCount);
-
-        // 写完转为着色器只读 —— 这次转换同时充当"计算写"到"后续读"的屏障。
-        // 目标阶段同时包含计算与片段: 环境贴图接下来既要被辐照度卷积
-        // (计算) 读, 又要被天空盒 (片段) 读。
-        commandBuffer->TransitionImageLayout(
-            targetTexture,
-            EImageLayout::General,
-            EImageLayout::ShaderReadOnly,
-            EPipelineStageFlags::ComputeShader,
-            EPipelineStageFlags::ComputeShader |
-                EPipelineStageFlags::FragmentShader,
-            EAccessFlags::ShaderWrite,
-            EAccessFlags::ShaderRead,
-            0, 1, 0, kCubeFaceCount);
+        commandBuffer->Dispatch(groupCountX, groupCountY, groupCountZ);
     }
 
     void Release()
@@ -306,10 +330,12 @@ public:
             m_Device->DestroyComputePipeline(m_Pipeline);
         }
 
-        if (m_DescriptorSet.IsValid())
+        for (SizeType i = 0; i < m_DescriptorSets.GetSize(); ++i)
         {
-            m_Device->FreeDescriptorSet(m_DescriptorSet);
+            m_Device->FreeDescriptorSet(m_DescriptorSets[i]);
         }
+
+        m_DescriptorSets.Clear();
 
         if (m_PipelineLayout.IsValid())
         {
@@ -330,13 +356,24 @@ public:
     }
 
 private:
-    IRHIDevice*               m_Device = nullptr;
-    FRHIShaderHandle          m_Shader;
-    FRHIDescSetLayoutHandle   m_DescSetLayout;
-    FRHIDescriptorSetHandle   m_DescriptorSet;
-    FRHIPipelineLayoutHandle  m_PipelineLayout;
-    FRHIComputePipelineHandle m_Pipeline;
+    IRHIDevice*                     m_Device    = nullptr;
+    bool                            m_HasSource = false;
+    FRHIShaderHandle                m_Shader;
+    FRHIDescSetLayoutHandle         m_DescSetLayout;
+    TArray<FRHIDescriptorSetHandle> m_DescriptorSets;
+    FRHIPipelineLayoutHandle        m_PipelineLayout;
+    FRHIComputePipelineHandle       m_Pipeline;
 };
+
+/// 按线程组边长算分派数, 向上取整
+///
+/// 向上取整而非整除: 预滤波最后几级 mip 的面只有 4x4, 整除会得到 0 个
+/// 线程组 —— 那一级根本不会被写, 留下的是未初始化的显存, 表现为最粗糙的
+/// 反射变成一片噪声。着色器里的边界判断负责丢弃多出来的线程。
+UInt32 ComputeGroupCount(UInt32 extent)
+{
+    return (extent + kThreadGroupSize - 1) / kThreadGroupSize;
+}
 
 } // namespace
 
@@ -356,10 +393,12 @@ void FCubeResource::Release(IRHIDevice* device)
         device->DestroyTextureView(SampleView);
     }
 
-    if (StorageView.IsValid())
+    for (SizeType i = 0; i < StorageViews.GetSize(); ++i)
     {
-        device->DestroyTextureView(StorageView);
+        device->DestroyTextureView(StorageViews[i]);
     }
+
+    StorageViews.Clear();
 
     if (Texture.IsValid())
     {
@@ -392,6 +431,22 @@ void FEnvironmentMap::Release()
         m_Device->DestroySampler(m_Sampler);
     }
 
+    if (m_BrdfSampler.IsValid())
+    {
+        m_Device->DestroySampler(m_BrdfSampler);
+    }
+
+    if (m_BrdfLutView.IsValid())
+    {
+        m_Device->DestroyTextureView(m_BrdfLutView);
+    }
+
+    if (m_BrdfLutTexture.IsValid())
+    {
+        m_Device->DestroyTexture(m_BrdfLutTexture);
+    }
+
+    m_Prefiltered.Release(m_Device);
     m_Irradiance.Release(m_Device);
     m_Environment.Release(m_Device);
 
@@ -508,6 +563,21 @@ ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext*   context,
 
     if (IsRHISuccess(result))
     {
+        // 预滤波贴图的 mip 不是分辨率层级而是**粗糙度层级** —— 因此级数
+        // 由粗糙度的分档决定, 而不是由面边长推出来
+        result = CreateCubeResource(m_Device, kPrefilterFaceSize,
+                                    kPrefilterMipLevels,
+                                    "EnvironmentMap.Prefiltered",
+                                    m_Prefiltered);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = CreateBrdfLutResources(m_Device);
+    }
+
+    if (IsRHISuccess(result))
+    {
         result = UploadEquirect(context, equirect);
     }
 
@@ -526,6 +596,16 @@ ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext*   context,
         result = ConvolveIrradiance(context);
     }
 
+    if (IsRHISuccess(result))
+    {
+        result = PrefilterSpecular(context);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = IntegrateBrdfLut(context);
+    }
+
     if (!IsRHISuccess(result))
     {
         Release();
@@ -541,11 +621,15 @@ ERHIResult FEnvironmentMap::BuildFromEquirect(FRenderContext*   context,
     m_EquirectSampler = FRHISamplerHandle();
 
     LIMX_LOG(LogEnvironment, Display,
-             "[EnvironmentMap] 生成完成: 环境 {}x{} ({} 级 mip) + 辐照度 {}x{}, "
-             "合计 {} MB (源图 {}x{}), 耗时 {} ms",
+             "[EnvironmentMap] 生成完成: 环境 {}x{}({}级) + 辐照度 {}x{} + "
+             "预滤波 {}x{}({}级) + BRDF {}x{}, 合计 {} MB "
+             "(源图 {}x{}), 耗时 {} ms",
              m_Environment.FaceSize, m_Environment.FaceSize,
              m_Environment.MipLevels,
              m_Irradiance.FaceSize, m_Irradiance.FaceSize,
+             m_Prefiltered.FaceSize, m_Prefiltered.FaceSize,
+             m_Prefiltered.MipLevels,
+             kBrdfLutSize, kBrdfLutSize,
              GetMemoryBytes() / (1024 * 1024),
              equirect.Width, equirect.Height,
              static_cast<Int32>(
@@ -790,13 +874,31 @@ ERHIResult FEnvironmentMap::CreateCubeResource(IRHIDevice*     device,
         return result;
     }
 
-    // 存储视图 —— 2D 数组类型, 只覆盖 mip 0。
-    // 存储图像不能是多级视图: 着色器里的 image2DArray 没有 LOD 概念。
-    FRHITextureViewDesc storageViewDesc = cubeViewDesc;
-    storageViewDesc.ViewType            = ETextureType::Texture2DArray;
-    storageViewDesc.MipLevelCount       = 1;
+    // 存储视图 —— 2D 数组类型, 每级 mip 一个。
+    // 存储图像不能是多级视图: 着色器里的 image2DArray 没有 LOD 概念,
+    // 一个视图只对应一级。
+    outResource.StorageViews.Reserve(outResource.MipLevels);
 
-    return device->CreateTextureView(storageViewDesc, outResource.StorageView);
+    for (UInt32 level = 0; level < outResource.MipLevels; ++level)
+    {
+        FRHITextureViewDesc storageViewDesc = cubeViewDesc;
+        storageViewDesc.ViewType            = ETextureType::Texture2DArray;
+        storageViewDesc.BaseMipLevel        = level;
+        storageViewDesc.MipLevelCount       = 1;
+
+        FRHITextureViewHandle storageView;
+
+        result = device->CreateTextureView(storageViewDesc, storageView);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        outResource.StorageViews.Add(storageView);
+    }
+
+    return ERHIResult::Success;
 }
 
 ERHIResult FEnvironmentMap::CreateSampler(IRHIDevice* device, UInt32 mipLevels)
@@ -812,6 +914,64 @@ ERHIResult FEnvironmentMap::CreateSampler(IRHIDevice* device, UInt32 mipLevels)
     samplerDesc.MaxLod = static_cast<Float32>(mipLevels);
 
     return device->CreateSampler(samplerDesc, m_Sampler);
+}
+
+// ============================================================================
+// CreateBrdfLutResources — RG16F 查找表 + 钳位采样器
+// ============================================================================
+
+ERHIResult FEnvironmentMap::CreateBrdfLutResources(IRHIDevice* device)
+{
+    // RG16F 而非 RGBA16F: 表只有 A、B 两个通道, 多存两个恒为零的通道
+    // 只是白占一半带宽。这张表每帧每片段都要采一次, 带宽是实打实的。
+    constexpr EPixelFormat kBrdfFormat = EPixelFormat::RG16_SFLOAT;
+
+    FRHITextureDesc lutDesc = {};
+    lutDesc.Type          = ETextureType::Texture2D;
+    lutDesc.Format        = kBrdfFormat;
+    lutDesc.Extent.Width  = kBrdfLutSize;
+    lutDesc.Extent.Height = kBrdfLutSize;
+    lutDesc.Extent.Depth  = 1;
+    lutDesc.MipLevels     = 1;
+    lutDesc.ArrayLayers   = 1;
+    lutDesc.Usage         = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::Storage) |
+        static_cast<UInt32>(ETextureUsage::TransferSrc));
+    lutDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
+    lutDesc.DebugName     = "EnvironmentMap.BrdfLut";
+
+    ERHIResult result = device->CreateTexture(lutDesc, m_BrdfLutTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHITextureViewDesc viewDesc = {};
+    viewDesc.Texture         = m_BrdfLutTexture;
+    viewDesc.ViewType        = ETextureType::Texture2D;
+    viewDesc.Format          = kBrdfFormat;
+    viewDesc.BaseMipLevel    = 0;
+    viewDesc.MipLevelCount   = 1;
+    viewDesc.BaseArrayLayer  = 0;
+    viewDesc.ArrayLayerCount = 1;
+
+    result = device->CreateTextureView(viewDesc, m_BrdfLutView);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // 必须 ClampToEdge。Repeat 会让 n·v→1 的一列取到 n·v→0 的值 ——
+    // 正面看物体时反射强度突然跳变, 而那正是最容易被注意到的角度。
+    FRHISamplerDesc samplerDesc     = FRHISamplerDesc::LinearClamp();
+    samplerDesc.IsAnisotropyEnabled = false;
+    samplerDesc.MipmapMode          = ESamplerMipmapMode::Nearest;
+    samplerDesc.MaxLod              = 1.0f;
+
+    return device->CreateSampler(samplerDesc, m_BrdfSampler);
 }
 
 // ============================================================================
@@ -921,7 +1081,8 @@ ERHIResult FEnvironmentMap::ConvertEquirectToCube(FRenderContext* context)
     ERHIResult result = pass.Create(
         m_Device, "Builtin/equirect_to_cube.comp",
         "EnvironmentMap.EquirectToCube",
-        m_EquirectView, m_EquirectSampler, m_Environment.StorageView);
+        m_EquirectView, m_EquirectSampler,
+        m_Environment.StorageViews.GetData(), 1);
 
     if (!IsRHISuccess(result))
     {
@@ -935,11 +1096,35 @@ ERHIResult FEnvironmentMap::ConvertEquirectToCube(FRenderContext* context)
         return ERHIResult::ErrorUnknown;
     }
 
+    // 只写 mip 0 —— 其余各级随后由 GenerateCubeMips 逐级 blit 出来
+    commandBuffer->TransitionImageLayout(
+        m_Environment.Texture,
+        EImageLayout::Undefined,
+        EImageLayout::General,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::ComputeShader,
+        EAccessFlags::None,
+        EAccessFlags::ShaderWrite,
+        0, 1, 0, kCubeFaceCount);
+
     FConvertPushConstant pushConstant;
     pushConstant.FaceSize = m_Environment.FaceSize;
 
-    pass.Dispatch(commandBuffer, m_Environment.Texture,
-                  m_Environment.FaceSize, pushConstant);
+    const UInt32 groupCount = ComputeGroupCount(m_Environment.FaceSize);
+
+    pass.Dispatch(commandBuffer, 0, groupCount, groupCount, kCubeFaceCount,
+                  pushConstant);
+
+    commandBuffer->TransitionImageLayout(
+        m_Environment.Texture,
+        EImageLayout::General,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::ComputeShader |
+            EPipelineStageFlags::FragmentShader,
+        EAccessFlags::ShaderWrite,
+        EAccessFlags::ShaderRead,
+        0, 1, 0, kCubeFaceCount);
 
     context->EndSingleTimeCommands(commandBuffer);
 
@@ -955,7 +1140,8 @@ ERHIResult FEnvironmentMap::ConvolveIrradiance(FRenderContext* context)
     ERHIResult result = pass.Create(
         m_Device, "Builtin/irradiance_convolve.comp",
         "EnvironmentMap.IrradianceConvolve",
-        m_Environment.SampleView, m_Sampler, m_Irradiance.StorageView);
+        m_Environment.SampleView, m_Sampler,
+        m_Irradiance.StorageViews.GetData(), 1);
 
     if (!IsRHISuccess(result))
     {
@@ -1007,8 +1193,171 @@ ERHIResult FEnvironmentMap::ConvolveIrradiance(FRenderContext* context)
              sourceMip, m_Environment.FaceSize >> sourceMip,
              static_cast<Int32>(targetFaceSize));
 
-    pass.Dispatch(commandBuffer, m_Irradiance.Texture,
-                  m_Irradiance.FaceSize, pushConstant);
+    commandBuffer->TransitionImageLayout(
+        m_Irradiance.Texture,
+        EImageLayout::Undefined,
+        EImageLayout::General,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::ComputeShader,
+        EAccessFlags::None,
+        EAccessFlags::ShaderWrite,
+        0, 1, 0, kCubeFaceCount);
+
+    const UInt32 groupCount = ComputeGroupCount(m_Irradiance.FaceSize);
+
+    pass.Dispatch(commandBuffer, 0, groupCount, groupCount, kCubeFaceCount,
+                  pushConstant);
+
+    commandBuffer->TransitionImageLayout(
+        m_Irradiance.Texture,
+        EImageLayout::General,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::ShaderWrite,
+        EAccessFlags::ShaderRead,
+        0, 1, 0, kCubeFaceCount);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    return ERHIResult::Success;
+}
+
+// ============================================================================
+// PrefilterSpecular — 按粗糙度分级的镜面反射贴图
+// ============================================================================
+
+ERHIResult FEnvironmentMap::PrefilterSpecular(FRenderContext* context)
+{
+    FComputePass pass;
+
+    // 每级 mip 一个描述符集 —— 管线、布局、着色器全部共用
+    ERHIResult result = pass.Create(
+        m_Device, "Builtin/prefilter_env.comp",
+        "EnvironmentMap.PrefilterSpecular",
+        m_Environment.SampleView, m_Sampler,
+        m_Prefiltered.StorageViews.GetData(),
+        static_cast<UInt32>(m_Prefiltered.StorageViews.GetSize()));
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    // 整条 mip 链一次转入 General —— 各级之间没有依赖, 可以并行写
+    commandBuffer->TransitionImageLayout(
+        m_Prefiltered.Texture,
+        EImageLayout::Undefined,
+        EImageLayout::General,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::ComputeShader,
+        EAccessFlags::None,
+        EAccessFlags::ShaderWrite,
+        0, m_Prefiltered.MipLevels, 0, kCubeFaceCount);
+
+    const UInt32 lastMip = (m_Prefiltered.MipLevels > 1)
+                         ? (m_Prefiltered.MipLevels - 1)
+                         : 1;
+
+    for (UInt32 level = 0; level < m_Prefiltered.MipLevels; ++level)
+    {
+        const UInt32 mipFaceSize = (m_Prefiltered.FaceSize >> level) > 0
+                                 ? (m_Prefiltered.FaceSize >> level)
+                                 : 1u;
+
+        FConvertPushConstant pushConstant;
+        pushConstant.FaceSize = mipFaceSize;
+
+        // 粗糙度在各级之间线性铺开: mip 0 = 完全光滑, 末级 = 完全粗糙。
+        // 着色器采样时用 roughness * maxLod 反查, 两边必须是同一个映射。
+        pushConstant.Roughness =
+            static_cast<Float32>(level) / static_cast<Float32>(lastMip);
+
+        // 源贴图 mip 0 的边长 —— 着色器据此算单个源纹素的立体角, 进而
+        // 为每个样本挑一级合适的 mip
+        pushConstant.SourceFaceSize = m_Environment.FaceSize;
+        pushConstant.SampleCount    = kPrefilterSampleCount;
+
+        const UInt32 groupCount = ComputeGroupCount(mipFaceSize);
+
+        pass.Dispatch(commandBuffer, level, groupCount, groupCount,
+                      kCubeFaceCount, pushConstant);
+    }
+
+    commandBuffer->TransitionImageLayout(
+        m_Prefiltered.Texture,
+        EImageLayout::General,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::ShaderWrite,
+        EAccessFlags::ShaderRead,
+        0, m_Prefiltered.MipLevels, 0, kCubeFaceCount);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    return ERHIResult::Success;
+}
+
+// ============================================================================
+// IntegrateBrdfLut — 与场景无关的环境 BRDF 表
+// ============================================================================
+
+ERHIResult FEnvironmentMap::IntegrateBrdfLut(FRenderContext* context)
+{
+    FComputePass pass;
+
+    // 无输入贴图 —— 这张表只依赖 (n·v, 粗糙度), 与环境无关
+    ERHIResult result = pass.Create(
+        m_Device, "Builtin/brdf_lut.comp",
+        "EnvironmentMap.BrdfLut",
+        FRHITextureViewHandle(), FRHISamplerHandle(),
+        &m_BrdfLutView, 1);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    commandBuffer->TransitionImageLayout(
+        m_BrdfLutTexture,
+        EImageLayout::Undefined,
+        EImageLayout::General,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::ComputeShader,
+        EAccessFlags::None,
+        EAccessFlags::ShaderWrite);
+
+    FConvertPushConstant pushConstant;
+    pushConstant.FaceSize    = kBrdfLutSize;
+    pushConstant.SampleCount = kBrdfLutSampleCount;
+
+    const UInt32 groupCount = ComputeGroupCount(kBrdfLutSize);
+
+    pass.Dispatch(commandBuffer, 0, groupCount, groupCount, 1, pushConstant);
+
+    commandBuffer->TransitionImageLayout(
+        m_BrdfLutTexture,
+        EImageLayout::General,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::ShaderWrite,
+        EAccessFlags::ShaderRead);
 
     context->EndSingleTimeCommands(commandBuffer);
 
@@ -1120,6 +1469,111 @@ bool FEnvironmentMap::ReadbackIrradiance(FRenderContext*  context,
     device->DestroyBuffer(readback);
 
     outFaceSize = faceSize;
+
+    return true;
+}
+
+// ============================================================================
+// ReadbackBrdfLut
+// ============================================================================
+
+bool FEnvironmentMap::ReadbackBrdfLut(FRenderContext*  context,
+                                      TArray<Float32>& outPixels,
+                                      UInt32&          outSize) const
+{
+    outPixels.Clear();
+    outSize = 0;
+
+    if (context == nullptr || m_Device == nullptr || !m_BrdfLutView.IsValid())
+    {
+        return false;
+    }
+
+    IRHIDevice* device = context->GetDevice();
+
+    const SizeType texelCount =
+        static_cast<SizeType>(kBrdfLutSize) * kBrdfLutSize;
+
+    // RG16F = 4 字节/纹素
+    const SizeType byteSize = texelCount * 4;
+
+    FRHIBufferDesc readbackDesc = {};
+    readbackDesc.Size        = byteSize;
+    readbackDesc.Usage       = EBufferUsage::TransferDst;
+    readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    readbackDesc.DebugName   = "EnvironmentMap.BrdfReadback";
+
+    FRHIBufferHandle readback;
+
+    if (!IsRHISuccess(device->CreateBuffer(readbackDesc, readback)))
+    {
+        return false;
+    }
+
+    IRHICommandBuffer* commandBuffer = context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        device->DestroyBuffer(readback);
+        return false;
+    }
+
+    commandBuffer->TransitionImageLayout(
+        m_BrdfLutTexture,
+        EImageLayout::ShaderReadOnly,
+        EImageLayout::TransferSrc,
+        EPipelineStageFlags::FragmentShader,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::ShaderRead,
+        EAccessFlags::TransferRead);
+
+    FRHIBufferTextureCopyRegion region = {};
+    region.BufferOffset      = 0;
+    region.BufferRowLength   = 0;
+    region.BufferImageHeight = 0;
+    region.MipLevel          = 0;
+    region.BaseLayer         = 0;
+    region.LayerCount        = 1;
+    region.TextureOffset     = { 0, 0, 0 };
+    region.TextureExtent     = { kBrdfLutSize, kBrdfLutSize, 1 };
+
+    commandBuffer->CopyTextureToBuffer(m_BrdfLutTexture,
+                                       EImageLayout::TransferSrc,
+                                       readback, region);
+
+    commandBuffer->TransitionImageLayout(
+        m_BrdfLutTexture,
+        EImageLayout::TransferSrc,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::Transfer,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::TransferRead,
+        EAccessFlags::ShaderRead);
+
+    context->EndSingleTimeCommands(commandBuffer);
+
+    void* mapped = nullptr;
+
+    if (!IsRHISuccess(device->MapBuffer(readback, &mapped)) ||
+        mapped == nullptr)
+    {
+        device->DestroyBuffer(readback);
+        return false;
+    }
+
+    const UInt16* source = static_cast<const UInt16*>(mapped);
+
+    outPixels.SetSize(texelCount * 2);
+
+    for (SizeType i = 0; i < texelCount * 2; ++i)
+    {
+        outPixels[i] = HalfToFloat(source[i]);
+    }
+
+    device->UnmapBuffer(readback);
+    device->DestroyBuffer(readback);
+
+    outSize = kBrdfLutSize;
 
     return true;
 }

@@ -232,8 +232,15 @@ struct FLightingUBO
     // 能在"用 IBL"与"用常数环境光"之间选择, 而不是把两者相加或相乘。
     Float32 IblEnabled   = 0.0f;
     Float32 IblIntensity = 1.0f;
+
+    /// 预滤波贴图的最高 mip 下标
+    ///
+    /// 着色器用 roughness * 该值反查 LOD, 必须与预滤波时"粗糙度在各级
+    /// 之间线性铺开"的映射严格互逆。写死成常数是不行的: 级数改了而着色器
+    /// 没跟上, 高粗糙度材质会采到一张根本没写过的 mip。
+    Float32 IblPrefilteredMaxLod = 0.0f;
+
     Float32 IblPad0      = 0.0f;
-    Float32 IblPad1      = 0.0f;
 };
 
 // 编译时验证 FLightingUBO 大小

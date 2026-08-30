@@ -1,0 +1,117 @@
+#version 450
+
+// ============================================================
+// 镜面预滤波 — 环境立方体贴图 → 按粗糙度分级的反射贴图
+//
+// split-sum 近似的前一半:
+//   ∫ L(l) f(l,v) (n·l) dl  ≈  [∫ L(l) D(l) (n·l) dl] · [∫ f(l,v) (n·l) dl]
+//                                └── 本着色器预计算 ──┘   └── BRDF 查找表 ──┘
+//
+//   左半只依赖 (反射方向, 粗糙度), 因此可以存成一张带 mip 的立方体贴图:
+//   mip 0 是完全光滑 (roughness=0, 即原图), 最后一级是最粗糙。
+//
+// N = V = R 的假设:
+//   真正的积分还依赖视线方向 —— 掠射角下的高光该被拉成长条 (各向异性
+//   拉伸)。预计算无法覆盖这个自由度, 于是统一假设视线沿法线。代价是
+//   掠射角的反射偏圆, 收益是把一个四维积分降到二维。这是 Epic 在
+//   《Real Shading in Unreal Engine 4》里的取舍, 也是业界标准做法。
+//
+// 按 pdf 选 mip:
+//   直接从 mip 0 采样会在粗糙度高时产生刺眼的亮点 —— 少数样本恰好命中
+//   太阳这类高频亮源, 而它们在最终平均里的权重远超其应有的份额。
+//   这正是漫反射卷积遇到过的同一个问题 (见 irradiance_convolve.comp)。
+//   这里的解法更精细: 每个样本按自身的 pdf 算出它"代表"多大的立体角,
+//   再选一级纹素立体角与之相当的 mip。样本越稀疏的方向, 采样越模糊,
+//   于是无论样本落在哪都能带上它应有的那份能量。
+// ============================================================
+
+#include "ibl_common.h"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube environmentMap;
+
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray prefilteredFaces;
+
+layout(push_constant) uniform Params {
+    uint  faceSize;         // 本级 mip 的面边长
+    float sampleDelta;      // 本着色器不用
+    float sourceMipLevel;   // 本着色器不用
+    float roughness;        // 本级 mip 对应的粗糙度
+    uint  sourceFaceSize;   // 源环境贴图 mip 0 的面边长
+    uint  sampleCount;      // 重要性采样的样本数
+    uint  _pad0;
+    uint  _pad1;
+} params;
+
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+
+    if (id.x >= params.faceSize || id.y >= params.faceSize)
+    {
+        return;
+    }
+
+    const vec2 uv = ((vec2(id.xy) + 0.5) / float(params.faceSize)) * 2.0 - 1.0;
+
+    const vec3 N = normalize(CubeFaceDirection(id.z, uv));
+    const vec3 R = N;
+    const vec3 V = R;
+
+    const float roughness = clamp(params.roughness, 0.0, 1.0);
+
+    // 一个源纹素的立体角: 整球 4π 均分给六个面的全部纹素
+    const float texelSolidAngle =
+        4.0 * kIblPi /
+        (6.0 * float(params.sourceFaceSize) * float(params.sourceFaceSize));
+
+    vec3  prefiltered = vec3(0.0);
+    float totalWeight = 0.0;
+
+    for (uint i = 0u; i < params.sampleCount; ++i)
+    {
+        const vec2 Xi = Hammersley(i, params.sampleCount);
+        const vec3 H  = ImportanceSampleGGX(Xi, N, roughness);
+
+        // 由半程向量反解入射方向
+        const vec3 L = normalize(2.0 * dot(V, H) * H - V);
+
+        const float NdotL = dot(N, L);
+
+        if (NdotL <= 0.0)
+        {
+            continue;
+        }
+
+        const float NdotH = max(dot(N, H), 0.0);
+        const float HdotV = max(dot(H, V), 0.0);
+
+        // 该样本的概率密度。乘 NdotH/(4·HdotV) 是从半程向量分布到
+        // 入射方向分布的雅可比。
+        const float pdf = DistributionGGX(NdotH, roughness) * NdotH /
+                          (4.0 * HdotV) + 1e-4;
+
+        // 该样本"代表"的立体角。样本越稀疏 (pdf 越小), 代表的范围越大,
+        // 就该从越模糊的一级采样。
+        const float sampleSolidAngle = 1.0 / (float(params.sampleCount) * pdf);
+
+        // 边长比是立体角比的平方根, 而 mip 每级边长减半 —— 因此是 0.5·log2
+        const float mipLevel = (roughness <= 0.0)
+            ? 0.0
+            : max(0.5 * log2(sampleSolidAngle / texelSolidAngle), 0.0);
+
+        prefiltered += textureLod(environmentMap, L, mipLevel).rgb * NdotL;
+        totalWeight += NdotL;
+    }
+
+    // 除以权重和而非样本数 —— NdotL 加权本身不是归一化的, 用样本数会让
+    // 结果整体偏暗, 且偏暗的程度随粗糙度变化 (粗糙时更多样本被 NdotL<=0
+    // 丢弃)。表现是"越粗糙越暗", 看着像能量守恒出了问题。
+    if (totalWeight > 0.0)
+    {
+        prefiltered /= totalWeight;
+    }
+
+    imageStore(prefilteredFaces, ivec3(id), vec4(prefiltered, 1.0));
+}

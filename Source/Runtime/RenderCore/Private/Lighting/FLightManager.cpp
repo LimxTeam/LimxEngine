@@ -97,12 +97,14 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     //   set 2, binding 0 — FLightingUBO
     //   set 2, binding 1 — 阴影贴图 (深度纹理 + 比较采样器)
     //   set 2, binding 2 — 漫反射辐照度立方体贴图
+    //   set 2, binding 3 — 镜面预滤波立方体贴图
+    //   set 2, binding 4 — 环境 BRDF 查找表
     //
     // 阴影贴图放在 set 2 而非 set 0: set 0 的描述符集也会被阴影 Pass 自己
     // 绑定 (它需要光源矩阵), 把正在写入的阴影贴图放进去会形成"同一帧内
     // 既作为附件写入又作为纹理读取"的冲突。set 2 只有前向 Pass 绑定,
     // 天然避开这个问题。
-    FRHIDescriptorBinding bindings[3] = {};
+    FRHIDescriptorBinding bindings[5] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -124,9 +126,19 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[2].Count      = 1;
     bindings[2].StageFlags = EShaderStage::Fragment;
 
+    bindings[3].Binding    = 3;
+    bindings[3].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[3].Count      = 1;
+    bindings[3].StageFlags = EShaderStage::Fragment;
+
+    bindings[4].Binding    = 4;
+    bindings[4].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[4].Count      = 1;
+    bindings[4].StageFlags = EShaderStage::Fragment;
+
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 3;
+    layoutDesc.BindingCount = 5;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -364,8 +376,9 @@ void FLightManager::UploadLightData(
     uboData.ShadowMapSize     = m_ShadowInfo.ShadowMapSize;
     uboData.ShadowEnabled     = m_IsShadowEnabled ? 1.0f : 0.0f;
 
-    uboData.IblEnabled   = m_IsIblEnabled ? 1.0f : 0.0f;
-    uboData.IblIntensity = m_IblIntensity;
+    uboData.IblEnabled           = m_IsIblEnabled ? 1.0f : 0.0f;
+    uboData.IblIntensity         = m_IblIntensity;
+    uboData.IblPrefilteredMaxLod = m_IblPrefilteredMaxLod;
 
     // 映射 UBO 并写入
     void* mappedPtr = nullptr;

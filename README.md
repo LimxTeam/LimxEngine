@@ -152,6 +152,8 @@ LimxLaunch.exe --hdri Content/HDRI/sky.hdr --camera-pitch -0.35                -
 | `--sky-intensity <倍数>` | 天空强度的线性倍数（默认 1.0） |
 | `--ibl-intensity <倍数>` | 环境光照强度的线性倍数（默认 1.0） |
 | `--probe-irradiance` | 输出辐照度贴图六个面的中心值（数值校验用） |
+| `--probe-brdf` | 输出 BRDF 查找表的采样网格（数值校验用） |
+| `--material-grid <N>` | 构建 N×N 球体阵列（横向粗糙度，纵向金属度） |
 | `--camera-yaw <弧度>` / `--camera-pitch <弧度>` | 固定相机朝向，用于可复现的截屏对照 |
 | `--screenshot <路径>` | 末帧截屏写入二进制 PPM（P6） |
 

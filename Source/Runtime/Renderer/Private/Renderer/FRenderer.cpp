@@ -235,11 +235,18 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
         return result;
     }
 
-    // IBL 占位图必须在光照描述符集之前建好 —— 后者的 binding 2 要写它
+    // IBL 占位图必须在光照描述符集之前建好 —— 后者的 binding 2/3/4 要写它
     result = CreateFallbackCubeMap();
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] IBL 占位立方体贴图创建失败");
+        return result;
+    }
+
+    result = CreateFallbackLut();
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[Renderer] BRDF 占位查找表创建失败");
         return result;
     }
 
@@ -559,39 +566,59 @@ void FRenderer::SetEnvironmentMap(const FEnvironmentMap* environment)
 
     if (hasEnvironment)
     {
-        UpdateIrradianceDescriptors(environment->GetIrradianceView(),
-                                    environment->GetSampler());
+        UpdateIblDescriptors(environment->GetIrradianceView(),
+                             environment->GetPrefilteredView(),
+                             environment->GetBrdfLutView(),
+                             environment->GetSampler(),
+                             environment->GetBrdfSampler());
 
-        FLightManager::Get().EnableIbl(m_IblIntensity);
+        FLightManager::Get().EnableIbl(m_IblIntensity,
+                                       environment->GetPrefilteredMaxLod());
     }
     else
     {
         // 退回占位图。不能只关开关就了事 —— 描述符里若留着已释放的视图,
         // 下一次销毁那张图像时验证层会指出它仍被描述符集引用。
-        UpdateIrradianceDescriptors(m_FallbackCubeView, m_FallbackCubeSampler);
+        UpdateIblDescriptors(m_FallbackCubeView, m_FallbackCubeView,
+                             m_FallbackLutView,
+                             m_FallbackCubeSampler, m_FallbackCubeSampler);
 
         FLightManager::Get().DisableIbl();
     }
 }
 
-void FRenderer::UpdateIrradianceDescriptors(
-    FRHITextureViewHandle irradianceView,
-    FRHISamplerHandle     sampler)
+void FRenderer::UpdateIblDescriptors(FRHITextureViewHandle irradianceView,
+                                     FRHITextureViewHandle prefilteredView,
+                                     FRHITextureViewHandle brdfLutView,
+                                     FRHISamplerHandle     cubeSampler,
+                                     FRHISamplerHandle     lutSampler)
 {
     IRHIDevice* device = m_Context->GetDevice();
 
-    if (device == nullptr || !irradianceView.IsValid() || !sampler.IsValid())
+    if (device == nullptr || !irradianceView.IsValid() ||
+        !prefilteredView.IsValid() || !brdfLutView.IsValid() ||
+        !cubeSampler.IsValid() || !lutSampler.IsValid())
     {
         return;
     }
 
     for (SizeType i = 0; i < m_LightDescriptorSets.GetSize(); ++i)
     {
-        FRHIDescriptorWrite write = FRHIDescriptorWrite::CombinedImageSampler(
-            m_LightDescriptorSets[i], 2, irradianceView, sampler,
+        FRHIDescriptorWrite iblWrites[3];
+
+        iblWrites[0] = FRHIDescriptorWrite::CombinedImageSampler(
+            m_LightDescriptorSets[i], 2, irradianceView, cubeSampler,
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(&write, 1);
+        iblWrites[1] = FRHIDescriptorWrite::CombinedImageSampler(
+            m_LightDescriptorSets[i], 3, prefilteredView, cubeSampler,
+            EImageLayout::ShaderReadOnly);
+
+        iblWrites[2] = FRHIDescriptorWrite::CombinedImageSampler(
+            m_LightDescriptorSets[i], 4, brdfLutView, lutSampler,
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(iblWrites, 3);
     }
 }
 
@@ -601,7 +628,10 @@ void FRenderer::SetIblIntensity(Float32 intensity)
 
     if (FLightManager::Get().IsIblEnabled())
     {
-        FLightManager::Get().EnableIbl(intensity);
+        // 只改强度, LOD 上限保持原样 —— 它由预滤波贴图的级数决定,
+        // 与强度无关
+        FLightManager::Get().EnableIbl(
+            intensity, FLightManager::Get().GetIblPrefilteredMaxLod());
     }
 }
 
@@ -708,6 +738,80 @@ ERHIResult FRenderer::CreateFallbackCubeMap()
     samplerDesc.MaxLod              = 1.0f;
 
     return device->CreateSampler(samplerDesc, m_FallbackCubeSampler);
+}
+
+// ============================================================================
+// CreateFallbackLut — 1x1 黑色 2D 纹理
+// ============================================================================
+
+ERHIResult FRenderer::CreateFallbackLut()
+{
+    IRHIDevice* device = m_Context->GetDevice();
+
+    // 格式与真正的查找表一致 (RG16F): 描述符本身不校验格式, 但保持一致
+    // 能让"换成占位图之后表现变了"这类问题少一个可能的原因。
+    FRHITextureDesc lutDesc = {};
+    lutDesc.Type          = ETextureType::Texture2D;
+    lutDesc.Format        = EPixelFormat::RG16_SFLOAT;
+    lutDesc.Extent.Width  = 1;
+    lutDesc.Extent.Height = 1;
+    lutDesc.Extent.Depth  = 1;
+    lutDesc.MipLevels     = 1;
+    lutDesc.ArrayLayers   = 1;
+    lutDesc.Usage         = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::TransferDst));
+    lutDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
+    lutDesc.DebugName     = "Renderer.FallbackLut";
+
+    ERHIResult result = device->CreateTexture(lutDesc, m_FallbackLutTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    IRHICommandBuffer* commandBuffer = m_Context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        return ERHIResult::ErrorUnknown;
+    }
+
+    commandBuffer->TransitionImageLayout(
+        m_FallbackLutTexture,
+        EImageLayout::Undefined,
+        EImageLayout::TransferDst,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::None,
+        EAccessFlags::TransferWrite);
+
+    commandBuffer->ClearColorImage(m_FallbackLutTexture,
+                                   EImageLayout::TransferDst,
+                                   FLinearColor(0.0f, 0.0f, 0.0f, 1.0f));
+
+    commandBuffer->TransitionImageLayout(
+        m_FallbackLutTexture,
+        EImageLayout::TransferDst,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::Transfer,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::TransferWrite,
+        EAccessFlags::ShaderRead);
+
+    m_Context->EndSingleTimeCommands(commandBuffer);
+
+    FRHITextureViewDesc viewDesc = {};
+    viewDesc.Texture         = m_FallbackLutTexture;
+    viewDesc.ViewType        = ETextureType::Texture2D;
+    viewDesc.Format          = EPixelFormat::RG16_SFLOAT;
+    viewDesc.BaseMipLevel    = 0;
+    viewDesc.MipLevelCount   = 1;
+    viewDesc.BaseArrayLayer  = 0;
+    viewDesc.ArrayLayerCount = 1;
+
+    return device->CreateTextureView(viewDesc, m_FallbackLutView);
 }
 
 // ============================================================================
@@ -994,6 +1098,9 @@ void FRenderer::DestroyTextureResources()
     device->DestroySampler(m_FallbackCubeSampler);
     device->DestroyTextureView(m_FallbackCubeView);
     device->DestroyTexture(m_FallbackCubeTexture);
+
+    device->DestroyTextureView(m_FallbackLutView);
+    device->DestroyTexture(m_FallbackLutTexture);
 }
 
 // ============================================================================
@@ -1182,14 +1289,14 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         }
 
         // set 2 binding 0 = 光照 UBO, binding 1 = 阴影贴图,
-        //       binding 2 = 漫反射辐照度立方体贴图
+        //       binding 2 = 辐照度, binding 3 = 预滤波, binding 4 = BRDF 表
         //
         // 阴影贴图在整个运行期都是同一张纹理, 因此只需在这里写一次;
         // 内容每帧被阴影 Pass 重写, 但描述符指向的对象不变。
         //
-        // 辐照度贴图先写占位图。着色器里出现的描述符必须在管线绑定时有效,
-        // 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[3];
+        // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
+        // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
+        FRHIDescriptorWrite writes[5];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1212,7 +1319,21 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_FallbackCubeSampler,
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(writes, 3);
+        writes[3] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet,
+            3,
+            m_FallbackCubeView,
+            m_FallbackCubeSampler,
+            EImageLayout::ShaderReadOnly);
+
+        writes[4] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet,
+            4,
+            m_FallbackLutView,
+            m_FallbackCubeSampler,
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(writes, 5);
 
         m_LightDescriptorSets.Add(descSet);
     }
