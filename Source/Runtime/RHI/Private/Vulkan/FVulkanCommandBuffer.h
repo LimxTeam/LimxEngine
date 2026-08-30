@@ -53,6 +53,8 @@ public:
     // ====================================================================
 
     ERHIResult Begin() override;
+    ERHIResult BeginSecondary(
+        const FRHICommandBufferInheritance& inheritance) override;
     ERHIResult End() override;
     ERHIResult Reset() override;
 
@@ -62,6 +64,8 @@ public:
 
     void BeginRenderPass(const FRHIRenderPassBeginInfo& beginInfo) override;
     void EndRenderPass() override;
+    void ExecuteCommands(const FRHICommandBufferHandle* buffers,
+                          UInt32 count) override;
     void NextSubpass() override;
 
     // ====================================================================

@@ -177,6 +177,9 @@ struct FVulkanCommandBufferData
 {
     VkCommandBuffer     CommandBuffer = VK_NULL_HANDLE;
     FRHICommandPoolHandle OwnerPool;
+
+    /// 分配时的级别 —— ExecuteCommands 要据此拦住"把主缓冲当次级执行"
+    ECommandBufferLevel Level = ECommandBufferLevel::Primary;
 };
 
 struct FVulkanSwapchainData
@@ -320,6 +323,7 @@ public:
     void DestroyCommandPool(FRHICommandPoolHandle& handle) override;
     ERHIResult ResetCommandPool(FRHICommandPoolHandle handle) override;
     ERHIResult AllocateCommandBuffer(FRHICommandPoolHandle pool,
+                                      ECommandBufferLevel level,
                                       FRHICommandBufferHandle& outHandle) override;
     void FreeCommandBuffer(FRHICommandBufferHandle& handle) override;
 

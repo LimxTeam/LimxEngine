@@ -246,6 +246,7 @@ ERHIResult FVulkanDevice::ResetCommandPool(FRHICommandPoolHandle handle)
 
 ERHIResult FVulkanDevice::AllocateCommandBuffer(
     FRHICommandPoolHandle pool,
+    ECommandBufferLevel level,
     FRHICommandBufferHandle& outHandle)
 {
     const FVulkanCommandPoolData* poolData = m_CommandPools.Get(pool);
@@ -257,7 +258,10 @@ ERHIResult FVulkanDevice::AllocateCommandBuffer(
     VkCommandBufferAllocateInfo allocInfo = {};
     allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool        = poolData->Pool;
-    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.level              =
+        (level == ECommandBufferLevel::Secondary)
+            ? VK_COMMAND_BUFFER_LEVEL_SECONDARY
+            : VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -274,6 +278,7 @@ ERHIResult FVulkanDevice::AllocateCommandBuffer(
     FVulkanCommandBufferData data;
     data.CommandBuffer = commandBuffer;
     data.OwnerPool     = pool;
+    data.Level         = level;
     outHandle = m_CommandBuffers.Allocate(data);
 
     return ERHIResult::Success;

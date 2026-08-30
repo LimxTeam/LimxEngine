@@ -84,6 +84,13 @@ struct FRHIRenderPassBeginInfo
     const FRHIClearColorValue*        ClearColors      = nullptr;
     UInt32                            ClearColorCount   = 0;
     const FRHIClearDepthStencilValue* ClearDepthStencil = nullptr;
+
+    /// 本通道的内容是否来自次级命令缓冲区
+    ///
+    /// 为 true 时通道内**只能**执行次级缓冲区, 不能直接录制绘制命令 ——
+    /// 这是 Vulkan 的硬性规定 (VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS)。
+    /// 两者混用会被验证层直接拦下。
+    bool UseSecondaryCommandBuffers = false;
 };
 
 // ============================================================================
@@ -207,6 +214,13 @@ public:
     // 开始命令录制
     virtual ERHIResult Begin() = 0;
 
+    /// 开始录制次级命令缓冲区
+    ///
+    /// 与 Begin() 的区别在于必须带继承信息, 且会置上
+    /// RENDER_PASS_CONTINUE 标志 —— 表示"我在一个已经开始的通道里录制"。
+    virtual ERHIResult BeginSecondary(
+        const FRHICommandBufferInheritance& inheritance) = 0;
+
     // 结束命令录制
     virtual ERHIResult End() = 0;
 
@@ -219,6 +233,18 @@ public:
 
     virtual void BeginRenderPass(const FRHIRenderPassBeginInfo& beginInfo) = 0;
     virtual void EndRenderPass() = 0;
+
+    /// 执行若干次级命令缓冲区
+    ///
+    /// 只能在主缓冲区上调用, 且当前通道必须是以
+    /// UseSecondaryCommandBuffers = true 开始的。
+    ///
+    /// 执行顺序即数组顺序 —— 这一点对结果的确定性至关重要: 并行录制时
+    /// 各线程的完成先后是随机的, 但只要按固定顺序执行, 输出就与单线程
+    /// 逐像素相同。若按完成顺序执行, 半透明排序与深度相等的表面会得到
+    /// 不确定的结果。
+    virtual void ExecuteCommands(const FRHICommandBufferHandle* buffers,
+                                  UInt32 count) = 0;
     virtual void NextSubpass() = 0;
 
     // ====================================================================

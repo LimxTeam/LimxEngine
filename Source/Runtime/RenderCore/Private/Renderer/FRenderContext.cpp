@@ -442,7 +442,8 @@ ERHIResult FRenderContext::CreateFrameResources()
 
         // 分配命令缓冲区
         result = m_Device->AllocateCommandBuffer(
-            frame.CommandPool, frame.CommandBuffer);
+            frame.CommandPool, ECommandBufferLevel::Primary,
+            frame.CommandBuffer);
         if (!IsRHISuccess(result))
         {
             return result;
@@ -540,7 +541,7 @@ IRHICommandBuffer* FRenderContext::BeginSingleTimeCommands()
     // 使用第 0 帧的命令池分配临时命令缓冲区
     FRHICommandBufferHandle cmdHandle;
     ERHIResult result = m_Device->AllocateCommandBuffer(
-        m_Frames[0].CommandPool, cmdHandle);
+        m_Frames[0].CommandPool, ECommandBufferLevel::Primary, cmdHandle);
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error,

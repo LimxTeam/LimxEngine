@@ -320,7 +320,11 @@ public:
     virtual void DestroyCommandPool(FRHICommandPoolHandle& handle) = 0;
     virtual ERHIResult ResetCommandPool(FRHICommandPoolHandle handle) = 0;
 
+    /// 分配命令缓冲区
+    ///
+    /// @param level Primary 直接提交; Secondary 只能被主缓冲执行
     virtual ERHIResult AllocateCommandBuffer(FRHICommandPoolHandle pool,
+                                              ECommandBufferLevel level,
                                               FRHICommandBufferHandle& outHandle) = 0;
     virtual void FreeCommandBuffer(FRHICommandBufferHandle& handle) = 0;
 

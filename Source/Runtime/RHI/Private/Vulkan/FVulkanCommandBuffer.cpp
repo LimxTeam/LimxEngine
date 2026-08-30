@@ -96,6 +96,42 @@ ERHIResult FVulkanCommandBuffer::Begin()
     return ERHIResult::Success;
 }
 
+ERHIResult FVulkanCommandBuffer::BeginSecondary(
+    const FRHICommandBufferInheritance& inheritance)
+{
+    VkCommandBufferInheritanceInfo inheritInfo = {};
+    inheritInfo.sType =
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    inheritInfo.renderPass  = m_Device->GetVkRenderPass(inheritance.RenderPass);
+    inheritInfo.subpass     = inheritance.Subpass;
+    inheritInfo.framebuffer =
+        inheritance.Framebuffer.IsValid()
+            ? m_Device->GetVkFramebuffer(inheritance.Framebuffer)
+            : VK_NULL_HANDLE;
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+    // RENDER_PASS_CONTINUE 是必需的 —— 它告诉驱动这段命令将在一个已经
+    // 开始的渲染通道内部执行。少了这个标志, 验证层会在 vkCmdExecuteCommands
+    // 时报错。
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+                    | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    beginInfo.pInheritanceInfo = &inheritInfo;
+
+    const VkResult vkResult =
+        vkBeginCommandBuffer(m_CommandBuffer, &beginInfo);
+
+    if (vkResult != VK_SUCCESS)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] vkBeginCommandBuffer (次级) 失败: {}", (Int32)vkResult);
+        return ERHIResult::ErrorUnknown;
+    }
+
+    return ERHIResult::Success;
+}
+
 ERHIResult FVulkanCommandBuffer::End()
 {
     VkResult vkResult = vkEndCommandBuffer(m_CommandBuffer);
@@ -174,8 +210,56 @@ void FVulkanCommandBuffer::BeginRenderPass(
     vkBeginInfo.clearValueCount = clearCount;
     vkBeginInfo.pClearValues    = clearValues;
 
-    vkCmdBeginRenderPass(m_CommandBuffer, &vkBeginInfo,
-                          VK_SUBPASS_CONTENTS_INLINE);
+    // 通道内容来自次级缓冲区时必须声明 SECONDARY_COMMAND_BUFFERS。
+    //
+    // 这不是提示而是约束: 声明为 INLINE 的通道里调用 vkCmdExecuteCommands,
+    // 或声明为 SECONDARY 的通道里直接录制绘制命令, 两种都是非法的。
+    vkCmdBeginRenderPass(
+        m_CommandBuffer, &vkBeginInfo,
+        beginInfo.UseSecondaryCommandBuffers
+            ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS
+            : VK_SUBPASS_CONTENTS_INLINE);
+}
+
+void FVulkanCommandBuffer::ExecuteCommands(
+    const FRHICommandBufferHandle* buffers, UInt32 count)
+{
+    if (buffers == nullptr || count == 0)
+    {
+        return;
+    }
+
+    constexpr UInt32 kMaxBatch = 64;
+
+    VkCommandBuffer native[kMaxBatch];
+
+    UInt32 written = 0;
+
+    for (UInt32 i = 0; i < count; ++i)
+    {
+        if (written >= kMaxBatch)
+        {
+            // 满一批就先交出去, 保持顺序不变
+            vkCmdExecuteCommands(m_CommandBuffer, written, native);
+            written = 0;
+        }
+
+        const VkCommandBuffer handle =
+            m_Device->GetVkCommandBuffer(buffers[i]);
+
+        if (handle == VK_NULL_HANDLE)
+        {
+            continue;
+        }
+
+        native[written] = handle;
+        ++written;
+    }
+
+    if (written > 0)
+    {
+        vkCmdExecuteCommands(m_CommandBuffer, written, native);
+    }
 }
 
 void FVulkanCommandBuffer::EndRenderPass()
