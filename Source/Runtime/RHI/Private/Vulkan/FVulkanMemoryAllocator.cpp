@@ -97,6 +97,7 @@ ERHIResult FVulkanMemoryAllocator::Initialize(
     m_DeviceAllocationCount = 0;
     m_SuballocationCount    = 0;
     m_DedicatedCount        = 0;
+    m_DedicatedBytes        = 0;
     m_TotalReservedBytes    = 0;
 
     LIMX_LOG(LogRHI, Log,
@@ -158,6 +159,7 @@ void FVulkanMemoryAllocator::Shutdown()
     m_DeviceAllocationCount = 0;
     m_SuballocationCount    = 0;
     m_DedicatedCount        = 0;
+    m_DedicatedBytes        = 0;
     m_TotalReservedBytes    = 0;
 }
 
@@ -204,20 +206,51 @@ VkDeviceSize FVulkanMemoryAllocator::ComputeBlockSize(
     const VkDeviceSize heapSize =
         m_MemoryProperties.memoryHeaps[heapIndex].size;
 
-    // 取堆容量的八分之一: 单块既不至于吃掉整个堆, 又足够容纳大量资源
-    VkDeviceSize blockSize = heapSize / 8;
+    // 上限取堆容量的八分之一: 单块既不至于吃掉整个堆, 又足够容纳大量资源
+    VkDeviceSize maxBlockSize = heapSize / 8;
 
-    if (blockSize < kMinBlockSize)
+    if (maxBlockSize > kMaxBlockSize)
     {
-        blockSize = kMinBlockSize;
+        maxBlockSize = kMaxBlockSize;
     }
 
-    if (blockSize > kMaxBlockSize)
+    if (maxBlockSize < kMinBlockSize)
     {
-        blockSize = kMaxBlockSize;
+        maxBlockSize = kMinBlockSize;
     }
 
-    // 堆本身小于下限时退让到堆容量的四分之一, 避免请求必然失败
+    // 逐块翻倍, 而非一上来就按上限开。
+    //
+    // 固定按上限开的代价在小场景上非常刺眼: 每种内存类型的**第一次**分配
+    // 就会立刻预留满额, 实测一个空场景只用 59 MiB 却向驱动申请了 560 MiB。
+    // 那部分显存别的进程也用不了, 在显存吃紧的机器上是实打实的压力。
+    //
+    // 翻倍策略两头兼顾: 小场景只开一两个小块, 大场景在几次翻倍后同样能
+    // 拿到大块, 分配次数仍是个位数。这也是 VMA 的做法。
+    UInt32 existingBlocks = 0;
+
+    for (SizeType i = 0; i < m_Blocks.GetSize(); ++i)
+    {
+        if (m_Blocks[i].IsActive() &&
+            m_Blocks[i].MemoryTypeIndex == memoryTypeIndex)
+        {
+            ++existingBlocks;
+        }
+    }
+
+    VkDeviceSize blockSize = kMinBlockSize;
+
+    for (UInt32 i = 0; i < existingBlocks && blockSize < maxBlockSize; ++i)
+    {
+        blockSize *= 2;
+    }
+
+    if (blockSize > maxBlockSize)
+    {
+        blockSize = maxBlockSize;
+    }
+
+    // 堆本身小于块尺寸时退让到堆容量的四分之一, 避免请求必然失败
     if (blockSize > heapSize)
     {
         blockSize = heapSize / 4;
@@ -430,6 +463,7 @@ ERHIResult FVulkanMemoryAllocator::AllocateDedicated(
     ++m_DeviceAllocationCount;
     ++m_DedicatedCount;
     m_TotalReservedBytes += requirements.size;
+    m_DedicatedBytes     += requirements.size;
 
     void* mappedBase = nullptr;
 
@@ -620,6 +654,7 @@ void FVulkanMemoryAllocator::Free(FVulkanAllocation& allocation)
         vkFreeMemory(m_Device, allocation.Memory, nullptr);
 
         m_TotalReservedBytes -= allocation.Size;
+        m_DedicatedBytes     -= allocation.Size;
         --m_DeviceAllocationCount;
         --m_DedicatedCount;
 
@@ -779,6 +814,10 @@ FVulkanMemoryStats FVulkanMemoryAllocator::GetStats() const
     stats.SuballocationCount    = m_SuballocationCount;
     stats.DedicatedCount        = m_DedicatedCount;
     stats.TotalReservedBytes    = m_TotalReservedBytes;
+
+    // 专用分配整块归一个资源独占, 因此"占用"就等于它的尺寸。
+    // 漏掉这一项会让大资源在统计里完全隐形。
+    stats.TotalUsedBytes        = m_DedicatedBytes;
 
     for (SizeType i = 0; i < m_Blocks.GetSize(); ++i)
     {

@@ -283,6 +283,17 @@ public:
     // 获取交换链图像数量
     virtual UInt32 GetSwapchainImageCount(FRHISwapchainHandle swapchain) = 0;
 
+    // ====================================================================
+    // 显存统计
+    // ====================================================================
+
+    /// 查询分配器视角的显存占用
+    ///
+    /// 这是唯一一个不会漏算的口径: 任何走 RHI 创建的资源都在其中, 无需
+    /// 每个子系统各自记账。子系统各自记账的做法迟早会漏 —— 新加一类资源
+    /// 时忘了登记, 报出来的数字就悄悄偏小了。
+    LIMX_NODISCARD virtual FRHIDeviceMemoryStats GetDeviceMemoryStats() const = 0;
+
     // 获取交换链图像纹理句柄
     virtual FRHITextureHandle GetSwapchainImage(
         FRHISwapchainHandle swapchain, UInt32 imageIndex) = 0;

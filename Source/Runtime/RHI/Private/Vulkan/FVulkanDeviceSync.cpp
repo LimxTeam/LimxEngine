@@ -614,6 +614,23 @@ ERHIResult FVulkanDevice::AcquireNextImage(
     return ERHIResult::Success;
 }
 
+// ============================================================================
+// GetDeviceMemoryStats — 把分配器的统计转成 RHI 口径
+// ============================================================================
+
+FRHIDeviceMemoryStats FVulkanDevice::GetDeviceMemoryStats() const
+{
+    const FVulkanMemoryStats source = m_MemoryAllocator.GetStats();
+
+    FRHIDeviceMemoryStats stats = {};
+    stats.AllocationCount = source.DeviceAllocationCount;
+    stats.AllocationLimit = source.DeviceAllocationLimit;
+    stats.ReservedBytes   = static_cast<UInt64>(source.TotalReservedBytes);
+    stats.UsedBytes       = static_cast<UInt64>(source.TotalUsedBytes);
+
+    return stats;
+}
+
 UInt32 FVulkanDevice::GetSwapchainImageCount(
     FRHISwapchainHandle swapchain)
 {

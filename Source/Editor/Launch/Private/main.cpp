@@ -1484,7 +1484,8 @@ static bool RunReloadTest(FRenderContext* context, FRenderer* renderer,
 // ============================================================================
 
 static void LogBenchmarkReport(const FLaunchOptions& options,
-                               const FRenderer& renderer)
+                               const FRenderer&      renderer,
+                               FRenderContext*       context)
 {
     const FRenderFrameStats& frameStats = renderer.GetFrameStats();
     const FSceneSyncStats&   sceneStats = FSceneManager::Get().GetStats();
@@ -1506,6 +1507,48 @@ static void LogBenchmarkReport(const FLaunchOptions& options,
              "[基准] 帧耗时: 平均 {} ms | 最差 {} ms | 平均帧率 {} | 总帧数 {}",
              frameStats.AverageFrameMs, frameStats.WorstFrameMs,
              frameStats.AverageFps, frameStats.TotalFrames);
+
+    // 两个口径都报。资产显存是关卡加载/卸载能控制的部分, 设备总量才是
+    // 真实占用 —— 渲染目标、阴影贴图、IBL 的立方体贴图、逐帧 UBO 都不
+    // 经资源管理器, 只看前者会以为显存已经归零。
+    if (context != nullptr)
+    {
+        const FRenderResourceStats& assetStats =
+            context->GetResourceManager().GetStats();
+
+        LIMX_LOG(LogLaunch, Log,
+                 "[基准] 资产显存: {} MiB (网格 {} 张 {} MiB | 纹理 {} 张 {} MiB)",
+                 assetStats.GetTotalBytes() / (1024 * 1024),
+                 assetStats.MeshCount, assetStats.MeshBytes / (1024 * 1024),
+                 assetStats.TextureCount,
+                 assetStats.TextureBytes / (1024 * 1024));
+
+        if (context->GetDevice() != nullptr)
+        {
+            const FRHIDeviceMemoryStats deviceStats =
+                context->GetDevice()->GetDeviceMemoryStats();
+
+            LIMX_LOG(LogLaunch, Log,
+                     "[基准] 设备显存: 占用 {} MiB / 申请 {} MiB | "
+                     "分配数 {}/{}",
+                     deviceStats.UsedBytes / (1024 * 1024),
+                     deviceStats.ReservedBytes / (1024 * 1024),
+                     deviceStats.AllocationCount,
+                     deviceStats.AllocationLimit);
+
+            // 引擎自身的常驻开销 = 设备总量 - 关卡资产。把它单独报出来,
+            // 是因为它才是"加载一个空场景要花多少显存"的答案。
+            const UInt64 engineBytes =
+                (deviceStats.UsedBytes > assetStats.GetTotalBytes())
+                    ? (deviceStats.UsedBytes - assetStats.GetTotalBytes())
+                    : 0;
+
+            LIMX_LOG(LogLaunch, Log,
+                     "[基准] 其中引擎常驻 (渲染目标/阴影/IBL/UBO): {} MiB",
+                     engineBytes / (1024 * 1024));
+        }
+    }
+
     LIMX_LOG(LogLaunch, Log, "[基准] ==========================");
 }
 
@@ -1793,7 +1836,7 @@ int WINAPI wWinMain(
             loopFrame >= static_cast<UInt64>(launchOptions.WarmupFrames) +
                          static_cast<UInt64>(launchOptions.FrameLimit))
         {
-            LogBenchmarkReport(launchOptions, renderer);
+            LogBenchmarkReport(launchOptions, renderer, &renderContext);
 
             // 截屏: 再渲一帧, 这一帧的命令缓冲区里带上拷贝命令
             if (!launchOptions.ScreenshotPath.IsEmpty() &&

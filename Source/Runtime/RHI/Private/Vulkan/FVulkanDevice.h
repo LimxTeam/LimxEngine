@@ -335,6 +335,8 @@ public:
                                  FRHIFenceHandle signalFence,
                                  UInt32& outImageIndex) override;
     UInt32 GetSwapchainImageCount(FRHISwapchainHandle swapchain) override;
+
+    LIMX_NODISCARD FRHIDeviceMemoryStats GetDeviceMemoryStats() const override;
     FRHITextureHandle GetSwapchainImage(
         FRHISwapchainHandle swapchain, UInt32 imageIndex) override;
     FRHITextureViewHandle GetSwapchainImageView(

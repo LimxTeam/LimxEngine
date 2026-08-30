@@ -21,7 +21,10 @@
 param(
     [int]$Grid   = 60,
     [int]$Frames = 300,
-    [int]$Warmup = 60
+    [int]$Warmup = 60,
+
+    # 环境贴图路径 —— 缺失时自动跳过 IBL 那一项
+    [string]$HdriPath = 'Content/HDRI/bloem_train_track_clear_2k.hdr'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -37,12 +40,18 @@ if (-not (Test-Path $Exe)) {
     exit 1
 }
 
-# 四种配置 —— 名称与开关一一对应
+# 五种配置 —— 名称与开关一一对应
+#
+# 最后一项在完整开关的基础上再加环境光照。它与第四项只差一个 --hdri,
+# 因此两者的差值就是 IBL 的逐帧成本 —— 那是三次立方体贴图采样加一次
+# 查找表采样, 应当只有零点几毫秒。一旦这个差值明显变大, 说明预滤波
+# 的 mip 选取或采样器配置出了问题, 而那种退化在画面上几乎看不出来。
 $Configurations = @(
     @{ Name = '基线 (剔除关 排序关)'; Args = '--no-cull --no-sort' },
     @{ Name = '仅剔除'.PadRight(0);   Args = '--no-sort' },
     @{ Name = '仅排序';               Args = '--no-cull' },
-    @{ Name = '剔除 + 排序';          Args = '' }
+    @{ Name = '剔除 + 排序';          Args = '' },
+    @{ Name = '剔除 + 排序 + IBL';    Args = "--hdri $HdriPath" }
 )
 
 $Results = @()
@@ -54,6 +63,13 @@ Write-Host "  Limx Engine — 渲染吞吐基准  (网格 ${Grid}x${Grid}, 采�
 Write-Host ('=' * 78)
 
 foreach ($config in $Configurations) {
+    # HDRI 是下载来的大文件, 不入库 —— 缺了就跳过那一项而非整体失败
+    if ($config.Args -like '*--hdri*' -and -not (Test-Path $HdriPath)) {
+        Write-Host ''
+        Write-Host "  跳过: $($config.Name) — 未找到 $HdriPath" -ForegroundColor Yellow
+        continue
+    }
+
     Remove-Item $Log -ErrorAction SilentlyContinue
 
     $argumentList = "--grid $Grid --frames $Frames --warmup $Warmup $($config.Args)"

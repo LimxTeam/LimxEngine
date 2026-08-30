@@ -133,6 +133,9 @@ LimxLaunch.exe --grid 60 --frames 300
 # 对照开关
 LimxLaunch.exe --grid 60 --frames 300 --no-cull --no-sort
 
+# 完整吞吐基准（五种配置对照，含 IBL 逐帧成本）
+powershell Scripts/benchmark.ps1
+
 # HDR 环境贴图 + 天空盒，固定机位截屏
 LimxLaunch.exe --hdri Content/HDRI/sky.hdr --camera-pitch -0.35                --frames 30 --screenshot shot.ppm
 ```

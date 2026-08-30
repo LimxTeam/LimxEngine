@@ -314,6 +314,13 @@ private:
     /// 当前专用分配数
     UInt32 m_DedicatedCount = 0;
 
+    /// 专用分配占用的字节数
+    ///
+    /// 单独记而非从块里推: 专用分配不进任何块, 而"已占用"过去只统计块内
+    /// 的子分配 —— 于是渲染目标、立方体贴图这类走专用路径的大资源在
+    /// 统计里完全隐形。实测环境贴图那 17 MiB 一个字节都没体现出来。
+    VkDeviceSize m_DedicatedBytes = 0;
+
     /// 已向驱动申请的显存总量
     VkDeviceSize m_TotalReservedBytes = 0;
 };
