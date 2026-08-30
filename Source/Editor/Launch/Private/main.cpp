@@ -1464,6 +1464,36 @@ static bool LoadSceneFromFile(LScene* scene, FRenderContext* context,
              loadResult.MissingTextureCount, loadResult.VertexCount,
              loadResult.TriangleCount, loadResult.ElapsedMilliseconds);
 
+    // 分项耗时 —— 优化之前必须先知道时间花在哪。
+    //
+    // "其它"是总耗时减去这四项: 节点构建、材质对象创建、包围盒累积这些
+    // 零碎步骤。它若明显偏大, 说明有一块没被埋到点上。
+    const Float64 accounted = loadResult.ParseMilliseconds +
+                              loadResult.TextureDecodeMilliseconds +
+                              loadResult.TextureUploadMilliseconds +
+                              loadResult.MeshUploadMilliseconds;
+
+    LIMX_LOG(LogLaunch, Log,
+             "[Launch]   分项 — 解析 {} ms | 纹理解码 {} ms | 纹理上传 {} ms "
+             "| 网格上传 {} ms | 其它 {} ms",
+             loadResult.ParseMilliseconds,
+             loadResult.TextureDecodeMilliseconds,
+             loadResult.TextureUploadMilliseconds,
+             loadResult.MeshUploadMilliseconds,
+             loadResult.ElapsedMilliseconds - accounted);
+
+    if (loadResult.DecodedImageBytes > 0 &&
+        loadResult.TextureDecodeMilliseconds > 0.0)
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[Launch]   解码吞吐 — {} MiB / {} ms = {} MiB/s",
+                 loadResult.DecodedImageBytes / (1024 * 1024),
+                 loadResult.TextureDecodeMilliseconds,
+                 static_cast<Float64>(loadResult.DecodedImageBytes) /
+                     (1024.0 * 1024.0) /
+                     (loadResult.TextureDecodeMilliseconds / 1000.0));
+    }
+
     context->GetResourceManager().LogStats("资产导入后");
 
     // ---- 按包围盒摆放相机 ----
