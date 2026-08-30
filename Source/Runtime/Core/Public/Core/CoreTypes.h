@@ -247,6 +247,7 @@
 #include "Core/Threading/FTaskGraph.h"
 #include "Core/Threading/TLockFreeQueue.h"
 #include "Core/Threading/FJobSystem.h"
+#include "Core/Threading/FJobExecutor.h"
 #include "Core/Threading/TTaskGroup.h"
 
 // --- 第 16 层: 日志系统 ---

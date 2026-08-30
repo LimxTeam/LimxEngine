@@ -4,25 +4,26 @@
  * 创建者: LimxTeam
  *
  * 功能描述:
- *   任务组 — 多任务并发提交与等待机制
- *   将一批任务提交到 FJobSystem，等待所有任务完成后继续
- *   用于并行几何处理、物理步进、批量资源加载等场景
+ *   任务组 — 一个"我提交了 N 件事, 告诉我什么时候都完了"的计数屏障
  *
  * 设计哲学:
- *   计数器屏障 — 原子计数器跟踪未完成任务数
- *   可复用 — Reset() 后可再次提交新批次任务
- *   非阻塞轮询 — IsComplete() 允许主线程轮询
+ *   只是一个屏障, 不是调度器。它不持有线程、不决定谁在哪跑 —— 任务投给谁
+ *   由调用方决定 (通常是 FTaskGraph)。这样它既能配合任务图, 也能用在
+ *   "自己开了几个线程"的临时场合。
+ *
+ *   原先它持有一个 `FJobSystem*`。而 `class FJobSystem` 全项目只存在于
+ *   本文件的一句前向声明里 —— 那个指针永远指不到任何东西, 两个访问器
+ *   也就永远只是在搬运空指针。已移除。
  *
  * 技术特性:
- *   - TTaskGroup: 任务组
- *   - AddTask: 提交单个任务
- *   - Wait: 自旋等待全部完成
+ *   - BeginTask/NotifyComplete: 手动配对的计数
+ *   - Wait: 让出时间片地等待, 而非空转
  *   - IsComplete: 非阻塞完成检测
  *   - Reset: 重置供下次使用
  *
  * 依赖关系:
  *   内部: Core/HAL/PlatformTypes.h, Core/CoreMacros.h,
- *          Core/Threading/FAtomic.h, Core/Threading/FJobSystem.h
+ *          Core/Threading/FAtomic.h, Core/Threading/FThread.h
  *
  ******************************************************************************/
 
@@ -32,13 +33,11 @@
 #include "Core/HAL/PlatformTypes.h"
 #include "Core/CoreMacros.h"
 #include "Core/Threading/FAtomic.h"
+#include "Core/Threading/FThread.h"
 #include "Core/Templates/TFunction.h"
 
 namespace Limx
 {
-
-// 前向声明
-class FJobSystem;
 
 /// 任务组 — 并发任务提交与等待
 class TTaskGroup
@@ -48,13 +47,6 @@ public:
 
     TTaskGroup()
         : m_PendingCount(0)
-        , m_JobSystem(nullptr)
-    {
-    }
-
-    explicit TTaskGroup(FJobSystem* jobSystem)
-        : m_PendingCount(0)
-        , m_JobSystem(jobSystem)
     {
     }
 
@@ -75,21 +67,31 @@ public:
     /// 通知一个任务完成
     void NotifyComplete()
     {
-        Int32 remaining = m_PendingCount.FetchSub(1);
-        LIMX_ASSERT(remaining > 0);
+        // FetchSub 返回的是**递减前**的值, 因此"递减前必须为正"才说明
+        // 这次递减是有配对的。判成 >= 0 会放过一次多余的通知, 而那会让
+        // 计数变负, 之后的 Wait 永远等不到零。
+        const Int32 before = m_PendingCount.FetchSub(1);
+
+        LIMX_ASSERT(before > 0);
+
+        static_cast<void>(before);
     }
 
     // ========================================================================
     // 等待
     // ========================================================================
 
-    /// 自旋等待所有任务完成
+    /// 等待所有任务完成
+    ///
+    /// 让出时间片而非空转。原先是纯自旋加一条内存屏障, 注释里写着
+    /// "在工程实践中可嵌入 Yield" —— 而那正是必须做的事: 等待方占满一个
+    /// 核心空转时, 它等的那些任务少了一个可用核心, 于是等得更久。
+    /// 工作线程数按硬件线程数减一来定, 这一个核心的差别是实打实的。
     void Wait()
     {
         while (m_PendingCount.Load() > 0)
         {
-            // 自旋 — 在工程实践中可嵌入 Yield 或帮助执行任务
-            AtomicOps::MemoryBarrier();
+            FThread::Yield();
         }
     }
 
@@ -116,23 +118,8 @@ public:
         m_PendingCount.Store(0);
     }
 
-    // ========================================================================
-    // 访问
-    // ========================================================================
-
-    void SetJobSystem(FJobSystem* jobSystem)
-    {
-        m_JobSystem = jobSystem;
-    }
-
-    LIMX_NODISCARD FJobSystem* GetJobSystem() const
-    {
-        return m_JobSystem;
-    }
-
 private:
     TAtomic<Int32> m_PendingCount;  ///< 未完成任务数
-    FJobSystem*    m_JobSystem;     ///< 关联的任务系统
 };
 
 } // namespace Limx
