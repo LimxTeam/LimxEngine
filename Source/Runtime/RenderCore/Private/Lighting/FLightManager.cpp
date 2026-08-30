@@ -355,10 +355,21 @@ void FLightManager::UploadLightData(
     uboData.CameraPositionZ = cameraPosition.Z;
     uboData.CameraPositionW = 0.0f;
 
-    // 环境光 — 微弱的白色环境光
-    uboData.AmbientColorR    = 0.03f;
-    uboData.AmbientColorG    = 0.03f;
-    uboData.AmbientColorB    = 0.03f;
+    // 常数环境光 —— 没有环境贴图时的兜底
+    //
+    // 它的职责只有一个: 别让没被直接光照到的表面变成纯黑。真正的环境
+    // 光照请用 IBL, 这里只是让场景在缺少 HDRI 时仍然可读。
+    //
+    // 0.15 而非原先的 0.03: 原值是对着一个双重 sRGB 编码的输出用肉眼调
+    // 出来的 (见 tonemap.frag), 那时它渲染出来是 45/255; 编码修正之后
+    // 同样的 0.03 只剩 6.8/255 —— Sponza 的室内会整片全黑。0.15 恢复的
+    // 正是当初调这个值时想要的观感。
+    //
+    // 这类"参数是照着 bug 调出来的"在 bug 修好那一刻会同时暴露, 一并
+    // 处理才不会留下一个看着没道理的常数。
+    uboData.AmbientColorR    = 0.15f;
+    uboData.AmbientColorG    = 0.15f;
+    uboData.AmbientColorB    = 0.15f;
     uboData.AmbientIntensity = 1.0f;
 
     // 阴影 —— 矩阵与参数由渲染器在阴影 Pass 之后写入本管理器

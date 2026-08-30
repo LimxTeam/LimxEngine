@@ -1399,6 +1399,29 @@ static bool RunReloadTest(FRenderContext* context, FRenderer* renderer,
             return false;
         }
 
+        // 每轮连同环境贴图一起建、一起拆。
+        //
+        // IBL 的三张贴图挂在**逐帧共享**的光照描述符集上, 而描述符集的
+        // 生存期跨越整个进程 —— 换关卡时若只销毁贴图而不改描述符, 集里
+        // 留下的就是指向已释放图像的视图。这是这条路径独有的失效方式,
+        // 加载/卸载场景本身的引用计数覆盖不到它。
+        FEnvironmentMap environmentMap;
+
+        {
+            const FImageData furnace = BuildFurnaceEnvironment();
+
+            if (IsRHISuccess(environmentMap.BuildFromEquirect(context, furnace)))
+            {
+                renderer->SetEnvironmentMap(&environmentMap);
+            }
+            else
+            {
+                LIMX_LOG(LogLaunch, Error, "[自检] 环境贴图构建失败");
+                LRegistry::Get().Destroy(scene);
+                return false;
+            }
+        }
+
         const UInt64 loadedBytes = resources.GetStats().GetTotalBytes();
 
         LIMX_LOG(LogLaunch, Log,
@@ -1413,6 +1436,16 @@ static bool RunReloadTest(FRenderContext* context, FRenderer* renderer,
         // (释放纹理引用), 最后收割。反过来的话, 材质销毁时 Trait 还活着,
         // 网格引用未放, 收割只能收回纹理。
         LRegistry::Get().Destroy(scene);
+
+        // 解绑必须早于释放, 且两者之间要等 GPU 空闲 —— 否则正在执行的
+        // 帧仍引用着这些图像
+        if (context->GetDevice() != nullptr)
+        {
+            context->GetDevice()->WaitIdle();
+        }
+
+        renderer->SetEnvironmentMap(nullptr);
+        environmentMap.Release();
 
         const UInt32 destroyedMaterials =
             FSceneLoader::UnloadMaterials(loadResult);
