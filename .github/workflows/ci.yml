@@ -136,6 +136,36 @@ jobs:
           name: limx-toolchain
           path: Binaries/Tools
 
+      # Vulkan 加载器必须在 exe 旁边或 PATH 上。
+      #
+      # LimxEngineTests 经 LimxRenderer/LimxRenderCore **静态导入**
+      # vulkan-1.dll。加载器找不到它时进程根本起不来 (0xC0000135), 而在
+      # CI 上这表现为"引擎层测试失败" —— 实际一条断言都没跑到。
+      #
+      # 对比: LimxCoreTests / LimxRHITests 只导入 KERNEL32 与 CRT, 所以
+      # 它们一直是绿的, 这个问题因此被掩盖着。
+      #
+      # 更彻底的做法是运行时 LoadLibrary 而非静态导入 —— 那样没有显卡的
+      # 环境也能跑纯 CPU 的用例。已记入 RHI 补齐那条副线。
+      - name: 准备 Vulkan 加载器
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path $env:VULKAN_SDK 'Bin/vulkan-1.dll'),
+            (Join-Path $env:VULKAN_SDK 'runtime/x64/vulkan-1.dll'),
+            (Join-Path $env:SystemRoot 'System32/vulkan-1.dll')
+          )
+          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host '候选路径均不存在:'
+            $candidates | ForEach-Object { Write-Host "  $_" }
+            throw '未找到 vulkan-1.dll'
+          }
+          Write-Host "使用 $found"
+          $dest = 'Binaries/Development/Win64'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item $found $dest -Force
+
       # 零 STL / 零 CRT / 无裸 new-delete 等强制规则。
       # lbt check 在发现 Error 级别问题时以 1 退出 (第四周修复, 在此之前
       # 它只打印不返回, 这一步从未真正拦住过任何东西)。

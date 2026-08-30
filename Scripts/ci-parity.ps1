@@ -52,9 +52,12 @@ function Get-ToolCommands {
         # 统一分隔符与前后缀, 使两个文件的写法可比
         if ($line -notmatch 'Binaries[\\/](Tools|Development)') { continue }
 
-        # YAML 的 path: / name: / key: 不是命令 —— 它们同样带 Binaries 路径。
-        # 不排掉的话产物上传下载会被当成"CI 独有的命令"报出来。
-        if ($line -match '^\s*(path|name|key)\s*:') { continue }
+        # 只认真正的可执行文件调用 —— 必须出现 .exe。
+        #
+        # 否则 YAML 的 path:/name: 与 PowerShell 的变量赋值 (两者都可能
+        # 带 Binaries 路径) 会被当成命令报出来。这条限制也意味着: 想被
+        # 比对的命令必须写全 .exe 后缀, 这在两个文件里本来就是惯例。
+        if ($line -notmatch '\.exe') { continue }
 
         $text = $line.Trim()
 
