@@ -1,4 +1,4 @@
-/*******************************************************************************
+﻿/*******************************************************************************
  * 文件: SmartPointerTests.cpp
  * 创建时间: 2026-08-29
  * 创建者: LimxTeam
@@ -587,4 +587,168 @@ LIMX_TEST(TOptional, NonTrivialTypeLeavesNoLeak)
     }
 
     LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+}
+
+
+// ============================================================================
+// TRefCounted / TRefPtr
+//
+// 这一族此前没有任何用例, 也没有任何使用者 —— 它的 Delete() 用的是裸
+// delete, 而项目禁止裸 new, 因此当时根本没有合规的创建方式。改为走默认
+// 分配器并补上 MakeRefCounted 之后, 分配与释放必须严格配对: 从一个堆
+// 分配、往另一个堆归还, 症状是随机的堆损坏, 不会当场报错。
+// ============================================================================
+
+namespace
+{
+
+/// 引用计数探针 — 构造/析构次数记在 FProbe 上
+class FRefProbe : public TRefCounted<FRefProbe>
+{
+public:
+    FRefProbe()
+        : m_Payload()
+    {
+    }
+
+    explicit FRefProbe(Int32 value)
+        : m_Payload(value)
+    {
+    }
+
+    LIMX_NODISCARD Int32 GetValue() const
+    {
+        return m_Payload.GetValue();
+    }
+
+private:
+    FProbe m_Payload;
+};
+
+} // namespace
+
+LIMX_TEST(RefCounted, MakeRefCountedStartsAtOne)
+{
+    FProbe::ResetCounters();
+
+    {
+        TRefPtr<FRefProbe> ptr = MakeRefCounted<FRefProbe>(42);
+
+        LIMX_REQUIRE_TRUE(ptr.Get() != nullptr);
+        LIMX_EXPECT_EQ(ptr->GetRefCount(), UInt32(1));
+        LIMX_EXPECT_TRUE(ptr->IsUnique());
+        LIMX_EXPECT_EQ(ptr->GetValue(), 42);
+        LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 1);
+    }
+
+    // 离开作用域即释放 —— 计数没归零说明 AddRef/Release 不配对
+    LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+}
+
+LIMX_TEST(RefCounted, CopyingSharesOwnership)
+{
+    FProbe::ResetCounters();
+
+    {
+        TRefPtr<FRefProbe> first = MakeRefCounted<FRefProbe>(7);
+
+        {
+            TRefPtr<FRefProbe> second = first;
+
+            LIMX_EXPECT_EQ(first->GetRefCount(), UInt32(2));
+            LIMX_EXPECT_FALSE(first->IsUnique());
+
+            // 两个指针指向同一个对象, 而不是各自一份拷贝
+            LIMX_EXPECT_TRUE(first == second.Get());
+            LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 1);
+        }
+
+        // 第二个引用消失后对象必须还活着
+        LIMX_EXPECT_EQ(first->GetRefCount(), UInt32(1));
+        LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 1);
+    }
+
+    LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+}
+
+LIMX_TEST(RefCounted, DestroysExactlyOnce)
+{
+    FProbe::ResetCounters();
+
+    {
+        TRefPtr<FRefProbe> a = MakeRefCounted<FRefProbe>(1);
+        TRefPtr<FRefProbe> b = a;
+        TRefPtr<FRefProbe> c = b;
+
+        LIMX_EXPECT_EQ(a->GetRefCount(), UInt32(3));
+    }
+
+    // 析构恰好一次 —— 多于一次是二次释放, 少于一次是泄漏。
+    // 两者都不会让上面任何一条断言失败, 只能靠这里的计数抓。
+    LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+    LIMX_EXPECT_EQ(FProbe::s_DestructCount, 1);
+}
+
+LIMX_TEST(RefCounted, ReleasesOnReassignment)
+{
+    FProbe::ResetCounters();
+
+    {
+        TRefPtr<FRefProbe> ptr = MakeRefCounted<FRefProbe>(1);
+
+        LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 1);
+
+        // 覆盖赋值必须先放掉旧对象
+        ptr = MakeRefCounted<FRefProbe>(2);
+
+        LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 1);
+        LIMX_EXPECT_EQ(ptr->GetValue(), 2);
+        LIMX_EXPECT_EQ(ptr->GetRefCount(), UInt32(1));
+    }
+
+    LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+}
+
+LIMX_TEST(RefCounted, SelfAssignmentKeepsObjectAlive)
+{
+    FProbe::ResetCounters();
+
+    {
+        TRefPtr<FRefProbe> ptr = MakeRefCounted<FRefProbe>(3);
+
+        // 自赋值若写成"先放旧的再取新的", 这里对象就已经没了
+        ptr = ptr;
+
+        LIMX_REQUIRE_TRUE(ptr.Get() != nullptr);
+        LIMX_EXPECT_EQ(ptr->GetValue(), 3);
+        LIMX_EXPECT_EQ(ptr->GetRefCount(), UInt32(1));
+        LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 1);
+    }
+
+    LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+}
+
+LIMX_TEST(RefCounted, AllocationAndReleaseArePaired)
+{
+    // 反复创建销毁 —— 分配器与释放路径接不上时, 这里是最容易把堆
+    // 损坏踩出来的形状。单次创建销毁往往看不出异常。
+    FProbe::ResetCounters();
+
+    constexpr Int32 kRounds = 512;
+
+    for (Int32 i = 0; i < kRounds; ++i)
+    {
+        TRefPtr<FRefProbe> ptr = MakeRefCounted<FRefProbe>(i);
+
+        LIMX_REQUIRE_TRUE(ptr.Get() != nullptr);
+
+        if (ptr->GetValue() != i)
+        {
+            LIMX_EXPECT_EQ(ptr->GetValue(), i);
+            break;
+        }
+    }
+
+    LIMX_EXPECT_EQ(FProbe::GetLiveCount(), 0);
+    LIMX_EXPECT_EQ(FProbe::s_DestructCount, kRounds);
 }

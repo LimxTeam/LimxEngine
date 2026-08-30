@@ -1,4 +1,4 @@
-/*******************************************************************************
+﻿/*******************************************************************************
  * 文件: FThread.h
  * 创建时间: 2026-04-06
  * 创建者: LimxTeam
@@ -24,7 +24,7 @@
  *
  * 依赖关系:
  *   内部: Core/HAL/PlatformTypes.h, Core/CoreMacros.h,
- *          Core/Templates/TFunction.h
+ *          Core/Templates/TFunction.h, Core/Templates/TUniquePtr.h
  *
  ******************************************************************************/
 
@@ -34,6 +34,7 @@
 #include "Core/HAL/PlatformTypes.h"
 #include "Core/CoreMacros.h"
 #include "Core/Templates/TFunction.h"
+#include "Core/Templates/TUniquePtr.h"
 #include "Core/HAL/FPlatformMemory.h"
 
 // Windows 线程 API 前向声明
@@ -163,8 +164,13 @@ public:
     {
         LIMX_ASSERT(!m_IsJoinable);
 
-        // 在堆上分配 TFunction — 线程入口函数需要持有所有权
-        auto* context = new ThreadContext();
+        // 在堆上分配 TFunction — 线程入口函数需要持有所有权。
+        //
+        // 所有权跨线程转移: 这里分配, 由新线程的入口点释放。中间那段
+        // (CreateThread 失败、或尚未 Release) 交给 TUniquePtr 兜底 ——
+        // 早先是裸 new 配失败分支里的裸 delete, 一旦中间新增任何提前
+        // 返回就会漏掉。
+        TUniquePtr<ThreadContext> context = MakeUnique<ThreadContext>();
         context->Function = MoveTemp(threadFunc);
 
 #if LIMX_PLATFORM_WINDOWS
@@ -173,7 +179,7 @@ public:
             nullptr,
             static_cast<unsigned long long>(stackSize),
             &ThreadEntryPoint,
-            context,
+            context.Get(),
             0,
             &threadId);
 
@@ -181,10 +187,20 @@ public:
         {
             m_ThreadId = static_cast<UInt32>(threadId);
             m_IsJoinable = true;
+
+            // 交出所有权 —— 此后由 ThreadEntryPoint 负责释放。
+            //
+            // 新线程可能在 CreateThread 返回之前就跑完并释放了 context,
+            // 因此这里只能放弃指针, 不能再解引用。Release 正是如此:
+            // 取出指针、置空、返回, 全程不触碰对象。
+            //
+            // 返回值确实要丢: 指针已经通过 CreateThread 的参数交给新线程,
+            // 这边不再需要它。Release 标了 nodiscard, 故显式弃用。
+            (void)context.Release();
         }
         else
         {
-            delete context;
+            // context 出作用域自动释放
             LIMX_ASSERT(false);
         }
 #endif
@@ -290,14 +306,24 @@ private:
     };
 
     /// Windows 线程入口点 (静态 C 调用约定)
+    ///
+    /// 接过 Start 交出的所有权。重新包成 TUniquePtr 而非裸 delete, 是
+    /// 为了让线程函数无论怎样退出都能释放上下文。
+    ///
+    /// 删除器必须配默认分配器 —— Start 用的是 MakeUnique, 它取的正是
+    /// GetDefaultAllocator()。两处要是接不上, 就是从一个堆分配、往另一
+    /// 个堆归还。
     static unsigned long __stdcall ThreadEntryPoint(void* parameter)
     {
-        auto* context = static_cast<ThreadContext*>(parameter);
+        TUniquePtr<ThreadContext> context(
+            static_cast<ThreadContext*>(parameter),
+            TDefaultDelete<ThreadContext>(GetDefaultAllocator()));
+
         if (context->Function)
         {
             context->Function();
         }
-        delete context;
+
         return 0;
     }
 

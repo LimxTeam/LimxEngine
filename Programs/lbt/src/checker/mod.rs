@@ -220,17 +220,17 @@ fn build_lint_rules() -> Vec<LintRule> {
             exclude_pattern: Some(Regex::new(
                 r"(placement|operator\s+new|MakeUnique|MakeShared|::new)"
             ).unwrap()),
-            // Core 智能指针/线程/分配器内部允许裸 new
-            exempt_files: vec![
-                "Templates/TUniquePtr.h",
-                "Templates/TSharedPtr.h",
-                "Templates/TRefCounted.h",
-                "Templates/TObjectPtr.h",
-                "Threading/FThread.h",
-                "Memory/IAllocator.h",
-                "Memory/DefaultAllocator.h",
-                "Memory/MemoryOps.h",
-            ],
+            // 无豁免。
+            //
+            // 这份清单原有八个文件, 但其中只有 FThread.h 与 TRefCounted.h
+            // 真的含裸 new/delete, 其余六个早已改用分配器, 豁免只是没人
+            // 撤。第四周把那两处也改掉了 (FThread 用 TUniquePtr 表达跨线程
+            // 所有权转移, TRefCounted::Delete 走默认分配器), 于是整份清单
+            // 一起清空 —— 规则从此对全工程生效。
+            //
+            // 分配器与智能指针自身的实现走 placement new + 显式析构, 由
+            // exclude_pattern 排除, 不需要按文件豁免。
+            exempt_files: vec![],
         },
         LintRule {
             id: "limx-no-raw-delete",
@@ -242,17 +242,8 @@ fn build_lint_rules() -> Vec<LintRule> {
             include_only: false,
             skip_in_comments: true,
             exclude_pattern: None,
-            // Core 智能指针/线程/内存内部允许裸 delete
-            exempt_files: vec![
-                "Templates/TUniquePtr.h",
-                "Templates/TSharedPtr.h",
-                "Templates/TRefCounted.h",
-                "Templates/TObjectPtr.h",
-                "Threading/FThread.h",
-                "Memory/IAllocator.h",
-                "Memory/DefaultAllocator.h",
-                "Memory/MemoryOps.h",
-            ],
+            // 无豁免 —— 理由同 limx-no-raw-new
+            exempt_files: vec![],
         },
 
         // ================================================================

@@ -525,6 +525,17 @@ fn main() -> Result<()> {
                 println!("  [TODO] MSVC /analyze + /Zs 深度分析模式");
                 println!("  此功能将在后续版本中实现");
             }
+
+            // Error 级别的发现必须让进程以非零退出。
+            //
+            // 在此之前这里只打印不返回, 于是 `lbt check` 无论发现多少
+            // 错误都退出 0 —— verify.ps1 的"源码规则"那一步因此从未真正
+            // 拦住过任何东西, 整套规则在 CI 里只是装饰。
+            //
+            // 警告与提示仍然不致命: 它们是建议, 不是约定。
+            if err_count > 0 {
+                std::process::exit(1);
+            }
         }
 
         Commands::GenerateProject {
