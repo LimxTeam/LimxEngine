@@ -1,19 +1,34 @@
 # ============================================================
 # Limx Engine 持续集成
 #
-# 三个作业:
-#   toolchain — Rust 工具链 (lbt/lht/lsc) 的检查、测试与构建
-#   engine    — C++ 引擎全量构建 + 单元测试 + 源码规则检查
-#   shaders   — 着色器编译与 SPIR-V 校验
+# ── 两层 ────────────────────────────────────────────────────
 #
-# 说明: 该工作流尚未在真实 GitHub Actions 环境中验证过。
-#       仓库已于 2026-08-29 推送到 LimxTeam/LimxEngine, 首次触发后
-#       需重点检查 Vulkan SDK 安装步骤与运行器镜像的兼容性。
+# 无 GPU 层 (toolchain / shaders / engine)
+#   Rust 工具链、着色器编译与校验、源码规则、C++ 全量构建、单元测试。
+#   只需要 CPU 与 Vulkan SDK (头文件与 glslang), 普通托管运行器即可。
+#   这一层全绿是一个**可信的完整结论**, 而不是"有几步跑不了"。
 #
-#       Source/ThirdParty 不入库, 但这不影响构建 —— 两个 SDK 是
-#       External 类型模块且无引擎模块依赖, 已实测确认。
+# 需 GPU 层 (gpu-checks)
+#   显存回收自检、IBL 白炉自检、资产导入回归哨兵。
+#   它们要创建真实 VkDevice 并提交命令 —— 托管运行器只有软件光栅化器
+#   (甚至没有 Vulkan 设备), 跑不了。该作业指定 self-hosted + gpu 标签,
+#   在没有这类运行器时不会排队阻塞, 也不会伪装成通过。
 #
-#       本地等价验证请使用 Scripts/verify.ps1 (九步, 唯一经过实测的入口)。
+# 分层的意义: 把跑不了的步骤混在必跑作业里, 结果是"红了但据说没关系",
+# 这种状态维持不了几周就会让整个 CI 被当成噪声。
+#
+# ── 说明 ────────────────────────────────────────────────────
+#
+# 该工作流尚未在真实 GitHub Actions 环境中验证过。仓库已于 2026-08-29
+# 推送到 LimxTeam/LimxEngine, 首次触发后需重点检查 Vulkan SDK 安装步骤
+# 与运行器镜像的兼容性。
+#
+# Source/ThirdParty 不入库, 但这不影响构建 —— 两个 SDK 是 External 类型
+# 模块且无引擎模块依赖, 已实测确认。
+#
+# 本地等价验证:
+#   pwsh Scripts/verify.ps1 -SkipGpu    # 对应无 GPU 层
+#   pwsh Scripts/verify.ps1 -OnlyGpu    # 对应需 GPU 层
 # ============================================================
 
 name: CI
@@ -30,8 +45,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ==========================================================
+  # 无 GPU 层
+  # ==========================================================
+
   # ----------------------------------------------------------
-  # Rust 工具链 — 不依赖 Vulkan, 可独立快速反馈
+  # Rust 工具链 — 不依赖 GPU, 可独立快速反馈
   # ----------------------------------------------------------
   toolchain:
     name: Rust 工具链
@@ -54,7 +73,8 @@ jobs:
             Programs/target
           key: cargo-${{ runner.os }}-${{ hashFiles('Programs/Cargo.lock') }}
 
-      # lsc 依赖 shaderc-sys, 需要 Vulkan SDK 提供的 glslang
+      # lsc 依赖 shaderc-sys, 需要 Vulkan SDK 提供的 glslang。
+      # 这是编译期依赖, 不需要 GPU。
       - name: 安装 Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
@@ -84,7 +104,11 @@ jobs:
             Programs/target/release/lsc.exe
 
   # ----------------------------------------------------------
-  # C++ 引擎 — 全量构建 + 单元测试
+  # C++ 引擎 — 源码规则 + 全量构建 + 单元测试
+  #
+  # 这里的每一步都是控制台程序, PowerShell 会等待它们并回填
+  # $LASTEXITCODE, 因此 run: 直接调用即可, 退出码非 0 即失败。
+  # 引擎可执行文件 (GUI 子系统) 不在这一层 —— 见 gpu-checks 的说明。
   # ----------------------------------------------------------
   engine:
     name: 引擎构建与测试
@@ -112,7 +136,9 @@ jobs:
           name: limx-toolchain
           path: Binaries/Tools
 
-      # 零 STL / 零 CRT / 无裸 new-delete 等强制规则
+      # 零 STL / 零 CRT / 无裸 new-delete 等强制规则。
+      # lbt check 在发现 Error 级别问题时以 1 退出 (第四周修复, 在此之前
+      # 它只打印不返回, 这一步从未真正拦住过任何东西)。
       - name: 源码规则检查
         run: .\Binaries\Tools\lbt.exe check --source-dir Source
 
@@ -135,10 +161,14 @@ jobs:
       - name: 引擎层单元测试
         run: .\Binaries\Development\Win64\LimxEngineTests.exe
 
-      # 需要真实 GPU —— CI 运行器通常只有软件光栅化器, 该步可能不适用。
-      # 首次触发时若失败, 应确认运行器是否具备 Vulkan 设备, 而非直接删掉。
-      - name: 显存回收自检
-        run: .\Binaries\Development\Win64\LimxLaunch.exe --scene Content/TestScene/testscene.obj --reload-test
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: limx-engine-build
+          path: |
+            Binaries/Development/Win64/
+            Binaries/Shaders/
+          retention-days: 3
 
       - name: 上传失败日志
         if: failure()
@@ -176,3 +206,57 @@ jobs:
 
       - name: 严格校验
         run: .\Binaries\Tools\lsc.exe validate -s Shaders --vulkan-version 1.4 --strict
+
+  # ==========================================================
+  # 需 GPU 层
+  # ==========================================================
+  #
+  # 这些步骤要创建真实 VkDevice。托管运行器给不了, 所以指定
+  # self-hosted + gpu 标签; 没有这类运行器时该作业不会开始, 也就
+  # 不会用一个假的绿色掩盖"没验过"。
+  #
+  # ── 为什么必须走 verify.ps1 而不是直接 run: ──
+  #
+  # LimxLaunch.exe 是 GUI 子系统程序 (PE Subsystem = 2)。PowerShell
+  # 调用 GUI 程序时**不等待、也不回填 $LASTEXITCODE** —— 直接写成
+  # `run: .\LimxLaunch.exe --furnace-check` 的话, 这一步会在进程刚启动
+  # 时就以成功返回, 哪怕自检全项失败、哪怕进程立刻崩溃。
+  #
+  # verify.ps1 的 Invoke-Engine 用 Start-Process -Wait -PassThru 并显式
+  # 取 ExitCode, 这是唯一被实测验证过能如实报告失败的调用方式。
+  gpu-checks:
+    name: GPU 自检 (需真实显卡)
+    runs-on: [self-hosted, windows, gpu]
+    needs: engine
+    # 没有 self-hosted GPU 运行器时, 该作业排队但不阻塞其它作业;
+    # 手动触发或打了 gpu 标签的分支才尝试运行。
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'gpu')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: limx-engine-build
+          path: Binaries
+
+      # 显存回收自检 + IBL 白炉自检 + 资产导入回归哨兵
+      - name: GPU 自检
+        run: pwsh Scripts/verify.ps1 -OnlyGpu
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-logs
+          path: Logs/

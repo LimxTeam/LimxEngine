@@ -2,11 +2,28 @@
 # verify.ps1 — 本地全量验证
 #
 # 与 .github/workflows/ci.yml 执行等价的检查，用于在提交前
-# 本地复现 CI 结论。CI 尚未在真实环境跑通，本脚本是当前
-# 唯一经过实测的验证入口。
+# 本地复现 CI 结论。本脚本是唯一经过实测的验证入口。
+#
+# ── 两层 ────────────────────────────────────────────────────
+#
+# 步骤分成两层, 由 Invoke-Step 的 -RequiresGpu 标记区分:
+#
+#   无 GPU 层  工具链、着色器编译、源码规则、C++ 构建、单元测试。
+#              这些只需要 CPU 与 Vulkan SDK (头文件与 glslang),
+#              普通 CI 运行器就能跑。
+#
+#   需 GPU 层  显存回收自检、IBL 白炉自检、导入基准。
+#              它们要创建真实的 VkDevice 并提交命令 —— 云端运行器
+#              通常只有软件光栅化器(甚至没有), 跑不了。
+#
+# 分层的意义在于: 没有 GPU 的环境里, 无 GPU 层仍然是**全绿即可信**
+# 的结论, 而不是"有几步失败但据说没关系"。后者用不了几次就会被当成
+# 噪声忽略, 于是整套验证一起失效。
 #
 # 用法:
-#   pwsh Scripts/verify.ps1              # 增量构建 + 全部检查
+#   pwsh Scripts/verify.ps1              # 全部 (本机有 GPU 时)
+#   pwsh Scripts/verify.ps1 -SkipGpu     # 只跑无 GPU 层
+#   pwsh Scripts/verify.ps1 -OnlyGpu     # 只跑需 GPU 层
 #   pwsh Scripts/verify.ps1 -Rebuild     # 强制全量重建
 #   pwsh Scripts/verify.ps1 -SkipTools   # 跳过 Rust 工具链构建
 #
@@ -16,8 +33,19 @@
 [CmdletBinding()]
 param(
     [switch]$Rebuild,
-    [switch]$SkipTools
+    [switch]$SkipTools,
+
+    # 只跑无 GPU 层 —— CI 的普通运行器用这个
+    [switch]$SkipGpu,
+
+    # 只跑需 GPU 层 —— 有真实显卡的机器上补跑
+    [switch]$OnlyGpu
 )
+
+if ($SkipGpu -and $OnlyGpu) {
+    Write-Host '错误: -SkipGpu 与 -OnlyGpu 互斥' -ForegroundColor Red
+    exit 1
+}
 
 $ErrorActionPreference = 'Continue'
 
@@ -30,6 +58,7 @@ Set-Location $RootDir
 
 $Script:StepIndex = 0
 $Script:Failures = @()
+$Script:Skipped  = @()
 
 function Write-Header {
     param([string]$Text)
@@ -40,11 +69,25 @@ function Write-Header {
 }
 
 # 执行一个验证步骤：失败只记录不中断，使一次运行暴露全部问题
+#
+# -RequiresGpu 标记那些必须有真实显卡才能跑的步骤。层的归属写在步骤
+# 本身而不是脚本外面, 是为了让 verify.ps1 与 ci.yml 不会各记一份而
+# 悄悄漂移 —— 加一个新步骤时, 它属于哪一层是当场就要回答的问题。
 function Invoke-Step {
     param(
         [string]$Name,
-        [scriptblock]$Action
+        [scriptblock]$Action,
+        [switch]$RequiresGpu
     )
+
+    if ($RequiresGpu -and $SkipGpu) {
+        $Script:Skipped += "$Name (需 GPU)"
+        return
+    }
+
+    if (-not $RequiresGpu -and $OnlyGpu) {
+        return
+    }
 
     $Script:StepIndex++
     Write-Host ''
@@ -64,6 +107,46 @@ function Invoke-Step {
         Write-Host "    通过" -ForegroundColor Green
     }
 }
+
+# ------------------------------------------------------------
+# 运行引擎可执行文件
+#
+# LimxLaunch.exe 是 GUI 子系统程序 (PE Subsystem = 2)。PowerShell 的调用
+# 运算符 & 对 GUI 程序**不等待也不回填 $LASTEXITCODE** —— 它启动进程后
+# 立刻返回, $LASTEXITCODE 保持未设置。
+#
+# 后果是: Invoke-Step 把未设置当成 0, 于是每一个跑 LimxLaunch 的步骤都
+# 无条件打印"通过"。显存回收自检与白炉自检因此从来没有真正验证过任何
+# 东西 —— 哪怕进程立刻崩溃, 这一步照样是绿的。
+#
+# 更隐蔽的连带后果: 进程还在后台跑, 下一步就开始了。白炉自检持有日志
+# 文件 (FILE_SHARE_READ), 紧接着的基准脚本删不掉它, 于是基准读到的是
+# 上一步留下的陈旧日志, 报"日志中没有结果"。
+#
+# 单元测试与 lbt 都是控制台程序 (Subsystem = 3), & 对它们的行为是对的,
+# 所以这个坑只在引擎这几步上。
+function Invoke-Engine {
+    param([string]$Arguments)
+
+    $stdout = Join-Path $env:TEMP 'limx_verify_stdout.txt'
+    $stderr = Join-Path $env:TEMP 'limx_verify_stderr.txt'
+
+    $process = Start-Process -FilePath $EngineExe -ArgumentList $Arguments `
+        -WorkingDirectory $RootDir -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+    foreach ($file in @($stdout, $stderr)) {
+        if (Test-Path $file) {
+            Get-Content $file
+            Remove-Item $file -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Invoke-Step 读的是 $LASTEXITCODE, 这里显式回填
+    $global:LASTEXITCODE = $process.ExitCode
+}
+
+$EngineExe = Join-Path $RootDir 'Binaries\Development\Win64\LimxLaunch.exe'
 
 Write-Header 'Limx Engine — 本地验证'
 Write-Host "  根目录: $RootDir"
@@ -221,8 +304,8 @@ Invoke-Step 'EngineTests' {
 # 显存回收自检 —— 需要真实 GPU, 因此放在单元测试之后单独一步。
 # 它验证的是"引用计数是否真的接通", 而这一点靠单元测试测不到:
 # 泄漏只在 GPU 资源实际分配与释放时才成立。
-Invoke-Step '显存回收自检' {
-    .\Binaries\Development\Win64\LimxLaunch.exe --scene Content/TestScene/testscene.obj --reload-test
+Invoke-Step '显存回收自检' -RequiresGpu {
+    Invoke-Engine '--scene Content/TestScene/testscene.obj --reload-test'
 }
 
 # IBL 白炉自检 —— 同样需要真实 GPU。
@@ -232,8 +315,21 @@ Invoke-Step '显存回收自检' {
 #
 # 这条链上的错误几乎全是"看着差不多"的: 卷积系数差一个 π、mip 与粗糙度
 # 的映射错位、归一化除错了分母 —— 画面上一律只表现为"环境光有点不对"。
-Invoke-Step 'IBL 白炉自检' {
-    .\Binaries\Development\Win64\LimxLaunch.exe --furnace-check
+Invoke-Step 'IBL 白炉自检' -RequiresGpu {
+    Invoke-Engine '--furnace-check'
+}
+
+# 资产导入回归哨兵 —— 需要真实 GPU (要建设备并上传纹理)。
+#
+# 导入是一次性成本, 不出现在任何逐帧数字里, 也不会让任何单元测试变红。
+# 第四周把 Sponza 的导入从 1.9 s 压到 0.84 s, 其中最大的一笔是一个反复
+# Reserve 造成的重分配问题 —— 那类退化极容易被无意改回去, 且悄无声息。
+#
+# 只跑导入基准那一段 (-SkipImport 的反面), 逐帧基准另有其用途, 不必
+# 每次验证都跑三百帧。
+Invoke-Step '资产导入回归哨兵' -RequiresGpu {
+    powershell -NoProfile -ExecutionPolicy Bypass -File Scripts/benchmark.ps1 `
+        -Grid 20 -Frames 20 -Warmup 5 -ImportRuns 3
 }
 
 # ------------------------------------------------------------
@@ -242,8 +338,27 @@ Invoke-Step 'IBL 白炉自检' {
 
 Write-Header '验证汇总'
 
+# 跳过的步骤必须列出来。
+#
+# 无 GPU 层全绿是一个可信的结论, 但它是"该层全绿", 不是"全部通过" ——
+# 把这两者混为一谈, 迟早会有人拿着一份没跑过白炉自检的绿色结果去发版。
+if ($Script:Skipped.Count -gt 0) {
+    Write-Host "  已跳过 $($Script:Skipped.Count) 个步骤 (本次只跑无 GPU 层):" -ForegroundColor Yellow
+    foreach ($skipped in $Script:Skipped) {
+        Write-Host "    - $skipped" -ForegroundColor Yellow
+    }
+    Write-Host ''
+}
+
 if ($Script:Failures.Count -eq 0) {
-    Write-Host "  全部 $Script:StepIndex 个步骤通过" -ForegroundColor Green
+    if ($Script:Skipped.Count -gt 0) {
+        Write-Host "  无 GPU 层 $Script:StepIndex 个步骤全部通过" -ForegroundColor Green
+        Write-Host '  (需 GPU 的步骤尚未验证 — 在有显卡的机器上跑 -OnlyGpu 补齐)' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  全部 $Script:StepIndex 个步骤通过" -ForegroundColor Green
+    }
+
     Write-Host ''
     exit 0
 }

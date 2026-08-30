@@ -46,8 +46,15 @@ $ErrorActionPreference = 'Continue'
 $RootDir = Split-Path -Parent $PSScriptRoot
 Set-Location $RootDir
 
-$Exe = 'Binaries\Development\Win64\LimxLaunch.exe'
-$Log = 'Logs\LimxEngine.log'
+# 路径一律取绝对值, 并给 Start-Process 显式指定工作目录。
+#
+# Set-Location 只改 PowerShell 的当前位置, 不改进程的工作目录, 而
+# Start-Process 用的是后者 —— 相对路径于是按"启动这个 PowerShell 的那个
+# 进程的目录"解析。脚本从命令行直接跑时两者恰好一致, 从 verify.ps1 里
+# 嵌套调用时就未必, 而症状极具误导性: 子进程退出码 0, 日志却还是上一步
+# 留下的陈旧文件, 报出来是"日志中没有基准结果"。
+$Exe = Join-Path $RootDir 'Binaries\Development\Win64\LimxLaunch.exe'
+$Log = Join-Path $RootDir 'Logs\LimxEngine.log'
 
 if (-not (Test-Path $Exe)) {
     Write-Host "错误: 未找到 $Exe，请先构建" -ForegroundColor Red
@@ -91,12 +98,24 @@ foreach ($config in $Configurations) {
     Write-Host ''
     Write-Host "  运行: $($config.Name)" -ForegroundColor Cyan
 
-    $process = Start-Process -FilePath $Exe -ArgumentList $argumentList -PassThru
+    $process = Start-Process -FilePath $Exe -ArgumentList $argumentList `
+        -WorkingDirectory $RootDir -PassThru
     $process.WaitForExit(300000) | Out-Null
 
     if (-not $process.HasExited) {
         $process.Kill()
         Write-Host '    超时' -ForegroundColor Red
+        $Failed = $true
+        continue
+    }
+
+    # 先看退出码再看日志。
+    #
+    # 反过来的话, 进程根本没跑起来时读到的是上一次留下的陈旧日志, 报出
+    # 来的是"日志里没有结果" —— 那句话把人引向日志格式, 而真正的原因是
+    # 进程压根没运行。
+    if ($process.ExitCode -ne 0) {
+        Write-Host "    进程退出码 $($process.ExitCode)" -ForegroundColor Red
         $Failed = $true
         continue
     }
@@ -193,13 +212,21 @@ if (-not $SkipImport) {
 
             Remove-Item $Log -ErrorAction SilentlyContinue
 
-            $p = Start-Process -FilePath $Exe -PassThru -ArgumentList `
+            $p = Start-Process -FilePath $Exe -PassThru `
+                -WorkingDirectory $RootDir -ArgumentList `
                 "--scene $ImportScene --frames 3 --warmup 1"
             $p.WaitForExit(300000) | Out-Null
 
             if (-not $p.HasExited) {
                 $p.Kill()
                 Write-Host "    第 $i 次: 超时" -ForegroundColor Red
+                $Failed = $true
+                continue
+            }
+
+            # 退出码优先 —— 理由同渲染段
+            if ($p.ExitCode -ne 0) {
+                Write-Host "    第 $i 次: 进程退出码 $($p.ExitCode)" -ForegroundColor Red
                 $Failed = $true
                 continue
             }
