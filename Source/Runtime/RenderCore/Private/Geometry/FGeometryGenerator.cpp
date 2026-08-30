@@ -260,7 +260,10 @@ FMeshData FGeometryGenerator::GenerateSphere(
     FMeshData mesh;
 
     UInt32 vertexCount = (slices + 1) * (stacks + 1);
-    UInt32 indexCount   = slices * stacks * 6;
+
+    // 两极那两圈各只有一个三角形, 中间每圈两个 —— 见下面索引生成处的说明。
+    // stacks == 1 时球退化成两个极点, 一个三角形都发不出来, 这里正好为 0。
+    UInt32 indexCount = (stacks >= 2) ? (slices * (stacks * 2 - 2) * 3) : 0;
     mesh.Vertices.Reserve(vertexCount);
     mesh.Indices.Reserve(indexCount);
 
@@ -331,13 +334,30 @@ FMeshData FGeometryGenerator::GenerateSphere(
             // 这个错误极难看出来: 球的轮廓一模一样, 只有着色不对。而漫反射
             // 加上一盏主光, 远侧半球看着也像是"光从另一边来"。它是被白炉
             // 测试抓出来的 —— 那是第一次有已知真值可以拿来核对法线。
-            mesh.Indices.Add(current);
-            mesh.Indices.Add(next);
-            mesh.Indices.Add(below);
 
-            mesh.Indices.Add(below);
-            mesh.Indices.Add(next);
-            mesh.Indices.Add(belowNext);
+            // 两极处整行顶点坍缩到同一点 (sinPhi 为零), 因此那两圈各有
+            // 一个三角形是零面积的, 必须跳过:
+            //
+            //   iStack == 0        current 与 next 同为北极点
+            //   iStack == stacks-1 below 与 belowNext 同为南极点
+            //
+            // 零面积三角形画不出任何东西, 但照样占索引、照样过顶点着色器,
+            // 而且叉积为零向量 —— 凡是按面法线做判断的地方 (背面剔除的
+            // 调试核对、切线求解、法线重建) 都得为它们特判。少发比后面
+            // 处处防守划算。
+            if (iStack > 0)
+            {
+                mesh.Indices.Add(current);
+                mesh.Indices.Add(next);
+                mesh.Indices.Add(below);
+            }
+
+            if (iStack + 1 < stacks)
+            {
+                mesh.Indices.Add(below);
+                mesh.Indices.Add(next);
+                mesh.Indices.Add(belowNext);
+            }
         }
     }
 

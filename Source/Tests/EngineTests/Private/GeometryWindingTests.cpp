@@ -116,6 +116,46 @@ LIMX_TEST(GeometryWinding, SphereWindsOutward)
 
     LIMX_EXPECT_GT(outward, static_cast<SizeType>(0));
     LIMX_EXPECT_EQ(inward, static_cast<SizeType>(0));
+
+    // UV 球在两极处整行顶点坍缩到同一点, 早先的实现照常给每个格子发两个
+    // 三角形, 于是每极多出 slices 个零面积三角形。它们画不出任何东西, 却
+    // 照样占索引、照样过顶点着色器, 而且任何按面法线做的判断 (背面剔除、
+    // 法线核对、切线求解) 都要为它们特判。
+    LIMX_EXPECT_EQ(degenerate, static_cast<SizeType>(0));
+}
+
+LIMX_TEST(GeometryWinding, SphereHasNoDegenerateTrianglesAtAnyResolution)
+{
+    // 退化三角形的数量与 slices 成正比、与 stacks 无关 —— 只在两极那两圈
+    // 出现。多试几组分辨率, 免得只在某一组恰好为零。
+    constexpr UInt32 kSlices[] = { 3, 4, 8, 16, 33 };
+    constexpr UInt32 kStacks[] = { 2, 3, 8, 16, 17 };
+
+    for (SizeType s = 0; s < LIMX_ARRAY_COUNT(kSlices); ++s)
+    {
+        for (SizeType t = 0; t < LIMX_ARRAY_COUNT(kStacks); ++t)
+        {
+            const FMeshData sphere =
+                FGeometryGenerator::GenerateSphere(1.0f, kSlices[s], kStacks[t]);
+
+            SizeType outward    = 0;
+            SizeType inward     = 0;
+            SizeType degenerate = 0;
+
+            CountOutwardTriangles(sphere, outward, inward, degenerate);
+
+            LIMX_EXPECT_EQ(degenerate, static_cast<SizeType>(0));
+            LIMX_EXPECT_EQ(inward, static_cast<SizeType>(0));
+            LIMX_EXPECT_GT(outward, static_cast<SizeType>(0));
+
+            // 三角形总数: 两极各是一圈三角形, 中间每圈两个。
+            const SizeType expected =
+                static_cast<SizeType>(kSlices[s]) *
+                (static_cast<SizeType>(kStacks[t]) * 2 - 2);
+
+            LIMX_EXPECT_EQ(sphere.Indices.GetSize() / 3, expected);
+        }
+    }
 }
 
 LIMX_TEST(GeometryWinding, CubeWindsOutward)
