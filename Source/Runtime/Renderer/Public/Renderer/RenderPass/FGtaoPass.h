@@ -100,11 +100,50 @@ public:
     /// 采样半径 (世界单位)
     void SetRadius(Float32 radius) { m_Radius = radius; }
 
+    /// 半分辨率求解 + 双边上采样
+    ///
+    /// GTAO 是整帧 GPU 里最贵的一项 (实测 1.128 ms, 占 64.6%), 而它的开销
+    /// 几乎全在采样次数上 —— 每像素 4 方向 × 8 步进。半分辨率把像素数降到
+    /// 四分之一。
+    ///
+    /// 上采样必须是**双边**的: 双线性会在深度不连续处把前景与背景的 AO 混在
+    /// 一起, 表现是物体边缘一圈发暗或发亮, 而那看起来像"AO 半径调大了"。
+    void SetHalfResolution(bool halfRes) { m_HalfResolution = halfRes; }
+
+    LIMX_NODISCARD bool IsHalfResolution() const { return m_HalfResolution; }
+
+    /// 半分辨率的尺寸 —— 至少 1x1
+    ///
+    /// 向上取整而不是向下: 向下取整时奇数宽度会少一列, 上采样在最右边一列
+    /// 采到边界外 (被 ClampToEdge 拉伸), 表现是最右边一列 AO 恒等于倒数第
+    /// 二列。一列的差别谁也看不见 —— 而那正是问题。
+    LIMX_NODISCARD static FRHIExtent2D HalfExtentOf(FRHIExtent2D full)
+    {
+        FRHIExtent2D half;
+        half.Width  = (full.Width  + 1u) / 2u;
+        half.Height = (full.Height + 1u) / 2u;
+
+        if (half.Width  == 0u) { half.Width  = 1u; }
+        if (half.Height == 0u) { half.Height = 1u; }
+
+        return half;
+    }
+
     /// 强度指数。1 = 物理值, 大于 1 则加深。
     void SetIntensity(Float32 intensity) { m_Intensity = intensity; }
 
 private:
     ERHIResult CreateTarget(IRHIDevice* device, FRHIExtent2D extent);
+
+    /// 半分辨率的 AO 目标与帧缓冲 (渲染通道复用全分辨率那一个)
+    ERHIResult CreateHalfTarget(IRHIDevice* device, FRHIExtent2D extent);
+
+    /// 双边上采样的管线与描述符
+    ERHIResult CreateUpsample(IRHIDevice* device);
+
+    void UpdateUpsampleDescriptors(IRHIDevice* device);
+
+    void DestroyHalfTarget(IRHIDevice* device);
     ERHIResult CreateRenderPassAndFramebuffer(IRHIDevice* device,
                                               FRHIExtent2D extent);
     ERHIResult CreateDescriptors(IRHIDevice* device);
@@ -118,6 +157,26 @@ private:
 
     FRHITextureHandle          m_AoTexture;
     FRHITextureViewHandle      m_AoView;
+
+    // ---- 半分辨率求解 ----
+    FRHITextureHandle          m_HalfAoTexture;
+    FRHITextureViewHandle      m_HalfAoView;
+    FRHIFramebufferHandle      m_HalfFramebuffer;
+
+    FRHIDescSetLayoutHandle    m_UpsampleSetLayout;
+    FRHIDescriptorSetHandle    m_UpsampleSet;
+    FRHIPipelineLayoutHandle   m_UpsampleLayout;
+    FRHIGraphicsPipelineHandle m_UpsamplePipeline;
+    FRHIShaderHandle           m_UpsampleShader;
+
+    /// 上采样用的线性采样器 —— 与 GTAO 那个 Nearest 的不同
+    ///
+    /// 上采样是自己按四个邻居手算权重的, 所以取数用 Nearest 也行; 但深度
+    /// 那一路要在半分辨率的邻居位置上取全分辨率深度, 那是个非对齐的坐标,
+    /// Nearest 会取到相邻像素。用 Linear 让硬件插值。
+    FRHISamplerHandle          m_LinearSampler;
+
+    bool                       m_HalfResolution = false;
 
     /// 深度纹理句柄 —— 采样前后要做布局转换, 光有视图不够
     FRHITextureHandle          m_DepthTexture;

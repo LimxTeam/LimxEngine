@@ -46,6 +46,19 @@ static_assert(sizeof(FGtaoPushConstant) == 144,
               "FGtaoPushConstant 必须是 144 字节 — 与 gtao.frag 的 "
               "push constant 块一致 (两个 mat4 + 一个 vec4)");
 
+/// 上采样的 push constant
+struct FGtaoUpsamplePushConstant
+{
+    Float32 HalfWidth  = 0.0f;
+    Float32 HalfHeight = 0.0f;
+    Float32 NearPlane  = 0.1f;
+    Float32 FarPlane   = 100.0f;
+};
+
+static_assert(sizeof(FGtaoUpsamplePushConstant) == 16,
+              "FGtaoUpsamplePushConstant 必须是 16 字节 — 与 "
+              "gtao_upsample.frag 的 push constant 块一致 (一个 vec4)");
+
 } // namespace
 
 // ============================================================================
@@ -72,6 +85,11 @@ ERHIResult FGtaoPass::Setup(const FPassSetupDesc& desc)
 
     result = CreateRenderPassAndFramebuffer(m_Device, m_Extent);
 
+    if (IsRHISuccess(result))
+    {
+        result = CreateHalfTarget(m_Device, m_Extent);
+    }
+
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[GtaoPass] 渲染通道创建失败");
@@ -91,6 +109,16 @@ ERHIResult FGtaoPass::Setup(const FPassSetupDesc& desc)
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[GtaoPass] 管线创建失败");
+        return result;
+    }
+
+    // 上采样管线必须在 CreatePipeline 之后建 —— 它复用同一个全屏顶点着色器,
+    // 而那个模块是在那里创建的。
+    result = CreateUpsample(m_Device);
+
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[GtaoPass] 上采样管线创建失败");
         return result;
     }
 
@@ -320,6 +348,7 @@ void FGtaoPass::SetInputs(FRHITextureHandle     depthTexture,
     if (m_Device != nullptr)
     {
         UpdateDescriptors(m_Device);
+        UpdateUpsampleDescriptors(m_Device);
     }
 }
 
@@ -412,6 +441,249 @@ ERHIResult FGtaoPass::CreatePipeline(IRHIDevice* device)
     return device->CreateGraphicsPipeline(pipelineDesc, m_Pipeline);
 }
 
+
+// ============================================================================
+// CreateHalfTarget — 半分辨率的 AO 目标与帧缓冲
+//
+// 渲染通道复用全分辨率那一个: Vulkan 判定帧缓冲与渲染通道兼容只看附件的格式
+// 与采样数, 尺寸不参与。两者都是 R16_SFLOAT / 单采样, 所以一个通道对象足够。
+// ============================================================================
+
+ERHIResult FGtaoPass::CreateHalfTarget(IRHIDevice* device, FRHIExtent2D extent)
+{
+    const FRHIExtent2D half = HalfExtentOf(extent);
+
+    FRHITextureDesc texDesc = {};
+    texDesc.Type        = ETextureType::Texture2D;
+    texDesc.Format      = kAoFormat;
+    texDesc.Extent      = { half.Width, half.Height, 1 };
+    texDesc.MipLevels   = 1;
+    texDesc.ArrayLayers = 1;
+    texDesc.Samples     = ESampleCount::Count1;
+
+    texDesc.Usage       = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::ColorAttachment) |
+        static_cast<UInt32>(ETextureUsage::Sampled));
+
+    texDesc.MemoryUsage = EMemoryUsage::GpuOnly;
+    texDesc.DebugName   = "GtaoHalfAO";
+
+    ERHIResult result = device->CreateTexture(texDesc, m_HalfAoTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHITextureViewDesc viewDesc = {};
+    viewDesc.Texture         = m_HalfAoTexture;
+    viewDesc.ViewType        = ETextureType::Texture2D;
+    viewDesc.Format          = kAoFormat;
+    viewDesc.BaseMipLevel    = 0;
+    viewDesc.MipLevelCount   = 1;
+    viewDesc.BaseArrayLayer  = 0;
+    viewDesc.ArrayLayerCount = 1;
+
+    result = device->CreateTextureView(viewDesc, m_HalfAoView);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHIFramebufferDesc fbDesc = {};
+    fbDesc.RenderPass      = m_RenderPass;
+    fbDesc.Attachments     = &m_HalfAoView;
+    fbDesc.AttachmentCount = 1;
+    fbDesc.Width           = half.Width;
+    fbDesc.Height          = half.Height;
+    fbDesc.Layers          = 1;
+    fbDesc.DebugName       = "GtaoPass_HalfFramebuffer";
+
+    return device->CreateFramebuffer(fbDesc, m_HalfFramebuffer);
+}
+
+// ============================================================================
+// CreateUpsample — 双边上采样的管线与描述符
+// ============================================================================
+
+ERHIResult FGtaoPass::CreateUpsample(IRHIDevice* device)
+{
+    // binding 0 = 半分辨率 AO, binding 1 = 全分辨率深度
+    FRHIDescriptorBinding bindings[2] = {};
+
+    for (UInt32 i = 0; i < 2; ++i)
+    {
+        bindings[i].Binding    = i;
+        bindings[i].Type       = EDescriptorType::CombinedImageSampler;
+        bindings[i].Count      = 1;
+        bindings[i].StageFlags = EShaderStage::Fragment;
+    }
+
+    FRHIDescSetLayoutDesc layoutDesc = {};
+    layoutDesc.Bindings     = bindings;
+    layoutDesc.BindingCount = 2;
+    layoutDesc.DebugName    = "GtaoUpsampleSetLayout";
+
+    ERHIResult result =
+        device->CreateDescSetLayout(layoutDesc, m_UpsampleSetLayout);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    result = device->AllocateDescriptorSet(m_UpsampleSetLayout, m_UpsampleSet);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // 线性采样器 —— 上采样要在非对齐的坐标上取全分辨率深度。
+    //
+    // 与 GTAO 那个 Nearest 的区别是刻意的: 那里采的是深度与八面体法线, 两者
+    // 都不能插值; 这里采的深度只用来判"在不在同一个表面上", 而在同一个表面
+    // 上插值是无害的 —— 不在同一个表面时权重本来就趋近于零。
+    FRHISamplerDesc samplerDesc = {};
+    samplerDesc.MinFilter    = EFilter::Linear;
+    samplerDesc.MagFilter    = EFilter::Linear;
+    samplerDesc.MipmapMode   = ESamplerMipmapMode::Nearest;
+    samplerDesc.AddressModeU = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.AddressModeV = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.AddressModeW = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.IsAnisotropyEnabled = false;
+    samplerDesc.MinLod = 0.0f;
+    samplerDesc.MaxLod = 1.0f;
+
+    result = device->CreateSampler(samplerDesc, m_LinearSampler);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHIPushConstantRange pushRange = {};
+    pushRange.StageFlags = EShaderStage::Fragment;
+    pushRange.Offset     = 0;
+    pushRange.Size       = sizeof(FGtaoUpsamplePushConstant);
+
+    FRHIPipelineLayoutDesc pipelineLayoutDesc = {};
+    pipelineLayoutDesc.SetLayouts             = &m_UpsampleSetLayout;
+    pipelineLayoutDesc.SetLayoutCount         = 1;
+    pipelineLayoutDesc.PushConstantRanges     = &pushRange;
+    pipelineLayoutDesc.PushConstantRangeCount = 1;
+    pipelineLayoutDesc.DebugName              = "GtaoUpsamplePipelineLayout";
+
+    result = device->CreatePipelineLayout(pipelineLayoutDesc, m_UpsampleLayout);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FShaderManager& shaders = FShaderManager::Get();
+
+    result = shaders.CreateShaderModule(
+        device, FString("Builtin/gtao_upsample.frag"), EShaderStage::Fragment,
+        m_UpsampleShader);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHIGraphicsPipelineDesc pipelineDesc = {};
+
+    pipelineDesc.ShaderStages[0].Shader     = m_VertShader;
+    pipelineDesc.ShaderStages[0].Stage      = EShaderStage::Vertex;
+    pipelineDesc.ShaderStages[0].EntryPoint = "main";
+
+    pipelineDesc.ShaderStages[1].Shader     = m_UpsampleShader;
+    pipelineDesc.ShaderStages[1].Stage      = EShaderStage::Fragment;
+    pipelineDesc.ShaderStages[1].EntryPoint = "main";
+
+    pipelineDesc.ShaderStageCount = 2;
+
+    pipelineDesc.InputAssembly.Topology = EPrimitiveTopology::TriangleList;
+
+    pipelineDesc.Rasterization.PolygonMode = EPolygonMode::Fill;
+    pipelineDesc.Rasterization.CullMode    = ECullMode::None;
+    pipelineDesc.Rasterization.FrontFace   = EFrontFace::CounterClockwise;
+    pipelineDesc.Rasterization.LineWidth   = 1.0f;
+
+    pipelineDesc.Multisample.RasterizationSamples = ESampleCount::Count1;
+
+    pipelineDesc.DepthStencil.IsDepthTestEnabled  = false;
+    pipelineDesc.DepthStencil.IsDepthWriteEnabled = false;
+
+    FRHIColorBlendAttachmentDesc colorBlend =
+        FRHIColorBlendAttachmentDesc::Opaque();
+
+    pipelineDesc.ColorBlend.Attachments     = &colorBlend;
+    pipelineDesc.ColorBlend.AttachmentCount = 1;
+
+    pipelineDesc.DynamicState.EnabledStates =
+        EDynamicState::Viewport | EDynamicState::Scissor;
+
+    pipelineDesc.PipelineLayout = m_UpsampleLayout;
+    pipelineDesc.RenderPass     = m_RenderPass;
+    pipelineDesc.SubpassIndex   = 0;
+    pipelineDesc.DebugName      = "GtaoPass_UpsamplePipeline";
+
+    return device->CreateGraphicsPipeline(pipelineDesc, m_UpsamplePipeline);
+}
+
+// ============================================================================
+// UpdateUpsampleDescriptors
+// ============================================================================
+
+void FGtaoPass::UpdateUpsampleDescriptors(IRHIDevice* device)
+{
+    if (!m_HalfAoView.IsValid() || !m_DepthView.IsValid())
+    {
+        return;
+    }
+
+    FRHIDescriptorWrite writes[2];
+
+    writes[0] = FRHIDescriptorWrite::CombinedImageSampler(
+        m_UpsampleSet, 0, m_HalfAoView, m_LinearSampler,
+        EImageLayout::ShaderReadOnly);
+
+    // 深度以 DepthReadOnly 布局被采样 —— 与 GTAO 那一路同一个理由
+    writes[1] = FRHIDescriptorWrite::CombinedImageSampler(
+        m_UpsampleSet, 1, m_DepthView, m_Sampler,
+        EImageLayout::DepthStencilReadOnly);
+
+    device->UpdateDescriptorSets(writes, 2);
+}
+
+// ============================================================================
+// DestroyHalfTarget
+// ============================================================================
+
+void FGtaoPass::DestroyHalfTarget(IRHIDevice* device)
+{
+    if (m_HalfFramebuffer.IsValid())
+    {
+        device->DestroyFramebuffer(m_HalfFramebuffer);
+        m_HalfFramebuffer = {};
+    }
+
+    if (m_HalfAoView.IsValid())
+    {
+        device->DestroyTextureView(m_HalfAoView);
+        m_HalfAoView = {};
+    }
+
+    if (m_HalfAoTexture.IsValid())
+    {
+        device->DestroyTexture(m_HalfAoTexture);
+        m_HalfAoTexture = {};
+    }
+}
+
 // ============================================================================
 // Execute
 // ============================================================================
@@ -465,11 +737,20 @@ void FGtaoPass::Execute(IRHICommandBuffer*        commandBuffer,
     clearColor.B = 1.0f;
     clearColor.A = 1.0f;
 
+    // 求解的目标: 半分辨率时先画进半分辨率那张, 再上采样进全分辨率那张。
+    const bool useHalf = m_Enabled && m_HalfResolution &&
+                         m_HalfFramebuffer.IsValid() &&
+                         m_UpsamplePipeline.IsValid();
+
+    const FRHIExtent2D solveExtent =
+        useHalf ? HalfExtentOf(context.SwapchainExtent)
+                : context.SwapchainExtent;
+
     FRHIRenderPassBeginInfo beginInfo = {};
     beginInfo.RenderPass        = m_RenderPass;
-    beginInfo.Framebuffer       = m_Framebuffer;
+    beginInfo.Framebuffer       = useHalf ? m_HalfFramebuffer : m_Framebuffer;
     beginInfo.RenderAreaOffset  = { 0, 0 };
-    beginInfo.RenderAreaExtent  = context.SwapchainExtent;
+    beginInfo.RenderAreaExtent  = solveExtent;
     beginInfo.ClearColors       = &clearColor;
     beginInfo.ClearColorCount   = 1;
     beginInfo.ClearDepthStencil = nullptr;
@@ -479,6 +760,70 @@ void FGtaoPass::Execute(IRHICommandBuffer*        commandBuffer,
     if (m_Enabled)
     {
         commandBuffer->BindGraphicsPipeline(m_Pipeline);
+
+        FRHIViewport viewport = {};
+        viewport.X        = 0.0f;
+        viewport.Y        = 0.0f;
+        viewport.Width    = static_cast<Float32>(solveExtent.Width);
+        viewport.Height   = static_cast<Float32>(solveExtent.Height);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+
+        commandBuffer->SetViewport(viewport);
+
+        FRHIScissorRect scissor = {};
+        scissor.X      = 0;
+        scissor.Y      = 0;
+        scissor.Width  = solveExtent.Width;
+        scissor.Height = solveExtent.Height;
+
+        commandBuffer->SetScissor(scissor);
+
+        commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
+                                         m_PipelineLayout, 0,
+                                         m_DescriptorSet, nullptr, 0);
+
+        // 屏幕尺寸传的是**求解分辨率**, 不是交换链的。
+        //
+        // gtao.frag 用它把 fragUV 换算成像素坐标去做地平线搜索。传全分辨率
+        // 的话半分辨率下每一步的步长会缩一半, 等效搜索半径减半 —— 而画面上
+        // 那只是"AO 淡了一点", 看着像强度参数没调好。
+        FGtaoPushConstant pushData;
+        pushData.InverseProjection = m_InverseProjection;
+        pushData.View              = m_View;
+        pushData.Radius            = m_Radius;
+        pushData.Intensity         = m_Intensity;
+        pushData.ScreenW           = static_cast<Float32>(solveExtent.Width);
+        pushData.ScreenH           = static_cast<Float32>(solveExtent.Height);
+
+        commandBuffer->PushConstants(m_PipelineLayout,
+                                     EShaderStage::Fragment, 0,
+                                     sizeof(FGtaoPushConstant), &pushData);
+
+        commandBuffer->Draw(3, 1, 0, 0);
+    }
+
+    commandBuffer->EndRenderPass();
+
+    // ---- 双边上采样 ----
+    //
+    // 半分辨率那张的布局在渲染通道结束时已经转成 ShaderReadOnly (附件的
+    // FinalLayout), 所以这里不需要额外的屏障 —— 通道之间的依赖由渲染通道
+    // 自己的 Dependency 覆盖。
+    if (useHalf)
+    {
+        FRHIRenderPassBeginInfo upsampleInfo = {};
+        upsampleInfo.RenderPass        = m_RenderPass;
+        upsampleInfo.Framebuffer       = m_Framebuffer;
+        upsampleInfo.RenderAreaOffset  = { 0, 0 };
+        upsampleInfo.RenderAreaExtent  = context.SwapchainExtent;
+        upsampleInfo.ClearColors       = &clearColor;
+        upsampleInfo.ClearColorCount   = 1;
+        upsampleInfo.ClearDepthStencil = nullptr;
+
+        commandBuffer->BeginRenderPass(upsampleInfo);
+
+        commandBuffer->BindGraphicsPipeline(m_UpsamplePipeline);
 
         FRHIViewport viewport = {};
         viewport.X        = 0.0f;
@@ -501,27 +846,24 @@ void FGtaoPass::Execute(IRHICommandBuffer*        commandBuffer,
         commandBuffer->SetScissor(scissor);
 
         commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
-                                         m_PipelineLayout, 0,
-                                         m_DescriptorSet, nullptr, 0);
+                                         m_UpsampleLayout, 0,
+                                         m_UpsampleSet, nullptr, 0);
 
-        FGtaoPushConstant pushData;
-        pushData.InverseProjection = m_InverseProjection;
-        pushData.View              = m_View;
-        pushData.Radius            = m_Radius;
-        pushData.Intensity         = m_Intensity;
-        pushData.ScreenW =
-            static_cast<Float32>(context.SwapchainExtent.Width);
-        pushData.ScreenH =
-            static_cast<Float32>(context.SwapchainExtent.Height);
+        FGtaoUpsamplePushConstant upsampleData;
+        upsampleData.HalfWidth  = static_cast<Float32>(solveExtent.Width);
+        upsampleData.HalfHeight = static_cast<Float32>(solveExtent.Height);
+        upsampleData.NearPlane  = m_NearPlane;
+        upsampleData.FarPlane   = m_FarPlane;
 
-        commandBuffer->PushConstants(m_PipelineLayout,
+        commandBuffer->PushConstants(m_UpsampleLayout,
                                      EShaderStage::Fragment, 0,
-                                     sizeof(FGtaoPushConstant), &pushData);
+                                     sizeof(FGtaoUpsamplePushConstant),
+                                     &upsampleData);
 
         commandBuffer->Draw(3, 1, 0, 0);
-    }
 
-    commandBuffer->EndRenderPass();
+        commandBuffer->EndRenderPass();
+    }
 
     // 深度转回去 —— 天空与前向通道声明的 InitialLayout 都是
     // DepthStencilAttachment。不转回去的话那两个通道会从错误的旧布局开始,
@@ -573,6 +915,8 @@ ERHIResult FGtaoPass::OnResize(const FPassResizeDesc& desc)
         m_AoTexture = {};
     }
 
+    DestroyHalfTarget(desc.Device);
+
     ERHIResult result = CreateTarget(desc.Device, m_Extent);
 
     if (!IsRHISuccess(result))
@@ -596,11 +940,19 @@ ERHIResult FGtaoPass::OnResize(const FPassResizeDesc& desc)
         return result;
     }
 
+    result = CreateHalfTarget(desc.Device, m_Extent);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
     // 深度与法线的视图换了新的
     m_DepthTexture = desc.SharedDepth;
     m_DepthView    = desc.SharedDepthView;
 
     UpdateDescriptors(desc.Device);
+    UpdateUpsampleDescriptors(desc.Device);
 
     m_ClearedToOne = false;
 
@@ -621,6 +973,38 @@ void FGtaoPass::Shutdown(IRHIDevice* device)
     if (device == nullptr)
     {
         return;
+    }
+
+    DestroyHalfTarget(device);
+
+    if (m_UpsamplePipeline.IsValid())
+    {
+        device->DestroyGraphicsPipeline(m_UpsamplePipeline);
+        m_UpsamplePipeline = {};
+    }
+
+    if (m_UpsampleLayout.IsValid())
+    {
+        device->DestroyPipelineLayout(m_UpsampleLayout);
+        m_UpsampleLayout = {};
+    }
+
+    if (m_UpsampleShader.IsValid())
+    {
+        device->DestroyShader(m_UpsampleShader);
+        m_UpsampleShader = {};
+    }
+
+    if (m_UpsampleSetLayout.IsValid())
+    {
+        device->DestroyDescSetLayout(m_UpsampleSetLayout);
+        m_UpsampleSetLayout = {};
+    }
+
+    if (m_LinearSampler.IsValid())
+    {
+        device->DestroySampler(m_LinearSampler);
+        m_LinearSampler = {};
     }
 
     if (m_Framebuffer.IsValid())

@@ -503,6 +503,23 @@ Invoke-Step 'GTAO 自检 (墙角的解析收敛)' -RequiresGpu {
     Invoke-Engine '--corner-scene --gtao --frames 20 --warmup 5 --ao-check'
 }
 
+# 半分辨率 GTAO 也要过同一条解析判据 —— 它是个近似, 但必须仍然收敛到 0.5。
+Invoke-Step 'GTAO 自检 (半分辨率下的解析收敛)' -RequiresGpu {
+    Invoke-Engine '--corner-scene --gtao --gtao-half --frames 20 --warmup 5 --ao-check'
+}
+
+# 半分辨率与全分辨率的逐像素比对。
+#
+# 三条判据里最要紧的是"平均差**不能为零**": 一个把 --gtao-half 忽略掉的实现
+# 会得到两张完全相同的图, 而"差异要小"那一条对它满分通过 —— 于是"没生效"与
+# "完美无损"在判据上无法区分。
+#
+# 容差 0.025 是从墙角场景量出来的 (正确实现给 0.014394), 与场景有关: 阴影
+# 场景上正确实现就有 0.0373。所以这一条只在墙角场景上跑。
+Invoke-Step 'GTAO 自检 (半分辨率与全分辨率逐像素比对)' -RequiresGpu {
+    Invoke-Engine '--corner-scene --gtao --frames 20 --warmup 5 --ao-half-check'
+}
+
 # GPU 驱动绘制自检 —— 需要真实 GPU。
 #
 # 判据是"GPU 驱动路径与逐物体绘制画出来的东西**完全一样**"。这一条比"看起来

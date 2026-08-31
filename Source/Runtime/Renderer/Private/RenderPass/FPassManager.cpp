@@ -418,6 +418,15 @@ ERHIResult FPassManager::CreateSharedDepth(IRHIDevice* device,
         extent.Width, extent.Height,
         kSharedDepthFormat,
         ESampleCount::Count1);
+    // 加上 TransferSrc —— 深度要能被回读。
+    //
+    // 不放在调试开关后面: 半分辨率 AO 的自检要按深度不连续挑像素, 而"判据
+    // 只在调试构建里有效"等于没有判据。一个 TransferSrc 位不占显存, 也不改
+    // 布局转换的语义。
+    depthDesc.Usage = static_cast<ETextureUsage>(
+        static_cast<UInt32>(depthDesc.Usage) |
+        static_cast<UInt32>(ETextureUsage::TransferSrc));
+
     depthDesc.DebugName = "SharedDepthBuffer";
 
     ERHIResult result = device->CreateTexture(depthDesc, m_SharedDepthTexture);

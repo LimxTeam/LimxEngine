@@ -203,6 +203,12 @@ struct FLaunchOptions
     /// 缺陷根本暴露不出来。
     UInt32 ShadowLights = 2;
 
+    /// GTAO 在半分辨率上求解 + 双边上采样
+    bool GtaoHalf = false;
+
+    /// 半分辨率 AO 自检: 与全分辨率逐像素比对, 以退出码报告
+    bool AoHalfCheck = false;
+
     /// GTAO 的采样半径 (世界单位)
     Float32 AoRadius = 0.8f;
 
@@ -423,6 +429,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --taa            启用时域抗锯齿 (Halton 2,3 抖动 + 解析通道)
 ///   --taa-check      TAA 自检: 与多帧平均比对, 以退出码报告
 ///   --gtao           启用屏幕空间环境光遮蔽
+///   --gtao-half      GTAO 在半分辨率上求解 + 双边上采样
+///   --ao-half-check  半分辨率 AO 自检: 与全分辨率逐像素比对, 以退出码报告
 ///   --bloom          启用泛光
 ///   --bloom-threshold T  泛光的亮度阈值 (默认 1.0)
 ///   --bloom-intensity I  泛光的合成强度 (默认 0.05)
@@ -648,6 +656,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--ao-radius") && (i + 1) < tokenCount)
         {
             options.AoRadius = ParseFloat32(tokens[++i], 0.8f);
+        }
+        else if (WideEquals(arg, L"--gtao-half"))
+        {
+            options.GtaoHalf = true;
+        }
+        else if (WideEquals(arg, L"--ao-half-check"))
+        {
+            options.AoHalfCheck = true;
         }
         else if (WideEquals(arg, L"--ao-check"))
         {
@@ -3498,6 +3514,426 @@ static Float64 NearCornerMean(const FAoProfile& profile)
 }
 
 } // namespace
+
+// ============================================================================
+// RunAoHalfChecks — 半分辨率 AO 与全分辨率的逐像素比对
+//
+// 三条判据, 缺一不可:
+//
+//   1. **平均差要小。** 半分辨率是个近似, 但它必须仍然是同一张图。
+//   2. **平均差不能为零。** 这一条防的是"开关没接上": 一个把 --gtao-half
+//      忽略掉的实现会得到两张完全相同的图, 而第一条判据对它满分通过 ——
+//      于是"半分辨率没生效"与"半分辨率完美无损"在判据上无法区分。
+//   3. **最大差要有界。** 平均差小掩盖得住局部的严重偏差: 深度不连续处若
+//      双边退化成双线性, 前景与背景的 AO 会混在一起, 那是几个百分点的像素
+//      上几十个百分点的误差 —— 平均下来看不见。
+//
+// 只在墙角场景上跑。那个场景有清晰的法线不连续 (直角) 与轮廓处的深度不连续
+// (物体与远平面), 两种上采样会出错的地方它都有。
+// ============================================================================
+
+namespace
+{
+
+/// 回读全分辨率 AO (R16_SFLOAT) 与深度 (D32_SFLOAT)
+///
+/// 深度是判据的一半: 双边上采样的**全部作用**都在深度不连续处 —— 平坦区域
+/// 它与双线性给出的结果完全一样。整幅平均因此量不出它有没有生效 (实测把它
+/// 退化成双线性, 平均差从 0.014394 变成 0.014394, 小数点后五位都一样)。
+static bool ReadAoAndDepth(FRenderContext* context, FRenderer& renderer,
+                           TArray<Float32>& outAo,
+                           TArray<Float32>& outDepth)
+{
+    FGtaoPass* const     gtao  = renderer.GetGtaoPass();
+    FDepthPrePass* const depth = renderer.GetDepthPrePass();
+
+    if (gtao == nullptr || depth == nullptr)
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle aoReadback;
+    FRHIBufferHandle depthReadback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+
+        desc.Size      = pixelCount * 2u;   // R16_SFLOAT
+        desc.DebugName = "AoHalfCheck.AO";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, aoReadback)))
+        {
+            return false;
+        }
+
+        desc.Size      = pixelCount * 4u;   // D32_SFLOAT
+        desc.DebugName = "AoHalfCheck.Depth";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, depthReadback)))
+        {
+            device->DestroyBuffer(aoReadback);
+            return false;
+        }
+    }
+
+    const FRHITextureHandle aoTexture    = gtao->GetAoTexture();
+    const FRHITextureHandle depthTexture = depth->GetSharedDepthTexture();
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, aoTexture, depthTexture, aoReadback,
+         depthReadback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                aoTexture,
+                EImageLayout::ShaderReadOnly, EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(aoTexture, EImageLayout::TransferSrc,
+                                     aoReadback, region);
+
+            cmd->TransitionImageLayout(
+                aoTexture,
+                EImageLayout::TransferSrc, EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            // 深度此刻停在 DepthStencilAttachment —— 前向通道的 FinalLayout
+            cmd->TransitionImageLayout(
+                depthTexture,
+                EImageLayout::DepthStencilAttachment,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::LateFragmentTests,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::DepthStencilAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(depthTexture, EImageLayout::TransferSrc,
+                                     depthReadback, region);
+
+            cmd->TransitionImageLayout(
+                depthTexture,
+                EImageLayout::TransferSrc,
+                EImageLayout::DepthStencilAttachment,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::EarlyFragmentTests,
+                EAccessFlags::TransferRead,
+                EAccessFlags::DepthStencilAttachmentWrite);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+
+    // 立刻摘掉回调 —— 捕获的是栈上的引用
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(aoReadback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const Float16Bits* src = static_cast<const Float16Bits*>(mapped);
+
+            outAo.Clear();
+            outAo.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outAo.Add(Float16ToFloat32(src[i]));
+            }
+
+            device->UnmapBuffer(aoReadback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    if (ok)
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(depthReadback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const Float32* src = static_cast<const Float32*>(mapped);
+
+            outDepth.Clear();
+            outDepth.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outDepth.Add(src[i]);
+            }
+
+            device->UnmapBuffer(depthReadback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(aoReadback);
+    device->DestroyBuffer(depthReadback);
+
+    return ok;
+}
+
+} // namespace
+
+static bool RunAoHalfChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FGtaoPass* const gtao = renderer.GetGtaoPass();
+
+    if (gtao == nullptr || !gtao->IsEnabled())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO半分] GTAO 未启用 — 自检无从判定 (加 --gtao)");
+        return false;
+    }
+
+    const bool originalHalf = gtao->IsHalfResolution();
+
+    TArray<Float32> full;
+    TArray<Float32> half;
+    TArray<Float32> depth;
+    TArray<Float32> depthIgnored;
+
+    gtao->SetHalfResolution(false);
+
+    if (!ReadAoAndDepth(context, renderer, full, depth))
+    {
+        gtao->SetHalfResolution(originalHalf);
+        LIMX_LOG(LogLaunch, Error, "[AO半分] 全分辨率回读失败");
+        return false;
+    }
+
+    gtao->SetHalfResolution(true);
+
+    if (!ReadAoAndDepth(context, renderer, half, depthIgnored))
+    {
+        gtao->SetHalfResolution(originalHalf);
+        LIMX_LOG(LogLaunch, Error, "[AO半分] 半分辨率回读失败");
+        return false;
+    }
+
+    gtao->SetHalfResolution(originalHalf);
+
+    if (full.GetSize() != half.GetSize() || full.GetSize() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO半分] 两次回读的尺寸不同 ({} vs {})",
+                 full.GetSize(), half.GetSize());
+        return false;
+    }
+
+    Float64 sumAbs   = 0.0;
+    Float32 maxAbs   = 0.0f;
+    SizeType shaded  = 0;   // AO 明显小于 1 的像素数
+
+    for (SizeType i = 0; i < full.GetSize(); ++i)
+    {
+        const Float32 diff = FMath::Abs(full[i] - half[i]);
+
+        sumAbs += static_cast<Float64>(diff);
+        maxAbs  = FMath::Max(maxAbs, diff);
+
+        if (full[i] < 0.95f)
+        {
+            ++shaded;
+        }
+    }
+
+    const Float32 meanAbs = static_cast<Float32>(
+        sumAbs / static_cast<Float64>(full.GetSize()));
+
+    LIMX_LOG(LogLaunch, Display,
+             "[AO半分] 平均差 {} 最大差 {} (有遮蔽的像素 {} / {})",
+             meanAbs, maxAbs, shaded, full.GetSize());
+
+    bool passed = true;
+
+    // ---- 0. 场景里必须真的有遮蔽 ----
+    //
+    // AO 全是 1 的话两张图当然一样, 而那证明不了任何事。
+    if (shaded * 10 < full.GetSize())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO半分] 只有 {} / {} 个像素有遮蔽 —— 比对无意义",
+                 shaded, full.GetSize());
+        passed = false;
+    }
+
+    // ---- 1. 平均差要小 ----
+    //
+    // 0.025 是从墙角场景量出来的: 正确实现给 0.014394。而能抓住的是
+    // "上采样恒取最近邻"(0.02 以上) 与"权重不归一化"(整幅崩掉)。
+    //
+    // 这个数与场景有关 —— 阴影场景上正确实现就有 0.0373 (那里 AO 的梯度
+    // 陡得多)。所以这条判据只在墙角场景上跑, verify.ps1 里也是这么调的。
+    if (meanAbs > 0.025f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO半分] 平均差 {} 超过 0.025 —— 半分辨率不是同一张图了",
+                 meanAbs);
+        passed = false;
+    }
+
+    // ---- 2. 平均差不能为零 ----
+    //
+    // 这一条防的是"开关没接上"。一个把 --gtao-half 忽略掉的实现会得到两张
+    // **完全相同**的图, 而第一条判据对它满分通过 —— 于是"没生效"与"完美
+    // 无损"在判据上无法区分。
+    if (meanAbs < 1.0e-4f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO半分] 平均差只有 {} —— 半分辨率是不是根本没生效?",
+                 meanAbs);
+        passed = false;
+    }
+
+    // ---- 3. 最大差要有界 ----
+    //
+    // 平均差小掩盖得住局部的严重偏差: 深度不连续处若双边退化成双线性, 前景
+    // 与背景的 AO 会混在一起 —— 那是几个百分点的像素上几十个百分点的误差,
+    // 平均下来看不见。
+    if (maxAbs > 0.35f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO半分] 最大差 {} 超过 0.35 —— 上采样在不连续处渗色?",
+                 maxAbs);
+        passed = false;
+    }
+
+    // ---- 4. 深度不连续处的差 —— **只报不判** ----
+    //
+    // 双边加权的全部作用都在深度不连续处。这一段本来是想为它建一条判据的,
+    // 而实测的结论是**建不起来**:
+    //
+    //   墙角场景 (--corner-scene): 两块平面填满视野, 深度不连续的像素
+    //     **一个都没有**。
+    //   阴影场景 (--shadow-scene): 1096 个不连续像素 (占万分之十二), 而
+    //     把双边退化成双线性之后, 那些像素上的平均差从 0.005806 变成
+    //     0.006379 —— 相对差 10%, 绝对差 0.0006。整幅平均则是
+    //     0.037312 对 0.037313, 小数点后五位才分得开。
+    //
+    // 也就是说: 手上的场景里, 深度加权这一项**量不出来**。它仍然留着 ——
+    // 它便宜, 而且防的是物体边缘一圈光晕, 那种光晕看起来像"AO 半径调大了",
+    // 调半径根本治不了。但把它写成判据就是自欺: 阈值只能宽到连双线性都放
+    // 过去, 那条判据就成了摆设。
+    //
+    // 所以这里只报数, 不参与判定。要真的验它, 需要一个**前景与背景 AO 差
+    // 别很大**的场景 —— 那是另一件事。
+    {
+        const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+        Float64  edgeSum   = 0.0;
+        SizeType edgeCount = 0;
+
+        for (UInt32 y = 1; y + 1 < extent.Height; ++y)
+        {
+            for (UInt32 x = 1; x + 1 < extent.Width; ++x)
+            {
+                const SizeType index =
+                    static_cast<SizeType>(y) * extent.Width + x;
+
+                const Float32 center = depth[index];
+
+                // 四邻的最大相对深度差 —— 与 gtao_upsample.frag 里的判据同源
+                Float32 maxRelative = 0.0f;
+
+                const SizeType neighbors[4] = {
+                    index - 1, index + 1,
+                    index - extent.Width, index + extent.Width
+                };
+
+                for (SizeType n = 0; n < 4; ++n)
+                {
+                    const Float32 other = depth[neighbors[n]];
+
+                    const Float32 relative =
+                        FMath::Abs(center - other) /
+                        FMath::Max(FMath::Max(center, other), 1.0e-4f);
+
+                    maxRelative = FMath::Max(maxRelative, relative);
+                }
+
+                // 0.002 的 NDC 相对差已经是很陡的一步了 —— 透视深度在
+                // 远处极度压缩, 用世界尺度的阈值会一个都选不出来。
+                if (maxRelative > 0.002f)
+                {
+                    edgeSum += static_cast<Float64>(
+                        FMath::Abs(full[index] - half[index]));
+                    ++edgeCount;
+                }
+            }
+        }
+
+        const Float32 edgeMean =
+            (edgeCount > 0)
+                ? static_cast<Float32>(edgeSum /
+                                       static_cast<Float64>(edgeCount))
+                : 0.0f;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[AO半分] 深度不连续处 {} 个像素, 平均差 {}",
+                 edgeCount, edgeMean);
+
+        // 不参与判定 —— 理由见上面那段。
+        (void)edgeMean;
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[AO半分] 通过 — 半分辨率与全分辨率是同一张图, 且确实生效");
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Error, "[AO半分] 失败");
+    }
+
+    return passed;
+}
 
 static bool RunAoChecks(FRenderContext* context, FRenderer& renderer)
 {
@@ -6939,12 +7375,15 @@ int WINAPI wWinMain(
         if (renderer.GetGtaoPass() != nullptr)
         {
             renderer.GetGtaoPass()->SetRadius(launchOptions.AoRadius);
+            renderer.GetGtaoPass()->SetHalfResolution(launchOptions.GtaoHalf);
         }
 
         LIMX_LOG(LogLaunch, Display,
                  "[Launch] 屏幕空间环境光遮蔽已启用 "
-                 "(GTAO, 4 方向 x 8 步进, 半径 {})",
-                 launchOptions.AoRadius);
+                 "(GTAO, 4 方向 x 8 步进, 半径 {}, {})",
+                 launchOptions.AoRadius,
+                 launchOptions.GtaoHalf ? "半分辨率 + 双边上采样"
+                                        : "全分辨率");
     }
 
     if (launchOptions.Bloom)
@@ -7064,6 +7503,7 @@ int WINAPI wWinMain(
     bool    bloomCheckPassed = true;
     bool    shadowCheckPassed = true;
     bool    gpuDrivenCheckPassed = true;
+    bool    aoHalfCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -7127,6 +7567,11 @@ int WINAPI wWinMain(
             if (launchOptions.AoCheck)
             {
                 aoCheckPassed = RunAoChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.AoHalfCheck)
+            {
+                aoHalfCheckPassed = RunAoHalfChecks(&renderContext, renderer);
             }
 
             if (launchOptions.BloomCheck)
@@ -7292,6 +7737,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.GpuDrivenCheck)
     {
         selfCheckCode = FinalizeSelfCheck(gpuDrivenCheckPassed, 15, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.AoHalfCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(aoHalfCheckPassed, 16, errorSink,
                                           errorsBeforeShutdown);
     }
 
