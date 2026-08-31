@@ -55,19 +55,35 @@ ERHIResult FVulkanDevice::CreateRenderPass(
     const FRHIRenderPassDesc& desc,
     FRHIRenderPassHandle& outHandle)
 {
+    // ------------------------------------------------------------------
+    // 数量一律不设上限 — 内联容量 + 分配器回退
+    //
+    // 附件/子通道/依赖的条数由调用方的通道结构决定, 不是本函数能约束的。
+    // 静默截断的后果在这里尤其难查: 少一个附件描述, 引用它的子通道就指向
+    // 了不存在的下标; 少一条子通道依赖, 通道之间的同步就没了。两者都不会
+    // 让 vkCreateRenderPass 失败得有指向性。
+    // ------------------------------------------------------------------
+
     // 转换附件描述
-    constexpr UInt32 kMaxAttachments = 16;
-    VkAttachmentDescription attachments[kMaxAttachments];
+    constexpr SizeType kInlineAttachments = 16;
+    TSmallVector<VkAttachmentDescription, kInlineAttachments> attachments;
+
     UInt32 attachmentCount = desc.AttachmentCount;
-    if (attachmentCount > kMaxAttachments)
+    if (attachmentCount > 0 && desc.Attachments == nullptr)
     {
-        attachmentCount = kMaxAttachments;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateRenderPass: 附件数组为空但计数为 {}",
+            attachmentCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    attachments.Reserve(static_cast<SizeType>(attachmentCount));
 
     for (UInt32 i = 0; i < attachmentCount; ++i)
     {
         const FRHIAttachmentDesc& src = desc.Attachments[i];
-        VkAttachmentDescription& dst  = attachments[i];
+
+        VkAttachmentDescription dst;
         MemZero(&dst, sizeof(VkAttachmentDescription));
 
         dst.format         = ToVkFormat(src.Format);
@@ -78,63 +94,115 @@ ERHIResult FVulkanDevice::CreateRenderPass(
         dst.stencilStoreOp = ToVkAttachmentStoreOp(src.StencilStoreOp);
         dst.initialLayout  = ToVkImageLayout(src.InitialLayout);
         dst.finalLayout    = ToVkImageLayout(src.FinalLayout);
+
+        attachments.Add(dst);
     }
 
+    // ------------------------------------------------------------------
     // 转换子通道描述
-    constexpr UInt32 kMaxSubpasses = 8;
-    constexpr UInt32 kMaxRefs      = 32;
-    VkSubpassDescription subpasses[kMaxSubpasses];
-    VkAttachmentReference colorRefs[kMaxRefs];
-    VkAttachmentReference depthRefs[kMaxSubpasses];
-    VkAttachmentReference inputRefs[kMaxRefs];
+    //
+    // 附件引用数组要一次性预留够: VkSubpassDescription 里存的是**指针**,
+    // 中途扩容会让先前几个子通道的 pColorAttachments 全部悬空。因此先扫
+    // 一遍求总数, Reserve 之后再填 —— Reserve 保证后续 Add 不再重新分配。
+    //
+    // 原实现在这里还藏着一个比截断更糟的形态: 引用放不下时跳过填充, 但
+    // colorAttachmentCount 已经按调用方给的数量写进去了, pColorAttachments
+    // 却留在 nullptr。那是"计数非零 + 空指针"交给驱动, 后果是读野指针,
+    // 而不是少几个附件。
+    // ------------------------------------------------------------------
+
+    constexpr SizeType kInlineSubpasses = 8;
+    constexpr SizeType kInlineRefs      = 32;
+
+    TSmallVector<VkSubpassDescription, kInlineSubpasses>  subpasses;
+    TSmallVector<VkAttachmentReference, kInlineRefs>      colorRefs;
+    TSmallVector<VkAttachmentReference, kInlineSubpasses> depthRefs;
+    TSmallVector<VkAttachmentReference, kInlineRefs>      inputRefs;
 
     UInt32 subpassCount = desc.SubpassCount;
-    if (subpassCount > kMaxSubpasses)
+    if (subpassCount > 0 && desc.Subpasses == nullptr)
     {
-        subpassCount = kMaxSubpasses;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateRenderPass: 子通道数组为空但计数为 {}",
+            subpassCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
 
-    UInt32 colorRefOffset = 0;
-    UInt32 inputRefOffset = 0;
+    SizeType totalColorRefs = 0;
+    SizeType totalInputRefs = 0;
+
+    for (UInt32 s = 0; s < subpassCount; ++s)
+    {
+        totalColorRefs += desc.Subpasses[s].ColorAttachmentCount;
+        totalInputRefs += desc.Subpasses[s].InputAttachmentCount;
+    }
+
+    subpasses.Reserve(static_cast<SizeType>(subpassCount));
+    depthRefs.Reserve(static_cast<SizeType>(subpassCount));
+    colorRefs.Reserve(totalColorRefs);
+    inputRefs.Reserve(totalInputRefs);
+
+    // 深度引用先全部占位 —— 与子通道一一对应, 下标即子通道号
+    for (UInt32 s = 0; s < subpassCount; ++s)
+    {
+        depthRefs.Add(VkAttachmentReference{});
+    }
 
     for (UInt32 s = 0; s < subpassCount; ++s)
     {
         const FRHISubpassDesc& src = desc.Subpasses[s];
-        VkSubpassDescription& dst  = subpasses[s];
+
+        VkSubpassDescription dst;
         MemZero(&dst, sizeof(VkSubpassDescription));
 
         dst.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 
         // 颜色附件引用
         dst.colorAttachmentCount = src.ColorAttachmentCount;
-        if (src.ColorAttachmentCount > 0 &&
-            colorRefOffset + src.ColorAttachmentCount <= kMaxRefs)
+        if (src.ColorAttachmentCount > 0)
         {
-            dst.pColorAttachments = &colorRefs[colorRefOffset];
+            if (src.ColorAttachments == nullptr)
+            {
+                LIMX_LOG(LogRHI, Error,
+                    "[Vulkan] CreateRenderPass: 子通道 {} 的颜色附件数组为空"
+                    "但计数为 {}", s, src.ColorAttachmentCount);
+                return ERHIResult::ErrorInvalidParameter;
+            }
+
+            dst.pColorAttachments = colorRefs.GetData() + colorRefs.GetSize();
+
             for (UInt32 c = 0; c < src.ColorAttachmentCount; ++c)
             {
-                colorRefs[colorRefOffset + c].attachment =
-                    src.ColorAttachments[c].AttachmentIndex;
-                colorRefs[colorRefOffset + c].layout =
+                VkAttachmentReference ref;
+                ref.attachment = src.ColorAttachments[c].AttachmentIndex;
+                ref.layout =
                     ToVkImageLayout(src.ColorAttachments[c].Layout);
+                colorRefs.Add(ref);
             }
-            colorRefOffset += src.ColorAttachmentCount;
         }
 
         // 输入附件引用
         dst.inputAttachmentCount = src.InputAttachmentCount;
-        if (src.InputAttachmentCount > 0 &&
-            inputRefOffset + src.InputAttachmentCount <= kMaxRefs)
+        if (src.InputAttachmentCount > 0)
         {
-            dst.pInputAttachments = &inputRefs[inputRefOffset];
+            if (src.InputAttachments == nullptr)
+            {
+                LIMX_LOG(LogRHI, Error,
+                    "[Vulkan] CreateRenderPass: 子通道 {} 的输入附件数组为空"
+                    "但计数为 {}", s, src.InputAttachmentCount);
+                return ERHIResult::ErrorInvalidParameter;
+            }
+
+            dst.pInputAttachments = inputRefs.GetData() + inputRefs.GetSize();
+
             for (UInt32 c = 0; c < src.InputAttachmentCount; ++c)
             {
-                inputRefs[inputRefOffset + c].attachment =
-                    src.InputAttachments[c].AttachmentIndex;
-                inputRefs[inputRefOffset + c].layout =
+                VkAttachmentReference ref;
+                ref.attachment = src.InputAttachments[c].AttachmentIndex;
+                ref.layout =
                     ToVkImageLayout(src.InputAttachments[c].Layout);
+                inputRefs.Add(ref);
             }
-            inputRefOffset += src.InputAttachmentCount;
         }
 
         // 深度模板附件引用
@@ -175,22 +243,29 @@ ERHIResult FVulkanDevice::CreateRenderPass(
         // 保留附件
         dst.preserveAttachmentCount = src.PreserveAttachmentCount;
         dst.pPreserveAttachments    = src.PreserveAttachments;
+
+        subpasses.Add(dst);
     }
 
-    // 转换子通道依赖
-    constexpr UInt32 kMaxDependencies = 16;
-    VkSubpassDependency dependencies[kMaxDependencies];
+    // 转换子通道依赖 — 少一条依赖就是少一处子通道间同步, 不能截断
+    constexpr SizeType kInlineDependencies = 16;
+    TSmallVector<VkSubpassDependency, kInlineDependencies> dependencies;
+
     UInt32 depCount = desc.DependencyCount;
-    if (depCount > kMaxDependencies)
+    if (depCount > 0 && desc.Dependencies == nullptr)
     {
-        depCount = kMaxDependencies;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateRenderPass: 依赖数组为空但计数为 {}", depCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    dependencies.Reserve(static_cast<SizeType>(depCount));
 
     for (UInt32 d = 0; d < depCount; ++d)
     {
         const FRHISubpassDependency& src = desc.Dependencies[d];
-        VkSubpassDependency& dst         = dependencies[d];
 
+        VkSubpassDependency dst;
         dst.srcSubpass      = (src.SrcSubpass == 0xFFFFFFFF)
             ? VK_SUBPASS_EXTERNAL : src.SrcSubpass;
         dst.dstSubpass      = src.DstSubpass;
@@ -199,16 +274,18 @@ ERHIResult FVulkanDevice::CreateRenderPass(
         dst.srcAccessMask   = ToVkAccessFlags(src.SrcAccessMask);
         dst.dstAccessMask   = ToVkAccessFlags(src.DstAccessMask);
         dst.dependencyFlags = 0;
+
+        dependencies.Add(dst);
     }
 
     VkRenderPassCreateInfo createInfo = {};
     createInfo.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     createInfo.attachmentCount = attachmentCount;
-    createInfo.pAttachments    = attachments;
+    createInfo.pAttachments    = attachments.GetData();
     createInfo.subpassCount    = subpassCount;
-    createInfo.pSubpasses      = subpasses;
+    createInfo.pSubpasses      = subpasses.GetData();
     createInfo.dependencyCount = depCount;
-    createInfo.pDependencies   = dependencies;
+    createInfo.pDependencies   = dependencies.GetData();
 
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkResult vkResult = vkCreateRenderPass(m_Device, &createInfo,
@@ -254,14 +331,20 @@ ERHIResult FVulkanDevice::CreateFramebuffer(
         return ERHIResult::ErrorInvalidHandle;
     }
 
-    // 转换附件视图句柄到 VkImageView
-    constexpr UInt32 kMaxAttachments = 16;
-    VkImageView imageViews[kMaxAttachments];
-    UInt32 attachmentCount = desc.AttachmentCount;
-    if (attachmentCount > kMaxAttachments)
+    // 转换附件视图句柄到 VkImageView — 数量必须与渲染通道一致, 不能截断
+    constexpr SizeType kInlineAttachments = 16;
+    TSmallVector<VkImageView, kInlineAttachments> imageViews;
+
+    const UInt32 attachmentCount = desc.AttachmentCount;
+    if (attachmentCount > 0 && desc.Attachments == nullptr)
     {
-        attachmentCount = kMaxAttachments;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateFramebuffer: 附件数组为空但计数为 {}",
+            attachmentCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    imageViews.Reserve(static_cast<SizeType>(attachmentCount));
 
     for (UInt32 i = 0; i < attachmentCount; ++i)
     {
@@ -270,14 +353,14 @@ ERHIResult FVulkanDevice::CreateFramebuffer(
         {
             return ERHIResult::ErrorInvalidHandle;
         }
-        imageViews[i] = view;
+        imageViews.Add(view);
     }
 
     VkFramebufferCreateInfo createInfo = {};
     createInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     createInfo.renderPass      = rpData->RenderPass;
     createInfo.attachmentCount = attachmentCount;
-    createInfo.pAttachments    = imageViews;
+    createInfo.pAttachments    = imageViews.GetData();
     createInfo.width           = desc.Width;
     createInfo.height          = desc.Height;
     createInfo.layers          = desc.Layers;
@@ -319,28 +402,38 @@ ERHIResult FVulkanDevice::CreateDescSetLayout(
     const FRHIDescSetLayoutDesc& desc,
     FRHIDescSetLayoutHandle& outHandle)
 {
-    constexpr UInt32 kMaxBindings = 32;
-    VkDescriptorSetLayoutBinding bindings[kMaxBindings];
-    VkDescriptorBindingFlags     bindingFlags[kMaxBindings];
+    // 绑定条数由着色器接口决定, 不能截断 —— 少一个绑定, 着色器里对应的
+    // 资源就永远读到未定义内容, 而管线创建与描述符写入都不会报错。
+    constexpr SizeType kInlineBindings = 32;
+    TSmallVector<VkDescriptorSetLayoutBinding, kInlineBindings> bindings;
+    TSmallVector<VkDescriptorBindingFlags, kInlineBindings>     bindingFlags;
 
-    UInt32 bindingCount = desc.BindingCount;
-    if (bindingCount > kMaxBindings)
+    const UInt32 bindingCount = desc.BindingCount;
+    if (bindingCount > 0 && desc.Bindings == nullptr)
     {
-        bindingCount = kMaxBindings;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateDescSetLayout: 绑定数组为空但计数为 {}",
+            bindingCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    bindings.Reserve(static_cast<SizeType>(bindingCount));
+    bindingFlags.Reserve(static_cast<SizeType>(bindingCount));
 
     bool anyFlags = false;
 
     for (UInt32 i = 0; i < bindingCount; ++i)
     {
         const FRHIDescriptorBinding& src = desc.Bindings[i];
-        VkDescriptorSetLayoutBinding& dst = bindings[i];
 
+        VkDescriptorSetLayoutBinding dst;
         dst.binding            = src.Binding;
         dst.descriptorType     = ToVkDescriptorType(src.Type);
         dst.descriptorCount    = src.Count;
         dst.stageFlags         = ToVkShaderStageFlags(src.StageFlags);
         dst.pImmutableSamplers = nullptr;
+
+        bindings.Add(dst);
 
         VkDescriptorBindingFlags flags = 0;
 
@@ -354,7 +447,7 @@ ERHIResult FVulkanDevice::CreateDescSetLayout(
             flags |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
         }
 
-        bindingFlags[i] = flags;
+        bindingFlags.Add(flags);
 
         anyFlags = anyFlags || (flags != 0);
     }
@@ -362,7 +455,7 @@ ERHIResult FVulkanDevice::CreateDescSetLayout(
     VkDescriptorSetLayoutCreateInfo createInfo = {};
     createInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     createInfo.bindingCount = bindingCount;
-    createInfo.pBindings    = bindings;
+    createInfo.pBindings    = bindings.GetData();
 
     // 只在真的用到标志时才挂扩展结构。
     //
@@ -375,7 +468,7 @@ ERHIResult FVulkanDevice::CreateDescSetLayout(
         flagsInfo.sType =
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
         flagsInfo.bindingCount  = bindingCount;
-        flagsInfo.pBindingFlags = bindingFlags;
+        flagsInfo.pBindingFlags = bindingFlags.GetData();
 
         createInfo.pNext = &flagsInfo;
 
@@ -431,15 +524,24 @@ ERHIResult FVulkanDevice::CreatePipelineLayout(
     const FRHIPipelineLayoutDesc& desc,
     FRHIPipelineLayoutHandle& outHandle)
 {
-    constexpr UInt32 kMaxSetLayouts       = 8;
-    constexpr UInt32 kMaxPushConstRanges  = 4;
+    // 集布局与推送常量范围都不能截断: 少一个集布局, 着色器里对应 set 的
+    // 全部绑定就失效; 少一段推送常量, 对应阶段读到的就是垃圾。两者都不会
+    // 让 vkCreatePipelineLayout 失败。
+    constexpr SizeType kInlineSetLayouts      = 8;
+    constexpr SizeType kInlinePushConstRanges = 4;
 
-    VkDescriptorSetLayout setLayouts[kMaxSetLayouts];
-    UInt32 setLayoutCount = desc.SetLayoutCount;
-    if (setLayoutCount > kMaxSetLayouts)
+    TSmallVector<VkDescriptorSetLayout, kInlineSetLayouts> setLayouts;
+
+    const UInt32 setLayoutCount = desc.SetLayoutCount;
+    if (setLayoutCount > 0 && desc.SetLayouts == nullptr)
     {
-        setLayoutCount = kMaxSetLayouts;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreatePipelineLayout: 集布局数组为空但计数为 {}",
+            setLayoutCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    setLayouts.Reserve(static_cast<SizeType>(setLayoutCount));
 
     for (UInt32 i = 0; i < setLayoutCount; ++i)
     {
@@ -449,31 +551,40 @@ ERHIResult FVulkanDevice::CreatePipelineLayout(
         {
             return ERHIResult::ErrorInvalidHandle;
         }
-        setLayouts[i] = layoutData->Layout;
+        setLayouts.Add(layoutData->Layout);
     }
 
-    VkPushConstantRange pushConstRanges[kMaxPushConstRanges];
-    UInt32 pushConstCount = desc.PushConstantRangeCount;
-    if (pushConstCount > kMaxPushConstRanges)
+    TSmallVector<VkPushConstantRange, kInlinePushConstRanges> pushConstRanges;
+
+    const UInt32 pushConstCount = desc.PushConstantRangeCount;
+    if (pushConstCount > 0 && desc.PushConstantRanges == nullptr)
     {
-        pushConstCount = kMaxPushConstRanges;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreatePipelineLayout: 推送常量范围数组为空但计数为 {}",
+            pushConstCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    pushConstRanges.Reserve(static_cast<SizeType>(pushConstCount));
 
     for (UInt32 i = 0; i < pushConstCount; ++i)
     {
         const FRHIPushConstantRange& src = desc.PushConstantRanges[i];
-        pushConstRanges[i].stageFlags = ToVkShaderStageFlags(
-            src.StageFlags);
-        pushConstRanges[i].offset     = src.Offset;
-        pushConstRanges[i].size       = src.Size;
+
+        VkPushConstantRange range;
+        range.stageFlags = ToVkShaderStageFlags(src.StageFlags);
+        range.offset     = src.Offset;
+        range.size       = src.Size;
+
+        pushConstRanges.Add(range);
     }
 
     VkPipelineLayoutCreateInfo createInfo = {};
     createInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     createInfo.setLayoutCount         = setLayoutCount;
-    createInfo.pSetLayouts            = setLayouts;
+    createInfo.pSetLayouts            = setLayouts.GetData();
     createInfo.pushConstantRangeCount = pushConstCount;
-    createInfo.pPushConstantRanges    = pushConstRanges;
+    createInfo.pPushConstantRanges    = pushConstRanges.GetData();
 
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkResult vkResult = vkCreatePipelineLayout(m_Device, &createInfo,
@@ -515,6 +626,18 @@ ERHIResult FVulkanDevice::CreateGraphicsPipeline(
     FRHIGraphicsPipelineHandle& outHandle)
 {
     // ---- 着色器阶段 ----
+    //
+    // ShaderStages 是 FRHIGraphicsPipelineDesc 里的定长数组, 因此
+    // ShaderStageCount 超过 kMaxShaderStages 时, 调用方自己就已经越界了。
+    // 这里不能顺着写下去 —— 那是往栈上写越界。拒绝并说明原因。
+    if (desc.ShaderStageCount > kMaxShaderStages)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateGraphicsPipeline: 着色器阶段数 {} 超过上限 {}",
+            desc.ShaderStageCount, kMaxShaderStages);
+        return ERHIResult::ErrorInvalidParameter;
+    }
+
     VkPipelineShaderStageCreateInfo shaderStages[kMaxShaderStages];
     for (UInt32 i = 0; i < desc.ShaderStageCount; ++i)
     {
@@ -536,48 +659,73 @@ ERHIResult FVulkanDevice::CreateGraphicsPipeline(
     }
 
     // ---- 顶点输入 ----
-    constexpr UInt32 kMaxVertexBindings   = 16;
-    constexpr UInt32 kMaxVertexAttributes = 32;
+    //
+    // 顶点属性由网格布局决定。少一个属性, 着色器里对应的 location 就读到
+    // 未定义值 —— 表现是模型的法线/UV 之类整体错乱, 而管线创建成功。
+    constexpr SizeType kInlineVertexBindings   = 16;
+    constexpr SizeType kInlineVertexAttributes = 32;
 
-    VkVertexInputBindingDescription vertexBindings[kMaxVertexBindings];
-    UInt32 vertBindCount = desc.VertexInput.BindingCount;
-    if (vertBindCount > kMaxVertexBindings)
+    TSmallVector<VkVertexInputBindingDescription, kInlineVertexBindings>
+        vertexBindings;
+
+    const UInt32 vertBindCount = desc.VertexInput.BindingCount;
+    if (vertBindCount > 0 && desc.VertexInput.Bindings == nullptr)
     {
-        vertBindCount = kMaxVertexBindings;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateGraphicsPipeline: 顶点绑定数组为空但计数为 {}",
+            vertBindCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    vertexBindings.Reserve(static_cast<SizeType>(vertBindCount));
 
     for (UInt32 i = 0; i < vertBindCount; ++i)
     {
         const FRHIVertexInputBinding& src = desc.VertexInput.Bindings[i];
-        vertexBindings[i].binding   = src.Binding;
-        vertexBindings[i].stride    = src.Stride;
-        vertexBindings[i].inputRate = ToVkVertexInputRate(src.InputRate);
+
+        VkVertexInputBindingDescription dst;
+        dst.binding   = src.Binding;
+        dst.stride    = src.Stride;
+        dst.inputRate = ToVkVertexInputRate(src.InputRate);
+
+        vertexBindings.Add(dst);
     }
 
-    VkVertexInputAttributeDescription vertexAttrs[kMaxVertexAttributes];
-    UInt32 vertAttrCount = desc.VertexInput.AttributeCount;
-    if (vertAttrCount > kMaxVertexAttributes)
+    TSmallVector<VkVertexInputAttributeDescription, kInlineVertexAttributes>
+        vertexAttrs;
+
+    const UInt32 vertAttrCount = desc.VertexInput.AttributeCount;
+    if (vertAttrCount > 0 && desc.VertexInput.Attributes == nullptr)
     {
-        vertAttrCount = kMaxVertexAttributes;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateGraphicsPipeline: 顶点属性数组为空但计数为 {}",
+            vertAttrCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    vertexAttrs.Reserve(static_cast<SizeType>(vertAttrCount));
 
     for (UInt32 i = 0; i < vertAttrCount; ++i)
     {
         const FRHIVertexInputAttribute& src =
             desc.VertexInput.Attributes[i];
-        vertexAttrs[i].location = src.Location;
-        vertexAttrs[i].binding  = src.Binding;
-        vertexAttrs[i].format   = ToVkFormat(src.Format);
-        vertexAttrs[i].offset   = src.Offset;
+
+        VkVertexInputAttributeDescription dst;
+        dst.location = src.Location;
+        dst.binding  = src.Binding;
+        dst.format   = ToVkFormat(src.Format);
+        dst.offset   = src.Offset;
+
+        vertexAttrs.Add(dst);
     }
 
     VkPipelineVertexInputStateCreateInfo vertexInputState = {};
     vertexInputState.sType =
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInputState.vertexBindingDescriptionCount   = vertBindCount;
-    vertexInputState.pVertexBindingDescriptions      = vertexBindings;
+    vertexInputState.pVertexBindingDescriptions      = vertexBindings.GetData();
     vertexInputState.vertexAttributeDescriptionCount = vertAttrCount;
-    vertexInputState.pVertexAttributeDescriptions    = vertexAttrs;
+    vertexInputState.pVertexAttributeDescriptions    = vertexAttrs.GetData();
 
     // ---- 输入装配 ----
     VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
@@ -680,21 +828,31 @@ ERHIResult FVulkanDevice::CreateGraphicsPipeline(
     depthStencil.back.reference   = desc.DepthStencil.Back.Reference;
 
     // ---- 颜色混合 ----
-    constexpr UInt32 kMaxColorAttachments = 8;
-    VkPipelineColorBlendAttachmentState blendAttachments[
-        kMaxColorAttachments];
-    UInt32 blendAttachCount = desc.ColorBlend.AttachmentCount;
-    if (blendAttachCount > kMaxColorAttachments)
+    //
+    // 混合状态必须与渲染通道的颜色附件一一对应。少一个, Vulkan 就会因为
+    // attachmentCount 与子通道的颜色附件数不匹配而拒绝 —— 但报出来的是
+    // "数量不匹配", 而不是"你的第 9 个混合状态被丢了"。
+    constexpr SizeType kInlineColorAttachments = 8;
+    TSmallVector<VkPipelineColorBlendAttachmentState,
+                 kInlineColorAttachments> blendAttachments;
+
+    const UInt32 blendAttachCount = desc.ColorBlend.AttachmentCount;
+    if (blendAttachCount > 0 && desc.ColorBlend.Attachments == nullptr)
     {
-        blendAttachCount = kMaxColorAttachments;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] CreateGraphicsPipeline: 混合附件数组为空但计数为 {}",
+            blendAttachCount);
+        return ERHIResult::ErrorInvalidParameter;
     }
+
+    blendAttachments.Reserve(static_cast<SizeType>(blendAttachCount));
 
     for (UInt32 i = 0; i < blendAttachCount; ++i)
     {
         const FRHIColorBlendAttachmentDesc& src =
             desc.ColorBlend.Attachments[i];
-        VkPipelineColorBlendAttachmentState& dst = blendAttachments[i];
 
+        VkPipelineColorBlendAttachmentState dst;
         dst.blendEnable         = src.IsBlendEnabled ? VK_TRUE : VK_FALSE;
         dst.srcColorBlendFactor = ToVkBlendFactor(
             src.SrcColorBlendFactor);
@@ -708,6 +866,8 @@ ERHIResult FVulkanDevice::CreateGraphicsPipeline(
         dst.alphaBlendOp        = ToVkBlendOp(src.AlphaBlendOp);
         dst.colorWriteMask      = ToVkColorComponentFlags(
             src.ColorWriteMask);
+
+        blendAttachments.Add(dst);
     }
 
     VkPipelineColorBlendStateCreateInfo colorBlend = {};
@@ -718,7 +878,7 @@ ERHIResult FVulkanDevice::CreateGraphicsPipeline(
     colorBlend.logicOp         = static_cast<VkLogicOp>(
         desc.ColorBlend.LogicOp);
     colorBlend.attachmentCount = blendAttachCount;
-    colorBlend.pAttachments    = blendAttachments;
+    colorBlend.pAttachments    = blendAttachments.GetData();
     MemCopy(colorBlend.blendConstants,
             desc.ColorBlend.BlendConstants, sizeof(Float32) * 4);
 
@@ -935,16 +1095,24 @@ void FVulkanDevice::UpdateDescriptorSets(const FRHIDescriptorWrite* writes,
         return;
     }
 
-    constexpr UInt32 kMaxWrites = 32;
-    UInt32 count = writeCount;
-    if (count > kMaxWrites)
-    {
-        count = kMaxWrites;
-    }
+    // 写入条数不设上限 —— bindless 之下一次刷新成百上千个描述符是常态。
+    // 截断的后果是被丢掉的那些绑定保持旧内容: 材质换了、贴图没换, 而
+    // vkUpdateDescriptorSets 无返回值, 验证层也无从察觉。
+    //
+    // 三个数组必须一次性撑到位再填: vkWrites[i] 里存的是指向
+    // bufferInfos[i] / imageInfos[i] 的**指针**, 中途扩容会让先前写好的
+    // 指针全部悬空。
+    constexpr SizeType kInlineWrites = 32;
 
-    VkWriteDescriptorSet   vkWrites[kMaxWrites]     = {};
-    VkDescriptorBufferInfo bufferInfos[kMaxWrites]   = {};
-    VkDescriptorImageInfo  imageInfos[kMaxWrites]    = {};
+    const UInt32 count = writeCount;
+
+    TSmallVector<VkWriteDescriptorSet, kInlineWrites>   vkWrites;
+    TSmallVector<VkDescriptorBufferInfo, kInlineWrites> bufferInfos;
+    TSmallVector<VkDescriptorImageInfo, kInlineWrites>  imageInfos;
+
+    ResizeZeroed(vkWrites, static_cast<SizeType>(count));
+    ResizeZeroed(bufferInfos, static_cast<SizeType>(count));
+    ResizeZeroed(imageInfos, static_cast<SizeType>(count));
 
     for (UInt32 i = 0; i < count; ++i)
     {
@@ -1002,7 +1170,7 @@ void FVulkanDevice::UpdateDescriptorSets(const FRHIDescriptorWrite* writes,
         }
     }
 
-    vkUpdateDescriptorSets(m_Device, count, vkWrites, 0, nullptr);
+    vkUpdateDescriptorSets(m_Device, count, vkWrites.GetData(), 0, nullptr);
 }
 
 // ============================================================================

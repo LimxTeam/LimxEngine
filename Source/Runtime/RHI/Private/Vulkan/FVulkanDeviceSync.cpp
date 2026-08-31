@@ -349,15 +349,21 @@ ERHIResult FVulkanDevice::CreateSwapchain(
     vkGetPhysicalDeviceSurfaceFormatsKHR(
         m_PhysicalDevice, m_Surface, &formatCount, nullptr);
 
-    constexpr UInt32 kMaxFormats = 32;
-    VkSurfaceFormatKHR surfaceFormats[kMaxFormats];
-    UInt32 formatQuery = formatCount;
-    if (formatQuery > kMaxFormats)
+    // 按驱动报的数量取全 — 截断会让期望格式落在看不见的尾巴里, 于是悄悄
+    // 退回 surfaceFormats[0], 画面色彩空间错了却没有任何提示。
+    if (formatCount == 0)
     {
-        formatQuery = kMaxFormats;
+        LIMX_LOG(LogRHI, Error, "[Vulkan] 表面未报告任何可用格式");
+        return ERHIResult::ErrorSurfaceLost;
     }
+
+    constexpr SizeType kInlineFormats = 32;
+    TSmallVector<VkSurfaceFormatKHR, kInlineFormats> surfaceFormats;
+    ResizeZeroed(surfaceFormats, static_cast<SizeType>(formatCount));
+
+    UInt32 formatQuery = formatCount;
     vkGetPhysicalDeviceSurfaceFormatsKHR(
-        m_PhysicalDevice, m_Surface, &formatQuery, surfaceFormats);
+        m_PhysicalDevice, m_Surface, &formatQuery, surfaceFormats.GetData());
 
     // 选择格式: 优先选择期望格式
     VkSurfaceFormatKHR selectedFormat = surfaceFormats[0];
@@ -379,15 +385,15 @@ ERHIResult FVulkanDevice::CreateSwapchain(
     vkGetPhysicalDeviceSurfacePresentModesKHR(
         m_PhysicalDevice, m_Surface, &presentModeCount, nullptr);
 
-    constexpr UInt32 kMaxPresentModes = 8;
-    VkPresentModeKHR presentModes[kMaxPresentModes];
+    // 取全 — 截断会让 Mailbox 落在看不见的尾巴里, 于是关掉垂直同步也悄悄
+    // 退回 FIFO, 表现为"这台机器就是延迟高", 没有任何提示。
+    constexpr SizeType kInlinePresentModes = 8;
+    TSmallVector<VkPresentModeKHR, kInlinePresentModes> presentModes;
+    ResizeZeroed(presentModes, static_cast<SizeType>(presentModeCount));
+
     UInt32 pmQuery = presentModeCount;
-    if (pmQuery > kMaxPresentModes)
-    {
-        pmQuery = kMaxPresentModes;
-    }
     vkGetPhysicalDeviceSurfacePresentModesKHR(
-        m_PhysicalDevice, m_Surface, &pmQuery, presentModes);
+        m_PhysicalDevice, m_Surface, &pmQuery, presentModes.GetData());
 
     // 选择呈现模式
     VkPresentModeKHR selectedPresentMode = VK_PRESENT_MODE_FIFO_KHR;
@@ -480,15 +486,19 @@ ERHIResult FVulkanDevice::CreateSwapchain(
     swapData.ImageCount = swapImageCount;
     swapData.RhiFormat  = ToEPixelFormat(selectedFormat.format);
 
-    // 获取 VkImage 数组
-    constexpr UInt32 kMaxSwapImages = 8;
-    VkImage swapImages[kMaxSwapImages];
+    // 获取 VkImage 数组 — 数量必须与上面记下的 ImageCount 一致
+    //
+    // 这一处的截断比别处更隐蔽: swapData.ImageCount 记的是驱动报的**全部**
+    // 数量, 而截断后只有前几张图像拿到了纹理句柄。于是
+    // GetSwapchainImageCount() 说有 N 张, GetSwapchainImage(N-1) 却拿到无效
+    // 句柄 —— 帧循环按前者建资源、按后者取图像, 崩在离这里很远的地方。
+    constexpr SizeType kInlineSwapImages = 8;
+    TSmallVector<VkImage, kInlineSwapImages> swapImages;
+    ResizeZeroed(swapImages, static_cast<SizeType>(swapImageCount));
+
     UInt32 imgQuery = swapImageCount;
-    if (imgQuery > kMaxSwapImages)
-    {
-        imgQuery = kMaxSwapImages;
-    }
-    vkGetSwapchainImagesKHR(m_Device, swapchain, &imgQuery, swapImages);
+    vkGetSwapchainImagesKHR(m_Device, swapchain, &imgQuery,
+                             swapImages.GetData());
 
     // 为每个交换链图像创建纹理句柄和视图
     for (UInt32 i = 0; i < imgQuery; ++i)
@@ -809,70 +819,127 @@ ERHIResult FVulkanDevice::Submit(EQueueType queue,
                                   const FRHISubmitInfo& submitInfo,
                                   FRHIFenceHandle signalFence)
 {
-    // 转换等待信号量
-    constexpr UInt32 kMaxSemaphores = 8;
-    constexpr UInt32 kMaxCmdBuffers = 16;
+    // ------------------------------------------------------------------
+    // 数量不设上限 — 内联容量 + 分配器回退
+    //
+    // 这里**不能**像管线屏障那样分批下发, 原因是提交的语义与屏障不同:
+    // VkSubmitInfo 的等待/信号信号量只作用于它自己那一批。
+    //
+    //   等待信号量若只挂在第 0 批, 就只挡住第 0 批 —— 后面几批的命令不受
+    //     它约束, 可以在等待条件还没满足时就开跑。也不能在每一批上都挂同
+    //     一个等待: 二值信号量的等待会把它置回未触发态, 一次触发只能配一
+    //     次等待, 重复等待是非法的。
+    //
+    //   信号信号量若只挂在最后一批, 就只表示最后一批完成。批次之间没有隐
+    //     式的执行顺序, 前面几批可能还在跑, 等待方却已经被放行 —— 这正是
+    //     "看起来跑通了, 数据却是半成品"的来源。
+    //
+    // 要让分批与单批等价, 就得额外造信号量把各批串起来, 等于为"看起来优
+    // 雅"引进一套新的生命周期管理和一批新的失败模式。正确答案是保持单个
+    // VkSubmitInfo, 数组超出内联容量时退到分配器。
+    //
+    // 内联容量取原先的硬上限, 因此常见路径一次堆分配都没有 —— 只有过去
+    // 会被静默丢弃的那些情况才会碰到分配器。
+    // ------------------------------------------------------------------
 
-    VkSemaphore waitSemaphores[kMaxSemaphores];
-    VkPipelineStageFlags waitStages[kMaxSemaphores];
+    constexpr SizeType kInlineSemaphores = 8;
+    constexpr SizeType kInlineCmdBuffers = 16;
+
+    TSmallVector<VkSemaphore, kInlineSemaphores>          waitSemaphores;
+    TSmallVector<VkPipelineStageFlags, kInlineSemaphores> waitStages;
+    TSmallVector<VkCommandBuffer, kInlineCmdBuffers>      commandBuffers;
+    TSmallVector<VkSemaphore, kInlineSemaphores>          signalSemaphores;
+
+    // 数组为空却给了非零计数是调用方的错误, 必须出声 —— 静默当作 0 处理
+    // 正是"这批活没提交, 一切看起来却正常"的那条路径。
     UInt32 waitCount = submitInfo.WaitSemaphoreCount;
-    if (waitCount > kMaxSemaphores)
+    if (waitCount > 0
+        && (submitInfo.WaitSemaphores == nullptr
+            || submitInfo.WaitStages == nullptr))
     {
-        waitCount = kMaxSemaphores;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] Submit: 等待信号量数组或阶段数组为空但计数为 {}",
+            waitCount);
+        waitCount = 0;
     }
+
+    waitSemaphores.Reserve(static_cast<SizeType>(waitCount));
+    waitStages.Reserve(static_cast<SizeType>(waitCount));
 
     for (UInt32 i = 0; i < waitCount; ++i)
     {
-        waitSemaphores[i] = GetVkSemaphore(
-            submitInfo.WaitSemaphores[i]);
-        waitStages[i] = ToVkPipelineStageFlags(
-            submitInfo.WaitStages[i]);
+        waitSemaphores.Add(GetVkSemaphore(submitInfo.WaitSemaphores[i]));
+        waitStages.Add(ToVkPipelineStageFlags(submitInfo.WaitStages[i]));
     }
 
-    // 转换命令缓冲区
-    VkCommandBuffer commandBuffers[kMaxCmdBuffers];
     UInt32 cmdCount = submitInfo.CommandBufferCount;
-    if (cmdCount > kMaxCmdBuffers)
+    if (cmdCount > 0 && submitInfo.CommandBuffers == nullptr)
     {
-        cmdCount = kMaxCmdBuffers;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] Submit: 命令缓冲区数组为空但计数为 {}", cmdCount);
+        cmdCount = 0;
     }
+
+    commandBuffers.Reserve(static_cast<SizeType>(cmdCount));
 
     for (UInt32 i = 0; i < cmdCount; ++i)
     {
-        commandBuffers[i] = GetVkCommandBuffer(
-            submitInfo.CommandBuffers[i]);
+        const VkCommandBuffer handle =
+            GetVkCommandBuffer(submitInfo.CommandBuffers[i]);
+
+        if (handle == VK_NULL_HANDLE)
+        {
+            // 无效句柄意味着这一整批录好的命令不会执行。默默跳过等于凭空
+            // 少做一批活, 而 vkQueueSubmit 照样返回 VK_SUCCESS。
+            LIMX_LOG(LogRHI, Error,
+                "[Vulkan] Submit: 第 {} 个命令缓冲区句柄无效, "
+                "该批命令不会执行", i);
+            continue;
+        }
+
+        commandBuffers.Add(handle);
     }
 
-    // 转换信号信号量
-    VkSemaphore signalSemaphores[kMaxSemaphores];
     UInt32 signalCount = submitInfo.SignalSemaphoreCount;
-    if (signalCount > kMaxSemaphores)
+    if (signalCount > 0 && submitInfo.SignalSemaphores == nullptr)
     {
-        signalCount = kMaxSemaphores;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] Submit: 信号信号量数组为空但计数为 {}", signalCount);
+        signalCount = 0;
     }
+
+    signalSemaphores.Reserve(static_cast<SizeType>(signalCount));
 
     for (UInt32 i = 0; i < signalCount; ++i)
     {
-        signalSemaphores[i] = GetVkSemaphore(
-            submitInfo.SignalSemaphores[i]);
+        signalSemaphores.Add(
+            GetVkSemaphore(submitInfo.SignalSemaphores[i]));
     }
+
+    const UInt32 finalWaitCount =
+        static_cast<UInt32>(waitSemaphores.GetSize());
+    const UInt32 finalCmdCount =
+        static_cast<UInt32>(commandBuffers.GetSize());
+    const UInt32 finalSignalCount =
+        static_cast<UInt32>(signalSemaphores.GetSize());
 
     VkSubmitInfo vkSubmitInfo = {};
     vkSubmitInfo.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    vkSubmitInfo.waitSemaphoreCount   = waitCount;
-    vkSubmitInfo.pWaitSemaphores      = waitSemaphores;
-    vkSubmitInfo.pWaitDstStageMask    = waitStages;
-    vkSubmitInfo.commandBufferCount   = cmdCount;
-    vkSubmitInfo.pCommandBuffers      = commandBuffers;
-    vkSubmitInfo.signalSemaphoreCount = signalCount;
-    vkSubmitInfo.pSignalSemaphores    = signalSemaphores;
+    vkSubmitInfo.waitSemaphoreCount   = finalWaitCount;
+    vkSubmitInfo.pWaitSemaphores      = waitSemaphores.GetData();
+    vkSubmitInfo.pWaitDstStageMask    = waitStages.GetData();
+    vkSubmitInfo.commandBufferCount   = finalCmdCount;
+    vkSubmitInfo.pCommandBuffers      = commandBuffers.GetData();
+    vkSubmitInfo.signalSemaphoreCount = finalSignalCount;
+    vkSubmitInfo.pSignalSemaphores    = signalSemaphores.GetData();
 
     VkFence fence = GetVkFence(signalFence);
 
     // 空提交 (无命令/信号量) 且仅需 signal fence:
     // 使用 submitCount=0 确保 fence 在所有先前队列操作完成后才被 signal
     // (包括 vkQueuePresentKHR 等非 Submit 类队列操作)
-    bool isEmptySubmit = (waitCount == 0 && cmdCount == 0 && signalCount == 0);
+    bool isEmptySubmit = (finalWaitCount == 0 && finalCmdCount == 0
+                          && finalSignalCount == 0);
 
     VkResult vkResult = isEmptySubmit
         ? vkQueueSubmit(GetVkQueue(queue), 0, nullptr, fence)
@@ -897,27 +964,36 @@ ERHIResult FVulkanDevice::Present(const FRHIPresentInfo& presentInfo)
         return ERHIResult::ErrorInvalidHandle;
     }
 
-    // 转换等待信号量
-    constexpr UInt32 kMaxSemaphores = 8;
-    VkSemaphore waitSemaphores[kMaxSemaphores];
+    // 转换等待信号量 — 数量不设上限
+    //
+    // VkPresentInfoKHR 只有一个等待数组, 连"分批"这个选项都不存在。丢掉
+    // 一个等待信号量的后果是: 渲染还没画完就把图像交给呈现引擎, 屏幕上
+    // 出现半张旧帧半张新帧, 而 vkQueuePresentKHR 返回 VK_SUCCESS。
+    constexpr SizeType kInlineSemaphores = 8;
+    TSmallVector<VkSemaphore, kInlineSemaphores> waitSemaphores;
+
     UInt32 waitCount = presentInfo.WaitSemaphoreCount;
-    if (waitCount > kMaxSemaphores)
+    if (waitCount > 0 && presentInfo.WaitSemaphores == nullptr)
     {
-        waitCount = kMaxSemaphores;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] Present: 等待信号量数组为空但计数为 {}", waitCount);
+        waitCount = 0;
     }
+
+    waitSemaphores.Reserve(static_cast<SizeType>(waitCount));
 
     for (UInt32 i = 0; i < waitCount; ++i)
     {
-        waitSemaphores[i] = GetVkSemaphore(
-            presentInfo.WaitSemaphores[i]);
+        waitSemaphores.Add(GetVkSemaphore(presentInfo.WaitSemaphores[i]));
     }
 
     UInt32 imageIndex = presentInfo.ImageIndex;
 
     VkPresentInfoKHR vkPresentInfo = {};
     vkPresentInfo.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    vkPresentInfo.waitSemaphoreCount = waitCount;
-    vkPresentInfo.pWaitSemaphores    = waitSemaphores;
+    vkPresentInfo.waitSemaphoreCount =
+        static_cast<UInt32>(waitSemaphores.GetSize());
+    vkPresentInfo.pWaitSemaphores    = waitSemaphores.GetData();
     vkPresentInfo.swapchainCount     = 1;
     vkPresentInfo.pSwapchains        = &swapData->Swapchain;
     vkPresentInfo.pImageIndices      = &imageIndex;
@@ -1067,15 +1143,15 @@ bool FVulkanDevice::IsRayTracingSupported() const
         return false;
     }
 
-    constexpr UInt32 kMaxExtensions = 512;
-    VkExtensionProperties extensions[kMaxExtensions];
+    // 取全 — 截断的后果是目标扩展落在看不见的尾巴里, 于是本函数报"不支持",
+    // 而调用方据此关掉一整套功能。没有任何一层会说"我只看了前 512 个"。
+    constexpr SizeType kInlineExtensions = 512;
+    TSmallVector<VkExtensionProperties, kInlineExtensions> extensions;
+    ResizeZeroed(extensions, static_cast<SizeType>(extensionCount));
+
     UInt32 extQuery = extensionCount;
-    if (extQuery > kMaxExtensions)
-    {
-        extQuery = kMaxExtensions;
-    }
     vkEnumerateDeviceExtensionProperties(
-        m_PhysicalDevice, nullptr, &extQuery, extensions);
+        m_PhysicalDevice, nullptr, &extQuery, extensions.GetData());
 
     const char* target =
         VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME;
@@ -1112,15 +1188,15 @@ bool FVulkanDevice::IsMeshShaderSupported() const
         return false;
     }
 
-    constexpr UInt32 kMaxExtensions = 512;
-    VkExtensionProperties extensions[kMaxExtensions];
+    // 取全 — 截断的后果是目标扩展落在看不见的尾巴里, 于是本函数报"不支持",
+    // 而调用方据此关掉一整套功能。没有任何一层会说"我只看了前 512 个"。
+    constexpr SizeType kInlineExtensions = 512;
+    TSmallVector<VkExtensionProperties, kInlineExtensions> extensions;
+    ResizeZeroed(extensions, static_cast<SizeType>(extensionCount));
+
     UInt32 extQuery = extensionCount;
-    if (extQuery > kMaxExtensions)
-    {
-        extQuery = kMaxExtensions;
-    }
     vkEnumerateDeviceExtensionProperties(
-        m_PhysicalDevice, nullptr, &extQuery, extensions);
+        m_PhysicalDevice, nullptr, &extQuery, extensions.GetData());
 
     const char* target = VK_EXT_MESH_SHADER_EXTENSION_NAME;
 

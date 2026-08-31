@@ -43,8 +43,10 @@
  ******************************************************************************/
 
 #include "RHITests/RHITestsMinimal.h"
+#include "RHITests/FRHITestDevice.h"
 
 using namespace Limx;
+using namespace Limx::RHITesting;
 
 namespace
 {
@@ -71,231 +73,6 @@ constexpr UInt32 kTextureSize = 4;
 /// 纹理像素字节数 (RGBA8)
 constexpr UInt64 kTexturePixelBytes = 4;
 
-// ============================================================================
-// FValidationErrorSink — 统计窗口期内验证层报出的错误
-// ============================================================================
-
-/// 只数 Error 级别 —— 验证层的警告 (性能提示等) 不参与判定
-class FValidationErrorSink final : public ILogSink
-{
-public:
-    void Write(const LogCategory& category,
-               LogVerbosity verbosity,
-               const AnsiChar* message) override
-    {
-        static_cast<void>(category);
-
-        if (verbosity != LogVerbosity::Error)
-        {
-            return;
-        }
-
-        ++m_ErrorCount;
-
-        if (m_FirstError.IsEmpty() && message != nullptr)
-        {
-            m_FirstError = FString(message);
-        }
-    }
-
-    LIMX_NODISCARD UInt32 GetErrorCount() const { return m_ErrorCount; }
-
-    LIMX_NODISCARD const FString& GetFirstError() const
-    {
-        return m_FirstError;
-    }
-
-private:
-    UInt32  m_ErrorCount = 0;
-    FString m_FirstError;
-};
-
-// ============================================================================
-// FBarrierTestDevice — 隐藏窗口 + RHI 设备 + 命令池的 RAII 组合
-// ============================================================================
-
-/// 设备初始化链路必经 VkSurfaceKHR, 而 Win32 表面需要一个真实 HWND。
-/// 用预定义的 "STATIC" 窗口类可以省掉注册窗口类的一整套代码; 窗口不显示、
-/// 不泵消息, 只是为了让 vkCreateWin32SurfaceKHR 有个合法句柄。
-class FBarrierTestDevice
-{
-public:
-    FBarrierTestDevice() = default;
-
-    ~FBarrierTestDevice()
-    {
-        Shutdown();
-    }
-
-    LIMX_NON_COPYABLE(FBarrierTestDevice);
-    LIMX_NON_MOVABLE(FBarrierTestDevice);
-
-    /// 建窗口 → 建设备 (验证层 + 同步验证) → 建命令池与主命令缓冲区
-    /// @return true 表示全部就绪; false 表示本机跑不了 GPU 用例
-    bool Initialize()
-    {
-        m_Window = CreateWindowExW(
-            0, L"STATIC", L"LimxRHITests",
-            WS_OVERLAPPED,
-            0, 0, 16, 16,
-            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-
-        if (m_Window == nullptr)
-        {
-            return false;
-        }
-
-        m_Device = CreateRHIDevice(m_Window,
-                                   /* enableValidation     */ true,
-                                   /* enableSyncValidation */ true);
-        if (!m_Device)
-        {
-            return false;
-        }
-
-        if (m_Device->CreateCommandPool(EQueueType::Graphics, m_Pool)
-            != ERHIResult::Success)
-        {
-            return false;
-        }
-
-        if (m_Device->AllocateCommandBuffer(
-                m_Pool, ECommandBufferLevel::Primary, m_CommandBufferHandle)
-            != ERHIResult::Success)
-        {
-            return false;
-        }
-
-        m_CommandBuffer = CreateRHICommandBuffer(m_Device.Get(),
-                                                 m_CommandBufferHandle);
-        if (!m_CommandBuffer)
-        {
-            return false;
-        }
-
-        if (m_Device->CreateFence(false, m_Fence) != ERHIResult::Success)
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    void Shutdown()
-    {
-        if (m_Device)
-        {
-            m_Device->WaitIdle();
-
-            m_CommandBuffer.Reset();
-
-            if (m_Fence.IsValid())
-            {
-                m_Device->DestroyFence(m_Fence);
-            }
-
-            if (m_CommandBufferHandle.IsValid())
-            {
-                m_Device->FreeCommandBuffer(m_CommandBufferHandle);
-            }
-
-            if (m_Pool.IsValid())
-            {
-                m_Device->DestroyCommandPool(m_Pool);
-            }
-
-            m_Device.Reset();
-        }
-
-        if (m_Window != nullptr)
-        {
-            DestroyWindow(static_cast<HWND>(m_Window));
-            m_Window = nullptr;
-        }
-    }
-
-    LIMX_NODISCARD IRHIDevice& GetDevice() { return *m_Device; }
-
-    LIMX_NODISCARD IRHICommandBuffer& GetCommandBuffer()
-    {
-        return *m_CommandBuffer;
-    }
-
-    /// 提交已录制的命令并等待执行完毕
-    LIMX_NODISCARD bool SubmitAndWait()
-    {
-        m_Device->ResetFence(m_Fence);
-
-        FRHISubmitInfo submitInfo;
-        submitInfo.CommandBuffers     = &m_CommandBufferHandle;
-        submitInfo.CommandBufferCount = 1;
-
-        if (m_Device->Submit(EQueueType::Graphics, submitInfo, m_Fence)
-            != ERHIResult::Success)
-        {
-            return false;
-        }
-
-        // 超时用有限值而非 UINT64_MAX —— 挂死的用例应当失败, 而不是把
-        // 整个测试进程一起卡住。10 秒对这几条拷贝命令绰绰有余。
-        constexpr UInt64 kTimeoutNanoseconds = 10ULL * 1000 * 1000 * 1000;
-
-        return m_Device->WaitForFence(m_Fence, kTimeoutNanoseconds)
-               == ERHIResult::Success;
-    }
-
-private:
-    void*                          m_Window = nullptr;
-    TUniquePtr<IRHIDevice>         m_Device;
-    TUniquePtr<IRHICommandBuffer>  m_CommandBuffer;
-    FRHICommandPoolHandle          m_Pool;
-    FRHICommandBufferHandle        m_CommandBufferHandle;
-    FRHIFenceHandle                m_Fence;
-};
-
-// ============================================================================
-// 辅助
-// ============================================================================
-
-/// 第 index 个纹理/缓冲区使用的填充字节 — 各不相同, 便于定位是哪一条错了
-LIMX_NODISCARD UInt8 MakeFillByte(UInt32 index)
-{
-    return static_cast<UInt8>(1 + (index % 250));
-}
-
-/// 构造一个把 Undefined 转到目标布局的图像屏障
-LIMX_NODISCARD FRHIImageMemoryBarrier MakeImageBarrier(
-    FRHITextureHandle texture,
-    EImageLayout oldLayout, EImageLayout newLayout,
-    EAccessFlags srcAccess, EAccessFlags dstAccess)
-{
-    FRHIImageMemoryBarrier barrier;
-    barrier.Texture         = texture;
-    barrier.OldLayout       = oldLayout;
-    barrier.NewLayout       = newLayout;
-    barrier.SrcAccessMask   = srcAccess;
-    barrier.DstAccessMask   = dstAccess;
-    barrier.BaseMipLevel    = 0;
-    barrier.MipLevelCount   = 1;
-    barrier.BaseArrayLayer  = 0;
-    barrier.ArrayLayerCount = 1;
-    return barrier;
-}
-
-/// 构造一个覆盖整个缓冲区的缓冲区屏障
-LIMX_NODISCARD FRHIBufferMemoryBarrier MakeBufferBarrier(
-    FRHIBufferHandle buffer, UInt64 size,
-    EAccessFlags srcAccess, EAccessFlags dstAccess)
-{
-    FRHIBufferMemoryBarrier barrier;
-    barrier.Buffer        = buffer;
-    barrier.Offset        = 0;
-    barrier.Size          = size;
-    barrier.SrcAccessMask = srcAccess;
-    barrier.DstAccessMask = dstAccess;
-    return barrier;
-}
-
 } // namespace
 
 // ============================================================================
@@ -304,7 +81,7 @@ LIMX_NODISCARD FRHIBufferMemoryBarrier MakeBufferBarrier(
 
 LIMX_TEST(PipelineBarrier, ImageBarriersBeyondBatchSizeAllTakeEffect)
 {
-    FBarrierTestDevice harness;
+    FRHITestDevice harness;
     if (!harness.Initialize())
     {
         LIMX_TEST_SKIP("本机无法创建带验证层的 Vulkan 设备 — 跳过 GPU 用例");
@@ -491,7 +268,7 @@ LIMX_TEST(PipelineBarrier, ImageBarriersBeyondBatchSizeAllTakeEffect)
 
 LIMX_TEST(PipelineBarrier, BufferBarriersBeyondBatchSizeAllTakeEffect)
 {
-    FBarrierTestDevice harness;
+    FRHITestDevice harness;
     if (!harness.Initialize())
     {
         LIMX_TEST_SKIP("本机无法创建带验证层的 Vulkan 设备 — 跳过 GPU 用例");
@@ -675,7 +452,7 @@ LIMX_TEST(PipelineBarrier, BufferBarriersBeyondBatchSizeAllTakeEffect)
 
 LIMX_TEST(PipelineBarrier, MemoryBarrierBeyondBatchSizeStillTakesEffect)
 {
-    FBarrierTestDevice harness;
+    FRHITestDevice harness;
     if (!harness.Initialize())
     {
         LIMX_TEST_SKIP("本机无法创建带验证层的 Vulkan 设备 — 跳过 GPU 用例");
@@ -847,7 +624,7 @@ LIMX_TEST(PipelineBarrier, MemoryBarrierBeyondBatchSizeStillTakesEffect)
 
 LIMX_TEST(PipelineBarrier, PureExecutionBarrierIsStillIssued)
 {
-    FBarrierTestDevice harness;
+    FRHITestDevice harness;
     if (!harness.Initialize())
     {
         LIMX_TEST_SKIP("本机无法创建带验证层的 Vulkan 设备 — 跳过 GPU 用例");
@@ -943,7 +720,7 @@ LIMX_TEST(PipelineBarrier, PureExecutionBarrierIsStillIssued)
 
 LIMX_TEST(ExecuteCommands, InvalidHandleIsReportedNotSkipped)
 {
-    FBarrierTestDevice harness;
+    FRHITestDevice harness;
     if (!harness.Initialize())
     {
         LIMX_TEST_SKIP("本机无法创建带验证层的 Vulkan 设备 — 跳过 GPU 用例");

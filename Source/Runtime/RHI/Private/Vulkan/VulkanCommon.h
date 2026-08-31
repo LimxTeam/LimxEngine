@@ -621,6 +621,35 @@ inline UInt32 CollectVkDynamicStates(EDynamicState mask,
 }
 
 // ============================================================================
+// 输出缓冲 — 把容器撑到指定长度
+// ============================================================================
+
+/// 将 TSmallVector 调整为恰好 count 个零初始化元素。
+///
+/// 两处用途, 都是"需要一块可按下标写入的定长缓冲, 但长度到运行期才知道":
+///   两段式查询 —— vkEnumerate* / vkGetPhysicalDevice* 先问数量再取内容;
+///   交叉引用   —— 元素 i 里要存指向另一个数组第 i 项的指针 (描述符写入)。
+///
+/// 存在的理由是消灭一整类静默截断: 用固定栈数组接这些结果时, 一旦实际数量
+/// 超过数组容量, 超出的尾巴就再也看不见了 —— 而那条尾巴里可能正好是要找的
+/// 那个扩展、那个队列族、那个表面格式。查询本身返回 VK_INCOMPLETE, 但调用
+/// 方通常只看有没有找到目标, 于是缺陷表现为"这张卡不支持", 而不是一个错误。
+///
+/// 内联容量足够时不碰堆; 只有真的超出才走分配器。
+template<typename TElement, SizeType TInlineCapacity>
+inline void ResizeZeroed(
+    TSmallVector<TElement, TInlineCapacity>& target, SizeType count)
+{
+    target.Clear();
+    target.Reserve(count);
+
+    for (SizeType i = 0; i < count; ++i)
+    {
+        target.Add(TElement{});
+    }
+}
+
+// ============================================================================
 // VkImageAspectFlags 辅助 — 根据格式判断 aspect
 // ============================================================================
 

@@ -408,14 +408,13 @@ ERHIResult FVulkanDevice::SelectPhysicalDevice()
         return ERHIResult::ErrorDeviceLost;
     }
 
-    // 使用栈缓冲区存储物理设备列表 (通常 ≤8 个 GPU)
-    constexpr UInt32 kMaxPhysicalDevices = 16;
-    VkPhysicalDevice devices[kMaxPhysicalDevices];
-    if (deviceCount > kMaxPhysicalDevices)
-    {
-        deviceCount = kMaxPhysicalDevices;
-    }
-    vkEnumeratePhysicalDevices(m_Instance, &deviceCount, devices);
+    // 内联容量按"通常 ≤8 个 GPU"取, 超出时退到分配器 —— 不截断:
+    // 被截掉的尾巴里可能正是那张独显, 而表现只会是"选中了核显"。
+    constexpr SizeType kInlinePhysicalDevices = 16;
+    TSmallVector<VkPhysicalDevice, kInlinePhysicalDevices> devices;
+    ResizeZeroed(devices, static_cast<SizeType>(deviceCount));
+
+    vkEnumeratePhysicalDevices(m_Instance, &deviceCount, devices.GetData());
 
     // 评分选择
     Int32 bestScore = -1;
@@ -437,16 +436,14 @@ ERHIResult FVulkanDevice::SelectPhysicalDevice()
             continue;
         }
 
-        // 检查是否有图形队列支持
-        constexpr UInt32 kMaxQueueFamilies = 16;
-        VkQueueFamilyProperties queueProps[kMaxQueueFamilies];
+        // 检查是否有图形队列支持 — 队列族必须看全, 截断会让这张卡被误判
+        constexpr SizeType kInlineQueueFamilies = 16;
+        TSmallVector<VkQueueFamilyProperties, kInlineQueueFamilies> queueProps;
+        ResizeZeroed(queueProps, static_cast<SizeType>(queueFamilyCount));
+
         UInt32 queryCount = queueFamilyCount;
-        if (queryCount > kMaxQueueFamilies)
-        {
-            queryCount = kMaxQueueFamilies;
-        }
         vkGetPhysicalDeviceQueueFamilyProperties(
-            devices[i], &queryCount, queueProps);
+            devices[i], &queryCount, queueProps.GetData());
 
         bool hasGraphicsQueue = false;
         for (UInt32 q = 0; q < queryCount; ++q)
@@ -471,15 +468,16 @@ ERHIResult FVulkanDevice::SelectPhysicalDevice()
         bool hasSwapchainExtension = false;
         if (extensionCount > 0)
         {
-            constexpr UInt32 kMaxExtensions = 512;
-            VkExtensionProperties extensions[kMaxExtensions];
+            // 取全 —— 若 VK_KHR_swapchain 落在被截掉的尾巴里, 这张卡会被
+            // 静默判为"不支持交换链"而跳过, 最终报"未找到满足要求的 GPU"。
+            constexpr SizeType kInlineExtensions = 512;
+            TSmallVector<VkExtensionProperties, kInlineExtensions> extensions;
+            ResizeZeroed(extensions,
+                           static_cast<SizeType>(extensionCount));
+
             UInt32 extQuery = extensionCount;
-            if (extQuery > kMaxExtensions)
-            {
-                extQuery = kMaxExtensions;
-            }
             vkEnumerateDeviceExtensionProperties(
-                devices[i], nullptr, &extQuery, extensions);
+                devices[i], nullptr, &extQuery, extensions.GetData());
 
             for (UInt32 e = 0; e < extQuery; ++e)
             {
@@ -661,15 +659,15 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     vkGetPhysicalDeviceQueueFamilyProperties(
         m_PhysicalDevice, &queueFamilyCount, nullptr);
 
-    constexpr UInt32 kMaxQueueFamilies = 16;
-    VkQueueFamilyProperties queueProps[kMaxQueueFamilies];
+    // 取全 —— 专用的传输/计算队列族往往排在后面, 截断会让它们看不见,
+    // 于是全部退回图形队列: 不报错、不崩, 只是异步传输悄悄没了。
+    constexpr SizeType kInlineQueueFamilies = 16;
+    TSmallVector<VkQueueFamilyProperties, kInlineQueueFamilies> queueProps;
+    ResizeZeroed(queueProps, static_cast<SizeType>(queueFamilyCount));
+
     UInt32 queryCount = queueFamilyCount;
-    if (queryCount > kMaxQueueFamilies)
-    {
-        queryCount = kMaxQueueFamilies;
-    }
     vkGetPhysicalDeviceQueueFamilyProperties(
-        m_PhysicalDevice, &queryCount, queueProps);
+        m_PhysicalDevice, &queryCount, queueProps.GetData());
 
     // 查找队列族索引
     m_GraphicsQueueFamily = 0xFFFFFFFF;
