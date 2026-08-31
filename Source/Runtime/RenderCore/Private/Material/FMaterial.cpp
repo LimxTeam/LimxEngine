@@ -220,6 +220,16 @@ void FMaterial::BindTexture(
     // 设置对应的纹理标志位
     m_Params.TextureFlags |= (1u << slot);
 
+    // 裸句柄绑定不知道纹理的像素格式, 因此只能按"存了三个通道"处理 ——
+    // 保守方向是必需的: 对一张真的 RGB 法线图做 Z 重建会覆盖掉作者存进
+    // 去的 Z; 反过来, 对一张 BC5 法线图不重建, 得到的 Z 恒为 -1, 光照
+    // 会整个翻过来 —— 后者一眼就能看出来, 前者不会。
+    // 知道格式的路径 (BindTextureResource) 会在下面把这一位补上。
+    if (slot == kMaterialTextureSlotNormal)
+    {
+        m_Params.TextureFlags &= ~kMaterialTexFlagNormalTwoChannel;
+    }
+
     m_IsDirty = true;
 }
 
@@ -255,6 +265,20 @@ void FMaterial::BindTextureResource(UInt32 slot,
     m_TextureResources[slot]  = handle;
 
     BindTexture(slot, texture->View, texture->Sampler);
+
+    // 法线槽位: 从纹理的实际像素格式推出"Z 存了没有"。
+    //
+    // BC5 只有 RG 两个通道, 采样得到的第三个分量恒为 0, 着色器必须用
+    // z = sqrt(1 - x² - y²) 把它算回来。这个判据只能来自数据本身 ——
+    // 从文件名或槽位约定去推, 在第一张未烘焙的 RGB 法线图上就会失效,
+    // 而失效的表现只是光照微妙地不对, 不会有任何报错。
+    if (slot == kMaterialTextureSlotNormal &&
+        (texture->Format == EPixelFormat::BC5_UNORM ||
+         texture->Format == EPixelFormat::BC5_SNORM))
+    {
+        m_Params.TextureFlags |= kMaterialTexFlagNormalTwoChannel;
+        m_IsDirty = true;
+    }
 }
 
 void FMaterial::ReleaseTextureResource(UInt32 slot)
@@ -279,6 +303,15 @@ void FMaterial::UnbindTexture(UInt32 slot)
 
     // 清除对应的纹理标志位
     m_Params.TextureFlags &= ~(1u << slot);
+
+    // 双通道法线标志不是槽位位, 上面那句掩码碰不到它 —— 漏清的话,
+    // 下一次绑一张 RGB 法线图时它还留着, 结果是那张图的 Z 被重建值
+    // 覆盖。这类"上一张贴图的属性泄漏到下一张"的错误在画面上表现为
+    // "换了材质之后光照就不对了", 极难定位。
+    if (slot == kMaterialTextureSlotNormal)
+    {
+        m_Params.TextureFlags &= ~kMaterialTexFlagNormalTwoChannel;
+    }
 
     m_IsDirty = true;
 }

@@ -404,6 +404,166 @@ ERHIResult FRenderResourceManager::UploadTexture2D(const void* pixels,
     return ERHIResult::Success;
 }
 
+// ============================================================================
+// 块压缩纹理的逐 mip 上传
+// ============================================================================
+
+ERHIResult FRenderResourceManager::UploadCompressedTexture2D(
+    const FCompressedImageData& image,
+    EPixelFormat format,
+    FRHITextureHandle& outTexture)
+{
+    if (!image.IsValid() || format == EPixelFormat::Unknown)
+    {
+        return ERHIResult::ErrorInvalidParameter;
+    }
+
+    const UInt32 mipLevels = image.GetMipLevelCount();
+
+    // ---- 格式能力 ----
+    //
+    // 块压缩格式的采样能力由 textureCompressionBC 特性提供, 桌面 GPU 上
+    // 普遍支持但不是规范保证。缺了就必须失败而不是退回未压缩 ——
+    // 这里没有像素可退, 我们手上只有块数据。
+    const EFormatFeature features = m_Device->GetFormatFeatures(format);
+
+    if (!HasFormatFeature(features, EFormatFeature::SampledImage))
+    {
+        LIMX_LOG(LogRenderCore, Error,
+                 "[资源管理器] 设备不支持采样格式 {} ({}) — "
+                 "块压缩纹理无法上传, 也无法退回未压缩: 手上只有块数据",
+                 static_cast<UInt32>(format),
+                 GetBlockCompressionFormatName(image.Format));
+        return ERHIResult::ErrorInvalidParameter;
+    }
+
+    const UInt64 payloadBytes = static_cast<UInt64>(image.Data.GetSize());
+
+    // ---- 暂存缓冲区 ----
+    //
+    // 整条 mip 链一次性搬进暂存区。分层建缓冲区会多出 N 次分配与 N 次
+    // 映射, 而 mip 链本来就是一段连续内存。
+    FRHIBufferDesc stagingDesc = {};
+    stagingDesc.Size        = payloadBytes;
+    stagingDesc.Usage       = EBufferUsage::TransferSrc;
+    stagingDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+
+    FRHIBufferHandle staging;
+    ERHIResult result = m_Device->CreateBuffer(stagingDesc, staging);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    void* mapped = nullptr;
+    result = m_Device->MapBuffer(staging, &mapped);
+
+    if (!IsRHISuccess(result) || mapped == nullptr)
+    {
+        m_Device->DestroyBuffer(staging);
+        return ERHIResult::ErrorUnknown;
+    }
+
+    Memory::MemCopy(mapped, image.Data.GetData(),
+                    static_cast<SizeType>(payloadBytes));
+    m_Device->UnmapBuffer(staging);
+
+    // ---- 目标纹理 ----
+    FRHITextureDesc textureDesc = {};
+    textureDesc.Type          = ETextureType::Texture2D;
+    textureDesc.Format        = format;
+    textureDesc.Extent.Width  = image.Width;
+    textureDesc.Extent.Height = image.Height;
+    textureDesc.Extent.Depth  = 1;
+    textureDesc.MipLevels     = mipLevels;
+    textureDesc.ArrayLayers   = 1;
+    // 不要 TransferSrc —— 这条路径永远不把纹理当 blit 源读回来。
+    // 写上它只会让"以后有人加一句 blit"看起来是合法的, 而对压缩格式
+    // 那是一条非法调用。
+    textureDesc.Usage         = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::TransferDst));
+    textureDesc.MemoryUsage   = EMemoryUsage::GpuOnly;
+
+    result = m_Device->CreateTexture(textureDesc, outTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        m_Device->DestroyBuffer(staging);
+        return result;
+    }
+
+    // ---- 逐层拷贝 ----
+    IRHICommandBuffer* commandBuffer = m_Context->BeginSingleTimeCommands();
+
+    if (commandBuffer == nullptr)
+    {
+        m_Device->DestroyBuffer(staging);
+        m_Device->DestroyTexture(outTexture);
+        return ERHIResult::ErrorUnknown;
+    }
+
+    commandBuffer->TransitionImageLayout(
+        outTexture,
+        EImageLayout::Undefined,
+        EImageLayout::TransferDst,
+        EPipelineStageFlags::TopOfPipe,
+        EPipelineStageFlags::Transfer,
+        EAccessFlags::None,
+        EAccessFlags::TransferWrite,
+        0, mipLevels);
+
+    // bufferOffset 的对齐要求 (块字节数的整数倍, 且是 4 的整数倍) 在这里
+    // 是**由构造保证**的, 不是靠运行时检查: 上面的 image.IsValid() 已经
+    // 核对过每一层的 ByteOffset 是前面各层 ByteSize 的前缀和, 而每个
+    // ByteSize 都是 块数 × 每块字节数 (8 或 16), 两者都是 4 的倍数。
+    // 在这里再加一道判断只会得到一条永远不会失败的检查 —— 真正把这件事
+    // 钉住的是 DdsDecoder 用例里对 ByteOffset % 8 / % 16 的断言。
+    for (UInt32 level = 0; level < mipLevels; ++level)
+    {
+        const FCompressedMipLevel& entry =
+            image.Levels[static_cast<SizeType>(level)];
+
+        FRHIBufferTextureCopyRegion region = {};
+        region.BufferOffset = static_cast<UInt64>(entry.ByteOffset);
+
+        // 对压缩格式而言这两个字段的单位是**像素**而非块。填 0 让驱动
+        // 按"该 mip 尺寸对应的紧凑排列"自己算, 是唯一不会算错的填法 ——
+        // 手工填时最常见的错误正是填成块数, 结果每一行都错位四倍。
+        region.BufferRowLength   = 0;
+        region.BufferImageHeight = 0;
+
+        region.MipLevel      = level;
+        region.BaseLayer     = 0;
+        region.LayerCount    = 1;
+        region.TextureOffset = { 0, 0, 0 };
+        region.TextureExtent = { entry.Width, entry.Height, 1 };
+
+        commandBuffer->CopyBufferToTexture(staging, outTexture,
+                                           EImageLayout::TransferDst,
+                                           region);
+    }
+
+    // 全部层一次性转为着色器只读 —— 与未压缩路径不同, 这里不存在
+    // "第 i 层要读第 i-1 层"的依赖, 因此不需要逐级转换。
+    commandBuffer->TransitionImageLayout(
+        outTexture,
+        EImageLayout::TransferDst,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::Transfer,
+        EPipelineStageFlags::FragmentShader,
+        EAccessFlags::TransferWrite,
+        EAccessFlags::ShaderRead,
+        0, mipLevels);
+
+    m_Context->EndSingleTimeCommands(commandBuffer);
+
+    m_Device->DestroyBuffer(staging);
+
+    return ERHIResult::Success;
+}
+
 FRHISamplerHandle FRenderResourceManager::AcquireSampler(const FSamplerKey& key)
 {
     // 采样器的配置种类极少 (寻址模式 × 各向异性 × mip 层数),
@@ -723,6 +883,148 @@ FTextureResourceHandle FRenderResourceManager::CreateTexture(
     slot.Resource.MemoryBytes =
         (mipLevels > 1) ? (image.Pixels.GetSize() * 4u / 3u)
                         : image.Pixels.GetSize();
+
+    slot.ReferenceCount = 1;
+    slot.IsActive       = true;
+
+    handle.Index      = slotIndex;
+    handle.Generation = slot.Generation;
+
+    return handle;
+}
+
+EPixelFormat FRenderResourceManager::MapCompressedPixelFormat(
+    EBlockCompressionFormat format)
+{
+    // 一一对应, 且没有兜底分支 —— 新增一个块压缩格式时若忘了在这里加,
+    // 得到的是"纹理创建失败"这条明确日志, 而不是一张按别的格式解读的图。
+    switch (format)
+    {
+        case EBlockCompressionFormat::BC1_UNORM:   return EPixelFormat::BC1_UNORM;
+        case EBlockCompressionFormat::BC1_SRGB:    return EPixelFormat::BC1_SRGB;
+        case EBlockCompressionFormat::BC2_UNORM:   return EPixelFormat::BC2_UNORM;
+        case EBlockCompressionFormat::BC2_SRGB:    return EPixelFormat::BC2_SRGB;
+        case EBlockCompressionFormat::BC3_UNORM:   return EPixelFormat::BC3_UNORM;
+        case EBlockCompressionFormat::BC3_SRGB:    return EPixelFormat::BC3_SRGB;
+        case EBlockCompressionFormat::BC4_UNORM:   return EPixelFormat::BC4_UNORM;
+        case EBlockCompressionFormat::BC4_SNORM:   return EPixelFormat::BC4_SNORM;
+        case EBlockCompressionFormat::BC5_UNORM:   return EPixelFormat::BC5_UNORM;
+        case EBlockCompressionFormat::BC5_SNORM:   return EPixelFormat::BC5_SNORM;
+        case EBlockCompressionFormat::BC6H_UFLOAT: return EPixelFormat::BC6H_UFLOAT;
+        case EBlockCompressionFormat::BC6H_SFLOAT: return EPixelFormat::BC6H_SFLOAT;
+        case EBlockCompressionFormat::BC7_UNORM:   return EPixelFormat::BC7_UNORM;
+        case EBlockCompressionFormat::BC7_SRGB:    return EPixelFormat::BC7_SRGB;
+
+        case EBlockCompressionFormat::Unknown:
+        default:                                   return EPixelFormat::Unknown;
+    }
+}
+
+FTextureResourceHandle FRenderResourceManager::CreateTexture(
+    const FCompressedImageData& image,
+    const FTextureUploadOptions& options,
+    const FName& name)
+{
+    FTextureResourceHandle handle;
+
+    if (m_Device == nullptr || !image.IsValid())
+    {
+        LIMX_LOG(LogRenderCore, Error,
+                 "[资源管理器] 压缩纹理数据不自洽, 拒绝上传: {}x{} / {} 层",
+                 image.Width, image.Height, image.GetMipLevelCount());
+        return handle;
+    }
+
+    const EPixelFormat format = MapCompressedPixelFormat(image.Format);
+
+    if (format == EPixelFormat::Unknown)
+    {
+        LIMX_LOG(LogRenderCore, Error,
+                 "[资源管理器] 无法映射的块压缩格式: {}",
+                 GetBlockCompressionFormatName(image.Format));
+        return handle;
+    }
+
+    // 色彩空间以文件为准。DDS 的 dxgiFormat 把 sRGB 与否写死了, 那是事实;
+    // 调用方按用途猜的 IsSrgb 只是意图。两者不一致时按事实走, 但必须让
+    // 这件事可见 —— 不然一张按线性烘出来的 albedo 会安静地偏暗。
+    if (options.IsSrgb != image.IsSrgb())
+    {
+        LIMX_LOG(LogRenderCore, Warning,
+                 "[资源管理器] 纹理 '{}' 的色彩空间与调用方预期不符: "
+                 "文件是 {}, 调用方按 {} 使用 — 以文件为准",
+                 name.GetCStr(),
+                 GetBlockCompressionFormatName(image.Format),
+                 options.IsSrgb ? "sRGB" : "线性");
+    }
+
+    FRHITextureHandle texture;
+
+    if (!IsRHISuccess(UploadCompressedTexture2D(image, format, texture)))
+    {
+        LIMX_LOG(LogRenderCore, Error,
+                 "[资源管理器] 压缩纹理上传失败: {}x{} {}",
+                 image.Width, image.Height,
+                 GetBlockCompressionFormatName(image.Format));
+        return handle;
+    }
+
+    const UInt32 mipLevels = image.GetMipLevelCount();
+
+    // ---- 视图 ----
+    FRHITextureViewDesc viewDesc = {};
+    viewDesc.Texture         = texture;
+    viewDesc.ViewType        = ETextureType::Texture2D;
+    viewDesc.Format          = format;
+    viewDesc.BaseMipLevel    = 0;
+    viewDesc.MipLevelCount   = mipLevels;
+    viewDesc.BaseArrayLayer  = 0;
+    viewDesc.ArrayLayerCount = 1;
+
+    FRHITextureViewHandle view;
+
+    if (!IsRHISuccess(m_Device->CreateTextureView(viewDesc, view)))
+    {
+        m_Device->DestroyTexture(texture);
+        LIMX_LOG(LogRenderCore, Error, "[资源管理器] 压缩纹理视图创建失败");
+        return handle;
+    }
+
+    // ---- 采样器 ----
+    FSamplerKey samplerKey;
+    samplerKey.AddressMode   = options.AddressMode;
+    samplerKey.UseAnisotropy = options.UseAnisotropy;
+    samplerKey.MipLevels     = mipLevels;
+
+    const FRHISamplerHandle sampler = AcquireSampler(samplerKey);
+
+    // ---- 取槽位 ----
+    UInt32 slotIndex = 0;
+
+    if (m_FreeTextureSlots.GetSize() > 0)
+    {
+        slotIndex = m_FreeTextureSlots.Last();
+        m_FreeTextureSlots.RemoveAt(m_FreeTextureSlots.GetSize() - 1);
+    }
+    else
+    {
+        slotIndex = static_cast<UInt32>(m_Textures.Add(FTextureSlot()));
+    }
+
+    FTextureSlot& slot = m_Textures[slotIndex];
+
+    slot.Resource.Name      = name.IsEmpty() ? image.Name : name;
+    slot.Resource.Texture   = texture;
+    slot.Resource.View      = view;
+    slot.Resource.Sampler   = sampler;
+    slot.Resource.Width     = image.Width;
+    slot.Resource.Height    = image.Height;
+    slot.Resource.MipLevels = mipLevels;
+    slot.Resource.Format    = format;
+
+    // 压缩纹理不需要按 4/3 估算 —— 载荷里已经是全部 mip 的实际字节数。
+    // 未压缩路径要估是因为那边的 mip 是 GPU 现生成的, CPU 侧没有它们。
+    slot.Resource.MemoryBytes = static_cast<UInt64>(image.Data.GetSize());
 
     slot.ReferenceCount = 1;
     slot.IsActive       = true;

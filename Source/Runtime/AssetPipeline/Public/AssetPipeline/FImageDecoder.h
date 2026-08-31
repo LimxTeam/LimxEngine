@@ -15,15 +15,20 @@
  *   PNG 还是 JPEG。新增格式只需在此处加一条分发规则。
  *
  * 技术特性:
- *   - 支持 PNG 与 JPEG; 未知格式明确报错并给出前几字节便于诊断
+ *   - 支持 PNG / JPEG / Radiance HDR; 未知格式明确报错并给出前几字节
+ *   - 识别 DDS 但不在此解码 — 它走 FDdsDecoder 的直传路径
  *   - 提供从文件路径加载的便捷入口
  *
  * 依赖关系:
- *   内部: AssetPipeline/FPngDecoder.h, AssetPipeline/FJpegDecoder.h
+ *   内部: AssetPipeline/FPngDecoder.h, AssetPipeline/FJpegDecoder.h,
+ *          AssetPipeline/FHdrDecoder.h, AssetPipeline/FDdsDecoder.h
  *
  * 注意事项:
- *   DDS / KTX2 等 GPU 压缩容器尚未支持 — 它们无需 CPU 解码,
- *   应走独立的直传路径而非本接口
+ *   DDS 块压缩纹理无需 CPU 解码, 产物也不是 FImageData —— 本接口能
+ *   *识别* 它并给出指路的错误信息, 但不解码。调用方应先用
+ *   FImageDecoder::DetectFormat 分流, DDS 交给 FDdsDecoder。
+ *
+ *   KTX2 容器尚未支持
  *
  ******************************************************************************/
 
@@ -32,6 +37,7 @@
 #include "AssetPipeline/FPngDecoder.h"
 #include "AssetPipeline/FHdrDecoder.h"
 #include "AssetPipeline/FJpegDecoder.h"
+#include "AssetPipeline/FDdsDecoder.h"
 
 namespace Limx
 {
@@ -43,6 +49,9 @@ enum class EImageFileFormat : UInt8
     Png     = 1,
     Jpeg    = 2,
     Hdr     = 3,
+
+    /// DDS 块压缩容器 — 由 FDdsDecoder 解析, 本接口只负责识别
+    Dds     = 4,
 };
 
 /// 图像解码统一入口 — 全静态接口

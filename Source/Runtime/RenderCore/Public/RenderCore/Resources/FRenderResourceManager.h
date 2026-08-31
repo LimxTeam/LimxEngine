@@ -55,6 +55,7 @@
 #include "RenderCore/Resources/FRenderResources.h"
 #include "AssetPipeline/FAssetTypes.h"
 #include "AssetPipeline/FImageTypes.h"
+#include "AssetPipeline/FDdsDecoder.h"
 #include "Core/Containers/TMap.h"
 
 namespace Limx
@@ -148,6 +149,31 @@ public:
         const FImageData& image,
         const FTextureUploadOptions& options = FTextureUploadOptions(),
         const FName& name = FName());
+
+    /// 由块压缩纹理 (DDS) 创建 GPU 纹理
+    ///
+    /// 与未压缩路径的关键差别: mip 链**不生成**, 而是逐层从文件里搬上去。
+    /// 块压缩格式没有 BLIT_SRC/BLIT_DST 能力, vkCmdBlitImage 对它们是非法
+    /// 调用 —— 验证层会直接报错。离线烘好的 mip 链质量也更高: 运行时逐级
+    /// blit 是"解压 → 放缩 → 重压", 量化误差会沿链累积。
+    ///
+    /// 色彩空间取自文件而非 options.IsSrgb —— DDS 的 dxgiFormat 已经把
+    /// sRGB 与否写死了, 那才是事实。两者不一致时以文件为准并记一条告警。
+    /// @param image   FDdsDecoder 解析出来的压缩纹理
+    /// @param options 上传选项 (寻址模式与各向异性; 色彩空间见上)
+    /// @param name    调试名称
+    FTextureResourceHandle CreateTexture(
+        const FCompressedImageData& image,
+        const FTextureUploadOptions& options = FTextureUploadOptions(),
+        const FName& name = FName());
+
+    /// 块压缩格式 → RHI 像素格式
+    ///
+    /// 一一对应且无默认分支 —— 认不出来返回 Unknown 由调用方报错。
+    /// 公开出来是为了让上层 (材质、场景导入) 能在上传之前就知道
+    /// 目标格式, 而不必先建一张纹理再去问它。
+    LIMX_NODISCARD static EPixelFormat MapCompressedPixelFormat(
+        EBlockCompressionFormat format);
 
     /// 创建一张纯色纹理 — 用于缺失贴图的兜底
     FTextureResourceHandle CreateSolidColorTexture(
@@ -286,6 +312,16 @@ private:
                                EPixelFormat format,
                                UInt32& outMipLevels,
                                FRHITextureHandle& outTexture);
+
+    /// 创建纹理并逐层上传已经烘好的 mip 链
+    ///
+    /// 不做任何 mip 生成 —— 块压缩格式不能 blit, 而 DDS 本来就带全了。
+    /// 每一层发一条 CopyBufferToTexture, 缓冲区偏移取该层在载荷中的偏移;
+    /// BufferRowLength/BufferImageHeight 填 0 让驱动按紧凑排列算 ——
+    /// 这两个字段对压缩格式的语义是**像素**数而非块数, 手工填极易填成块数。
+    ERHIResult UploadCompressedTexture2D(const FCompressedImageData& image,
+                                         EPixelFormat format,
+                                         FRHITextureHandle& outTexture);
 
     /// 取或创建匹配配置的采样器
     FRHISamplerHandle AcquireSampler(const FSamplerKey& key);

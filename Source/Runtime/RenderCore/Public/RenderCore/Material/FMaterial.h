@@ -98,6 +98,26 @@ static constexpr UInt32 kMaterialTexFlagMetallicRoughness = LIMX_BIT(2);
 static constexpr UInt32 kMaterialTexFlagOcclusion        = LIMX_BIT(3);
 static constexpr UInt32 kMaterialTexFlagEmissive         = LIMX_BIT(4);
 
+/// 法线贴图只存了两个通道 (BC5), Z 必须由着色器重建
+///
+/// 为什么是逐材质的标志位, 而不是"约定法线槽位一律用 BC5":
+///
+///   1. 引擎并没有停止接收 RGB 法线图。glTF 内嵌的法线贴图是 PNG/JPEG,
+///      OBJ/MTL 引用的也是, FSceneLoader 会照常把它们解成 RGBA8。一条
+///      代码无法强制的"约定", 在第一次加载未烘焙资产时就会被打破 ——
+///      而它的失效方式是: 作者存进去的 Z 被 sqrt 重建值覆盖, 光照
+///      微妙地不对, 没有任何报错。
+///
+///   2. lat 自己就拒绝这个约定。它的 resolve_format 明确不从文件名猜
+///      "这是法线图", 文档里写着三通道的切线空间法线会落到 BC1 ——
+///      也就是说, 连烘焙工具都不保证"法线槽 ⇒ BC5"。
+///
+///   3. 这个标志位是免费的。TextureFlags 是一个 uint, 只用掉了 5 位;
+///      不增加结构体大小、不增加描述符、材质内取值一致因此不产生分支
+///      发散。而且它由 BindTextureResource 从纹理的实际像素格式推出来,
+///      不是手工填的, 因此不会与真实数据脱节。
+static constexpr UInt32 kMaterialTexFlagNormalTwoChannel = LIMX_BIT(5);
+
 // ============================================================================
 // EMaterialBlendMode — 材质混合模式
 // ============================================================================

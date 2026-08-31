@@ -39,6 +39,11 @@ EImageFileFormat FImageDecoder::DetectFormat(const UInt8* data, SizeType length)
         return EImageFileFormat::Hdr;
     }
 
+    if (FDdsDecoder::IsDds(data, length))
+    {
+        return EImageFileFormat::Dds;
+    }
+
     return EImageFileFormat::Unknown;
 }
 
@@ -56,6 +61,15 @@ FImageDecodeResult FImageDecoder::Decode(const UInt8* data, SizeType length,
 
         case EImageFileFormat::Hdr:
             return FHdrDecoder::Decode(data, length, outImage, options);
+
+        case EImageFileFormat::Dds:
+            // 块压缩纹理不解压 —— 它的产物是 FCompressedImageData 而非
+            // FImageData。这里报一句指路的错, 比让调用方看到
+            // "无法识别的图像格式" 要有用得多。
+            outImage.Reset();
+            return FImageDecodeResult::Failure(FString(
+                "这是一张 DDS 块压缩纹理, 不经 CPU 解码 — "
+                "请改用 FDdsDecoder::Decode 走逐 mip 直传路径"));
 
         default:
             break;

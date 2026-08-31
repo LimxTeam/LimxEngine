@@ -18,6 +18,17 @@
 #define TEX_OCCLUSION           (1u << 3)
 #define TEX_EMISSIVE            (1u << 4)
 
+// 法线贴图只存了两个通道 (BC5), Z 必须由着色器重建。
+//
+// 本文件里没有用到它 —— 目前只有 pbr.frag 采样法线贴图, 重建逻辑就写在
+// 那里。列在这张表里是因为这里是标志位的**唯一权威清单**: 少了它, 下一个
+// 加标志位的人会理所当然地占用第 5 位, 而冲突的表现是"某些材质的法线
+// 突然不对了", 没有任何编译期或运行期报错。
+//
+// 由 C++ 侧的 FMaterial::BindTextureResource 从纹理的实际像素格式推出,
+// 不是手工填的 —— 见 kMaterialTexFlagNormalTwoChannel 处的说明。
+#define TEX_NORMAL_TWO_CHANNEL  (1u << 5)
+
 // ── 混合模式 (与 C++ 侧 EMaterialBlendMode 对应) ──
 #define BLEND_OPAQUE      0u
 #define BLEND_MASKED      1u

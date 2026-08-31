@@ -42,6 +42,8 @@
 #include "Core/Threading/FJobExecutor.h"
 #include "AssetPipeline/FAssetRegistry.h"
 #include "AssetPipeline/FImageDecoder.h"
+#include "AssetPipeline/FDdsDecoder.h"
+#include "Core/HAL/FPlatformFile.h"
 #include "RenderCore/Material/FMaterialManager.h"
 
 namespace Limx
@@ -132,6 +134,11 @@ FString MakeTextureCacheKey(const FAssetScene& assetScene,
 // ============================================================================
 
 /// 一张待解码的纹理
+///
+/// 两种产物二选一, 由文件魔数决定 —— 块压缩纹理不经 CPU 解码, 它的产物
+/// 是一段原样的块数据加一张分层索引, 与 FImageData 的不变量完全不同。
+/// 用一个标志位区分而不是让 FImageData 兼容两者: 后者会让"每像素字节数"
+/// 之类的字段在压缩情形下变成无意义的值, 而无意义的值迟早会被某处当真。
 struct FPendingTexture
 {
     FString                  Key;
@@ -139,7 +146,12 @@ struct FPendingTexture
     bool                     IsSrgb    = false;
 
     // ---- 工作线程填写 ----
-    FImageData Image;
+    FImageData           Image;
+    FCompressedImageData Compressed;
+
+    /// 产物在 Compressed 而非 Image 里
+    bool       IsCompressed = false;
+
     bool       Succeeded = false;
     FString    Error;
 };
@@ -178,6 +190,73 @@ void CollectPendingTexture(const FAssetScene&       assetScene,
     pending.Add(MoveTemp(entry));
 }
 
+/// 解一张待处理纹理 —— 按**魔数**在压缩与非压缩两条路之间分流
+///
+/// 为什么不看扩展名: 资产库里的扩展名经常与实际内容不符 (被批量改名的
+/// .png 其实是 JPEG, 用 texconv 转过又忘了改名的 .png 其实是 DDS)。
+/// 走错分支的表现是"这张贴图加载不出来", 而排查要花的时间远超过在这里
+/// 多读四个字节。这与 FImageDecoder 的分发策略是同一条原则。
+///
+/// 在工作线程上执行 —— 两个解码器都没有可变静态状态, 各自只写自己那份
+/// entry。日志一律不在这里打: FLog 没有加锁。
+FImageDecodeResult DecodePendingTexture(const FAssetScene& assetScene,
+                                        FPendingTexture&   entry)
+{
+    const UInt8* bytes     = nullptr;
+    SizeType     byteCount = 0;
+
+    // 外部文件的字节要活到解码结束, 因此声明在这一层而不是分支里。
+    TArray<UInt8> fileBytes;
+
+    if (entry.Reference->EmbeddedIndex >= 0)
+    {
+        const FEmbeddedImage& embedded =
+            assetScene.EmbeddedImages[
+                static_cast<SizeType>(entry.Reference->EmbeddedIndex)];
+
+        bytes     = embedded.Bytes.GetData();
+        byteCount = embedded.Bytes.GetSize();
+    }
+    else
+    {
+        fileBytes = FPlatformFile::ReadAllBytes(entry.Reference->Path);
+
+        if (fileBytes.GetSize() == 0)
+        {
+            return FImageDecodeResult::Failure(StringFormat(
+                "无法读取图像文件: {}", entry.Reference->Path.GetCStr()));
+        }
+
+        bytes     = fileBytes.GetData();
+        byteCount = fileBytes.GetSize();
+    }
+
+    if (FDdsDecoder::IsDds(bytes, byteCount))
+    {
+        entry.IsCompressed = true;
+
+        FImageDecodeResult result =
+            FDdsDecoder::Decode(bytes, byteCount, entry.Compressed);
+
+        if (result.Succeeded)
+        {
+            entry.Compressed.Name = FName(entry.Key.GetCStr());
+        }
+
+        return result;
+    }
+
+    FImageDecodeResult result =
+        FImageDecoder::Decode(bytes, byteCount, entry.Image);
+
+    if (result.Succeeded)
+    {
+        entry.Image.Name = FName(entry.Key.GetCStr());
+    }
+
+    return result;
+}
+
 /// 投递一波纹理解码 —— **不等待**, 完成情况由 outCounter 反映
 ///
 /// 非阻塞是为了让下一波能在本波收尾之前就排上队。逐波阻塞的话, 每一波
@@ -211,25 +290,8 @@ void DispatchTextureWave(FTaskGraph&        graph,
                 {
                     FPendingTexture& entry = base[i];
 
-                    FImageDecodeResult decodeResult;
-
-                    if (entry.Reference->EmbeddedIndex >= 0)
-                    {
-                        const FEmbeddedImage& embedded =
-                            scenePtr->EmbeddedImages[
-                                static_cast<SizeType>(
-                                    entry.Reference->EmbeddedIndex)];
-
-                        decodeResult = FImageDecoder::Decode(
-                            embedded.Bytes.GetData(),
-                            embedded.Bytes.GetSize(),
-                            entry.Image);
-                    }
-                    else
-                    {
-                        decodeResult = FImageDecoder::DecodeFile(
-                            entry.Reference->Path, entry.Image);
-                    }
+                    const FImageDecodeResult decodeResult =
+                        DecodePendingTexture(*scenePtr, entry);
 
                     entry.Succeeded = decodeResult.Succeeded;
 
@@ -273,10 +335,24 @@ void UploadTextureWave(FRenderResourceManager& resources,
         uploadOptions.IsSrgb        = entry.IsSrgb;
         uploadOptions.UseAnisotropy = useAnisotropy;
 
-        timing.DecodedBytes += entry.Image.Pixels.GetSize();
+        FTextureResourceHandle handle;
 
-        const FTextureResourceHandle handle = resources.CreateTexture(
-            entry.Image, uploadOptions, FName(entry.Key.GetCStr()));
+        if (entry.IsCompressed)
+        {
+            // 块压缩纹理走逐 mip 直传 —— mip 链已经在文件里, 不生成也
+            // 不能生成 (vkCmdBlitImage 对压缩格式是非法调用)。
+            timing.DecodedBytes += entry.Compressed.Data.GetSize();
+
+            handle = resources.CreateTexture(entry.Compressed, uploadOptions,
+                                             FName(entry.Key.GetCStr()));
+        }
+        else
+        {
+            timing.DecodedBytes += entry.Image.Pixels.GetSize();
+
+            handle = resources.CreateTexture(entry.Image, uploadOptions,
+                                             FName(entry.Key.GetCStr()));
+        }
 
         if (!handle.IsValid())
         {
@@ -286,8 +362,9 @@ void UploadTextureWave(FRenderResourceManager& resources,
 
         cache.Add(entry.Key, handle);
 
-        // 像素数据已经进了显存, 立刻放掉
+        // 数据已经进了显存, 立刻放掉
         entry.Image.Reset();
+        entry.Compressed.Reset();
     }
 }
 

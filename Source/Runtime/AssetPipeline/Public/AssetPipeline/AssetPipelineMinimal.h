@@ -14,6 +14,7 @@
  *   FAssetTypes.h       — 中性资产数据结构
  *   FObjLoader.h        — Wavefront OBJ / MTL 解析器
  *   FGltfLoader.h       — glTF 2.0 / GLB 解析器
+ *   FDdsDecoder.h       — DDS (DX10) 块压缩纹理读取器
  *
  * 依赖关系:
  *   聚合 AssetPipeline 模块公开头文件
@@ -31,5 +32,6 @@
 #include "AssetPipeline/FImageTypes.h"
 #include "AssetPipeline/FPngDecoder.h"
 #include "AssetPipeline/FJpegDecoder.h"
+#include "AssetPipeline/FDdsDecoder.h"
 #include "AssetPipeline/FImageDecoder.h"
 #include "AssetPipeline/FAssetRegistry.h"
