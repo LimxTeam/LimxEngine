@@ -229,6 +229,12 @@ public:
         return m_IsInitialized;
     }
 
+    /// 共享深度目标的视图 —— GTAO 要采样它
+    LIMX_NODISCARD FRHITextureViewHandle GetSharedDepthView() const
+    {
+        return m_SharedDepthTextureView;
+    }
+
     /// 共享 HDR 颜色目标的视图
     ///
     /// TAA 关闭时后处理直接采样它; 开启时改采 TAA 的解析目标。

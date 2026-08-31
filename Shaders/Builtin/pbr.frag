@@ -150,6 +150,13 @@ layout(std430, set = 2, binding = 7) readonly buffer ClusterLightIndices {
     uint indices[];
 } clusterIndices;
 
+// ── 屏幕空间环境光遮蔽 (set 2, binding 8) ──
+//
+// 由 FGtaoPass 每帧写入。关闭 GTAO 时那张图被清成 1, 于是这里不需要任何
+// 开关 —— 少一个 uniform、少一个分支。更要紧的是: 有分支的话"GTAO 通道
+// 没跑"与"AO 恰好全是 1"在画面上无法区分, 而前者是缺陷。
+layout(set = 2, binding = 8) uniform sampler2D ambientOcclusion;
+
 #include "cluster_common.h"
 
 // ── 阴影贴图数组 (set 2, binding 1) ──
@@ -645,6 +652,18 @@ void main()
     {
         ao *= SampleBindless(material.OcclusionIndex, fragTexCoord).r;
     }
+
+    // 屏幕空间遮蔽与材质自带的遮蔽相乘。
+    //
+    // 两者管的不是同一件事: 材质的 AO 贴图记录的是**模型自身**的凹陷 (烘焙
+    // 时就定下来了), 屏幕空间的 AO 记录的是**物体之间**的接触与遮挡 (运行时
+    // 才知道)。相加会让两处同时凹陷的地方变亮, 取最小值会丢掉其中一个的
+    // 层次 —— 相乘是唯一保留两者的做法。
+    //
+    // 用 gl_FragCoord 而非任何插值来的 UV: AO 是屏幕空间的量, 必须按像素
+    // 位置取。
+    ao *= texture(ambientOcclusion,
+                  gl_FragCoord.xy / lighting.clusterParams.zw).r;
 
     vec3 emissive = material.EmissiveColor.rgb;
     if ((material.TextureFlags & TEX_EMISSIVE) != 0u)

@@ -446,6 +446,19 @@ Invoke-Step 'G-Buffer 自检 (开 TAA 抖动)' -RequiresGpu {
     Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check --taa'
 }
 
+# GTAO 自检 —— 需要真实 GPU。
+#
+# 90 度凹角处余弦加权的可见度解析值是 0.5, 但那是"搜索半径 → ∞"的极限。
+# 判据因此不是"等于 0.5", 而是**随半径增大朝 0.5 单调收敛** —— 那是这个算法
+# 的物理签名, 而写错的实现 (法线没转视空间、角度约定反了、地平线取错方向)
+# 不会有: 它们要么恒为 1, 要么与半径无关, 要么往反方向走。
+#
+# 用专门的墙角场景 (两个 20x20 平面成直角)。多一个物体解析值就不再成立,
+# 而"解析值不成立"与"实现算错了"在结果上无法区分。
+Invoke-Step 'GTAO 自检 (墙角的解析收敛)' -RequiresGpu {
+    Invoke-Engine '--corner-scene --gtao --frames 20 --warmup 5 --ao-check'
+}
+
 # TAA 自检 —— 需要真实 GPU。
 #
 # TAA 最危险的失效方式是**看起来正常但什么都没做**: 裁剪范围取小了历史每帧

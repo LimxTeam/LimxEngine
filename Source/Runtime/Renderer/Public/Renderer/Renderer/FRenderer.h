@@ -91,6 +91,7 @@ class FShadowPass;
 class FDepthPrePass;
 class FClusterLightPass;
 class FTaaPass;
+class FGtaoPass;
 class FSkyPass;
 class FPostProcessPass;
 class FEnvironmentMap;
@@ -491,6 +492,14 @@ public:
     /// TAA 解析通道 —— 自检要用
     LIMX_NODISCARD FTaaPass* GetTaaPass() const { return m_TaaPass.Get(); }
 
+    /// GTAO 通道 —— 自检要用
+    LIMX_NODISCARD FGtaoPass* GetGtaoPass() const { return m_GtaoPass.Get(); }
+
+    /// 屏幕空间环境光遮蔽开关
+    void SetGtaoEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsGtaoEnabled() const { return m_GtaoEnabled; }
+
     /// 时域抗锯齿总开关
     ///
     /// **同时控制抖动与解析。** 两者必须同开同关: 抖动开而解析关 = 画面纯粹
@@ -664,6 +673,10 @@ private:
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FTaaPass>              m_TaaPass;
+    TUniquePtr<FGtaoPass>             m_GtaoPass;
+
+    /// GTAO 是否启用 (默认关 —— 它有真实开销, 由调用方决定)
+    bool                              m_GtaoEnabled = false;
 
     /// 是否启用分簇光照
     ///
@@ -688,7 +701,12 @@ private:
     // ---- IBL 占位资源 ----
     FRHITextureHandle                 m_FallbackCubeTexture;
     FRHITextureViewHandle             m_FallbackCubeView;
-    FRHISamplerHandle                 m_FallbackCubeSampler;
+    /// 通用的线性+Clamp 采样器
+    ///
+    /// 服务多个绑定: IBL 的兜底立方体贴图、BRDF 查找表、GTAO 的结果。
+    /// Vulkan 的采样器不带维度信息, 同一个可以采 2D 也可以采 Cube ——
+    /// 原名 m_FallbackCubeSampler 会让人以为它只能给立方体贴图用。
+    FRHISamplerHandle                 m_LinearClampSampler;
 
     FRHITextureHandle                 m_FallbackLutTexture;
     FRHITextureViewHandle             m_FallbackLutView;

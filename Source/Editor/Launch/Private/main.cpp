@@ -53,6 +53,7 @@
 #include "RenderCore/Profiling/FOctahedral.h"
 #include "RenderCore/Lighting/FClusterGrid.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
+#include "Renderer/RenderPass/FGtaoPass.h"
 
 namespace Limx
 {
@@ -153,6 +154,18 @@ struct FLaunchOptions
 
     /// TAA 自检: 断言解析结果比任何单帧都更接近多帧平均, 以退出码报告
     bool TaaCheck = false;
+
+    /// 启用屏幕空间环境光遮蔽
+    bool Gtao = false;
+
+    /// 构建直角墙角场景 (GTAO 自检的解析基准)
+    bool CornerScene = false;
+
+    /// GTAO 的采样半径 (世界单位)
+    Float32 AoRadius = 0.8f;
+
+    /// GTAO 自检: 在墙角场景上断言解析值, 以退出码报告
+    bool AoCheck = false;
 
     /// 分簇剔除自检: 回读簇表与 CPU 参照逐簇比对, 以退出码报告
     bool ClusterCheck = false;
@@ -367,6 +380,9 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
 ///   --taa            启用时域抗锯齿 (Halton 2,3 抖动 + 解析通道)
 ///   --taa-check      TAA 自检: 与多帧平均比对, 以退出码报告
+///   --gtao           启用屏幕空间环境光遮蔽
+///   --corner-scene   构建直角墙角场景 (GTAO 自检的解析基准)
+///   --ao-check       GTAO 自检: 断言墙角处的解析值, 以退出码报告
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
 ///   --no-clustered   关闭分簇, 强制暴力遍历全部光源 (性能对照用)
 ///   --light-cull-check 分簇着色自检: 与暴力法逐像素比对, 以退出码报告
@@ -522,6 +538,22 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--cluster-check"))
         {
             options.ClusterCheck = true;
+        }
+        else if (WideEquals(arg, L"--gtao"))
+        {
+            options.Gtao = true;
+        }
+        else if (WideEquals(arg, L"--corner-scene"))
+        {
+            options.CornerScene = true;
+        }
+        else if (WideEquals(arg, L"--ao-radius") && (i + 1) < tokenCount)
+        {
+            options.AoRadius = ParseFloat32(tokens[++i], 0.8f);
+        }
+        else if (WideEquals(arg, L"--ao-check"))
+        {
+            options.AoCheck = true;
         }
         else if (WideEquals(arg, L"--taa-check"))
         {
@@ -1623,6 +1655,522 @@ private:
     bool             m_IsPending   = false;
     bool             m_IsRecorded  = false;
 };
+
+// ============================================================================
+// RunAoChecks — GTAO 的解析判据
+//
+// 90 度凹角处, 余弦加权的可见度**解析值是 0.5** —— 半个半球被另一面墙挡住。
+// 但那是"搜索半径 → ∞"的极限: 有限半径下只能看到墙的一段, 遮挡必然偏小。
+// 实测 (夹角 0~0.25 个单位内的均值):
+//
+//     半径 0.8 → 0.679    半径 2 → 0.586    半径 8 → 0.557
+//
+// 所以判据不是"等于 0.5", 而是**随半径增大朝 0.5 单调收敛**。那是这个算法
+// 的物理签名, 而一个写错的实现 (法线没转视空间、角度约定反了、地平线取错
+// 方向) 不会有这个签名 —— 它们要么恒为 1, 要么与半径无关, 要么往错误的方向
+// 走。
+//
+// GTAO 这类算法最危险的失效方式是**输出一张看起来合理但数值无意义的图**:
+// 每一种写错都会给出一张"边角发暗"的图, 而那正是人眼期待看到的。
+//
+// 分箱方式: 回读 AO 与法线, 对法线朝上 (地面) 的像素反投影到 y=0 平面, 用
+// 得到的 z 坐标作为"到夹角的距离"。夹角在 z=0。
+// ============================================================================
+
+namespace
+{
+
+/// 一次采集的结果 —— 按到夹角的距离分箱后的 AO 均值
+struct FAoProfile
+{
+    static constexpr SizeType kBins    = 20;
+    static constexpr Float32  kBinSize = 0.25f;
+
+    Float64  Mean[kBins]  = {};
+    SizeType Count[kBins] = {};
+
+    SizeType FloorPixels = 0;
+    SizeType OutOfRange  = 0;
+    bool     Valid       = false;
+};
+
+/// 渲一帧, 回读 AO 与法线, 按距离分箱
+static FAoProfile CaptureAoProfile(FRenderContext* context,
+                                   FRenderer&      renderer,
+                                   Float32         radius)
+{
+    FAoProfile profile;
+
+    FGtaoPass* const gtao      = renderer.GetGtaoPass();
+    FDepthPrePass* const depth = renderer.GetDepthPrePass();
+
+    if (gtao == nullptr || depth == nullptr)
+    {
+        return profile;
+    }
+
+    gtao->SetRadius(radius);
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle aoReadback;
+    FRHIBufferHandle normalReadback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+
+        desc.Size      = pixelCount * 2u;
+        desc.DebugName = "AoCheck.AO";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, aoReadback)))
+        {
+            return profile;
+        }
+
+        desc.Size      = pixelCount * 4u;
+        desc.DebugName = "AoCheck.Normal";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, normalReadback)))
+        {
+            device->DestroyBuffer(aoReadback);
+            return profile;
+        }
+    }
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, gtao, depth, aoReadback, normalReadback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            const FRHITextureHandle sources[2] =
+            {
+                gtao->GetAoTexture(),
+                depth->GetNormalTexture(),
+            };
+
+            const FRHIBufferHandle targets[2] = { aoReadback, normalReadback };
+
+            for (UInt32 i = 0; i < 2; ++i)
+            {
+                cmd->TransitionImageLayout(
+                    sources[i],
+                    EImageLayout::ShaderReadOnly,
+                    EImageLayout::TransferSrc,
+                    EPipelineStageFlags::FragmentShader,
+                    EPipelineStageFlags::Transfer,
+                    EAccessFlags::ShaderRead,
+                    EAccessFlags::TransferRead);
+
+                FRHIBufferTextureCopyRegion region = {};
+                region.BufferOffset      = 0;
+                region.BufferRowLength   = 0;
+                region.BufferImageHeight = 0;
+                region.MipLevel          = 0;
+                region.BaseLayer         = 0;
+                region.LayerCount        = 1;
+                region.TextureOffset     = { 0, 0, 0 };
+                region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+                cmd->CopyTextureToBuffer(sources[i],
+                                         EImageLayout::TransferSrc,
+                                         targets[i], region);
+
+                cmd->TransitionImageLayout(
+                    sources[i],
+                    EImageLayout::TransferSrc,
+                    EImageLayout::ShaderReadOnly,
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::FragmentShader,
+                    EAccessFlags::TransferRead,
+                    EAccessFlags::ShaderRead);
+            }
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    if (!recorded)
+    {
+        device->DestroyBuffer(aoReadback);
+        device->DestroyBuffer(normalReadback);
+        return profile;
+    }
+
+    device->WaitIdle();
+
+    TArray<Float32>  ao;
+    TArray<FVector2> normals;
+
+    {
+        void* mapped = nullptr;
+
+        if (!IsRHISuccess(device->MapBuffer(aoReadback, &mapped)) ||
+            mapped == nullptr)
+        {
+            device->DestroyBuffer(aoReadback);
+            device->DestroyBuffer(normalReadback);
+            return profile;
+        }
+
+        const Float16Bits* src = static_cast<const Float16Bits*>(mapped);
+
+        ao.Reserve(pixelCount);
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            ao.Add(Float16ToFloat32(src[i]));
+        }
+
+        device->UnmapBuffer(aoReadback);
+    }
+
+    {
+        void* mapped = nullptr;
+
+        if (!IsRHISuccess(device->MapBuffer(normalReadback, &mapped)) ||
+            mapped == nullptr)
+        {
+            device->DestroyBuffer(aoReadback);
+            device->DestroyBuffer(normalReadback);
+            return profile;
+        }
+
+        const Float16Bits* src = static_cast<const Float16Bits*>(mapped);
+
+        normals.Reserve(pixelCount);
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            normals.Add(FVector2(Float16ToFloat32(src[i * 2]),
+                                 Float16ToFloat32(src[i * 2 + 1])));
+        }
+
+        device->UnmapBuffer(normalReadback);
+    }
+
+    device->DestroyBuffer(aoReadback);
+    device->DestroyBuffer(normalReadback);
+
+    // ---- 分箱 ----
+    const FCamera& camera = renderer.GetCamera();
+
+    const FMatrix inverse =
+        (camera.GetProjectionMatrix() * camera.GetViewMatrix()).Inverse();
+
+    const FVector3 cameraPos = camera.GetPosition();
+
+    Float64 sum[FAoProfile::kBins] = {};
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const SizeType index =
+                static_cast<SizeType>(y) * extent.Width + x;
+
+            const Float32 value = ao[index];
+
+            if (value < -1.0e-3f || value > 1.0f + 1.0e-3f)
+            {
+                ++profile.OutOfRange;
+                continue;
+            }
+
+            if (FMath::Abs(normals[index].X) > 1.0f ||
+                FMath::Abs(normals[index].Y) > 1.0f)
+            {
+                continue;
+            }
+
+            const FVector3 n = DecodeOctahedralNormal(normals[index]);
+
+            if (n.Y < 0.95f)
+            {
+                continue;
+            }
+
+            ++profile.FloorPixels;
+
+            const Float32 ndcX =
+                (static_cast<Float32>(x) + 0.5f) /
+                    static_cast<Float32>(extent.Width) * 2.0f - 1.0f;
+            const Float32 ndcY =
+                (static_cast<Float32>(y) + 0.5f) /
+                    static_cast<Float32>(extent.Height) * 2.0f - 1.0f;
+
+            const FVector4 farWorld =
+                inverse.TransformVector4(FVector4(ndcX, ndcY, 1.0f, 1.0f));
+
+            if (FMath::Abs(farWorld.W) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            const FVector3 dir(farWorld.X / farWorld.W - cameraPos.X,
+                               farWorld.Y / farWorld.W - cameraPos.Y,
+                               farWorld.Z / farWorld.W - cameraPos.Z);
+
+            if (FMath::Abs(dir.Y) < 1.0e-6f)
+            {
+                continue;
+            }
+
+            const Float32 t = -cameraPos.Y / dir.Y;
+
+            if (t <= 0.0f)
+            {
+                continue;
+            }
+
+            const Float32 worldZ = cameraPos.Z + dir.Z * t;
+
+            if (worldZ < 0.0f)
+            {
+                continue;
+            }
+
+            const SizeType bin =
+                static_cast<SizeType>(worldZ / FAoProfile::kBinSize);
+
+            if (bin < FAoProfile::kBins)
+            {
+                sum[bin] += static_cast<Float64>(value);
+                ++profile.Count[bin];
+            }
+        }
+    }
+
+    for (SizeType b = 0; b < FAoProfile::kBins; ++b)
+    {
+        if (profile.Count[b] > 0)
+        {
+            profile.Mean[b] =
+                sum[b] / static_cast<Float64>(profile.Count[b]);
+        }
+    }
+
+    profile.Valid = true;
+
+    return profile;
+}
+
+/// 第一个样本足够的箱的均值 (最靠近夹角)
+static Float64 NearCornerMean(const FAoProfile& profile)
+{
+    for (SizeType b = 0; b < FAoProfile::kBins; ++b)
+    {
+        if (profile.Count[b] >= 64)
+        {
+            return profile.Mean[b];
+        }
+    }
+
+    return -1.0;
+}
+
+} // namespace
+
+static bool RunAoChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FGtaoPass* const gtao = renderer.GetGtaoPass();
+
+    if (gtao == nullptr || !gtao->IsEnabled())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] GTAO 未启用 — 自检无从判定 (加 --gtao)");
+        return false;
+    }
+
+    // 两个半径。小的那个用来验"远处开阔地面不该有遮蔽" (它必须远大于半径,
+    // 否则那条判据在物理上就不成立); 大的那个用来验收敛趋势。
+    constexpr Float32 kSmallRadius = 2.0f;
+    constexpr Float32 kLargeRadius = 8.0f;
+
+    const Float32 originalRadius = 2.0f;
+
+    const FAoProfile small = CaptureAoProfile(context, renderer, kSmallRadius);
+    const FAoProfile large = CaptureAoProfile(context, renderer, kLargeRadius);
+
+    gtao->SetRadius(originalRadius);
+
+    if (!small.Valid || !large.Valid)
+    {
+        LIMX_LOG(LogLaunch, Error, "[AO] 采集失败");
+        return false;
+    }
+
+    bool passed = true;
+
+    // 分箱曲线总是打印 —— 判定通过与否都要能看到形状。只在失败时打的话,
+    // 通过的那次就没有可对照的基线, 下一次数值漂移了也无从发现。
+    for (SizeType b = 0; b < FAoProfile::kBins; ++b)
+    {
+        if (small.Count[b] >= 64)
+        {
+            LIMX_LOG(LogLaunch, Display,
+                     "[AO] z {} ~ {}: R=2 → {} | R=8 → {} ({} 样本)",
+                     static_cast<Float32>(b) * FAoProfile::kBinSize,
+                     static_cast<Float32>(b + 1) * FAoProfile::kBinSize,
+                     small.Mean[b], large.Mean[b], small.Count[b]);
+        }
+    }
+
+    // ---- 1. 值域 ----
+    if (small.OutOfRange > 0 || large.OutOfRange > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] AO 超出 [0,1] 的像素: R=2 有 {} 个, R=8 有 {} 个",
+                 small.OutOfRange, large.OutOfRange);
+        passed = false;
+    }
+
+    // ---- 判定有效性 ----
+    const SizeType pixelCount =
+        static_cast<SizeType>(context->GetSwapchainExtent().Width) *
+        context->GetSwapchainExtent().Height;
+
+    if (small.FloorPixels * 10 < pixelCount)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 只有 {} / {} 个像素是地面 —— 场景不对, 判定无效",
+                 small.FloorPixels, pixelCount);
+        return false;
+    }
+
+    const Float64 nearSmall = NearCornerMean(small);
+    const Float64 nearLarge = NearCornerMean(large);
+
+    if (nearSmall < 0.0 || nearLarge < 0.0)
+    {
+        LIMX_LOG(LogLaunch, Error, "[AO] 夹角附近样本不足");
+        return false;
+    }
+
+    // ---- 2. 夹角处确实被遮蔽 ----
+    //
+    // 上界 0.75: 一个什么都不做的实现给 1.0, 一个只做了一半的给 0.85 以上。
+    // 下界 0.40: 低于它说明遮挡被高估, 那通常是角度约定反了。
+    if (nearSmall > 0.75 || nearSmall < 0.40)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 夹角处 (R=2) 的 AO 是 {}, 应在 [0.40, 0.75] —— "
+                 "解析极限是 0.5, 有限半径下略高",
+                 nearSmall);
+        passed = false;
+    }
+
+    // ---- 3. 随半径增大朝 0.5 收敛 ----
+    //
+    // 这是这个算法的物理签名。写错的实现要么与半径无关, 要么往错误的方向走。
+    if (nearLarge >= nearSmall - 0.01)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 半径从 2 增到 8, 夹角处的 AO 从 {} 变成 {} —— "
+                 "没有朝 0.5 收敛。遮挡量与搜索半径无关说明实现有误",
+                 nearSmall, nearLarge);
+        passed = false;
+    }
+
+    if (nearLarge < 0.40 || nearLarge > 0.70)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 夹角处 (R=8) 的 AO 是 {}, 应在 [0.40, 0.70]",
+                 nearLarge);
+        passed = false;
+    }
+
+    // ---- 4. 远处开阔地面 ≈ 1 ----
+    //
+    // 只在小半径下验。距离必须远大于半径, 否则墙的遮挡在物理上本就存在 ——
+    // R=8 时 z=5 处的地面确实被遮住不少, 那不是缺陷。
+    Float64 farOpen = -1.0;
+
+    for (SizeType b = FAoProfile::kBins; b > 0; --b)
+    {
+        if (small.Count[b - 1] >= 64)
+        {
+            const Float32 distance =
+                static_cast<Float32>(b - 1) * FAoProfile::kBinSize;
+
+            if (distance > kSmallRadius * 2.0f)
+            {
+                farOpen = small.Mean[b - 1];
+            }
+
+            break;
+        }
+    }
+
+    if (farOpen < 0.0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 最远的箱距离夹角不足 {} 个单位 —— "
+                 "取不到开阔地面的样本, 判定无效",
+                 kSmallRadius * 2.0f);
+        passed = false;
+    }
+    else if (farOpen < 0.95)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 开阔地面的 AO 是 {}, 应接近 1 —— 无遮挡处不该有遮蔽",
+                 farOpen);
+        passed = false;
+    }
+
+    // ---- 5. 单调性 ----
+    SizeType inversions = 0;
+
+    Float64 previous = -1.0;
+
+    for (SizeType b = 0; b < FAoProfile::kBins; ++b)
+    {
+        if (small.Count[b] < 64)
+        {
+            continue;
+        }
+
+        if (previous >= 0.0 && small.Mean[b] < previous - 0.02)
+        {
+            ++inversions;
+        }
+
+        previous = small.Mean[b];
+    }
+
+    if (inversions > 1)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO] 沿离开夹角的方向出现 {} 处非单调下降", inversions);
+        passed = false;
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[AO] 夹角处 R=2 → {}, R=8 → {} (朝解析值 0.5 收敛); "
+                 "开阔处 {}; {} 个地面像素",
+                 nearSmall, nearLarge, farOpen, small.FloorPixels);
+    }
+
+    return passed;
+}
 
 // ============================================================================
 // RunTaaChecks — 证明 TAA 真的在做抗锯齿
@@ -3134,6 +3682,92 @@ static void BuildLightGrid(UInt32 gridSize)
 }
 
 // ============================================================================
+// BuildCornerScene — 两面成直角的大平面
+//
+// GTAO 的验收基准。90 度凹角处, 余弦加权的可见度**解析值恰好是 0.5** —— 半
+// 个半球被另一面墙挡住。这是一个不依赖"看起来对不对"的数, 而 GTAO 这类算法
+// 最危险的失效方式恰恰是"输出一张看起来合理但数值无意义的图"。
+//
+// 场景刻意做得极简: 两个足够大的平面, 相机正对夹角、距离固定。多一个物体都
+// 会让解析值不再成立 —— 而"解析值不再成立"与"实现算错了"在结果上无法区分。
+//
+// 地面在 y=0 的 xz 平面, 墙在 z=0 的 xy 平面 (由地面绕 x 轴转 90 度得到)。
+// 夹角是 z=0, y=0 那条线。
+// ============================================================================
+static void BuildCornerScene(LScene* scene, FRenderContext* context,
+                             FRenderer* renderer)
+{
+    LIMX_CHECK(scene != nullptr);
+    LIMX_CHECK(context != nullptr);
+    LIMX_CHECK(renderer != nullptr);
+
+    FRenderResourceManager& resources = context->GetResourceManager();
+    FMaterial* defaultMaterial        = renderer->GetDefaultMaterial();
+
+    // 20x20 —— 远大于 GTAO 的采样半径, 于是夹角附近的遮挡与无限半平面
+    // 几乎没有差别。平面小了的话边缘会漏光, 解析值就不成立。
+    FMeshData planeMesh = FGeometryGenerator::GeneratePlane(20.0f, 20.0f, 2, 2);
+
+    FMeshResourceHandle meshHandle =
+        resources.CreateMesh(planeMesh, FName("CornerPlane"));
+
+    if (!meshHandle.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 墙角场景的平面上传失败");
+        return;
+    }
+
+    struct FCornerEntry
+    {
+        const AnsiChar* Name;
+        FVector3        Position;
+        FQuat           Rotation;
+    };
+
+    const FCornerEntry entries[2] =
+    {
+        // 地面: 不旋转, 中心往 +z 挪 10 使夹角落在 z=0
+        { "CornerFloor", FVector3(0.0f, 0.0f, 10.0f),
+          FQuat::kIdentity },
+
+        // 墙: 绕 x 轴转 90 度让法线朝 +z, 中心往 +y 挪 10
+        { "CornerWall", FVector3(0.0f, 10.0f, 0.0f),
+          FQuat::FromAxisAngle(FVector3(1.0f, 0.0f, 0.0f),
+                               FMath::kHalfPi) },
+    };
+
+    for (UInt32 i = 0; i < 2; ++i)
+    {
+        FTransform nodeTransform;
+        nodeTransform.Translation = entries[i].Position;
+        nodeTransform.Rotation    = entries[i].Rotation;
+
+        LNode* node = scene->SpawnNode<LNode>(FName(entries[i].Name),
+                                              nodeTransform);
+
+        LMeshTrait* meshTrait = node->AddTrait<LMeshTrait>(FName("Mesh"));
+        meshTrait->SetMesh(&resources, meshHandle);
+        meshTrait->SetMaterial(defaultMaterial);
+        meshTrait->SetVisible(true);
+    }
+
+    resources.ReleaseMeshReference(meshHandle);
+
+    // 相机: 正对夹角, 略微俯视, 使地面与墙各占屏幕一半左右
+    // yaw 0 是朝 -Z 看, 也就是朝着夹角。用 π 的话背对夹角, 屏幕上只有
+    // 一片延伸出去的地面 —— 而那看起来"也挺正常", 只是自检永远取不到样本。
+    //
+    // 俯角 -0.35: 相机在 y=3, 视线中心落在 y=0 平面上距离 3/tan(0.35) ≈ 8.2
+    // 处, 即 z ≈ -0.2 —— 正好是夹角。
+    renderer->GetCamera().SetPosition(FVector3(0.0f, 3.0f, 8.0f));
+    renderer->GetCamera().SetRotation(0.0f, -0.35f);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Launch] 墙角场景已构建 — 两个 20x20 平面成直角, "
+             "夹角在 y=0 z=0");
+}
+
+// ============================================================================
 // BuildMaterialGrid — 粗糙度 × 金属度 的球体阵列
 //
 // 这是验证 IBL 的标准场景, 理由是它把两个自由度摊平成一张图:
@@ -4008,6 +4642,10 @@ int WINAPI wWinMain(
             BuildDemoScene(scene, &renderContext, &renderer);
         }
     }
+    else if (launchOptions.CornerScene)
+    {
+        BuildCornerScene(scene, &renderContext, &renderer);
+    }
     else if (launchOptions.MaterialGrid > 0)
     {
         BuildMaterialGrid(scene, &renderContext, &renderer,
@@ -4052,6 +4690,21 @@ int WINAPI wWinMain(
 
         LIMX_LOG(LogLaunch, Display,
                  "[Launch] 分簇光照已关闭 — 暴力遍历全部光源");
+    }
+
+    if (launchOptions.Gtao)
+    {
+        renderer.SetGtaoEnabled(true);
+
+        if (renderer.GetGtaoPass() != nullptr)
+        {
+            renderer.GetGtaoPass()->SetRadius(launchOptions.AoRadius);
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Launch] 屏幕空间环境光遮蔽已启用 "
+                 "(GTAO, 4 方向 x 8 步进, 半径 {})",
+                 launchOptions.AoRadius);
     }
 
     if (launchOptions.TemporalAA)
@@ -4125,6 +4778,7 @@ int WINAPI wWinMain(
     bool    clusterCheckPassed = true;
     bool    lightCullCheckPassed = true;
     bool    taaCheckPassed = true;
+    bool    aoCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -4183,6 +4837,11 @@ int WINAPI wWinMain(
             {
                 lightCullCheckPassed =
                     RunLightCullChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.AoCheck)
+            {
+                aoCheckPassed = RunAoChecks(&renderContext, renderer);
             }
 
             if (launchOptions.TaaCheck)
@@ -4298,6 +4957,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.TaaCheck)
     {
         selfCheckCode = FinalizeSelfCheck(taaCheckPassed, 11, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.AoCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(aoCheckPassed, 12, errorSink,
                                           errorsBeforeShutdown);
     }
 

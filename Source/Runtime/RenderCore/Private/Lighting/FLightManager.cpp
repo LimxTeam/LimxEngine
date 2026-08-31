@@ -111,7 +111,8 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     // 含 Compute: 分簇剔除的计算着色器读的是同一份数据。
     //   set 2, binding 6 — 每簇的 (起点, 数量)
     //   set 2, binding 7 — 全局光源索引表
-    FRHIDescriptorBinding bindings[8] = {};
+    //   set 2, binding 8 — 屏幕空间环境光遮蔽
+    FRHIDescriptorBinding bindings[9] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -160,9 +161,14 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[7].Count      = 1;
     bindings[7].StageFlags = EShaderStage::Fragment;
 
+    bindings[8].Binding    = 8;
+    bindings[8].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[8].Count      = 1;
+    bindings[8].StageFlags = EShaderStage::Fragment;
+
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 8;
+    layoutDesc.BindingCount = 9;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(

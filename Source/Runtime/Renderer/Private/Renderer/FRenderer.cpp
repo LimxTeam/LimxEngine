@@ -69,6 +69,7 @@
 #include "Renderer/RenderPass/FShadowPass.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
+#include "Renderer/RenderPass/FGtaoPass.h"
 #include "Renderer/RenderPass/FSkyPass.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
 #include "Renderer/RenderPass/FPostProcessPass.h"
@@ -234,9 +235,11 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_TaaPass          = MakeUnique<FTaaPass>();
+    m_GtaoPass         = MakeUnique<FGtaoPass>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
+    m_PassManager->RegisterPass(m_GtaoPass.Get());
     m_PassManager->RegisterPass(m_TaaPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
@@ -303,11 +306,18 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
         return result;
     }
 
-    // TAA 的速度输入来自深度预通道的附件 —— 必须在 SetupAll 之后接,
-    // 那时它才存在。
+    // TAA 的速度输入与 GTAO 的深度/法线输入都来自深度预通道的附件 ——
+    // 必须在 SetupAll 之后接, 那时它们才存在。
     if (m_TaaPass && m_DepthPrePass)
     {
         m_TaaPass->SetVelocityView(m_DepthPrePass->GetVelocityView());
+    }
+
+    if (m_GtaoPass && m_DepthPrePass && m_PassManager)
+    {
+        m_GtaoPass->SetInputs(m_DepthPrePass->GetSharedDepthTexture(),
+                              m_PassManager->GetSharedDepthView(),
+                              m_DepthPrePass->GetNormalView());
     }
 
     // set 2 光照描述符集必须在 SetupAll 之后创建 —— 它的 binding 1 指向
@@ -592,6 +602,13 @@ void FRenderer::RenderFrame()
         m_ClusterLightPass->SetEnabled(m_ClusteredLighting);
     }
 
+    // GTAO 与分簇用同一对相机矩阵 —— 都要未抖动的那一个
+    if (m_GtaoPass)
+    {
+        m_GtaoPass->SetCameraParams(m_Camera.GetViewMatrix(),
+                                    m_Camera.GetProjectionMatrix());
+    }
+
     const Float64 recordBegin = FPlatformTime::Seconds();
 
     // 通过 PassManager 按顺序录制全部 Pass 命令
@@ -752,7 +769,7 @@ void FRenderer::SetEnvironmentMap(const FEnvironmentMap* environment)
         // 下一次销毁那张图像时验证层会指出它仍被描述符集引用。
         UpdateIblDescriptors(m_FallbackCubeView, m_FallbackCubeView,
                              m_FallbackLutView,
-                             m_FallbackCubeSampler, m_FallbackCubeSampler);
+                             m_LinearClampSampler, m_LinearClampSampler);
 
         FLightManager::Get().DisableIbl();
     }
@@ -908,7 +925,7 @@ ERHIResult FRenderer::CreateFallbackCubeMap()
     samplerDesc.IsAnisotropyEnabled = false;
     samplerDesc.MaxLod              = 1.0f;
 
-    return device->CreateSampler(samplerDesc, m_FallbackCubeSampler);
+    return device->CreateSampler(samplerDesc, m_LinearClampSampler);
 }
 
 // ============================================================================
@@ -1266,7 +1283,7 @@ void FRenderer::DestroyTextureResources()
     device->DestroyTextureView(m_TextureView);
     device->DestroyTexture(m_Texture);
 
-    device->DestroySampler(m_FallbackCubeSampler);
+    device->DestroySampler(m_LinearClampSampler);
     device->DestroyTextureView(m_FallbackCubeView);
     device->DestroyTexture(m_FallbackCubeTexture);
 
@@ -1477,7 +1494,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         //
         // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
         // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[8];
+        FRHIDescriptorWrite writes[9];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1497,21 +1514,21 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             descSet,
             2,
             m_FallbackCubeView,
-            m_FallbackCubeSampler,
+            m_LinearClampSampler,
             EImageLayout::ShaderReadOnly);
 
         writes[3] = FRHIDescriptorWrite::CombinedImageSampler(
             descSet,
             3,
             m_FallbackCubeView,
-            m_FallbackCubeSampler,
+            m_LinearClampSampler,
             EImageLayout::ShaderReadOnly);
 
         writes[4] = FRHIDescriptorWrite::CombinedImageSampler(
             descSet,
             4,
             m_FallbackLutView,
-            m_FallbackCubeSampler,
+            m_LinearClampSampler,
             EImageLayout::ShaderReadOnly);
 
         // binding 5 — 光源数组 storage buffer
@@ -1539,7 +1556,15 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_ClusterLightPass->GetLightIndexBuffer(i), 0,
             static_cast<UInt64>(kClusterLightIndexCapacity) * 4u);
 
-        device->UpdateDescriptorSets(writes, 8);
+        // binding 8 — 屏幕空间环境光遮蔽
+        //
+        // GTAO 关闭时那张图被清成 1, 所以这里无条件写、着色器无条件读。
+        writes[8] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet, 8,
+            m_GtaoPass->GetAoView(), m_LinearClampSampler,
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(writes, 9);
 
         m_LightDescriptorSets.Add(descSet);
     }
@@ -1626,6 +1651,20 @@ void FRenderer::SetTaaEnabled(bool enabled)
         device,
         enabled ? m_TaaPass->GetResolveView()
                 : m_PassManager->GetSharedColorView());
+}
+
+// ============================================================================
+// SetGtaoEnabled
+// ============================================================================
+
+void FRenderer::SetGtaoEnabled(bool enabled)
+{
+    m_GtaoEnabled = enabled;
+
+    if (m_GtaoPass)
+    {
+        m_GtaoPass->SetEnabled(enabled);
+    }
 }
 
 // ============================================================================
