@@ -429,7 +429,7 @@ Invoke-Step '引擎层测试 · ShadowAtlas' {
 # 判据放在二进制里而不是脚本里: 脚本要判断就得解析输出文本, 而解析失败会
 # 退化成"没发现问题"。
 Invoke-Step '引擎层测试 · 用例数下限' {
-    .\Binaries\Development\Win64\LimxEngineTests.exe --min-cases 78
+    .\Binaries\Development\Win64\LimxEngineTests.exe --min-cases 85
 }
 
 # 显存回收自检 —— 需要真实 GPU, 因此放在单元测试之后单独一步。
