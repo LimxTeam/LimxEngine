@@ -123,11 +123,19 @@ struct FLightData
     Float32 AttQuadratic = 0.032f;
     Float32 AttPad       = 0.0f;
 
-    // vec4: 聚光灯参数 — x=内锥角余弦, y=外锥角余弦, z=保留, w=保留
-    Float32 SpotInnerCos = 0.9763f;   // cos(12.5°) // NOLINT
-    Float32 SpotOuterCos = 0.9659f;   // cos(15°)   // NOLINT
-    Float32 SpotPad0     = 0.0f;
-    Float32 SpotPad1     = 0.0f;
+    // vec4: 聚光灯参数 — x=内锥角余弦, y=外锥角余弦, z=阴影块下标, w=保留
+    //
+    // 阴影块下标借用原来的 SpotPad0 而不是给结构体加一个 vec4。这不是抠
+    // 显存 (1024 盏也才 16 KiB), 而是分簇剔除的计算着色器读的是**同一个**
+    // 结构: 每加 16 字节, 每个线程从全局内存搬的量就多 20%, 而剔除是纯
+    // 带宽瓶颈 —— 光源数据搬得越少, 剔除越快。
+    //
+    // -1 表示该灯不投射阴影。用负数而非 0xFFFFFFFF: 这一格在着色器里是
+    // float, 大整数转 float 会丢精度, 而 -1 精确可表示且判据只是 < 0。
+    Float32 SpotInnerCos      = 0.9763f;   // cos(12.5°) // NOLINT
+    Float32 SpotOuterCos      = 0.9659f;   // cos(15°)   // NOLINT
+    Float32 ShadowTileIndex   = -1.0f;
+    Float32 SpotPad1          = 0.0f;
 };
 
 // 编译时验证 FLightData 大小 (std140 要求 16 字节倍数)
@@ -317,6 +325,16 @@ public:
     ~FLight() = default;
 
     // 允许移动
+    //
+    // **两个移动函数是手写的, 逐字段搬。** 加新成员时必须同时改这两处 ——
+    // 漏掉不会有任何报错, 新成员在移动之后悄悄退回默认值。
+    //
+    // 这一条不是假设: m_CastsShadow 刚加上时就漏了, 表现是 AddLight
+    // (按值移入数组) 之后所有光源都不投影, 而调用方明明设过。查了一圈
+    // 阴影图集才回到这里。
+    //
+    // 不用 = default 是因为移动之后要把源对象置为"已失效" (禁用 + 改名),
+    // 而那正是 = default 做不到的。
     FLight(FLight&& other) noexcept;
     FLight& operator=(FLight&& other) noexcept;
 
@@ -408,6 +426,17 @@ public:
     LIMX_NODISCARD bool IsEnabled() const { return m_IsEnabled; }
     void SetEnabled(bool isEnabled) { m_IsEnabled = isEnabled; }
 
+    /// 是否投射阴影 (当前仅聚光灯支持)
+    ///
+    /// 默认**关闭**, 需要显式打开。这与"阴影是常态"的直觉相反, 理由是代价:
+    /// 每盏投影的灯都要把场景重画一遍进图集, 而图集只有 64 块。默认打开的话,
+    /// 一个几百盏灯的场景会有几百次多余的场景重绘, 其中绝大多数光源的照射
+    /// 半径只有几米、根本看不出有没有影子 —— 而那笔开销没有任何人要求过。
+    ///
+    /// 关掉时该灯按无遮挡着色, 与图集里没有它的块是同一个结果。
+    LIMX_NODISCARD bool CastsShadow() const { return m_CastsShadow; }
+    void SetCastsShadow(bool castsShadow) { m_CastsShadow = castsShadow; }
+
     LIMX_NODISCARD const AnsiChar* GetDebugName() const { return m_DebugName; }
     void SetDebugName(const AnsiChar* name) { m_DebugName = name; }
 
@@ -446,6 +475,9 @@ private:
 
     /// 是否启用
     bool         m_IsEnabled          = true;
+
+    /// 是否投射阴影 — 默认关闭, 理由见 SetCastsShadow
+    bool         m_CastsShadow        = false;
 
     /// 调试名称 (非拥有指针，不管理生命周期)
     const AnsiChar* m_DebugName       = "UnnamedLight";

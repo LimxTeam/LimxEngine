@@ -88,6 +88,7 @@ class FRenderContext;
 class FPassManager;
 class FForwardPass;
 class FShadowPass;
+class FShadowAtlasPass;
 class FDepthPrePass;
 class FClusterLightPass;
 class FTaaPass;
@@ -496,6 +497,12 @@ public:
     /// GTAO 通道 —— 自检要用
     LIMX_NODISCARD FGtaoPass* GetGtaoPass() const { return m_GtaoPass.Get(); }
 
+    /// 聚光灯阴影图集通道 —— 自检要用
+    LIMX_NODISCARD FShadowAtlasPass* GetShadowAtlasPass() const
+    {
+        return m_ShadowAtlasPass.Get();
+    }
+
     /// 泛光通道 —— 自检要用
     LIMX_NODISCARD FBloomPass* GetBloomPass() const
     {
@@ -691,6 +698,7 @@ private:
     /// 落到同一槽, 后写的覆盖前写的。
     UInt64                            m_GpuFrameNumber = 0;
     TUniquePtr<FShadowPass>           m_ShadowPass;
+    TUniquePtr<FShadowAtlasPass>      m_ShadowAtlasPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FTaaPass>              m_TaaPass;

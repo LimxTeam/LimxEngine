@@ -102,7 +102,7 @@ struct LightData {
     vec4 directionAndRange;    // xyz=方向, w=衰减距离
     vec4 colorAndIntensity;    // xyz=颜色, w=强度
     vec4 attenuationParams;    // x=常量, y=线性, z=二次, w=保留
-    vec4 spotParams;           // x=内锥角余弦, y=外锥角余弦, z/w=保留
+    vec4 spotParams;           // x=内锥角余弦, y=外锥角余弦, z=阴影块下标
 };
 
 // ── 光照 UBO (set 2, binding 0) ──
@@ -187,6 +187,31 @@ layout(set = 2, binding = 3) uniform samplerCube prefilteredMap;
 // R = F0 的系数, G = 常数偏置。它与环境、与材质都无关, 只依赖
 // (n·v, 粗糙度) —— 因此是一张算一次就能一直用的常量表。
 layout(set = 2, binding = 4) uniform sampler2D brdfLut;
+
+// ── 聚光灯阴影的每块数据 (set 2, binding 9) ──
+//
+// UV 变换随矩阵一起上传, 而不是让这里按块下标现算。现算意味着着色器要
+// 复制一份图集布局的知识 (每行几块、块多大), 而那份复制品无法被单元测试
+// 覆盖 —— 它与 C++ 侧漂移时的表现是"阴影取到了隔壁灯那一块", 画面上看是
+// 形状完全不对的影子, 而不是没有影子。
+//
+// row_major 与 FMatrix 的行主序一致。漏掉的话矩阵整体转置, 阴影坐标会落到
+// 完全无关的位置 —— 这个坑在分簇的两个计算着色器上已经踩过一次。
+struct SpotShadowData {
+    mat4 viewProj;
+    vec4 uvTransform;   // xy=块偏移, zw=块缩放
+    vec4 params;        // x=深度偏移, y=图集边长
+};
+
+layout(row_major, std430, set = 2, binding = 9) readonly buffer SpotShadowBuffer {
+    SpotShadowData spotShadows[];
+} spotShadowBuffer;
+
+// ── 聚光灯阴影图集 (set 2, binding 10) ──
+//
+// sampler2DShadow 而非 sampler2DArrayShadow: 图集是一张 2D 纹理, 块靠 UV
+// 偏移区分, 不是数组层。
+layout(set = 2, binding = 10) uniform sampler2DShadow spotShadowAtlas;
 
 const int SHADOW_CASCADE_COUNT = 3;
 
@@ -556,6 +581,119 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
 }
 
 // ============================================================
+// 聚光灯阴影 — 从图集里取
+//
+// 与级联那一套的差别不只是"少了选级"这一步:
+//
+//   1. 透视投影, w 不再恒为 1 —— 除法是必需的, 不是保险。
+//   2. 采样坐标要先钳在块内再加偏移。**越过一块的边界就进了隔壁那盏灯
+//      的块**, 而寻址模式救不了这个: ClampToBorder 只在整张图集的边界
+//      上起作用, 图集内部的块与块之间没有"边界"可言。
+//      漏掉这一句的表现是某盏灯的阴影边缘印着另一盏灯的影子。
+//   3. 深度偏移是**世界单位**, 加在世界坐标上, 不是加在 NDC 深度上。
+//      透视投影下 d(ndc)/dd ≈ near·far/((far-near)·d²) —— 近远平面取
+//      0.05 与 30 时, 在 d=6 处只有 0.0014 每单位。照搬级联那个加在 NDC
+//      上的 0.0015 等于把采样点沿光线推开一整个世界单位, 阴影整片脱离
+//      物体; 而画面上那看起来像"这盏灯根本没有阴影"。
+// ============================================================
+float ComputeSpotShadow(vec3 worldPos, vec3 normal, vec3 lightDir,
+                        int tileIndex)
+{
+    SpotShadowData data = spotShadowBuffer.spotShadows[tileIndex];
+
+    float NdotL = clamp(dot(normal, lightDir), 0.0, 1.0);
+
+    // 法线偏移沿法线把采样点推离表面 —— 掠射角下深度偏移救不了的那部分。
+    // 用的是级联那一套的同一个参数: 两者的量纲相同 (世界单位), 而单独给
+    // 聚光灯一个参数意味着多一个要调的旋钮, 且没有证据说明它该不一样。
+    float normalBias = lighting.shadowParams.y;
+
+    // 深度偏移沿**光照方向**把接收点朝光源挪一点, 而不是在 NDC 深度上减。
+    // 挪的量随掠射角增大 —— 掠射时同一个纹素覆盖的深度跨度更大。
+    //
+    // 沿光线挪有一个不显然的好处: **它完全不会移动影子的边界。**
+    //
+    // 点光源的阴影测试是"从灯出发经过该点的射线有没有撞到遮挡物"。沿着
+    // 那条射线本身挪, 挪完还在同一条射线上, 撞不撞得到不变。代入相似
+    // 三角形算一遍, 偏移量在分子分母里正好约掉。
+    //
+    // 这不是推测: 把偏移量放大十倍, --shadow-check 量到的边界一动不动
+    // (误差仍是 0.013)。而 NDC 深度上减一个常数就完全不同 —— 那等价于
+    // 把接收面整体朝灯平移, 影子会跟着缩, 也就是 peter-panning。
+    //
+    // 反过来说, 边界判据抓不到"深度偏移调错"这一类。抓得到的是法线偏移
+    // 过大 (那是沿法线挪, 会真的移动边界) 和偏移大到把采样点推过遮挡物
+    // (那时影子整片消失)。
+    float depthBias  = data.params.x;
+    float slopeScale = clamp(1.0 - NdotL, 0.0, 1.0);
+
+    vec3 offsetPos = worldPos +
+                     normal   * (normalBias * (1.0 - NdotL * 0.5)) +
+                     lightDir * (depthBias * (1.0 + slopeScale * 4.0));
+
+    vec4 shadowClip = data.viewProj * vec4(offsetPos, 1.0);
+
+    // 光源背后的点 —— 判为无遮挡。除以负的 w 会把它翻到锥的正面, 于是
+    // 灯背后的墙上会出现一块与灯前方对称的假阴影。
+    if (shadowClip.w <= 0.0)
+    {
+        return 1.0;
+    }
+
+    vec3 projected = shadowClip.xyz / shadowClip.w;
+
+    float receiverDepth = projected.z;
+
+    if (receiverDepth > 1.0 || receiverDepth < 0.0)
+    {
+        return 1.0;
+    }
+
+    // 块内归一化坐标。锥外的点落在 [0,1] 之外 —— 那里没有该灯的深度信息,
+    // 判为无遮挡而不是钳进块内: 钳的话锥边缘那一圈纹素会被拉伸到整个锥外,
+    // 表现为聚光灯的光斑外拖出一条长长的阴影。
+    vec2 tileUV = projected.xy * 0.5 + 0.5;
+
+    if (tileUV.x < 0.0 || tileUV.x > 1.0 ||
+        tileUV.y < 0.0 || tileUV.y > 1.0)
+    {
+        return 1.0;
+    }
+
+    float atlasSize = max(data.params.y, 1.0);
+
+    // 偏移已经在世界空间里做过了, 这里直接比。再在 NDC 上减一次的话,
+    // 同一件事做了两遍而量纲还不同 —— 调其中一个另一个就失配。
+    float compareDepth = receiverDepth;
+
+    // PCF 的偏移在**块内**做, 加上块偏移之前先钳。顺序反了的话, 块边缘的
+    // 像素会有一两个抽头落进隔壁的块。
+    float texelSize = 1.0 / atlasSize;
+
+    // 块内的半纹素余量 —— PCF 最多偏出一个纹素, 留一个半就够。
+    vec2 tileInset = vec2(1.5) * texelSize / data.uvTransform.zw;
+
+    float sum = 0.0;
+
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            vec2 offset = vec2(float(x), float(y)) * texelSize /
+                          data.uvTransform.zw;
+
+            vec2 clamped = clamp(tileUV + offset, tileInset, 1.0 - tileInset);
+
+            vec2 atlasUV = data.uvTransform.xy + clamped * data.uvTransform.zw;
+
+            sum += texture(spotShadowAtlas, vec3(atlasUV, compareDepth));
+        }
+    }
+
+    return sum / 9.0;
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 // ── 单盏光的贡献 ──
@@ -604,12 +742,25 @@ vec3 ShadeOneLight(LightData light, int lightIndex,
 
     float NdotL = max(dot(N, L), 0.0);
 
-    // 阴影 —— 当前只有主方向光(第 0 盏)投射阴影。
-    // 其余光源按无遮挡处理: 每盏光一张阴影贴图的代价与收益在这个阶段完全
-    // 不成比例, 而"只有主光有影子"在户外场景里几乎看不出来。
-    float shadow = (lightIndex == 0 && int(light.positionAndType.w) == 0)
-                       ? ComputeShadow(fragWorldPos, N, L)
-                       : 1.0;
+    // 阴影。两条来源:
+    //   主方向光 (第 0 盏) 走级联贴图;
+    //   聚光灯若拿到了图集里的一块, 走图集。
+    //
+    // 点光源仍按无遮挡处理 —— 它需要六面立方体阴影, 是另一件事。
+    //
+    // 块下标从光源数据里读而非另建一张表: 两者只要有一处漂移, 这盏灯就会
+    // 采到另一盏灯的块, 而那是个"有影子、但形状完全不对"的结果。
+    float shadow = 1.0;
+
+    if (lightIndex == 0 && int(light.positionAndType.w) == 0)
+    {
+        shadow = ComputeShadow(fragWorldPos, N, L);
+    }
+    else if (int(light.positionAndType.w) == 2 && light.spotParams.z >= 0.0)
+    {
+        shadow = ComputeSpotShadow(fragWorldPos, N, L,
+                                   int(light.spotParams.z));
+    }
 
     return (diffuse + specular) * radiance * NdotL * shadow;
 }

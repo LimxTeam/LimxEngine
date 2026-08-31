@@ -72,6 +72,7 @@ FLight::FLight(FLight&& other) noexcept
     , m_SpotInnerAngleDeg(other.m_SpotInnerAngleDeg)
     , m_SpotOuterAngleDeg(other.m_SpotOuterAngleDeg)
     , m_IsEnabled(other.m_IsEnabled)
+    , m_CastsShadow(other.m_CastsShadow)
     , m_DebugName(other.m_DebugName)
 {
     other.m_IsEnabled = false;
@@ -94,6 +95,7 @@ FLight& FLight::operator=(FLight&& other) noexcept
         m_SpotInnerAngleDeg  = other.m_SpotInnerAngleDeg;
         m_SpotOuterAngleDeg  = other.m_SpotOuterAngleDeg;
         m_IsEnabled          = other.m_IsEnabled;
+        m_CastsShadow        = other.m_CastsShadow;
         m_DebugName          = other.m_DebugName;
 
         other.m_IsEnabled = false;
@@ -240,8 +242,12 @@ FLightData FLight::ToGpuData() const
         FMath::DegreesToRadians(m_SpotInnerAngleDeg));
     data.SpotOuterCos = FMath::Cos(
         FMath::DegreesToRadians(m_SpotOuterAngleDeg));
-    data.SpotPad0     = 0.0f;
-    data.SpotPad1     = 0.0f;
+    // 阴影块下标由 FLightManager 在打包时分配 —— 它才知道有多少盏灯在争
+    // 那 64 块。这里恒填 -1 (不投影), 而不是留着不写: 结构体是逐字段赋值
+    // 的, 漏一个字段的表现是那一格残留上一盏灯的值, 于是本该没有阴影的灯
+    // 采到了别人的块。
+    data.ShadowTileIndex = -1.0f;
+    data.SpotPad1        = 0.0f;
 
     return data;
 }

@@ -67,6 +67,7 @@
 #include "RenderCore/Lighting/FLight.h"
 #include "Renderer/RenderPass/FPassManager.h"
 #include "Renderer/RenderPass/FShadowPass.h"
+#include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
@@ -227,7 +228,8 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     }
 
     // 初始化 Pass 系统 —— 阴影 Pass 的 Order 最小, 先于深度预 Pass 执行
-    m_ShadowPass   = MakeUnique<FShadowPass>();
+    m_ShadowPass      = MakeUnique<FShadowPass>();
+    m_ShadowAtlasPass = MakeUnique<FShadowAtlasPass>();
     m_DepthPrePass = MakeUnique<FDepthPrePass>();
     m_SkyPass      = MakeUnique<FSkyPass>();
     m_ForwardPass  = MakeUnique<FForwardPass>();
@@ -240,6 +242,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_BloomPass        = MakeUnique<FBloomPass>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
+    m_PassManager->RegisterPass(m_ShadowAtlasPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
     m_PassManager->RegisterPass(m_GtaoPass.Get());
     m_PassManager->RegisterPass(m_TaaPass.Get());
@@ -291,6 +294,17 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] 阴影光源 UBO 创建失败");
+        return result;
+    }
+
+    // 图集 Pass 只要一份单位矩阵的 set 0 —— 阴影矩阵走 push constant,
+    // 所以它不随帧变化, 不必每帧一份。
+    result = m_ShadowAtlasPass->CreateIdentityUniform(
+        device, m_DescSetLayout, m_TextureView, m_Sampler);
+
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[Renderer] 阴影图集单位矩阵 UBO 创建失败");
         return result;
     }
 
@@ -371,6 +385,7 @@ void FRenderer::Shutdown()
     m_ForwardPass.Reset();
     m_SkyPass.Reset();
     m_DepthPrePass.Reset();
+    m_ShadowAtlasPass.Reset();
     m_ShadowPass.Reset();
 
     // 2. 销毁管线布局
@@ -1499,7 +1514,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         //
         // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
         // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[9];
+        FRHIDescriptorWrite writes[11];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1569,7 +1584,22 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_GtaoPass->GetAoView(), m_LinearClampSampler,
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(writes, 9);
+        // binding 9/10 — 聚光灯阴影的每块数据与图集本身
+        //
+        // 与 binding 1 的级联贴图同理: 图集在整个运行期都是同一张纹理,
+        // 内容每帧被图集 Pass 重写, 但描述符指向的对象不变。
+        writes[9] = FRHIDescriptorWrite::StorageBuffer(
+            descSet, 9,
+            FLightManager::Get().GetSpotShadowBuffer(i), 0,
+            static_cast<UInt64>(sizeof(FSpotShadowData)) * kShadowTileCount);
+
+        writes[10] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet, 10,
+            m_ShadowAtlasPass->GetAtlasView(),
+            m_ShadowAtlasPass->GetAtlasSampler(),
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(writes, 11);
 
         m_LightDescriptorSets.Add(descSet);
     }

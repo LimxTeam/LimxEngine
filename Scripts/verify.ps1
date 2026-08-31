@@ -360,15 +360,15 @@ Invoke-Step $(if ($Rebuild) { '全量重建' } else { '增量构建' }) {
 Write-Header '单元测试'
 
 Invoke-Step 'CoreTests' {
-    .\Binaries\Development\Win64\LimxCoreTests.exe
+    .\Binaries\Development\Win64\LimxCoreTests.exe --min-cases 406
 }
 
 Invoke-Step 'RHITests' {
-    .\Binaries\Development\Win64\LimxRHITests.exe
+    .\Binaries\Development\Win64\LimxRHITests.exe --min-cases 58
 }
 
 Invoke-Step 'AssetTests' {
-    .\Binaries\Development\Win64\LimxAssetTests.exe
+    .\Binaries\Development\Win64\LimxAssetTests.exe --min-cases 200
 }
 
 # 引擎层测试逐套件跑 —— 与 ci.yml 保持一致。
@@ -402,6 +402,34 @@ Invoke-Step '引擎层测试 · LSpatialTrait' {
 
 Invoke-Step '引擎层测试 · TranslucentSort' {
     .\Binaries\Development\Win64\LimxEngineTests.exe --suite TranslucentSort
+}
+
+Invoke-Step '引擎层测试 · ClusterGrid' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite ClusterGrid
+}
+
+Invoke-Step '引擎层测试 · CompressedTextureFormat' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite CompressedTextureFormat
+}
+
+Invoke-Step '引擎层测试 · Octahedral' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite Octahedral
+}
+
+Invoke-Step '引擎层测试 · ShadowAtlas' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --suite ShadowAtlas
+}
+
+# 用例数下限 —— 防的是"套件悄悄消失"。
+#
+# 上面每一条都是手写的套件名。新加一个套件而忘了补一行, 它就永远不会被执行,
+# 而"没执行"与"全过"在退出码上完全一样。ClusterGrid、Octahedral、ShadowAtlas
+# 三个就是这么漏掉的 —— 注册了整整一个周期, 一次都没跑过。
+#
+# 判据放在二进制里而不是脚本里: 脚本要判断就得解析输出文本, 而解析失败会
+# 退化成"没发现问题"。
+Invoke-Step '引擎层测试 · 用例数下限' {
+    .\Binaries\Development\Win64\LimxEngineTests.exe --min-cases 78
 }
 
 # 显存回收自检 —— 需要真实 GPU, 因此放在单元测试之后单独一步。
@@ -473,6 +501,25 @@ Invoke-Step '泛光自检 (点扩散函数)' -RequiresGpu {
 # 而"解析值不成立"与"实现算错了"在结果上无法区分。
 Invoke-Step 'GTAO 自检 (墙角的解析收敛)' -RequiresGpu {
     Invoke-Engine '--corner-scene --gtao --frames 20 --warmup 5 --ao-check'
+}
+
+# 聚光灯阴影自检 —— 需要真实 GPU。
+#
+# 阴影这类缺陷的表现高度趋同: 图集块偏移算错、矩阵没转置、绘制的视口与采样的
+# UV 不一致、深度偏移过大 —— 在画面上都是"影子位置不对"或"影子没了", 而人的
+# 第一反应永远是去调 bias。
+#
+# 判据因此是**解析的**: 灯在 (0,0,6), 薄板在 z=3, 墙在 z=0, 影子边界由相似
+# 三角形唯一确定为 板半宽 × 6/(6-3)。实测与解析值差 0.8%, 而那 0.8% 有确切的
+# 来源 (法线偏移把接收点推离墙面 0.027 单位)。
+#
+# 灯必须在**相机轴上** —— 这样遮挡物在画面上的像一定落在它自己影子之外
+# (灯离板子近, 放大率更大), 影子边界才不会被自己的遮挡物挡住。
+#
+# 两盏灯而非一盏: 只有一块的话, "块偏移算错"会退化成"偏到了图集的空白区",
+# 而空白区深度是 1.0 恰好判为无遮挡 —— 与"这盏灯没有影子"在画面上一模一样。
+Invoke-Step '聚光灯阴影自检 (相似三角形的解析边界)' -RequiresGpu {
+    Invoke-Engine '--shadow-scene --frames 20 --warmup 5 --shadow-check'
 }
 
 # TAA 自检 —— 需要真实 GPU。

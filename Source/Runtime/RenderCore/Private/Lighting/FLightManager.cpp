@@ -112,7 +112,9 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     //   set 2, binding 6 — 每簇的 (起点, 数量)
     //   set 2, binding 7 — 全局光源索引表
     //   set 2, binding 8 — 屏幕空间环境光遮蔽
-    FRHIDescriptorBinding bindings[9] = {};
+    //   set 2, binding 9 — 聚光灯阴影的每块数据 (矩阵 + UV 变换)
+    //   set 2, binding 10 — 聚光灯阴影图集 (深度纹理 + 比较采样器)
+    FRHIDescriptorBinding bindings[11] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -166,9 +168,25 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[8].Count      = 1;
     bindings[8].StageFlags = EShaderStage::Fragment;
 
+    // binding 9/10 — 聚光灯阴影
+    //
+    // 阴影图集不放在 binding 1 那张级联贴图旁边另起一个数组层, 而是单独
+    // 一张纹理: 两者的分辨率、投影类型与采样方式都不同 (级联是正交 +
+    // 数组层, 图集是透视 + 块偏移), 硬塞进一个 sampler2DArrayShadow 之后
+    // 每次采样都要先判断"这一层是级联还是图集"。
+    bindings[9].Binding    = 9;
+    bindings[9].Type       = EDescriptorType::StorageBuffer;
+    bindings[9].Count      = 1;
+    bindings[9].StageFlags = EShaderStage::Fragment;
+
+    bindings[10].Binding    = 10;
+    bindings[10].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[10].Count      = 1;
+    bindings[10].StageFlags = EShaderStage::Fragment;
+
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 9;
+    layoutDesc.BindingCount = 11;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -226,8 +244,37 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
         m_LightStorageBuffers.Add(buffer);
     }
 
+    // ---- 为每并行帧创建一个聚光灯阴影 storage buffer ----
+    //
+    // 尺寸按块数而非光源数: 图集只有 64 块, 再多的灯也拿不到第 65 块。
+    // 按 kMaxLightCount 开的话是 1024 × 96 = 96 KiB 里 94 KiB 永远是零,
+    // 而且着色器索引的是块下标, 越界与否得另外判 —— 现在越界不可能发生。
+    m_SpotShadowBuffers.Reserve(maxFramesInFlight);
+
+    for (UInt32 i = 0; i < maxFramesInFlight; ++i)
+    {
+        FRHIBufferDesc bufferDesc = {};
+        bufferDesc.Size        = sizeof(FSpotShadowData) * kShadowTileCount;
+        bufferDesc.Usage       = EBufferUsage::StorageBuffer;
+        bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+        bufferDesc.DebugName   = "SpotShadowBuffer";
+
+        FRHIBufferHandle buffer;
+        result = m_Device->CreateBuffer(bufferDesc, buffer);
+        if (!IsRHISuccess(result))
+        {
+            LIMX_LOG(LogLighting, Error,
+                     "[LightManager] 聚光灯阴影 storage buffer [{}] 创建失败", i);
+            Shutdown();
+            return result;
+        }
+
+        m_SpotShadowBuffers.Add(buffer);
+    }
+
     // 预分配光源数组容量
     m_Lights.Reserve(kMaxLightCount);
+    m_SpotShadowCasters.Reserve(kShadowTileCount);
 
     m_IsInitialized = true;
 
@@ -264,6 +311,15 @@ void FLightManager::Shutdown()
         m_Device->DestroyBuffer(m_LightStorageBuffers[i]);
     }
     m_LightStorageBuffers.Clear();
+
+    // 释放聚光灯阴影 storage buffer
+    for (SizeType i = 0; i < m_SpotShadowBuffers.GetSize(); ++i)
+    {
+        m_Device->DestroyBuffer(m_SpotShadowBuffers[i]);
+    }
+    m_SpotShadowBuffers.Clear();
+
+    m_SpotShadowCasters.Clear();
 
     // 释放描述符集布局
     m_Device->DestroyDescSetLayout(m_DescSetLayout);
@@ -391,6 +447,13 @@ void FLightManager::UploadLightData(
     UInt32 activeLightCount = 0;
     UInt32 directionalCount = 0;
 
+    // 阴影块的分配从零开始重来。沿用上一帧的分配看似能少写几次缓冲区,
+    // 但灯的增删会让"块下标"与"第几盏投影灯"错位, 而那的表现是某盏灯
+    // 突然采到别人的阴影 —— 只在增删灯的那一帧之后才出现, 极难复现。
+    m_SpotShadowCasters.Clear();
+
+    UInt32 shadowRequestCount = 0;
+
     void* lightPtr = nullptr;
 
     if (IsRHISuccess(m_Device->MapBuffer(m_LightStorageBuffers[frameIndex],
@@ -438,6 +501,35 @@ void FLightManager::UploadLightData(
                 }
 
                 lights[activeLightCount] = m_Lights[i].ToGpuData();
+
+                // ---- 阴影块分配 ----
+                //
+                // 块下标就是"本帧第几盏投影灯", 与光源在缓冲区里的位置无关。
+                // 两者绑定的话, 方向光排在前面这件事就会把块 0~N 白白占掉。
+                if (m_Lights[i].GetType() == ELightType::Spot &&
+                    m_Lights[i].CastsShadow())
+                {
+                    ++shadowRequestCount;
+
+                    const UInt32 tileIndex =
+                        static_cast<UInt32>(m_SpotShadowCasters.GetSize());
+
+                    if (tileIndex < kShadowTileCount)
+                    {
+                        const FMatrix viewProj = ComputeSpotShadowMatrix(
+                            m_Lights[i].GetPosition(),
+                            m_Lights[i].GetDirection(),
+                            lights[activeLightCount].SpotOuterCos,
+                            m_Lights[i].GetRange());
+
+                        m_SpotShadowCasters.Add(
+                            MakeSpotShadowData(tileIndex, viewProj));
+
+                        lights[activeLightCount].ShadowTileIndex =
+                            static_cast<Float32>(tileIndex);
+                    }
+                }
+
                 ++activeLightCount;
 
                 if (wantDirectional)
@@ -456,6 +548,20 @@ void FLightManager::UploadLightData(
     }
 
     m_ActiveLightCount = activeLightCount;
+
+    // 要块的灯多过块数时明确报出来。
+    //
+    // 静默丢弃的表现是"有些灯没有影子", 而那与"这盏灯本来就没开阴影"在
+    // 画面上完全一样 —— 于是没人会去查图集满没满。
+    if (shadowRequestCount > kShadowTileCount)
+    {
+        LIMX_LOG(LogLighting, Warning,
+                 "[LightManager] 请求阴影的聚光灯 {} 盏, 超过图集的 {} 块 — "
+                 "其余按无遮挡处理",
+                 shadowRequestCount, kShadowTileCount);
+    }
+
+    UploadSpotShadowData(frameIndex);
 
     // 写入全局光照参数
     uboData.LightCount       = static_cast<Float32>(activeLightCount);
@@ -537,6 +643,60 @@ FRHIBufferHandle FLightManager::GetLightStorageBuffer(UInt32 frameIndex) const
     }
 
     return m_LightStorageBuffers[frameIndex];
+}
+
+// ============================================================================
+// UploadSpotShadowData — 把本帧的阴影块写进 storage buffer
+//
+// 先整块清零再写前缀。只写用到的那几块也能跑, 但上一帧留下的数据会一直
+// 躺在后面 —— 而只要有一个环节把块下标算错一位, 读到的就是上一帧某盏灯
+// 的矩阵: 一个**看着挺像回事**的阴影, 位置却是错的。清零之后同样的错误
+// 会读到全零矩阵, 那是一眼可见的坏。
+//
+// 代价是每帧 6 KiB 的写入, 在 CpuToGpu 内存上不到一微秒。
+// ============================================================================
+
+void FLightManager::UploadSpotShadowData(UInt32 frameIndex)
+{
+    if (frameIndex >= m_SpotShadowBuffers.GetSize())
+    {
+        return;
+    }
+
+    void* mapped = nullptr;
+
+    if (!IsRHISuccess(m_Device->MapBuffer(m_SpotShadowBuffers[frameIndex],
+                                          &mapped)) ||
+        mapped == nullptr)
+    {
+        LIMX_LOG(LogLighting, Error,
+                 "[LightManager] 聚光灯阴影缓冲区映射失败 — 本帧无聚光灯阴影");
+        return;
+    }
+
+    MemZero(mapped, sizeof(FSpotShadowData) * kShadowTileCount);
+
+    if (!m_SpotShadowCasters.IsEmpty())
+    {
+        MemCopy(mapped, m_SpotShadowCasters.GetData(),
+                sizeof(FSpotShadowData) * m_SpotShadowCasters.GetSize());
+    }
+
+    m_Device->UnmapBuffer(m_SpotShadowBuffers[frameIndex]);
+}
+
+// ============================================================================
+// GetSpotShadowBuffer — 聚光灯阴影数据 (set 2, binding 9)
+// ============================================================================
+
+FRHIBufferHandle FLightManager::GetSpotShadowBuffer(UInt32 frameIndex) const
+{
+    if (frameIndex >= m_SpotShadowBuffers.GetSize())
+    {
+        return FRHIBufferHandle();
+    }
+
+    return m_SpotShadowBuffers[frameIndex];
 }
 
 // ============================================================================

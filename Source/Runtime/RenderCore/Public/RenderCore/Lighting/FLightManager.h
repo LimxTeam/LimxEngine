@@ -49,6 +49,7 @@
 #pragma once
 
 #include "RenderCore/Lighting/FLight.h"
+#include "RenderCore/Lighting/FShadowAtlas.h"
 
 namespace Limx
 {
@@ -184,6 +185,20 @@ public:
         return m_ActiveLightCount;
     }
 
+    /// 获取指定帧的聚光灯阴影 storage buffer 句柄 (set 2, binding 9)
+    LIMX_NODISCARD FRHIBufferHandle GetSpotShadowBuffer(
+        UInt32 frameIndex) const;
+
+    /// 本帧分配出去的阴影块 —— 阴影图集 Pass 照着它逐块绘制
+    ///
+    /// 由 UploadLightData 填写。分块与矩阵在那里算一次, 图集绘制与片段
+    /// 着色器采样用的因此是**同一份**数据 —— 各算一遍的话, 快速转动的
+    /// 聚光灯会出现"影子跟不上灯"的一帧延迟, 而那看着像是阴影偏移没调好。
+    LIMX_NODISCARD const TArray<FSpotShadowData>& GetSpotShadowCasters() const
+    {
+        return m_SpotShadowCasters;
+    }
+
     /// 设置分簇光照的每帧参数
     ///
     /// 由 FRenderer 在 UploadLightData 之前调用。近远平面必须与
@@ -215,6 +230,9 @@ private:
     FLightManager();
     ~FLightManager();
 
+    /// 把本帧分配出去的阴影块写进指定帧的 storage buffer
+    void UploadSpotShadowData(UInt32 frameIndex);
+
     // ====================================================================
     // 成员
     // ====================================================================
@@ -227,6 +245,12 @@ private:
 
     /// 每并行帧一个光源 storage buffer (kMaxLightCount × 80 字节)
     TArray<FRHIBufferHandle>    m_LightStorageBuffers;
+
+    /// 每并行帧一个聚光灯阴影 storage buffer (kShadowTileCount × 96 字节)
+    TArray<FRHIBufferHandle>    m_SpotShadowBuffers;
+
+    /// 本帧分配出去的阴影块 (下标即块下标)
+    TArray<FSpotShadowData>     m_SpotShadowCasters;
 
     /// 上一次 UploadLightData 写进去的活跃光源数
     UInt32                      m_ActiveLightCount = 0;
