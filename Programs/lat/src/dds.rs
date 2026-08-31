@@ -175,8 +175,11 @@ impl DdsTexture {
             caps |= DDSCAPS_MIPMAP | DDSCAPS_COMPLEX;
         }
 
+        // 能携带 alpha 的格式都要声明 alpha 是直通 (未预乘) 的。
+        // 我们没有做预乘, 声明成 PREMULTIPLIED 会让正确的读取方把颜色
+        // 再除一遍 alpha。BC1/BC4/BC5 没有 alpha 通道, 写 UNKNOWN。
         let misc_flags2 = match self.format {
-            BcFormat::Bc3 => DDS_ALPHA_MODE_STRAIGHT,
+            BcFormat::Bc3 | BcFormat::Bc7 => DDS_ALPHA_MODE_STRAIGHT,
             _ => DDS_ALPHA_MODE_UNKNOWN,
         };
 

@@ -35,9 +35,17 @@ LAT (Limx Asset Tool) 把源图离线烘焙成 GPU 能直接采样的块压缩�
   mip 链也必须在这里生成: 引擎运行时的 mip 是用 vkCmdBlitImage 放缩的,
   而 BC 格式不支持 blit —— 压缩纹理的 mip 只能离线做。
 
-这一轮支持的格式:
-  BC1 (RGB, 1/8)   BC3 (RGBA, 1/4)   BC4 (R, 1/8)   BC5 (RG, 1/4)
-  BC7 是下一步。
+支持的格式 (括号里是相对未压缩 RGBA8 的显存):
+  BC1 (RGB,  1/8)   BC3 (RGBA, 1/4)   BC4 (R, 1/8)   BC5 (RG, 1/4)
+  BC7 (RGBA, 1/4)
+
+  BC7 与 BC3 每块都是 16 字节, 但质量高得多 (端点最高 8 位有效精度、
+  索引 4 位、可把一个块切成两个子集分别拟合), 所以 auto 里已经没有
+  BC3 —— 凡是要 alpha 的地方一律 BC7。BC3 保留为显式选项, 给只认
+  DXT5 的外部工具链用。
+
+  BC7 相对 BC1 是两倍体积。auto 不会替不透明的 sRGB 颜色做这个决定,
+  要为某张贴图付这一倍显存请显式 --format bc7。
 
 色彩空间必须显式指定, 工具不从文件名猜:
   --color-space srgb     albedo / baseColor / emissive
@@ -45,6 +53,7 @@ LAT (Limx Asset Tool) 把源图离线烘焙成 GPU 能直接采样的块压缩�
 
 示例:
   lat bake wall_albedo.png -o wall_albedo.dds --color-space srgb
+  lat bake hero_albedo.png -o hero_albedo.dds --color-space srgb --format bc7
   lat bake wall_normal.png -o wall_normal.dds --color-space linear --format bc5
   lat bake-all -s Content/Sponza -o Baked/Sponza --color-space srgb
   lat inspect Baked/Sponza/wall_albedo.dds
@@ -71,8 +80,12 @@ pub struct BakeArgs {
 
     /// 输出格式。auto 按通道数与 alpha 有效性决定。
     ///
-    /// 3 通道的切线空间法线图必须显式写 --format bc5: 从像素上分不出
-    /// "RGB 法线" 和 "RGB 颜色", auto 只能保守地给 BC1。
+    /// auto 的取法: sRGB 不透明 → BC1; sRGB 带 alpha → BC7;
+    /// linear 1/2 通道 → BC4/BC5; linear 3/4 通道 → BC7。
+    ///
+    /// 3 通道的切线空间法线图必须显式写 --format bc5 才会走"只存 XY、
+    /// Z 由着色器重建"那条路: 从像素上分不出 "RGB 法线" 和 "RGB 数据",
+    /// auto 只能给通用的 BC7。
     #[arg(long, value_enum, default_value = "auto")]
     pub format: FormatOption,
 
@@ -90,7 +103,9 @@ pub struct BakeArgs {
     /// PSNR 下限 (dB), 低于它这张图判为失败。隐含开启 --verify。
     ///
     /// 参考值: BC1 在照片类贴图上通常 30~40 dB, 低于 25 说明这张图
-    /// 不适合 BC1 (常见于强色阶、纯色块、或者被当成颜色烘的法线图)。
+    /// 不适合 BC1 (常见于强色阶、纯色块、或者被当成颜色烘的法线图) ——
+    /// 那时改用 --format bc7 通常能拿回 6~10 dB。BC7 在同类贴图上
+    /// 通常 40~50 dB。
     #[arg(long, value_name = "DB")]
     pub min_psnr: Option<f64>,
 

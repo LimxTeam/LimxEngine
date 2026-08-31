@@ -20,9 +20,10 @@ use block_compression::CompressionVariant;
 
 /// 输出的 BC 格式。
 ///
-/// 这一轮只做 BC1/BC3/BC4/BC5 —— 它们共用同一套 RGB565 + 索引 / 单通道插值
-/// 的结构, 编码器是纯算术的, 跑通全链路后拿到的数字才可信。BC7 的搜索空间
-/// (8 种 mode × partition) 大一个量级, 单独作为第二步。
+/// BC1/BC3/BC4/BC5 共用同一套 RGB565 + 索引 / 单通道插值的结构, 编码走
+/// block_compression。BC7 的结构完全不同 (8 种 mode × 64 张分区表 ×
+/// 可变端点位宽), 编码器与解码器都在 `crate::bc7` 里自己实现 —— 理由
+/// 见那个文件的头注释。
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum BcFormat {
     /// RGB, 每 4×4 块 8 字节。无 alpha (1-bit 抠图 alpha 不使用)
@@ -33,6 +34,10 @@ pub enum BcFormat {
     Bc4,
     /// 双通道 (RG), 每 4×4 块 16 字节 = 两个 BC4 块
     Bc5,
+    /// RGBA, 每 4×4 块 16 字节。与 BC3 同尺寸但质量高得多 —— 端点最高
+    /// 8 位有效精度 (BC1/BC3 的颜色端点只有 5-6-5), 索引最高 4 位
+    /// (BC1/BC3 只有 2 位), 还能把一个块切成两个子集各拟合各的端点线。
+    Bc7,
 }
 
 /// 命令行上的格式选项: `auto` 走策略, 其余是显式指定。
@@ -43,6 +48,7 @@ pub enum FormatOption {
     Bc3,
     Bc4,
     Bc5,
+    Bc7,
 }
 
 /// 源图的色彩空间。必须由调用方显式指定, 没有默认值。
@@ -66,10 +72,11 @@ impl BcFormat {
     /// BC1/BC4 = 8 字节: 两个端点 + 每像素 2 bit 索引。
     /// BC3 = BC4 的 alpha 块(8) + BC1 的颜色块(8)。
     /// BC5 = 两个 BC4 块 (R 一个, G 一个)。
+    /// BC7 = 固定 128 bit, 内部怎么分配由 mode 决定。
     pub const fn block_bytes(self) -> usize {
         match self {
             BcFormat::Bc1 | BcFormat::Bc4 => 8,
-            BcFormat::Bc3 | BcFormat::Bc5 => 16,
+            BcFormat::Bc3 | BcFormat::Bc5 | BcFormat::Bc7 => 16,
         }
     }
 
@@ -85,12 +92,18 @@ impl BcFormat {
     }
 
     /// 映射到 block_compression 的编码器变体。
-    pub const fn variant(self) -> CompressionVariant {
+    ///
+    /// BC7 返回 `None` —— 它不走 block_compression (那个 crate 的 BC7 在
+    /// `bc7` feature 后面, 而那个 feature 会把 wgpu 拉进依赖树)。BC7 的
+    /// 编解码在 `crate::bc7`, 分派在 `bake::compress_level` / `decode_level`。
+    /// 用 Option 而不是 panic 是为了让"忘了分派"变成编译期就要处理的分支。
+    pub const fn variant(self) -> Option<CompressionVariant> {
         match self {
-            BcFormat::Bc1 => CompressionVariant::BC1,
-            BcFormat::Bc3 => CompressionVariant::BC3,
-            BcFormat::Bc4 => CompressionVariant::BC4,
-            BcFormat::Bc5 => CompressionVariant::BC5,
+            BcFormat::Bc1 => Some(CompressionVariant::BC1),
+            BcFormat::Bc3 => Some(CompressionVariant::BC3),
+            BcFormat::Bc4 => Some(CompressionVariant::BC4),
+            BcFormat::Bc5 => Some(CompressionVariant::BC5),
+            BcFormat::Bc7 => None,
         }
     }
 
@@ -110,6 +123,8 @@ impl BcFormat {
             (BcFormat::Bc4, ColorSpace::Linear) => Some(DXGI_FORMAT_BC4_UNORM),
             (BcFormat::Bc5, ColorSpace::Linear) => Some(DXGI_FORMAT_BC5_UNORM),
             (BcFormat::Bc4 | BcFormat::Bc5, ColorSpace::Srgb) => None,
+            (BcFormat::Bc7, ColorSpace::Linear) => Some(DXGI_FORMAT_BC7_UNORM),
+            (BcFormat::Bc7, ColorSpace::Srgb) => Some(DXGI_FORMAT_BC7_UNORM_SRGB),
         }
     }
 
@@ -118,7 +133,7 @@ impl BcFormat {
     pub const fn meaningful_channels(self) -> &'static [usize] {
         match self {
             BcFormat::Bc1 => &[0, 1, 2],
-            BcFormat::Bc3 => &[0, 1, 2, 3],
+            BcFormat::Bc3 | BcFormat::Bc7 => &[0, 1, 2, 3],
             BcFormat::Bc4 => &[0],
             BcFormat::Bc5 => &[0, 1],
         }
@@ -130,6 +145,7 @@ impl BcFormat {
             BcFormat::Bc3 => "BC3",
             BcFormat::Bc4 => "BC4",
             BcFormat::Bc5 => "BC5",
+            BcFormat::Bc7 => "BC7",
         }
     }
 }
@@ -208,18 +224,45 @@ pub struct SourceTraits {
 ///
 /// * **srgb** —— 调用方声明"这是给人眼看的颜色"。颜色数据只能落到有 sRGB
 ///   变体的格式上, 所以通道数在这里 *只* 用来决定要不要 alpha:
-///   有效 alpha → BC3, 否则 → BC1。一张灰度的 albedo 仍然是 sRGB 颜色,
+///   有效 alpha → BC7, 否则 → BC1。一张灰度的 albedo 仍然是 sRGB 颜色,
 ///   走 BC1 (灰度复制到 RGB) 比走 BC4 正确 —— BC4 会把 sRGB 标记丢掉。
 ///
 /// * **linear** —— 调用方声明"这是数值"。此时通道数就是语义:
 ///   1 → BC4 (occlusion / roughness 单通道)
 ///   2 → BC5 (切线空间法线的 XY)
-///   3/4 → BC1/BC3 (线性的彩色数据, 例如已经打包好的 MR 贴图)
+///   3/4 → BC7 (线性的多通道数据: 打包的 MR 贴图 / RGB 法线 / 遮罩图)
 ///
-/// 注意 3 通道的切线空间法线图 (glTF 的常见形态) 会落到 BC1 —— 这是错的
-/// 选择但也是唯一诚实的默认: 从像素上分不出"RGB 法线"和"RGB 颜色"。
-/// 调用方必须显式 `--format bc5`, 那时我们只取 R/G 两通道, Z 由着色器
-/// 用 sqrt(1-x²-y²) 重建。这个决定必须留给调用方, 不能猜。
+/// ── BC7 什么时候是自动选择, 为什么 ──────────────────────────────────
+///
+/// BC7 的取舍是 **体积是 BC1 的两倍, 和 BC3 一样大**。所以这里的规则不是
+/// "质量优先"或"体积优先", 而是分成两个完全不同的问题:
+///
+/// 1. **凡是本来要选 BC3 的地方, 一律改选 BC7。** 两者每块都是 16 字节,
+///    显存分毫不差; 而 BC7 的颜色端点最高有 8 位有效精度、索引 4 位、还能
+///    双子集, BC3 的颜色部分就是 BC1 (5-6-5 端点 + 2 位索引)。同样的字节数
+///    下没有任何理由继续选 BC3。BC3 仍然保留为显式选项 (`--format bc3`),
+///    因为有些外部工具链只认 DXT5。
+///
+/// 2. **本来要选 BC1 的地方 (不透明的 sRGB 颜色) 保持 BC1。** 升到 BC7 要
+///    多花一倍显存, 而 albedo 通常是一个场景里贴图显存的大头。sRGB 颜色
+///    数据的三个通道高度相关 (自然材质的 R/G/B 基本沿同一条明暗轴变化),
+///    正好是 BC1 那条"单条端点线穿过 RGB 空间"的模型最擅长的形态。
+///    要不要为某张贴图付这一倍显存, 是美术/性能预算的决定, 工具不替它做;
+///    需要时显式 `--format bc7`, 或者用 `--min-psnr` 在 CI 里把 BC1 扛不住
+///    的贴图挑出来再逐张升级。
+///
+/// 3. **线性的 3/4 通道数据选 BC7, 不选 BC1。** 这是与上一条相反的判断,
+///    理由是数据的形态不同: `--color-space linear` 且有三个通道的图, 在
+///    真实资产里几乎都是 *通道之间互不相关* 的打包数据 —— 法线的 XYZ、
+///    metallic/roughness/occlusion 塞进 RGB、各种遮罩图。三个互不相关的
+///    通道恰好是 BC1 的最坏情况: 一条直线穿不过一团各向同性的点云,
+///    而且量化误差在这里不是"颜色略偏", 是法线歪掉、粗糙度跳台阶。
+///    这类图的数量和分辨率通常也远小于 albedo, 多花的显存有限。
+///
+/// 注意 3 通道的切线空间法线图 (glTF 的常见形态) 现在会落到 BC7 而不是
+/// BC5 —— BC7 保住了三个通道且质量够, 但每块 16 字节, 和 BC5 一样大而
+/// 少了"Z 由着色器重建"带来的精度。真要按法线处理仍然要显式 `--format bc5`:
+/// 从像素上分不出"RGB 法线"和"RGB 数据", 这个决定必须留给调用方。
 pub fn resolve_format(
     option: FormatOption,
     traits: SourceTraits,
@@ -230,10 +273,11 @@ pub fn resolve_format(
         FormatOption::Bc3 => BcFormat::Bc3,
         FormatOption::Bc4 => BcFormat::Bc4,
         FormatOption::Bc5 => BcFormat::Bc5,
+        FormatOption::Bc7 => BcFormat::Bc7,
         FormatOption::Auto => match color_space {
             ColorSpace::Srgb => {
                 if traits.alpha_significant {
-                    BcFormat::Bc3
+                    BcFormat::Bc7
                 } else {
                     BcFormat::Bc1
                 }
@@ -241,13 +285,7 @@ pub fn resolve_format(
             ColorSpace::Linear => match traits.channels {
                 1 => BcFormat::Bc4,
                 2 => BcFormat::Bc5,
-                _ => {
-                    if traits.alpha_significant {
-                        BcFormat::Bc3
-                    } else {
-                        BcFormat::Bc1
-                    }
-                }
+                _ => BcFormat::Bc7,
             },
         },
     };
@@ -343,27 +381,73 @@ mod tests {
             resolve_format(auto, traits(2, false), lin).unwrap(),
             BcFormat::Bc5
         );
+        // 线性的 3/4 通道 = 互不相关的打包数据, 是 BC1 的最坏情况。
+        // 见 resolve_format 的第 3 条理由。
         assert_eq!(
             resolve_format(auto, traits(3, false), lin).unwrap(),
-            BcFormat::Bc1
+            BcFormat::Bc7
         );
         assert_eq!(
             resolve_format(auto, traits(4, true), lin).unwrap(),
-            BcFormat::Bc3
+            BcFormat::Bc7
         );
     }
 
     #[test]
     fn auto_falls_back_to_bc1_when_alpha_is_opaque() {
-        // 4 通道但 alpha 全 255: 走 BC3 会白花一倍显存。
+        // 4 通道但 alpha 全 255 的 sRGB 颜色: 升到 16 字节/块会白花一倍显存。
         assert_eq!(
             resolve_format(FormatOption::Auto, traits(4, false), ColorSpace::Srgb).unwrap(),
             BcFormat::Bc1
         );
+        // 有有效 alpha 时必须是 BC7 而不是 BC3 —— 同样 16 字节/块,
+        // 没有理由选质量差的那个。
         assert_eq!(
             resolve_format(FormatOption::Auto, traits(4, true), ColorSpace::Srgb).unwrap(),
+            BcFormat::Bc7
+        );
+    }
+
+    #[test]
+    fn auto_never_selects_bc3_anymore() {
+        // BC3 与 BC7 每块都是 16 字节, 自动策略里没有任何一格该落到 BC3。
+        // 这条守着"某天有人把 BC7 分支改回 BC3"这种回退。
+        for channels in 1..=4u8 {
+            for alpha in [false, true] {
+                for cs in [ColorSpace::Srgb, ColorSpace::Linear] {
+                    let f = resolve_format(FormatOption::Auto, traits(channels, alpha), cs)
+                        .expect("auto 策略不该产出非法组合");
+                    assert_ne!(
+                        f,
+                        BcFormat::Bc3,
+                        "auto({} 通道, alpha={}, {:?}) 落到了 BC3",
+                        channels,
+                        alpha,
+                        cs
+                    );
+                }
+            }
+        }
+        // 但显式指定仍然要能拿到 BC3 —— 有些外部工具链只认 DXT5。
+        assert_eq!(
+            resolve_format(FormatOption::Bc3, traits(4, true), ColorSpace::Srgb).unwrap(),
             BcFormat::Bc3
         );
+    }
+
+    #[test]
+    fn bc7_has_both_color_spaces() {
+        // BC4/BC5 没有 sRGB 变体, BC7 有 —— 它既能当颜色也能当数据用。
+        assert_eq!(
+            BcFormat::Bc7.dxgi_format(ColorSpace::Srgb),
+            Some(DXGI_FORMAT_BC7_UNORM_SRGB)
+        );
+        assert_eq!(
+            BcFormat::Bc7.dxgi_format(ColorSpace::Linear),
+            Some(DXGI_FORMAT_BC7_UNORM)
+        );
+        assert!(resolve_format(FormatOption::Bc7, traits(3, false), ColorSpace::Srgb).is_ok());
+        assert!(resolve_format(FormatOption::Bc7, traits(3, false), ColorSpace::Linear).is_ok());
     }
 
     #[test]
@@ -394,7 +478,13 @@ mod tests {
 
     #[test]
     fn dxgi_mapping_agrees_with_block_size() {
-        for f in [BcFormat::Bc1, BcFormat::Bc3, BcFormat::Bc4, BcFormat::Bc5] {
+        for f in [
+            BcFormat::Bc1,
+            BcFormat::Bc3,
+            BcFormat::Bc4,
+            BcFormat::Bc5,
+            BcFormat::Bc7,
+        ] {
             for cs in [ColorSpace::Linear, ColorSpace::Srgb] {
                 if let Some(dxgi) = f.dxgi_format(cs) {
                     assert_eq!(

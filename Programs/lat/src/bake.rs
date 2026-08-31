@@ -13,6 +13,8 @@
  *   的办法是把压缩结果解回来和原图比。block_compression 自带的 decode
  *   模块正好能当这个 oracle: 它是独立于编码路径的一份实现, 按 BC 规范
  *   写的, 编码器出错时它不会跟着一起错。
+ *   BC7 走 `crate::bc7`, 那里的解码器同样是按规范单独写的一份 (不复用
+ *   编码器的任何一步), 扮演的是同一个角色。
  *
  ******************************************************************************/
 
@@ -167,15 +169,46 @@ fn ensure_chain_converges(chain: &[Rgba8Image]) -> Result<()> {
 /// 的误差本身也是真实的质量信息。
 fn verify_level0(level0: &Rgba8Image, blocks: &[u8], format: BcFormat) -> f64 {
     let padded = pad_to_block_multiple(level0);
-    let mut decoded = vec![0u8; padded.pixels.len()];
-    decompress_blocks_as_rgba8(
-        format.variant(),
-        padded.width,
-        padded.height,
-        blocks,
-        &mut decoded,
-    );
+    let decoded = decode_blocks(format, padded.width, padded.height, blocks);
     psnr(&padded.pixels, &decoded, format.meaningful_channels())
+}
+
+/// 解开一层块数据成 RGBA8。分派到对应格式的解码器。
+///
+/// 两条路的解码器都 **不是** 各自编码器的逆过程: BC1..BC5 用的是
+/// block_compression 里独立的 decode 模块, BC7 用的是 `crate::bc7` 里
+/// 按规范单独写的一份。这是这些往返数字有意义的前提 —— 用编码器自己
+/// 的逆过程去验编码器, 端点顺序反了之类的错误会自洽地通过。
+pub fn decode_blocks(format: BcFormat, width: u32, height: u32, blocks: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; width as usize * height as usize * 4];
+    match format.variant() {
+        Some(variant) => {
+            decompress_blocks_as_rgba8(variant, width, height, blocks, &mut out);
+        }
+        None => {
+            debug_assert_eq!(format, BcFormat::Bc7);
+            crate::bc7::decompress_blocks(width, height, blocks, &mut out);
+        }
+    }
+    out
+}
+
+/// 压缩一段像素成块数据。分派到对应格式的编码器。
+fn encode_blocks(
+    format: BcFormat,
+    pixels: &[u8],
+    out: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+) {
+    match format.variant() {
+        Some(variant) => compress_rgba8(variant, pixels, out, width, height, stride),
+        None => {
+            debug_assert_eq!(format, BcFormat::Bc7);
+            crate::bc7::compress_blocks(pixels, out, width, height, stride);
+        }
+    }
 }
 
 /// 压缩一个 mip 层。
@@ -198,8 +231,8 @@ pub fn compress_level(level: &Rgba8Image, format: BcFormat) -> Vec<u8> {
 
     // 块行太少时并行的调度开销比压缩本身还大。
     if block_rows < 8 {
-        compress_rgba8(
-            format.variant(),
+        encode_blocks(
+            format,
             &padded.pixels,
             &mut out,
             padded.width,
@@ -215,8 +248,8 @@ pub fn compress_level(level: &Rgba8Image, format: BcFormat) -> Vec<u8> {
             // 每个任务处理一行 4 像素高的块。BC 的块存储是块行优先的,
             // 所以第 row 行块的输出正好是 out 的第 row 个 row_bytes 分片。
             let src_offset = row * 4 * stride as usize;
-            compress_rgba8(
-                format.variant(),
+            encode_blocks(
+                format,
                 &padded.pixels[src_offset..],
                 chunk,
                 padded.width,
@@ -289,15 +322,7 @@ mod tests {
     fn roundtrip(img: &Rgba8Image, format: BcFormat) -> Vec<u8> {
         let blocks = compress_level(img, format);
         let padded = pad_to_block_multiple(img);
-        let mut decoded = vec![0u8; padded.pixels.len()];
-        decompress_blocks_as_rgba8(
-            format.variant(),
-            padded.width,
-            padded.height,
-            &blocks,
-            &mut decoded,
-        );
-        decoded
+        decode_blocks(format, padded.width, padded.height, &blocks)
     }
 
     // ── 往返 PSNR: 正例 ────────────────────────────────────────────────
@@ -335,14 +360,7 @@ mod tests {
         assert_ne!(good_blocks, bad_blocks, "对照组必须真的改动了数据");
 
         let padded = pad_to_block_multiple(&img);
-        let mut decoded = vec![0u8; padded.pixels.len()];
-        decompress_blocks_as_rgba8(
-            BcFormat::Bc1.variant(),
-            padded.width,
-            padded.height,
-            &bad_blocks,
-            &mut decoded,
-        );
+        let decoded = decode_blocks(BcFormat::Bc1, padded.width, padded.height, &bad_blocks);
 
         let bad = psnr(&img.pixels, &decoded, BcFormat::Bc1.meaningful_channels());
         assert!(
@@ -436,6 +454,200 @@ mod tests {
         );
     }
 
+    // ── BC7 相对 BC1 / BC3 的质量 ──────────────────────────────────────
+
+    /// 一张"像真实贴图"的合成图: 大片平缓渐变 + 几条硬色彩边界 + 细节。
+    ///
+    /// 纯渐变会高估 BC1 (它拟合直线很在行), 纯噪声会低估两者。真实贴图的
+    /// 难点在边界: 一个 4×4 块里跨过材质接缝时, BC1 只有一条端点线,
+    /// 中间两级插值落在谁也不是的颜色上 —— 这正是 BC7 双子集要解决的。
+    fn synthetic_material(width: u32, height: u32, alpha: bool) -> Rgba8Image {
+        let mut px = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let fx = x as f32 / width as f32;
+                let fy = y as f32 / height as f32;
+                // 底色: 双向渐变 (BC1 擅长)
+                let mut r = (40.0 + 180.0 * fx) as i32;
+                let mut g = (60.0 + 120.0 * fy) as i32;
+                let mut b = (200.0 - 150.0 * fx * fy) as i32;
+                // 硬边界: 竖直的砖缝 + 斜向的接缝 (BC1 不擅长)
+                if (x / 7) % 3 == 0 {
+                    r = 230 - r / 4;
+                    g = 40;
+                    b = 30 + b / 5;
+                }
+                if (x + y) % 23 < 2 {
+                    r = 250;
+                    g = 250;
+                    b = 90;
+                }
+                let a = if alpha {
+                    // 抠图形态的 alpha: 与颜色无关的阶跃
+                    if (y / 5) % 2 == 0 {
+                        255
+                    } else {
+                        (x * 255 / width.max(1)) as i32
+                    }
+                } else {
+                    255
+                };
+                px.push(r.clamp(0, 255) as u8);
+                px.push(g.clamp(0, 255) as u8);
+                px.push(b.clamp(0, 255) as u8);
+                px.push(a.clamp(0, 255) as u8);
+            }
+        }
+        Rgba8Image::new(width, height, px)
+    }
+
+    /// BC7 相对 BC1 至少要拿到的 dB。
+    ///
+    /// 实测 Sponza 的 65 张不透明贴图上平均 +7.85 dB, 最小 +1.25 dB
+    /// (那一张是近乎纯色的贴图, BC1 本来就有 52.9 dB, 没有多少可拿的),
+    /// 这张合成图上是 +9 dB 左右。取 4.0 作为下限 —— 它足够宽, 不会因为
+    /// 编码器的细微改动误报; 又足够窄, "BC7 退化成只用 mode 6 的单子集
+    /// 编码器"这类回退会立刻把它压破。
+    const BC7_OVER_BC1_FLOOR: f64 = 4.0;
+
+    #[test]
+    fn bc7_beats_bc1_by_a_wide_margin_on_the_same_channels() {
+        // 关键: 两边都只统计 RGB 三通道。BC1 压根不存 alpha, 用各自的
+        // meaningful_channels 去比等于让 BC1 免考一门 —— 那样的对比
+        // 说明不了任何事。
+        let img = synthetic_material(128, 128, false);
+        let rgb = &[0usize, 1, 2][..];
+
+        let bc1 = psnr(&img.pixels, &roundtrip(&img, BcFormat::Bc1), rgb);
+        let bc7 = psnr(&img.pixels, &roundtrip(&img, BcFormat::Bc7), rgb);
+
+        assert!(
+            bc7 - bc1 > BC7_OVER_BC1_FLOOR,
+            "BC7 只比 BC1 好 {:.2} dB (BC1 {:.2} / BC7 {:.2}), 低于下限 {:.1} dB —— \
+             要么编码器退化了, 要么这张测试图对两者没有区分度",
+            bc7 - bc1,
+            bc1,
+            bc7,
+            BC7_OVER_BC1_FLOOR
+        );
+        // 绝对值也要看一眼: 光有差距但两边都很差没有意义。
+        assert!(bc7 > 40.0, "BC7 在合成材质图上只有 {:.2} dB", bc7);
+    }
+
+    #[test]
+    fn bc7_beats_bc3_at_the_same_block_size() {
+        // BC7 与 BC3 每块都是 16 字节。auto 策略里已经不再选 BC3, 依据
+        // 就是这条 —— 同样的显存下 BC7 严格更好。这里连 alpha 一起比,
+        // 两者的 meaningful_channels 相同, 是公平对照。
+        let img = synthetic_material(128, 128, true);
+        let rgba = BcFormat::Bc3.meaningful_channels();
+        assert_eq!(rgba, BcFormat::Bc7.meaningful_channels());
+
+        let bc3 = psnr(&img.pixels, &roundtrip(&img, BcFormat::Bc3), rgba);
+        let bc7 = psnr(&img.pixels, &roundtrip(&img, BcFormat::Bc7), rgba);
+
+        assert_eq!(
+            BcFormat::Bc3.block_bytes(),
+            BcFormat::Bc7.block_bytes(),
+            "这条对比的前提是两者同尺寸"
+        );
+        assert!(
+            bc7 > bc3 + 2.0,
+            "同为 16 字节/块, BC7 {:.2} dB 没有明显好过 BC3 {:.2} dB",
+            bc7,
+            bc3
+        );
+    }
+
+    #[test]
+    fn bc7_is_nearly_lossless_on_flat_and_two_tone_content() {
+        // UI / 图集 / 色卡这类内容 BC1 会明显崩 (5-6-5 端点 + 4 级插值),
+        // BC7 应当几乎无损。这条同时是"BC7 的收益不只在照片上"的证据。
+        let (w, h) = (64u32, 64u32);
+        let mut px = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let c: [u8; 4] = match ((x / 8) + (y / 8)) % 3 {
+                    0 => [17, 200, 133, 255],
+                    1 => [240, 31, 90, 255],
+                    _ => [12, 44, 233, 255],
+                };
+                px.extend_from_slice(&c);
+            }
+        }
+        let img = Rgba8Image::new(w, h, px);
+        let rgb = &[0usize, 1, 2][..];
+
+        let bc1 = psnr(&img.pixels, &roundtrip(&img, BcFormat::Bc1), rgb);
+        let bc7 = psnr(&img.pixels, &roundtrip(&img, BcFormat::Bc7), rgb);
+        assert!(
+            bc7 > 45.0,
+            "三色块图上 BC7 只有 {:.2} dB, 这类内容应当几乎无损",
+            bc7
+        );
+        assert!(
+            bc7 - bc1 > 8.0,
+            "三色块图: BC7 {:.2} dB 与 BC1 {:.2} dB 只差 {:.2} dB",
+            bc7,
+            bc1,
+            bc7 - bc1
+        );
+    }
+
+    #[test]
+    fn bc7_end_to_end_writes_a_bc7_dds() {
+        // 端到端: auto + 有效 alpha 必须落到 BC7, 头里写的是 BC7 的
+        // DXGI 号, 层大小按 16 字节/块算, 且能被自己的解析器读回。
+        let img = synthetic_material(64, 64, true);
+        let (bytes, report) = bake(
+            &img,
+            SourceTraits {
+                channels: 4,
+                alpha_significant: true,
+            },
+            BakeOptions {
+                format: FormatOption::Auto,
+                color_space: ColorSpace::Srgb,
+                mipmaps: true,
+                verify: true,
+                min_psnr: Some(35.0),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.format, BcFormat::Bc7);
+        let info = crate::dds::parse(&bytes).unwrap();
+        assert_eq!(info.dxgi_format, crate::format::DXGI_FORMAT_BC7_UNORM_SRGB);
+        assert_eq!(info.mip_count, 7);
+        assert_eq!(info.level_sizes[0], 16 * 16 * 16);
+        assert_eq!(
+            info.level_sizes.last(),
+            Some(&16),
+            "1×1 层仍要占满一个 16 字节的 BC7 块"
+        );
+        let q = report.psnr.expect("开了 verify 就必须有 PSNR");
+        assert!(q > 35.0, "BC7 在合成材质图上只有 {:.2} dB", q);
+
+        // 反向: 同一张图要求 BC1 达到同样的 PSNR 下限必须失败 ——
+        // 否则上面那个 min_psnr 的门槛对格式没有区分力。
+        let err = bake(
+            &img,
+            SourceTraits {
+                channels: 4,
+                alpha_significant: true,
+            },
+            BakeOptions {
+                format: FormatOption::Bc1,
+                color_space: ColorSpace::Srgb,
+                mipmaps: true,
+                verify: true,
+                min_psnr: Some(35.0),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{:#}", err).contains("PSNR"), "实际: {:#}", err);
+    }
+
     // ── 并行切分的正确性 ───────────────────────────────────────────────
 
     #[test]
@@ -443,14 +655,27 @@ mod tests {
         // 按块行切分并行压缩, 结果必须和一次性压缩逐字节相同。
         // 切分写错 (源偏移算错 / 输出分片错位) 时图像仍然"看着像",
         // 只有逐字节比对才抓得住。
-        let img = gradient(256, 128);
-        for format in [BcFormat::Bc1, BcFormat::Bc3, BcFormat::Bc4, BcFormat::Bc5] {
+        for format in [
+            BcFormat::Bc1,
+            BcFormat::Bc3,
+            BcFormat::Bc4,
+            BcFormat::Bc5,
+            BcFormat::Bc7,
+        ] {
+            // BC7 的编码比其它格式贵一个量级 (debug 构建下尤甚), 用小一号的
+            // 图。高度仍然 ≥ 32 (8 个块行), 否则走不到并行分支, 这条用例就
+            // 什么也没验到。
+            let img = if format == BcFormat::Bc7 {
+                gradient(64, 64)
+            } else {
+                gradient(256, 128)
+            };
             let parallel = compress_level(&img, format);
 
             let padded = pad_to_block_multiple(&img);
             let mut single = vec![0u8; format.level_byte_size(img.width, img.height)];
-            compress_rgba8(
-                format.variant(),
+            encode_blocks(
+                format,
                 &padded.pixels,
                 &mut single,
                 padded.width,
@@ -566,6 +791,8 @@ mod tests {
         // 偏移"、"某几层压根没写(全 0)" 这三类 bug 全都能通过尺寸检查 ——
         // 每层的字节数都是对的, 只是内容不对。
         // 这里把载荷按 level_sizes 切开, 逐层解码, 和 CPU 生成的对应层比 PSNR。
+        // 走 sRGB/不透明这一支, 落到 BC1 —— 这条用例验的是"每层写到了正确
+        // 的偏移", 与用哪个编码器无关, 挑最便宜的那个。
         let img = gradient(256, 256);
         let (bytes, _) = bake(
             &img,
@@ -575,7 +802,7 @@ mod tests {
             },
             BakeOptions {
                 format: FormatOption::Auto,
-                color_space: ColorSpace::Linear,
+                color_space: ColorSpace::Srgb,
                 mipmaps: true,
                 verify: false,
                 min_psnr: None,
@@ -584,7 +811,7 @@ mod tests {
         .unwrap();
 
         let info = crate::dds::parse(&bytes).unwrap();
-        let expected_chain = crate::mip::generate_mip_chain(&img, ColorSpace::Linear);
+        let expected_chain = crate::mip::generate_mip_chain(&img, ColorSpace::Srgb);
         assert_eq!(info.mip_count as usize, expected_chain.len());
 
         // 逐层做 **逐字节** 比对而不是比 PSNR。
