@@ -253,14 +253,17 @@ ERHIResult FPassManager::OnResizeAll(IRHIDevice*         device,
     // 2. 通知所有 Pass 重建尺寸相关资源
     for (SizeType i = 0; i < m_Passes.GetSize(); ++i)
     {
-        result = m_Passes[i]->OnResize(device,
-                                        swapchain,
-                                        newExtent,
-                                        swapchainImageCount,
-                                        m_SharedDepthTexture,
-                                        m_SharedDepthTextureView,
-                                        m_SharedColorTexture,
-                                        m_SharedColorTextureView);
+        FPassResizeDesc resizeDesc;
+        resizeDesc.Device              = device;
+        resizeDesc.Swapchain           = swapchain;
+        resizeDesc.Extent              = newExtent;
+        resizeDesc.SwapchainImageCount = swapchainImageCount;
+        resizeDesc.SharedDepth         = m_SharedDepthTexture;
+        resizeDesc.SharedDepthView     = m_SharedDepthTextureView;
+        resizeDesc.SharedColor         = m_SharedColorTexture;
+        resizeDesc.SharedColorView     = m_SharedColorTextureView;
+
+        result = m_Passes[i]->OnResize(resizeDesc);
         if (!IsRHISuccess(result))
         {
             LIMX_LOG(LogRenderer, Error,

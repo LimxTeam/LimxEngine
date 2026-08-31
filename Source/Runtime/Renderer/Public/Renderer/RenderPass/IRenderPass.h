@@ -100,6 +100,42 @@ struct FPassSetupDesc
 };
 
 // ============================================================================
+// FPassResizeDesc — 交换链重建时传给各 Pass 的资源
+// ============================================================================
+
+/// 用结构体而不是位置参数。
+///
+/// 原先是 8 个位置参数, 其中 4 个是同族句柄 (FRHITextureHandle 与
+/// FRHITextureViewHandle 各两个)。同族句柄互相传反**不会编译报错** ——
+/// 只会在运行时表现为"这张图里存着另一张图的内容", 而那种错误在画面上
+/// 常常似是而非。
+///
+/// 薄 G-Buffer 之后这里还要再加法线与速度两组, 到 12 个参数; 那时靠位置
+/// 对齐已经不现实了。
+struct FPassResizeDesc
+{
+    /// GPU 设备
+    IRHIDevice* Device = nullptr;
+
+    /// 新交换链句柄
+    FRHISwapchainHandle Swapchain;
+
+    /// 新交换链尺寸
+    FRHIExtent2D Extent = {};
+
+    /// 新交换链图像数量
+    UInt32 SwapchainImageCount = 0;
+
+    /// 共享深度
+    FRHITextureHandle     SharedDepth;
+    FRHITextureViewHandle SharedDepthView;
+
+    /// 共享颜色 (HDR 离屏目标)
+    FRHITextureHandle     SharedColor;
+    FRHITextureViewHandle SharedColorView;
+};
+
+// ============================================================================
 // FRenderPassContext — Pass 执行上下文
 // 在 FPassManager::ExecuteAll 中构建，传递给各 Pass 的 Execute()。
 // ============================================================================
@@ -187,21 +223,9 @@ public:
                          const FRenderPassContext& context) = 0;
 
     /// 交换链重建时重建 Pass 的尺寸相关 GPU 资源
-    /// @param device               GPU 设备
-    /// @param swapchain            新交换链句柄
-    /// @param newExtent            新交换链尺寸
-    /// @param swapchainImageCount  新交换链图像数量
-    /// @param newSharedDepth       新共享深度纹理句柄
-    /// @param newSharedDepthView   新共享深度纹理视图
+    /// @param desc 重建所需的全部资源与参数
     /// @return Success 或错误码
-    virtual ERHIResult OnResize(IRHIDevice*           device,
-                                FRHISwapchainHandle   swapchain,
-                                FRHIExtent2D          newExtent,
-                                UInt32                swapchainImageCount,
-                                FRHITextureHandle     newSharedDepth,
-                                FRHITextureViewHandle newSharedDepthView,
-                                FRHITextureHandle     newSharedColor,
-                                FRHITextureViewHandle newSharedColorView) = 0;
+    virtual ERHIResult OnResize(const FPassResizeDesc& desc) = 0;
 
     /// 释放依赖交换链尺寸或图像视图的资源。
     /// 在交换链销毁前调用，避免 framebuffer 持有失效的 swapchain image view。

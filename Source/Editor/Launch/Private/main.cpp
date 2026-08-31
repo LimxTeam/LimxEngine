@@ -81,6 +81,12 @@ struct FLaunchOptions
     /// 并行命令录制的线程数 (0 = 按硬件并发数)
     UInt32 RecordThreads = 0;
 
+    /// 每隔多少帧强制重建一次交换链 (0 = 不重建)
+    ///
+    /// OnResize 平时只有窗口缩放时才走, 自动化里没有任何东西会改窗口
+    /// 尺寸。这个开关让那条路径可以被回归覆盖。
+    UInt32 ResizeEveryFrames = 0;
+
     /// 是否启用并行命令录制
     ///
     /// 关掉时前向 Pass 走内联路径。两条路径共用同一份绘制代码, 因此
@@ -390,6 +396,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--record-threads") && (i + 1) < tokenCount)
         {
             options.RecordThreads = ParseUInt32(tokens[++i], 0);
+        }
+        else if (WideEquals(arg, L"--resize-test") && (i + 1) < tokenCount)
+        {
+            options.ResizeEveryFrames = ParseUInt32(tokens[++i], 0);
         }
         else if (WideEquals(arg, L"--no-parallel-record"))
         {
@@ -2178,6 +2188,21 @@ int WINAPI wWinMain(
         renderer.RenderFrame();
 
         ++loopFrame;
+
+        // 强制重建交换链 —— 让 OnResize 那条路径被回归覆盖。
+        //
+        // 放在 RenderFrame 之后而不是之前: 重建内部会 WaitIdle, 此刻上一帧
+        // 已经提交, 是最安全的时机。
+        if (launchOptions.ResizeEveryFrames > 0 &&
+            (loopFrame % launchOptions.ResizeEveryFrames) == 0)
+        {
+            if (!renderer.ForceRecreateSwapchain())
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Launch] 第 {} 帧的交换链重建失败", loopFrame);
+                return 6;
+            }
+        }
 
         // 5d. 预热结束后清空统计, 使基准只覆盖稳态帧
         if (!statsReset && loopFrame >= launchOptions.WarmupFrames)

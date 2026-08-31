@@ -67,14 +67,7 @@ public:
     void Execute(IRHICommandBuffer*        commandBuffer,
                  const FRenderPassContext& context) override;
 
-    ERHIResult OnResize(IRHIDevice*           device,
-                        FRHISwapchainHandle   swapchain,
-                        FRHIExtent2D          newExtent,
-                        UInt32                swapchainImageCount,
-                        FRHITextureHandle     newSharedDepth,
-                        FRHITextureViewHandle newSharedDepthView,
-                        FRHITextureHandle     newSharedColor,
-                        FRHITextureViewHandle newSharedColorView) override;
+    ERHIResult OnResize(const FPassResizeDesc& desc) override;
 
     void ReleaseSwapchainResources(IRHIDevice* device) override;
 

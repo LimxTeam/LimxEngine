@@ -331,6 +331,16 @@ public:
         return m_Recorder;
     }
 
+    /// 强制重建交换链资源 (走一遍完整的 OnResizeAll)
+    ///
+    /// 只为测试而暴露。这条路径平时只有窗口尺寸变化时才走, 而自动化里
+    /// 没有任何东西会改窗口尺寸 —— 于是它长期不被覆盖, 直到某次真的
+    /// 缩放窗口时才发现坏了。
+    LIMX_NODISCARD bool ForceRecreateSwapchain()
+    {
+        return IsRHISuccess(RecreateSwapchainResources());
+    }
+
     /// 设置录制线程数 (0 = 按硬件并发数, 1 = 单段)
     ///
     /// 必须在 Initialize 之前调用 —— 命令池与次级缓冲区在那时一次性建好,

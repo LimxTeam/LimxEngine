@@ -475,15 +475,30 @@ void FSkyPass::Execute(IRHICommandBuffer*        commandBuffer,
 // OnResize
 // ============================================================================
 
-ERHIResult FSkyPass::OnResize(IRHIDevice*           device,
-                              FRHISwapchainHandle   swapchain,
-                              FRHIExtent2D          newExtent,
-                              UInt32                swapchainImageCount,
-                              FRHITextureHandle     newSharedDepth,
-                              FRHITextureViewHandle newSharedDepthView,
-                              FRHITextureHandle     newSharedColor,
-                              FRHITextureViewHandle newSharedColorView)
+ERHIResult FSkyPass::OnResize(const FPassResizeDesc& desc)
 {
+    // 解出局部别名 —— 下面的函数体沿用原来的名字。
+    //
+    // 这样改动只落在签名上, 函数体一行不动, 便于确认这次重构确实没有
+    // 改变行为。
+    IRHIDevice* const           device               = desc.Device;
+    const FRHISwapchainHandle   swapchain            = desc.Swapchain;
+    const FRHIExtent2D          newExtent            = desc.Extent;
+    const UInt32                swapchainImageCount  = desc.SwapchainImageCount;
+    const FRHITextureHandle     newSharedDepth       = desc.SharedDepth;
+    const FRHITextureViewHandle newSharedDepthView   = desc.SharedDepthView;
+    const FRHITextureHandle     newSharedColor       = desc.SharedColor;
+    const FRHITextureViewHandle newSharedColorView   = desc.SharedColorView;
+
+    (void)device;
+    (void)swapchain;
+    (void)newExtent;
+    (void)swapchainImageCount;
+    (void)newSharedDepth;
+    (void)newSharedDepthView;
+    (void)newSharedColor;
+    (void)newSharedColorView;
+
     (void)swapchain;
     (void)swapchainImageCount;
     (void)newSharedDepth;

@@ -409,6 +409,18 @@ Invoke-Step 'IBL 白炉自检' -RequiresGpu {
     Invoke-Engine '--furnace-check'
 }
 
+# 交换链重建自检 —— 需要真实 GPU。
+#
+# OnResize 平时只有窗口缩放时才走, 而自动化里没有任何东西会改窗口尺寸。
+# 这条路径因此长期不被覆盖: 第五阶段 Day 4 把 OnResize 的 8 个位置参数
+# 重构成结构体之后, "构建通过 + 画面没变"看着像验过了 —— 而画面没变恰恰
+# 是因为那段代码根本没执行。
+#
+# 强制重建 8 次, 靠验证层与逐像素比对确认资源重建正确。
+Invoke-Step '交换链重建自检' -RequiresGpu {
+    Invoke-Engine '--scene Content/TestScene/testscene.obj --frames 40 --warmup 5 --resize-test 5'
+}
+
 # 资产导入回归哨兵 —— 需要真实 GPU (要建设备并上传纹理)。
 #
 # 导入是一次性成本, 不出现在任何逐帧数字里, 也不会让任何单元测试变红。
