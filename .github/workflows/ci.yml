@@ -102,6 +102,7 @@ jobs:
             Programs/target/release/lbt.exe
             Programs/target/release/lht.exe
             Programs/target/release/lsc.exe
+            Programs/target/release/lat.exe
 
   # ----------------------------------------------------------
   # C++ 引擎 — 源码规则 + 全量构建 + 单元测试

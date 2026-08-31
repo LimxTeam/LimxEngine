@@ -222,7 +222,7 @@ if (-not $SkipTools) {
     }
 
     Invoke-Step '发布工具到 Binaries/Tools' {
-        foreach ($tool in @('lbt', 'lht', 'lsc')) {
+        foreach ($tool in @('lbt', 'lht', 'lsc', 'lat')) {
             $source = "Programs/target/release/$tool.exe"
             if (Test-Path $source) {
                 Copy-Item $source "Binaries/Tools/$tool.exe" -Force
