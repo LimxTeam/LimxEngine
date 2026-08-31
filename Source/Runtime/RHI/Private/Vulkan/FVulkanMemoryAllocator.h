@@ -154,9 +154,12 @@ public:
     /// @param device         逻辑设备
     /// @param memoryProps    物理设备内存属性
     /// @param deviceLimits   物理设备限制 (取粒度、原子尺寸、分配数上限)
+    /// @param deviceAddressEnabled 设备是否启用了 bufferDeviceAddress。
+    ///        为真时所有显存分配都带上 DEVICE_ADDRESS 标志 —— 加速结构要用。
     ERHIResult Initialize(VkDevice device,
                           const VkPhysicalDeviceMemoryProperties& memoryProps,
-                          const VkPhysicalDeviceLimits& deviceLimits);
+                          const VkPhysicalDeviceLimits& deviceLimits,
+                          bool deviceAddressEnabled);
 
     /// 释放全部块与专用分配
     void Shutdown();
@@ -292,6 +295,9 @@ private:
 
     /// 设备允许的最大 vkAllocateMemory 存活数
     UInt32 m_MaxDeviceAllocationCount = 0;
+
+    /// 是否给每次分配都带上设备地址标志
+    bool m_DeviceAddressEnabled = false;
 
     /// 超过此尺寸的请求走专用分配
     VkDeviceSize m_DedicatedThreshold = 0;

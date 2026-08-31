@@ -432,6 +432,149 @@ void FVulkanCommandBuffer::DrawIndexedIndirect(
 // 计算
 // ============================================================================
 
+// ============================================================================
+// 加速结构构建
+// ============================================================================
+
+void FVulkanCommandBuffer::BuildAccelStruct(
+    FRHIAccelStructHandle handle, UInt32 instanceCount)
+{
+    const FVulkanAccelStructData* data =
+        m_Device->GetAccelStructData(handle);
+
+    const FVulkanDevice::FRayTracingFunctions& rt =
+        m_Device->GetRayTracingFunctions();
+
+    if (data == nullptr || data->AccelStruct == VK_NULL_HANDLE ||
+        rt.CmdBuild == nullptr)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] BuildAccelStruct 的句柄无效或扩展函数缺失");
+        return;
+    }
+
+    // 本次构建的图元数。TLAS 是实例数, BLAS 是三角形数。
+    //
+    // TLAS 传 0 会构建出一棵空树 —— 所有射线都不命中, 而画面上"什么都
+    // 没照到"和"场景本来就是空的"看起来完全一样。所以这里把它判掉。
+    UInt32 primitiveCount = data->PrimitiveCount;
+
+    if (data->IsTopLevel)
+    {
+        if (instanceCount == 0)
+        {
+            LIMX_LOG(LogRHI, Error,
+                "[Vulkan] TLAS 构建的实例数为 0 — 这会得到一棵空树");
+            return;
+        }
+
+        if (instanceCount > data->MaxInstanceCount)
+        {
+            LIMX_LOG(LogRHI, Error,
+                "[Vulkan] TLAS 构建的实例数 {} 超过上限 {}",
+                instanceCount, data->MaxInstanceCount);
+            return;
+        }
+
+        primitiveCount = instanceCount;
+    }
+
+    // 几何信息在创建时用过一遍, 这里必须**逐字重建**同一份 —— Vulkan 不
+    // 保存它。少填一个字段 (比如 maxVertex) 的后果不是报错, 而是驱动按
+    // 一个错的范围去读顶点。
+    VkAccelerationStructureGeometryKHR geom = {};
+    geom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+
+    if (data->IsTopLevel)
+    {
+        geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        geom.flags        = VK_GEOMETRY_OPAQUE_BIT_KHR;
+
+        VkAccelerationStructureGeometryInstancesDataKHR& inst =
+            geom.geometry.instances;
+        inst.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        inst.arrayOfPointers    = VK_FALSE;
+        inst.data.deviceAddress = data->InstanceAddress;
+    }
+    else
+    {
+        geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geom.flags        = data->GeometryFlags;
+
+        VkAccelerationStructureGeometryTrianglesDataKHR& tri =
+            geom.geometry.triangles;
+        tri.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tri.vertexFormat             = data->VertexFormat;
+        tri.vertexData.deviceAddress = data->VertexAddress;
+        tri.vertexStride             = data->VertexStride;
+        tri.maxVertex                = data->MaxVertex;
+        tri.indexType                = data->IndexType;
+        tri.indexData.deviceAddress  = data->IndexAddress;
+        tri.transformData.deviceAddress = 0;
+    }
+
+    // 暂存地址向上取整到规范要求的对齐。创建时已经为此多要了 (对齐-1) 字节。
+    const UInt64 rawScratch =
+        m_Device->GetBufferDeviceAddress(data->ScratchBuffer);
+
+    if (rawScratch == 0)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] 暂存缓冲区取不到设备地址 — 构建取消");
+        return;
+    }
+
+    const UInt64 align = m_Device->GetScratchAlignment();
+    const UInt64 scratchAddress = (rawScratch + align - 1) & ~(align - 1);
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
+    buildInfo.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = data->IsTopLevel
+        ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+        : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    buildInfo.flags = data->BuildFlags;
+    buildInfo.mode  = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.dstAccelerationStructure = data->AccelStruct;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries   = &geom;
+    buildInfo.scratchData.deviceAddress = scratchAddress;
+
+    VkAccelerationStructureBuildRangeInfoKHR range = {};
+    range.primitiveCount  = primitiveCount;
+    range.primitiveOffset = 0;
+    range.firstVertex     = 0;
+    range.transformOffset = 0;
+
+    const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = { &range };
+
+    rt.CmdBuild(m_CommandBuffer, 1, &buildInfo, ranges);
+}
+
+void FVulkanCommandBuffer::AccelStructBarrier()
+{
+    // 构建写 -> 着色器读。
+    //
+    // 这里必须是全局内存屏障而不是缓冲区屏障: 加速结构的存储在驱动看来
+    // 不只是那块存储缓冲区, TLAS 还会去读 BLAS。按缓冲区逐个挡的话,
+    // 挡不住的那部分是驱动内部的引用, 而那正是竞争最容易发生的地方。
+    VkMemoryBarrier barrier = {};
+    barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                            VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        m_CommandBuffer,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 void FVulkanCommandBuffer::Dispatch(
     UInt32 groupCountX, UInt32 groupCountY, UInt32 groupCountZ)
 {

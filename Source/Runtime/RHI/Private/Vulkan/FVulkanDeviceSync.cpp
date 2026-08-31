@@ -1133,7 +1133,23 @@ EFormatFeature FVulkanDevice::GetFormatFeatures(EPixelFormat format) const
 
 bool FVulkanDevice::IsRayTracingSupported() const
 {
-    // 通过检查扩展列表判断 (简化实现)
+    // 读初始化时定下的那个值。
+    //
+    // 原来的实现每次调用都重新枚举一遍设备扩展, 而且**只看扩展不看特性** ——
+    // 驱动完全可以报告扩展却把特性位关掉 (虚拟化与软件实现里很常见)。那时
+    // 这个函数报"支持", 而任何一次加速结构调用都会失败, 报的却是别的错。
+    //
+    // 现在它与"设备创建时到底启用了没有"是同一个事实。
+    return m_RayTracingAvailable;
+}
+
+bool FVulkanDevice::HasDeviceExtension(const AnsiChar* name) const
+{
+    if (name == nullptr)
+    {
+        return false;
+    }
+
     UInt32 extensionCount = 0;
     vkEnumerateDeviceExtensionProperties(
         m_PhysicalDevice, nullptr, &extensionCount, nullptr);
@@ -1153,22 +1169,23 @@ bool FVulkanDevice::IsRayTracingSupported() const
     vkEnumerateDeviceExtensionProperties(
         m_PhysicalDevice, nullptr, &extQuery, extensions.GetData());
 
-    const char* target =
-        VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME;
-
     for (UInt32 i = 0; i < extQuery; ++i)
     {
-        const char* ext = extensions[i].extensionName;
-        bool isMatch = true;
-        for (Int32 c = 0; target[c] != '\0'; ++c)
+        const AnsiChar* ext = extensions[i].extensionName;
+
+        Int32 c = 0;
+        while (name[c] != '\0' && ext[c] == name[c])
         {
-            if (ext[c] != target[c])
-            {
-                isMatch = false;
-                break;
-            }
+            ++c;
         }
-        if (isMatch)
+
+        // 两端都到头才算命中。
+        //
+        // 只判"name 走完了"是前缀匹配 —— VK_KHR_ray_query 会命中一个叫
+        // VK_KHR_ray_query_something 的扩展。这个引擎已经在着色器布局检查
+        // 上栽过一次同样的跟头 (fragMaterialIndex 命中 materialIndex),
+        // 所以这里把两个终止条件都写上。
+        if (name[c] == '\0' && ext[c] == '\0')
         {
             return true;
         }

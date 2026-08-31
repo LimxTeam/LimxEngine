@@ -455,8 +455,46 @@ public:
     // 具体设备上的能力。这些能力**不是普遍保证的**, 必须查询而非假定。
     virtual EFormatFeature GetFormatFeatures(EPixelFormat format) const = 0;
 
-    // 是否支持光线追踪
+    // 是否支持光线追踪 (扩展齐备 + 特性可用 + 设备创建时已启用)
     virtual bool IsRayTracingSupported() const = 0;
+
+    // ------------------------------------------------------------------
+    // 加速结构
+    //
+    // 创建只分配存储并拿到句柄, **不填内容** —— 内容要靠命令缓冲区上的
+    // BuildAccelStruct 在 GPU 上构建。分开是因为构建要排进命令流, 而
+    // 创建不需要。
+    // ------------------------------------------------------------------
+
+    /// 创建底层加速结构 (装三角形)
+    virtual ERHIResult CreateBottomLevelAS(
+        const FRHIBlasDesc& desc, FRHIAccelStructHandle& outHandle) = 0;
+
+    /// 创建顶层加速结构 (装指向 BLAS 的实例)
+    virtual ERHIResult CreateTopLevelAS(
+        const FRHITlasDesc& desc, FRHIAccelStructHandle& outHandle) = 0;
+
+    /// 销毁加速结构 (连同它的存储与暂存缓冲区)
+    virtual void DestroyAccelStruct(FRHIAccelStructHandle& handle) = 0;
+
+    /// 把实例数组写进 TLAS 的实例缓冲区
+    ///
+    /// 只写内存, 不构建 —— 写完还要在命令缓冲区上 BuildAccelStruct 才生效。
+    /// count 超过创建时的 MaxInstanceCount 会失败而不是截断: 截断的后果是
+    /// 多出来的那些物体在光追里凭空消失, 而画面上什么错误都不会报。
+    virtual ERHIResult UpdateTlasInstances(
+        FRHIAccelStructHandle handle,
+        const FRHIAccelStructInstance* instances,
+        UInt32 count) = 0;
+
+    /// 取加速结构的设备地址 (失败返回 0)
+    virtual UInt64 GetAccelStructDeviceAddress(
+        FRHIAccelStructHandle handle) const = 0;
+
+    /// 取缓冲区的设备地址 (失败返回 0)
+    ///
+    /// 缓冲区必须以 EBufferUsage::ShaderDeviceAddress 创建。
+    virtual UInt64 GetBufferDeviceAddress(FRHIBufferHandle handle) const = 0;
 
     // 是否支持 Mesh Shader
     virtual bool IsMeshShaderSupported() const = 0;

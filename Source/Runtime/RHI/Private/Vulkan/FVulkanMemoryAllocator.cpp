@@ -70,12 +70,14 @@ FVulkanMemoryAllocator::~FVulkanMemoryAllocator()
 ERHIResult FVulkanMemoryAllocator::Initialize(
     VkDevice device,
     const VkPhysicalDeviceMemoryProperties& memoryProps,
-    const VkPhysicalDeviceLimits& deviceLimits)
+    const VkPhysicalDeviceLimits& deviceLimits,
+    bool deviceAddressEnabled)
 {
     LIMX_ASSERT(device != VK_NULL_HANDLE);
 
-    m_Device           = device;
-    m_MemoryProperties = memoryProps;
+    m_Device               = device;
+    m_MemoryProperties     = memoryProps;
+    m_DeviceAddressEnabled = deviceAddressEnabled;
 
     // 粒度为 0 在规范上不合法, 但个别驱动会上报 0 — 归一到 1 (无约束)
     m_BufferImageGranularity =
@@ -280,6 +282,22 @@ UInt32 FVulkanMemoryAllocator::CreateBlock(UInt32 memoryTypeIndex,
     allocInfo.allocationSize  = blockSize;
     allocInfo.memoryTypeIndex = memoryTypeIndex;
 
+    // 设备地址标志 —— 加速结构的构建输入 (顶点/索引/实例缓冲区) 与
+    // 暂存缓冲区都是靠 64 位设备地址喂给驱动的, 而 vkGetBufferDeviceAddress
+    // 要求**这块显存在分配时就带上这个标志**。
+    //
+    // 分配器不知道将来会有谁来问地址, 所以特性开启时一律带上 —— 这正是
+    // VMA 在 BUFFER_DEVICE_ADDRESS 模式下的做法。代价只是驱动多预留一段
+    // 地址空间; 而漏带的代价是取地址时返回 0, 加速结构静默地建在空气上。
+    VkMemoryAllocateFlagsInfo flagsInfo = {};
+
+    if (m_DeviceAddressEnabled)
+    {
+        flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        allocInfo.pNext = &flagsInfo;
+    }
+
     VkDeviceMemory memory = VK_NULL_HANDLE;
     const VkResult vkResult =
         vkAllocateMemory(m_Device, &allocInfo, nullptr, &memory);
@@ -446,6 +464,22 @@ ERHIResult FVulkanMemoryAllocator::AllocateDedicated(
     allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize  = requirements.size;
     allocInfo.memoryTypeIndex = memoryTypeIndex;
+
+    // 设备地址标志 —— 加速结构的构建输入 (顶点/索引/实例缓冲区) 与
+    // 暂存缓冲区都是靠 64 位设备地址喂给驱动的, 而 vkGetBufferDeviceAddress
+    // 要求**这块显存在分配时就带上这个标志**。
+    //
+    // 分配器不知道将来会有谁来问地址, 所以特性开启时一律带上 —— 这正是
+    // VMA 在 BUFFER_DEVICE_ADDRESS 模式下的做法。代价只是驱动多预留一段
+    // 地址空间; 而漏带的代价是取地址时返回 0, 加速结构静默地建在空气上。
+    VkMemoryAllocateFlagsInfo flagsInfo = {};
+
+    if (m_DeviceAddressEnabled)
+    {
+        flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        allocInfo.pNext = &flagsInfo;
+    }
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     const VkResult vkResult =

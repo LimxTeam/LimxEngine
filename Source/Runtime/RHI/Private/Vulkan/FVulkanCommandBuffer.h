@@ -113,6 +113,10 @@ public:
     // 计算
     // ====================================================================
 
+    void BuildAccelStruct(FRHIAccelStructHandle handle,
+                          UInt32 instanceCount) override;
+    void AccelStructBarrier() override;
+
     void Dispatch(UInt32 groupCountX, UInt32 groupCountY,
                    UInt32 groupCountZ) override;
     void DispatchIndirect(FRHIBufferHandle buffer,

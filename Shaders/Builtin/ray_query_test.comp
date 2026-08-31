@@ -1,0 +1,106 @@
+// ============================================================
+// 文件名称：ray_query_test.comp
+// 创建时间：2026-08-31
+// 创建者  ：LimxTeam
+// 设计哲学：这支着色器唯一的用途是给"加速结构到底建对了没有"提供一个
+//          可与 CPU 解析解直接比对的数字。它不参与任何画面 —— 判据的
+//          价值在于它失败时能被看见，而"看画面"看不见一棵结构错误的树。
+// 功能描述：对一批射线做 ray query 遍历，逐条输出命中距离、实例自定义
+//          下标、图元下标与命中标志。
+// 技术特性：GL_EXT_ray_query（无需光追管线，普通计算着色器即可发射线）；
+//          不透明标志下遍历自动提交，无需 any-hit 处理。
+// ============================================================
+
+#version 460
+
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 64) in;
+
+// 一条射线：原点 + tMin，方向 + tMax
+struct Ray
+{
+    vec4 OriginTMin;
+    vec4 DirTMax;
+};
+
+// 一条结果。与 C++ 侧的 FRayQueryResult 逐字段一致 (16 字节)
+struct RayResult
+{
+    float T;
+    uint  CustomIndex;
+    uint  PrimitiveIndex;
+    uint  Hit;
+};
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+
+layout(std430, set = 0, binding = 1) readonly buffer RayBuffer
+{
+    Ray rays[];
+} rayBuffer;
+
+layout(std430, set = 0, binding = 2) writeonly buffer ResultBuffer
+{
+    RayResult results[];
+} resultBuffer;
+
+layout(push_constant) uniform Params
+{
+    uint RayCount;
+} pc;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+
+    // 越界的线程直接退出。不写越界结果, 也不把最后一格重复写一遍 ——
+    // 后者会让"少发了几条射线"表现为最后几条结果相同, 而那看起来
+    // 完全像是几条射线本来就打在同一个地方。
+    if (index >= pc.RayCount)
+    {
+        return;
+    }
+
+    const Ray ray = rayBuffer.rays[index];
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        topLevel,
+        gl_RayFlagsOpaqueEXT,
+        0xFFu,
+        ray.OriginTMin.xyz,
+        ray.OriginTMin.w,
+        ray.DirTMax.xyz,
+        ray.DirTMax.w);
+
+    // 不透明几何体下这个循环至多转一圈就结束 —— 遍历自己提交最近命中。
+    while (rayQueryProceedEXT(query))
+    {
+    }
+
+    RayResult result;
+
+    if (rayQueryGetIntersectionTypeEXT(query, true) ==
+        gl_RayQueryCommittedIntersectionTriangleEXT)
+    {
+        result.T = rayQueryGetIntersectionTEXT(query, true);
+        result.CustomIndex = uint(
+            rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
+        result.PrimitiveIndex = uint(
+            rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+        result.Hit = 1u;
+    }
+    else
+    {
+        // 未命中用 -1 而不是 0 或极大值: 0 与"贴着原点命中"分不开,
+        // 极大值与"命中很远处"分不开。负距离在几何上不可能出现。
+        result.T = -1.0;
+        result.CustomIndex    = 0xFFFFFFFFu;
+        result.PrimitiveIndex = 0xFFFFFFFFu;
+        result.Hit = 0u;
+    }
+
+    resultBuffer.results[index] = result;
+}

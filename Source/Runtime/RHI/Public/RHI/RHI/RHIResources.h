@@ -89,6 +89,7 @@ namespace RHITags
     struct CommandBufferTag {};
     struct SwapchainTag {};
     struct QueryPoolTag {};
+    struct AccelStructTag {};
 } // namespace RHITags
 
 // ============================================================================
@@ -113,6 +114,117 @@ using FRHICommandPoolHandle     = THandle<RHITags::CommandPoolTag>;
 using FRHICommandBufferHandle   = THandle<RHITags::CommandBufferTag>;
 using FRHISwapchainHandle       = THandle<RHITags::SwapchainTag>;
 using FRHIQueryPoolHandle       = THandle<RHITags::QueryPoolTag>;
+using FRHIAccelStructHandle     = THandle<RHITags::AccelStructTag>;
+
+// ============================================================================
+// 光线追踪 — 加速结构
+//
+// 两层: 底层 (BLAS) 装三角形, 顶层 (TLAS) 装指向 BLAS 的实例及其变换。
+// 同一份几何体被摆放 100 次时只建一次 BLAS, TLAS 里放 100 个实例。
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// FRHIAccelStructGeometry — BLAS 里的一份三角形几何体
+// ----------------------------------------------------------------------------
+
+struct FRHIAccelStructGeometry
+{
+    // 顶点缓冲区。必须带 EBufferUsage::AccelStructBuild 与 ShaderDeviceAddress
+    FRHIBufferHandle VertexBuffer;
+
+    // 顶点数据在缓冲区里的起始字节偏移
+    UInt64 VertexOffset = 0;
+
+    // 顶点个数 (不是字节数)
+    UInt32 VertexCount = 0;
+
+    // 相邻两个顶点之间的字节跨度
+    UInt32 VertexStride = 0;
+
+    // 顶点位置的格式。加速结构只读位置那三个分量, 其余属性驱动一概不看
+    EPixelFormat VertexFormat = EPixelFormat::RGB32_SFLOAT;
+
+    // 索引缓冲区。同样需要 AccelStructBuild 与 ShaderDeviceAddress
+    FRHIBufferHandle IndexBuffer;
+
+    // 索引数据的起始字节偏移
+    UInt64 IndexOffset = 0;
+
+    // 索引个数。必须是 3 的倍数
+    UInt32 IndexCount = 0;
+
+    // 索引位宽
+    EIndexType IndexType = EIndexType::UInt32;
+
+    // 是否不透明 —— 为真时命中即终止, 不去调 any-hit 逻辑
+    bool Opaque = true;
+};
+
+// ----------------------------------------------------------------------------
+// FRHIAccelStructInstance — TLAS 里的一个实例
+//
+// 刻意不用 FMatrix: RHI 层不依赖 Core 的数学库, 而且这里是 3x4 而非 4x4 ——
+// 光追的实例变换没有透视行。行主序, 与 Vulkan 的 VkTransformMatrixKHR 一致。
+// ----------------------------------------------------------------------------
+
+struct FRHIAccelStructInstance
+{
+    // 3x4 行主序变换。Transform[row * 4 + col], 第 4 列是平移
+    Float32 Transform[12] =
+    {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+    };
+
+    // 着色器里通过 rayQueryGetIntersectionInstanceCustomIndexEXT 读到的值。
+    // 只有低 24 位有效 —— 高位会被静默丢弃, 所以超出范围要在上传前判掉
+    UInt32 CustomIndex = 0;
+
+    // 可见性掩码, 与射线的 cullMask 按位与, 结果为 0 则跳过该实例。只有低 8 位有效
+    UInt32 Mask = 0xFF;
+
+    // 这个实例引用的 BLAS
+    FRHIAccelStructHandle Blas;
+};
+
+/// CustomIndex 的有效位数 — 超出会被 Vulkan 静默截断
+inline constexpr UInt32 kAccelStructCustomIndexBits = 24;
+
+/// CustomIndex 的最大值
+inline constexpr UInt32 kAccelStructMaxCustomIndex =
+    (1u << kAccelStructCustomIndexBits) - 1u;
+
+// ----------------------------------------------------------------------------
+// FRHIBlasDesc / FRHITlasDesc — 加速结构创建描述符
+// ----------------------------------------------------------------------------
+
+struct FRHIBlasDesc
+{
+    // 几何体数组
+    const FRHIAccelStructGeometry* Geometries = nullptr;
+
+    // 几何体个数
+    UInt32 GeometryCount = 0;
+
+    // 偏向遍历速度 (为假时偏向构建速度)
+    bool PreferFastTrace = true;
+
+    // 调试名称
+    const char* DebugName = nullptr;
+};
+
+struct FRHITlasDesc
+{
+    // 实例数上限。构建时的实际实例数可以少于它, 但不能多
+    UInt32 MaxInstanceCount = 0;
+
+    // 偏向遍历速度
+    bool PreferFastTrace = true;
+
+    // 调试名称
+    const char* DebugName = nullptr;
+};
 
 // ============================================================================
 // FRHIBufferDesc — 缓冲区创建描述符
@@ -698,6 +810,11 @@ struct FRHIDescriptorWrite
 
     // 图像布局
     EImageLayout ImageLayout = EImageLayout::ShaderReadOnly;
+
+    // ── 加速结构绑定 (AccelerationStructure) ──
+
+    // 加速结构句柄 (通常是 TLAS)
+    FRHIAccelStructHandle AccelStruct;
 
     // 便捷工厂: Uniform 缓冲区绑定
     static FRHIDescriptorWrite UniformBuffer(

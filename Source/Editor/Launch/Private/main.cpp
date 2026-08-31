@@ -42,6 +42,7 @@
 // ============================================================
 
 #include "Launch/LaunchMinimal.h"
+#include "RayTracingCheck.h"
 #include "RenderCore/Material/FMaterialManager.h"
 #include "Engine/Rendering/FSceneLoader.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
@@ -214,6 +215,9 @@ struct FLaunchOptions
 
     /// 半分辨率 AO 自检: 与全分辨率逐像素比对, 以退出码报告
     bool AoHalfCheck = false;
+
+    /// 光追自检: 加速结构的 GPU 遍历与 CPU 解析解逐条比对, 以退出码报告
+    bool RayTracingCheck = false;
 
     /// GTAO 的采样半径 (世界单位)
     Float32 AoRadius = 0.8f;
@@ -680,6 +684,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--ao-half-check"))
         {
             options.AoHalfCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-check"))
+        {
+            options.RayTracingCheck = true;
         }
         else if (WideEquals(arg, L"--ao-check"))
         {
@@ -8032,6 +8040,7 @@ int WINAPI wWinMain(
     bool    gpuDrivenCheckPassed = true;
     bool    aoHalfCheckPassed = true;
     bool    showcaseCheckPassed = true;
+    bool    rayTracingCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -8100,6 +8109,12 @@ int WINAPI wWinMain(
             if (launchOptions.AoHalfCheck)
             {
                 aoHalfCheckPassed = RunAoHalfChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.RayTracingCheck)
+            {
+                rayTracingCheckPassed = RunRayTracingChecks(
+                    renderContext.GetDevice(), &renderContext);
             }
 
             if (launchOptions.ShowcaseCheck)
@@ -8283,6 +8298,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.ShowcaseCheck)
     {
         selfCheckCode = FinalizeSelfCheck(showcaseCheckPassed, 17, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RayTracingCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rayTracingCheckPassed, 18, errorSink,
                                           errorsBeforeShutdown);
     }
 

@@ -321,6 +321,23 @@ public:
     // 计算分派
     // ====================================================================
 
+    // ------------------------------------------------------------------
+    // 加速结构构建
+    //
+    // 录进命令流, 在 GPU 上执行。构建之后、着色器读取之前必须插一道
+    // 屏障 (AccelerationStructureWrite -> AccelerationStructureRead)。
+    // ------------------------------------------------------------------
+
+    /// 构建 (或重建) 一个加速结构
+    ///
+    /// instanceCount 只对 TLAS 有意义: 本次构建实际使用多少个实例。
+    /// 对 BLAS 传 0。
+    virtual void BuildAccelStruct(FRHIAccelStructHandle handle,
+                                  UInt32 instanceCount) = 0;
+
+    /// 加速结构写入 -> 着色器读取 的屏障
+    virtual void AccelStructBarrier() = 0;
+
     virtual void Dispatch(UInt32 groupCountX,
                            UInt32 groupCountY,
                            UInt32 groupCountZ) = 0;

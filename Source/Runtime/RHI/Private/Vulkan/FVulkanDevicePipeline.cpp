@@ -1110,9 +1110,18 @@ void FVulkanDevice::UpdateDescriptorSets(const FRHIDescriptorWrite* writes,
     TSmallVector<VkDescriptorBufferInfo, kInlineWrites> bufferInfos;
     TSmallVector<VkDescriptorImageInfo, kInlineWrites>  imageInfos;
 
+    // 加速结构走 pNext 而不是 pBufferInfo/pImageInfo, 所以要第四个数组。
+    // 同样一次撑到位 —— vkWrites[i].pNext 指向 accelInfos[i], 中途扩容
+    // 会让先前写好的指针全部悬空。
+    TSmallVector<VkWriteDescriptorSetAccelerationStructureKHR, kInlineWrites>
+        accelInfos;
+    TSmallVector<VkAccelerationStructureKHR, kInlineWrites> accelHandles;
+
     ResizeZeroed(vkWrites, static_cast<SizeType>(count));
     ResizeZeroed(bufferInfos, static_cast<SizeType>(count));
     ResizeZeroed(imageInfos, static_cast<SizeType>(count));
+    ResizeZeroed(accelInfos, static_cast<SizeType>(count));
+    ResizeZeroed(accelHandles, static_cast<SizeType>(count));
 
     for (UInt32 i = 0; i < count; ++i)
     {
@@ -1165,7 +1174,33 @@ void FVulkanDevice::UpdateDescriptorSets(const FRHIDescriptorWrite* writes,
             break;
         }
 
+        case EDescriptorType::AccelerationStructure:
+        {
+            const FVulkanAccelStructData* accel =
+                m_AccelStructs.Get(src.AccelStruct);
+
+            accelHandles[i] = (accel != nullptr)
+                ? accel->AccelStruct : VK_NULL_HANDLE;
+
+            VkWriteDescriptorSetAccelerationStructureKHR& accelInfo =
+                accelInfos[i];
+            accelInfo.sType =
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+            accelInfo.accelerationStructureCount = 1;
+            accelInfo.pAccelerationStructures    = &accelHandles[i];
+
+            dst.pNext = &accelInfos[i];
+            break;
+        }
+
         default:
+            // 静默跳过的后果是这一条写入带着空载荷交给驱动: 描述符保持
+            // 旧内容, 而着色器照读不误。加一种描述符类型却忘了在这里加
+            // 分支时, 这条日志是唯一会说话的地方。
+            LIMX_LOG(LogRHI, Error,
+                "[Vulkan] UpdateDescriptorSets 遇到未处理的描述符类型 {} "
+                "(绑定 {}) — 该绑定不会被更新",
+                static_cast<Int32>(src.Type), src.Binding);
             break;
         }
     }

@@ -188,8 +188,9 @@ ERHIResult FVulkanDevice::Initialize(void* nativeWindowHandle,
     }
 
     // 显存分配器必须在逻辑设备就绪后、任何资源创建之前初始化
-    result = m_MemoryAllocator.Initialize(m_Device, m_MemoryProperties,
-                                          m_DeviceProperties.limits);
+    result = m_MemoryAllocator.Initialize(
+        m_Device, m_MemoryProperties, m_DeviceProperties.limits,
+        m_DeviceFeatures12.bufferDeviceAddress != VK_FALSE);
     if (!IsRHISuccess(result))
     {
         return result;
@@ -604,11 +605,24 @@ ERHIResult FVulkanDevice::SelectPhysicalDevice()
     m_DeviceFeatures14.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
 
+    m_AccelStructFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    m_RayQueryFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+
     m_DeviceFeatures11.pNext = &m_DeviceFeatures12;
     m_DeviceFeatures12.pNext = &m_DeviceFeatures13;
     m_DeviceFeatures13.pNext =
-        (m_ApiVersion >= VK_API_VERSION_1_4) ? &m_DeviceFeatures14 : nullptr;
-    m_DeviceFeatures14.pNext = nullptr;
+        (m_ApiVersion >= VK_API_VERSION_1_4)
+            ? static_cast<void*>(&m_DeviceFeatures14)
+            : static_cast<void*>(&m_AccelStructFeatures);
+    m_DeviceFeatures14.pNext = &m_AccelStructFeatures;
+
+    // 光追那两个结构挂在链尾。挂之前不需要判扩展在不在 ——
+    // vkGetPhysicalDeviceFeatures2 对不认识的结构体会原样跳过并把里面的位
+    // 全部置零, 于是"不支持"自然表现为特性位为假。
+    m_AccelStructFeatures.pNext = &m_RayQueryFeatures;
+    m_RayQueryFeatures.pNext    = nullptr;
 
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -804,11 +818,51 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     deviceFeatures.pipelineStatisticsQuery =
         m_DeviceFeatures.pipelineStatisticsQuery;
 
-    // 必需的设备扩展
-    const char* deviceExtensions[] =
+    // ------------------------------------------------------------------
+    // 设备扩展 —— 必需的 + 可选的光追那一组
+    //
+    // 光追要三个扩展一起: acceleration_structure 建加速结构,
+    // ray_query 让普通着色器 (片段/计算) 里能发射线,
+    // deferred_host_operations 是前者的依赖 (即使不用主机侧构建也必须启用)。
+    //
+    // 少启用其中任何一个, vkCreateDevice 会报 EXTENSION_NOT_PRESENT ——
+    // 而那条错误不会告诉你缺的是哪一个。
+    // ------------------------------------------------------------------
+    const char* deviceExtensions[8] =
     {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
+
+    UInt32 extensionCount = 1;
+
+    const bool wantRayTracing =
+        HasDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+        HasDeviceExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+        HasDeviceExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+        m_AccelStructFeatures.accelerationStructure != VK_FALSE &&
+        m_RayQueryFeatures.rayQuery != VK_FALSE &&
+        m_DeviceFeatures12.bufferDeviceAddress != VK_FALSE;
+
+    if (wantRayTracing)
+    {
+        deviceExtensions[extensionCount++] =
+            VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+        deviceExtensions[extensionCount++] =
+            VK_KHR_RAY_QUERY_EXTENSION_NAME;
+        deviceExtensions[extensionCount++] =
+            VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+    }
+
+    LIMX_LOG(LogRHI, Display,
+        "[Vulkan] 光追 — 扩展齐备:{} 加速结构特性:{} rayQuery 特性:{} "
+        "设备地址:{} → {}",
+        HasDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+            HasDeviceExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+            HasDeviceExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME),
+        m_AccelStructFeatures.accelerationStructure != VK_FALSE,
+        m_RayQueryFeatures.rayQuery != VK_FALSE,
+        m_DeviceFeatures12.bufferDeviceAddress != VK_FALSE,
+        wantRayTracing ? "启用" : "不可用");
 
     // ------------------------------------------------------------------
     // 版本特性裁剪
@@ -887,17 +941,41 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     features13.shaderZeroInitializeWorkgroupMemory =
         m_DeviceFeatures13.shaderZeroInitializeWorkgroupMemory;
 
+    // 光追特性 —— 只在三个扩展都齐备且特性位为真时才挂进链里。
+    //
+    // 请求任一不支持的特性会让 vkCreateDevice 整个失败, 所以这里的判断
+    // 必须与上面决定"启不启用扩展"的判断是**同一个** wantRayTracing。
+    // 两处各判一次的话, 扩展启了而特性没挂 (或反过来) 都是创建失败。
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeatures = {};
+    accelFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    accelFeatures.accelerationStructure = VK_TRUE;
+
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures = {};
+    rayQueryFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQueryFeatures.rayQuery = VK_TRUE;
+
     // 特性链
     features12.pNext = &features13;
-    features13.pNext = nullptr;
+
+    if (wantRayTracing)
+    {
+        features13.pNext        = &accelFeatures;
+        accelFeatures.pNext     = &rayQueryFeatures;
+        rayQueryFeatures.pNext  = nullptr;
+    }
+    else
+    {
+        features13.pNext = nullptr;
+    }
 
     VkDeviceCreateInfo createInfo = {};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.pNext                   = &features12;
     createInfo.queueCreateInfoCount    = uniqueCount;
     createInfo.pQueueCreateInfos       = queueCreateInfos;
-    createInfo.enabledExtensionCount   =
-        static_cast<UInt32>(LIMX_ARRAY_COUNT(deviceExtensions));
+    createInfo.enabledExtensionCount   = extensionCount;
     createInfo.ppEnabledExtensionNames = deviceExtensions;
     createInfo.pEnabledFeatures        = &deviceFeatures;
 
@@ -920,10 +998,18 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     vkGetDeviceQueue(m_Device, m_PresentQueueFamily, 0,
                       &m_PresentQueue);
 
+    // 设备创建成功之后才算数 —— 在此之前 wantRayTracing 只是"打算启用"。
+    m_RayTracingAvailable = wantRayTracing;
+
+    // 扩展函数入口必须在这里载入 —— 它们要 VkDevice, 所以早一步都拿不到。
+    // 载入失败会把 m_RayTracingAvailable 再改回假。
+    LoadRayTracingFunctions();
+
     LIMX_LOG(LogRHI, Log,
-        "[Vulkan] 逻辑设备创建完成 — 图形:{} 计算:{} 传输:{} 呈现:{}",
+        "[Vulkan] 逻辑设备创建完成 — 图形:{} 计算:{} 传输:{} 呈现:{} 光追:{}",
         m_GraphicsQueueFamily, m_ComputeQueueFamily,
-        m_TransferQueueFamily, m_PresentQueueFamily);
+        m_TransferQueueFamily, m_PresentQueueFamily,
+        m_RayTracingAvailable);
 
     return ERHIResult::Success;
 }
@@ -948,7 +1034,24 @@ ERHIResult FVulkanDevice::CreateDescriptorPool()
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1024 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1024 },
         { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,        512  },
+
+        // 加速结构 —— 只在光追可用时才占一格。扩展没启用时把这个类型写进
+        // 池里是非法的, 所以下面的 poolSizeCount 要跟着变。
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 256 },
     };
+
+    // 数组长度自己算 —— 之前这里是写死的 11, 与数组各改各的。加一项而忘了
+    // 改数字的后果是新类型的描述符一个都分配不出来, 而报错发生在很远的
+    // 分配点上, 看不出跟这里有关。
+    UInt32 poolSizeCount =
+        static_cast<UInt32>(LIMX_ARRAY_COUNT(poolSizes));
+
+    if (!m_RayTracingAvailable)
+    {
+        // 靠"加速结构那一项排在数组最后"才能这样砍。往后面再加类型的话,
+        // 必须加在它前面。
+        --poolSizeCount;
+    }
 
     VkDescriptorPoolCreateInfo createInfo = {};
     createInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -958,7 +1061,7 @@ ERHIResult FVulkanDevice::CreateDescriptorPool()
     createInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
                              | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     createInfo.maxSets       = 8192;
-    createInfo.poolSizeCount = 11;
+    createInfo.poolSizeCount = poolSizeCount;
     createInfo.pPoolSizes    = poolSizes;
 
     VkResult vkResult = vkCreateDescriptorPool(m_Device, &createInfo,

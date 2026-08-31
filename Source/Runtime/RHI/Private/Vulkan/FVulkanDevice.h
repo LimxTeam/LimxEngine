@@ -201,6 +201,52 @@ struct FVulkanQueryPoolData
     UInt32      Count = 0;
 };
 
+/// 一个加速结构连同它自带的三块缓冲区
+///
+/// 加速结构本身只是个"视图" —— 真正的数据在 StorageBuffer 里。另外两块是
+/// 构建期需要的: ScratchBuffer 是驱动的临时工作区, InstanceBuffer 只有
+/// TLAS 用 (装 VkAccelerationStructureInstanceKHR 数组)。
+///
+/// 三块都跟着加速结构一起活到销毁, 而不是构建完就放 —— 因为重建时还要用,
+/// 而重建 (每帧更新 TLAS) 是常态。
+struct FVulkanAccelStructData
+{
+    VkAccelerationStructureKHR AccelStruct = VK_NULL_HANDLE;
+
+    /// 加速结构数据所在的缓冲区
+    FRHIBufferHandle StorageBuffer;
+
+    /// 构建期的临时工作区
+    FRHIBufferHandle ScratchBuffer;
+
+    /// TLAS 的实例数组 (BLAS 上无效)
+    FRHIBufferHandle InstanceBuffer;
+
+    /// 构建输入的几何信息 —— 重建时原样再用一次
+    ///
+    /// 这些字段里存的是**设备地址**而不是句柄, 所以缓冲区被销毁重建之后
+    /// 必须重新创建加速结构, 不能只重建。
+    VkDeviceAddress VertexAddress = 0;
+    VkDeviceAddress IndexAddress  = 0;
+    VkDeviceAddress InstanceAddress = 0;
+
+    UInt32 PrimitiveCount   = 0;
+    UInt32 MaxVertex        = 0;
+    UInt32 VertexStride     = 0;
+    VkFormat VertexFormat   = VK_FORMAT_R32G32B32_SFLOAT;
+    VkIndexType IndexType   = VK_INDEX_TYPE_UINT32;
+    VkGeometryFlagsKHR GeometryFlags = 0;
+
+    /// TLAS 时为真
+    bool IsTopLevel = false;
+
+    /// 创建时定下的实例数上限 (BLAS 上为 0)
+    UInt32 MaxInstanceCount = 0;
+
+    /// 偏向遍历速度还是构建速度
+    VkBuildAccelerationStructureFlagsKHR BuildFlags = 0;
+};
+
 // ============================================================================
 // FVulkanDevice — IRHIDevice Vulkan 实现
 // ============================================================================
@@ -389,6 +435,66 @@ public:
     EFormatFeature GetFormatFeatures(EPixelFormat format) const override;
     bool IsRayTracingSupported() const override;
     bool IsMeshShaderSupported() const override;
+
+    // ---- 加速结构 ----
+    ERHIResult CreateBottomLevelAS(
+        const FRHIBlasDesc& desc,
+        FRHIAccelStructHandle& outHandle) override;
+    ERHIResult CreateTopLevelAS(
+        const FRHITlasDesc& desc,
+        FRHIAccelStructHandle& outHandle) override;
+    void DestroyAccelStruct(FRHIAccelStructHandle& handle) override;
+    ERHIResult UpdateTlasInstances(
+        FRHIAccelStructHandle handle,
+        const FRHIAccelStructInstance* instances,
+        UInt32 count) override;
+    UInt64 GetAccelStructDeviceAddress(
+        FRHIAccelStructHandle handle) const override;
+    UInt64 GetBufferDeviceAddress(FRHIBufferHandle handle) const override;
+
+    /// 取加速结构的内部数据 (命令缓冲区构建时用)
+    LIMX_NODISCARD const FVulkanAccelStructData* GetAccelStructData(
+        FRHIAccelStructHandle handle) const
+    {
+        return m_AccelStructs.Get(handle);
+    }
+
+    /// 光追扩展函数入口 —— 设备创建后由 LoadRayTracingFunctions 填好
+    ///
+    /// 这些是扩展函数, 不在 vulkan-1.dll 的导出表里, 必须逐个
+    /// vkGetDeviceProcAddr。取不到时留 nullptr, 调用方在用之前必须判空 ——
+    /// 直接调空指针是崩溃, 而崩溃至少还看得见; 真正危险的是"取不到就跳过",
+    /// 那会让加速结构静默地不构建。
+    struct FRayTracingFunctions
+    {
+        PFN_vkCreateAccelerationStructureKHR Create = nullptr;
+        PFN_vkDestroyAccelerationStructureKHR Destroy = nullptr;
+        PFN_vkGetAccelerationStructureBuildSizesKHR GetBuildSizes = nullptr;
+        PFN_vkCmdBuildAccelerationStructuresKHR CmdBuild = nullptr;
+        PFN_vkGetAccelerationStructureDeviceAddressKHR GetDeviceAddress =
+            nullptr;
+
+        LIMX_NODISCARD bool IsComplete() const
+        {
+            return Create != nullptr && Destroy != nullptr &&
+                   GetBuildSizes != nullptr && CmdBuild != nullptr &&
+                   GetDeviceAddress != nullptr;
+        }
+    };
+
+    LIMX_NODISCARD const FRayTracingFunctions& GetRayTracingFunctions() const
+    {
+        return m_RayTracingFunctions;
+    }
+
+    /// 暂存缓冲区的设备地址对齐要求 (至少 1, 恒为 2 的幂)
+    LIMX_NODISCARD UInt64 GetScratchAlignment() const
+    {
+        const UInt64 reported = static_cast<UInt64>(
+            m_AccelStructProperties
+                .minAccelerationStructureScratchOffsetAlignment);
+        return (reported > 0) ? reported : 1;
+    }
     bool IsDrawIndirectFirstInstanceSupported() const override;
 
     // ====================================================================
@@ -552,6 +658,45 @@ private:
     VkPhysicalDeviceVulkan13Features m_DeviceFeatures13 = {};
     VkPhysicalDeviceVulkan14Features m_DeviceFeatures14 = {};
 
+    // ---- 光追 ----
+    //
+    // 扩展存在**不等于**特性可用: 驱动可以报告扩展而把特性位关掉 (常见于
+    // 虚拟化与软件实现)。两者都查, 缺一不可 —— 只查扩展的话
+    // vkCreateDevice 会因为请求了未支持的特性而整个失败, 而那时的报错是
+    // "FEATURE_NOT_PRESENT", 与"这台机器没有光追"看不出区别。
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR
+        m_AccelStructFeatures = {};
+    VkPhysicalDeviceRayQueryFeaturesKHR m_RayQueryFeatures = {};
+
+    /// 查询某个设备扩展在物理设备上是否可用 (全字匹配, 非前缀)
+    LIMX_NODISCARD bool HasDeviceExtension(const AnsiChar* name) const;
+
+    /// 光追是否真的可用 (扩展 + 特性 + 已在设备创建时启用)
+    ///
+    /// 在初始化时定下来, 之后只读。原来的 IsRayTracingSupported 每次调用都
+    /// 重新枚举一遍扩展 —— 既慢, 又只看扩展不看特性。
+    bool m_RayTracingAvailable = false;
+
+    /// 光追扩展函数入口
+    FRayTracingFunctions m_RayTracingFunctions;
+
+    /// 加速结构的设备限制 —— 其中 minAccelerationStructureScratchOffsetAlignment
+    /// 是必须遵守的: 暂存缓冲区的设备地址没对齐时构建行为未定义, 而验证层
+    /// 之外没有任何东西会提醒你。
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR
+        m_AccelStructProperties = {};
+
+    /// 载入光追扩展函数, 任何一个取不到就把 m_RayTracingAvailable 置假
+    void LoadRayTracingFunctions();
+
+    /// 加速结构创建的公共部分 (BLAS 与 TLAS 只有几何描述不同)
+    ERHIResult CreateAccelStructCommon(
+        FVulkanAccelStructData& data,
+        const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+        UInt32 primitiveCount,
+        const char* debugName,
+        FRHIAccelStructHandle& outHandle);
+
     /// 实际协商出的 Vulkan API 版本 (min(实例支持, 设备支持, 引擎目标))
     UInt32 m_ApiVersion = 0;
 
@@ -629,6 +774,8 @@ private:
         RHITags::SwapchainTag>           m_Swapchains;
     TVulkanResourcePool<FVulkanQueryPoolData,
         RHITags::QueryPoolTag>           m_QueryPools;
+    TVulkanResourcePool<FVulkanAccelStructData,
+        RHITags::AccelStructTag>         m_AccelStructs;
 };
 
 } // namespace Limx
