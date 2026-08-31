@@ -434,6 +434,18 @@ Invoke-Step 'G-Buffer 自检 (法线编码 + 速度矢量)' -RequiresGpu {
     Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check'
 }
 
+# 同一套自检再跑一遍, 这次开抖动。
+#
+# 两次都要跑, 因为两边验的不是同一件事: 关抖动时验的是速度本身;
+# 开抖动时验的是"速度里没有混进抖动" —— 相机静止下速度依然精确为零。
+# 只跑其中一个的话, 另一边的失效方式完全没有覆盖。
+#
+# 开抖动那次还多验一条正向对照: 相机不变的两帧覆盖掩码必须有差异。
+# 没有它, "--jitter 是个空开关"会让上面每一项都完美通过。
+Invoke-Step 'G-Buffer 自检 (开 TAA 抖动)' -RequiresGpu {
+    Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check --jitter'
+}
+
 # 交换链重建自检 —— 需要真实 GPU。
 #
 # OnResize 平时只有窗口缩放时才走, 而自动化里没有任何东西会改窗口尺寸。

@@ -56,6 +56,7 @@
 // ============================================================
 
 #include "Renderer/Renderer/FRenderer.h"
+#include "Core/Math/FHalton.h"
 #include "RenderCore/Renderer/FRenderContext.h"
 #include "ApplicationCore/Window/FWindow.h"
 #include "RenderCore/Geometry/FGeometryGenerator.h"
@@ -1536,18 +1537,53 @@ void FRenderer::UpdateUniformBuffer(UInt32 frameIndex)
 
     // 仅写入 View + Projection (Model 在 Pass::Execute 中通过 Push Constant 逐物体推送)
     FViewProjUBO viewProj;
-    viewProj.View = m_Camera.GetViewMatrix();
-    viewProj.Proj = m_Camera.GetProjectionMatrix();
 
-    // 上一帧的 Proj * View —— 速度矢量靠它算。
+    const FMatrix viewMatrix   = m_Camera.GetViewMatrix();
+    const FMatrix projNoJitter = m_Camera.GetProjectionMatrix();
+
+    // TAA 亚像素抖动。
+    //
+    // 只改写进 UBO 的这份拷贝, 不回写相机 —— 剔除视锥由 FSceneManager 从
+    // 相机矩阵导出, 抖动若进了那里, 每帧的可见集合会在边界物体上反复跳变,
+    // 表现为画面边缘物体闪烁, 而那看起来像是剔除余量不够。
+    FMatrix projJittered = projNoJitter;
+
+    m_CurrentJitter = FVector2(0.0f, 0.0f);
+
+    if (m_TemporalJitterEnabled)
+    {
+        Float32 offsetX = 0.0f;
+        Float32 offsetY = 0.0f;
+
+        // 下标从 1 开始 —— Halton 的 0 号点恒为 0, 那是像素角点而非采样位置
+        HaltonJitterPixels(
+            static_cast<UInt32>(m_GpuFrameNumber % kJitterPeriod) + 1u,
+            offsetX, offsetY);
+
+        // 像素 → NDC。NDC 的 x 与 y 各横跨 2 个单位, 所以是 2/尺寸。
+        m_CurrentJitter = FVector2(
+            offsetX * 2.0f / static_cast<Float32>(FMath::Max(extent.Width, 1u)),
+            offsetY * 2.0f / static_cast<Float32>(FMath::Max(extent.Height, 1u)));
+
+        // 矩阵那一步单独成函数是为了能脱离 GPU 测 —— "偏移是否与深度无关"
+        // 这个性质在画面上看不出来 (两种写法都"在抖"), 只能靠数值断言。
+        // 见 FHalton.h 里 ApplyJitterToProjection 的说明。
+        ApplyJitterToProjection(projJittered, m_CurrentJitter);
+    }
+
+    viewProj.View     = viewMatrix;
+    viewProj.Proj     = projJittered;
+    viewProj.ViewProj = projJittered * viewMatrix;
+
+    viewProj.ViewProjNoJitter = projNoJitter * viewMatrix;
+
+    // 上一帧的 Proj * View (无抖动) —— 速度矢量靠它算。
     //
     // 第一帧没有"上一帧", 此时填本帧的矩阵, 速度就恒等于零。这比填单位
     // 矩阵好: 单位矩阵会让第一帧的速度等于整个 viewProj 变换的量, 那是个
     // 巨大的假运动, TAA 接上以后表现为开场第一帧的整屏拖影。
-    viewProj.ViewProj = viewProj.Proj * viewProj.View;
-
-    viewProj.PrevViewProj =
-        m_HasPrevViewProj ? m_PrevViewProj : viewProj.ViewProj;
+    viewProj.PrevViewProjNoJitter =
+        m_HasPrevViewProj ? m_PrevViewProjNoJitter : viewProj.ViewProjNoJitter;
 
     // 映射并写入 Uniform Buffer
     void* mappedPtr = nullptr;
@@ -1564,8 +1600,8 @@ void FRenderer::UpdateUniformBuffer(UInt32 frameIndex)
     // 必须在这里 (写完 UBO 之后) 存, 而不是在下一帧开头算 —— 下一帧开头时
     // 相机已经被 Tick 更新过了, 那时读到的是新矩阵, 速度会恒等于零而且没
     // 有任何报错。这类"少一帧延迟"的错位是速度缓冲最典型的失效方式。
-    m_PrevViewProj    = viewProj.ViewProj;
-    m_HasPrevViewProj = true;
+    m_PrevViewProjNoJitter = viewProj.ViewProjNoJitter;
+    m_HasPrevViewProj      = true;
 }
 
 } // namespace Limx

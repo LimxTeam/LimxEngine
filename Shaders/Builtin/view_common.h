@@ -35,12 +35,18 @@ layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
     ///    一片 1e-7 量级的噪声。
     mat4 viewProj;
 
-    /// 上一帧的 proj * view (已含抖动)
+    /// 本帧的 proj * view, **不含抖动** —— 只给速度矢量用
     ///
-    /// 存的必须是**上一帧同样抖动过的**矩阵。若存未抖动的版本, 速度矢量里
-    /// 会混进抖动本身的偏移 —— 那是一个每帧固定模式的假运动, TAA 会当真,
-    /// 表现为静止画面上的持续抖动。
-    mat4 prevViewProj;
+    /// 速度必须是无抖动的。抖动是每帧变化的亚像素偏移, 把它算进速度就等于
+    /// 告诉 TAA "画面每帧都在抖" —— 而那正是 TAA 要消掉的东西。结果是静止
+    /// 画面上持续的重投影噪声, 看起来像 TAA 的钳制参数没调好。
+    ///
+    /// 于是有了这条不变量: **相机与物体都静止时, 速度缓冲精确为零,
+    /// 无论抖动是否开启**。--gbuffer-check 直接断言它。
+    mat4 viewProjNoJitter;
+
+    /// 上一帧的 proj * view, 同样不含抖动
+    mat4 prevViewProjNoJitter;
 } ubo;
 
 #endif // LIMX_VIEW_COMMON_H

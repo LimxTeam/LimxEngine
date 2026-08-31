@@ -146,6 +146,9 @@ struct FLaunchOptions
     /// G-Buffer 自检: 法线编码与速度矢量的数值校验, 以退出码报告
     bool GBufferCheck = false;
 
+    /// 启用 TAA 亚像素抖动 (默认关 —— TAA 本身尚未落地)
+    bool TemporalJitter = false;
+
     /// 白炉测试 —— 用各方向恒为 1 的合成环境替代 HDRI, 并关掉全部直接光
     ///
     /// 能量守恒唯一的客观判据: 反照率为 1 的表面在这个环境下必须原样反射
@@ -341,6 +344,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --furnace        白炉测试: 合成均匀环境 + 关闭直接光
 ///   --furnace-check  白炉自检: 断言 IBL 各级预计算, 以退出码报告
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
+///   --jitter         启用 TAA 亚像素抖动 (Halton 2,3, 周期 16 帧)
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -477,6 +481,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--furnace"))
         {
             options.Furnace = true;
+        }
+        else if (WideEquals(arg, L"--jitter"))
+        {
+            options.TemporalJitter = true;
         }
         else if (WideEquals(arg, L"--gbuffer-check"))
         {
@@ -1264,9 +1272,16 @@ static bool RunGBufferChecks(FRenderContext* context,
     // 主相机 Trait 的外部矩阵, 把这里的 SetRotation 覆盖掉。
     (void)scene;
 
+    // 逐帧记下抖动量。覆盖翻转那条判据抓不到单轴退化 —— 只有 X 轴抖动
+    // 时覆盖照样翻转, 而 TAA 拿到的是一维退化的采样图案, 表现为竖直方向
+    // 的锯齿永远消不掉。像素→NDC 的换算就在 FRenderer 里那四行, 没有别的
+    // 地方覆盖它。
+    FVector2 jitterPerFrame[3] = {};
+
     // ---- 阶段 A: 建立上一帧矩阵 ----
     camera.SetRotation(baseYaw, basePitch);
     renderer.RenderFrame();
+    jitterPerFrame[0] = renderer.GetCurrentJitter();
 
     const FMatrix viewProjA =
         camera.GetProjectionMatrix() * camera.GetViewMatrix();
@@ -1286,6 +1301,7 @@ static bool RunGBufferChecks(FRenderContext* context,
         });
 
     renderer.RenderFrame();
+    jitterPerFrame[1] = renderer.GetCurrentJitter();
 
     const FMatrix viewProjB =
         camera.GetProjectionMatrix() * camera.GetViewMatrix();
@@ -1298,7 +1314,7 @@ static bool RunGBufferChecks(FRenderContext* context,
 
     // 渲染器实际用的上一帧矩阵必须就是阶段 A 那个。这一条直接钉住"保存
     // 时机错位"这类 bug —— 它比后面的逐像素比较更早、更明确地失败。
-    const FMatrix& rendererPrev = renderer.GetPrevViewProj();
+    const FMatrix& rendererPrev = renderer.GetPrevViewProjNoJitter();
 
     Float32 prevMatrixDrift = 0.0f;
 
@@ -1323,9 +1339,12 @@ static bool RunGBufferChecks(FRenderContext* context,
         passed = false;
     }
 
-    const TArray<FVector2>& normalB   = capture.GetNormal();
-    const TArray<FVector2>& velocityB = capture.GetVelocity();
-    const FRHIExtent2D      extent    = capture.GetExtent();
+    // 必须拷贝而不是引用: capture 在阶段 C 会被复用, Resolve 会把这两个
+    // 数组整体覆盖掉。持引用的话阶段 C 之后 normalB 指向的就是阶段 C 的
+    // 数据 —— 于是"两帧覆盖对比"变成了自己跟自己比, 恒等于 0 个差异。
+    const TArray<FVector2> normalB   = capture.GetNormal();
+    const TArray<FVector2> velocityB = capture.GetVelocity();
+    const FRHIExtent2D     extent    = capture.GetExtent();
 
     const FMatrix inverseB = viewProjB.Inverse();
 
@@ -1514,6 +1533,7 @@ static bool RunGBufferChecks(FRenderContext* context,
     }
 
     renderer.RenderFrame();
+    jitterPerFrame[2] = renderer.GetCurrentJitter();
 
     if (!capture.Resolve(context))
     {
@@ -1522,6 +1542,7 @@ static bool RunGBufferChecks(FRenderContext* context,
     }
 
     const TArray<FVector2>& velocityC = capture.GetVelocity();
+    const TArray<FVector2>& normalC   = capture.GetNormal();
 
     SizeType nonZero    = 0;
     Float32  maxNonZero = 0.0f;
@@ -1553,6 +1574,110 @@ static bool RunGBufferChecks(FRenderContext* context,
     {
         LIMX_LOG(LogLaunch, Log,
                  "[GBuffer] 静止帧: {} 个像素速度全部为零", totalPixels);
+    }
+
+    // ---- 抖动幅度 ----
+    Float32 maxJitterX = 0.0f;
+    Float32 maxJitterY = 0.0f;
+
+    for (SizeType i = 0; i < 3; ++i)
+    {
+        maxJitterX = FMath::Max(maxJitterX, FMath::Abs(jitterPerFrame[i].X));
+        maxJitterY = FMath::Max(maxJitterY, FMath::Abs(jitterPerFrame[i].Y));
+    }
+
+    // 半个像素在 NDC 里就是 1/尺寸 (NDC 横跨 2 个单位)
+    const Float32 halfPixelX = 1.0f / static_cast<Float32>(extent.Width);
+    const Float32 halfPixelY = 1.0f / static_cast<Float32>(extent.Height);
+
+    if (renderer.IsTemporalJitterEnabled())
+    {
+        // 两轴都必须动过。取三帧里的最大值而不是逐帧判 —— Halton 基 2 的
+        // 1 号点恰好是 0.5, 减去 0.5 之后偏移正好为零, 所以单独一帧的某个
+        // 分量为零是合法的。三帧里不可能有两帧撞上同一个下标。
+        if (maxJitterX <= 0.0f || maxJitterY <= 0.0f)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GBuffer] 抖动幅度在某个轴上恒为零 "
+                     "(三帧最大 X={} Y={}) —— 采样图案退化成一维",
+                     maxJitterX, maxJitterY);
+            passed = false;
+        }
+
+        // 超过半个像素说明像素→NDC 的换算写错了 (比如漏了那个 2, 或者除
+        // 错了维度)。幅度过大的表现是画面明显抖动而不是亚像素抖动。
+        if (maxJitterX > halfPixelX * 1.001f ||
+            maxJitterY > halfPixelY * 1.001f)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GBuffer] 抖动幅度超过半个像素 "
+                     "(X={} 上限 {}, Y={} 上限 {})",
+                     maxJitterX, halfPixelX, maxJitterY, halfPixelY);
+            passed = false;
+        }
+    }
+    else
+    {
+        if (maxJitterX != 0.0f || maxJitterY != 0.0f)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GBuffer] 抖动未开启但偏移非零 (X={} Y={})",
+                     maxJitterX, maxJitterY);
+            passed = false;
+        }
+    }
+
+    // ---- 抖动的正向对照: 覆盖掩码必须逐帧变化 ----
+    //
+    // 阶段 B 与阶段 C 的相机朝向完全相同, 所以:
+    //   抖动关 → 两帧的光栅化覆盖必须**逐像素完全一致**
+    //   抖动开 → 亚像素偏移会让轮廓上的像素翻转覆盖状态
+    //
+    // 没有这一条时, "--jitter 是个空开关"这种情况会让上面每一项都完美
+    // 通过 —— 速度为零、法线正确、一切正常, 只是抖动根本没生效。而抖动
+    // 没生效的后果要等 TAA 接上之后才看得出来 (锯齿消不掉), 那时已经很难
+    // 定位到这里。
+    SizeType coverageFlips = 0;
+
+    for (SizeType index = 0; index < totalPixels; ++index)
+    {
+        const bool coveredB = (FMath::Abs(normalB[index].X) <= 1.0f &&
+                               FMath::Abs(normalB[index].Y) <= 1.0f);
+        const bool coveredC = (FMath::Abs(normalC[index].X) <= 1.0f &&
+                               FMath::Abs(normalC[index].Y) <= 1.0f);
+
+        if (coveredB != coveredC)
+        {
+            ++coverageFlips;
+        }
+    }
+
+    if (renderer.IsTemporalJitterEnabled())
+    {
+        // 1280x720 下演示场景的轮廓约数千像素, 半像素抖动实测翻转数百个。
+        // 取 32 作为下限 —— 远低于实测值, 又远高于"抖动没生效"时的 0。
+        if (coverageFlips < 32)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GBuffer] 抖动已开启但两帧覆盖只差 {} 个像素 —— "
+                     "抖动未真正作用到投影矩阵上",
+                     coverageFlips);
+            passed = false;
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Log,
+                     "[GBuffer] 抖动生效: 相机不变的两帧覆盖差 {} 个像素",
+                     coverageFlips);
+        }
+    }
+    else if (coverageFlips > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 抖动未开启, 但相机不变的两帧覆盖差了 {} 个像素 "
+                 "—— 存在未受控的每帧变化",
+                 coverageFlips);
+        passed = false;
     }
 
     // ---- 法线判据的结论 (数据在运动帧那一轮里已经统计完) ----
@@ -2756,6 +2881,14 @@ int WINAPI wWinMain(
         LIMX_LOG(LogLaunch, Log,
                  "[Launch] 相机朝向已固定: yaw={} pitch={}",
                  launchOptions.CameraYaw, launchOptions.CameraPitch);
+    }
+
+    if (launchOptions.TemporalJitter)
+    {
+        renderer.SetTemporalJitterEnabled(true);
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Launch] TAA 亚像素抖动已启用 (Halton 2,3, 周期 16 帧)");
     }
 
     // 4f. 环境贴图 — 必须在渲染器初始化之后 (天空 Pass 的描述符集才存在)

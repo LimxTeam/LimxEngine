@@ -115,12 +115,14 @@ struct FViewProjUBO
     /// 的重结合可靠得多。详见 Shaders/Builtin/view_common.h。
     FMatrix ViewProj = FMatrix::kIdentity;
 
-    /// 上一帧的 Proj * View (已含抖动)
+    /// 本帧的 Proj * View, **不含抖动** —— 只给速度矢量用
     ///
-    /// 速度矢量靠它与本帧的差算出。必须是**上一帧同样抖动过的**矩阵 ——
-    /// 存未抖动的版本会让速度里混进抖动本身的偏移, 那是一个每帧固定模式
-    /// 的假运动, TAA 会当真。
-    FMatrix PrevViewProj = FMatrix::kIdentity;
+    /// 见 Shaders/Builtin/view_common.h 的说明: 速度必须无抖动, 否则等于
+    /// 告诉 TAA "画面每帧都在抖", 而那正是它要消掉的东西。
+    FMatrix ViewProjNoJitter = FMatrix::kIdentity;
+
+    /// 上一帧的 Proj * View, 同样不含抖动
+    FMatrix PrevViewProjNoJitter = FMatrix::kIdentity;
 };
 
 /// 这是扇出最大的 GPU 结构 — 四个着色器 (pbr.vert / depth_only.vert /
@@ -129,8 +131,8 @@ struct FViewProjUBO
 ///
 /// 在中间加字段会让 Proj 错位, 在末尾加字段会让 C++ 侧六处缓冲区与
 /// 描述符 range 自动跟着变大, 而着色器不会 —— 两种都不报错。
-static_assert(sizeof(FViewProjUBO) == 256,
-              "FViewProjUBO 必须是 256 字节 (四个 mat4) — "
+static_assert(sizeof(FViewProjUBO) == 320,
+              "FViewProjUBO 必须是 320 字节 (五个 mat4) — "
               "与 Shaders/Builtin/view_common.h 的 ViewProjUBO 块一致");
 
 // ============================================================================
@@ -455,12 +457,34 @@ public:
         return m_DepthPrePass.Get();
     }
 
-    /// 上一帧的 Proj * View —— 校验速度缓冲时要拿它做 CPU 侧对照
+    /// 上一帧的 Proj * View (无抖动) —— 校验速度缓冲时做 CPU 侧对照
     ///
     /// 返回的是**下一帧将会用到的**那一个, 即刚渲染完那一帧的矩阵。
-    LIMX_NODISCARD const FMatrix& GetPrevViewProj() const
+    LIMX_NODISCARD const FMatrix& GetPrevViewProjNoJitter() const
     {
-        return m_PrevViewProj;
+        return m_PrevViewProjNoJitter;
+    }
+
+    /// TAA 亚像素抖动开关
+    ///
+    /// 抖动只作用在写进 UBO 的那一份投影矩阵拷贝上, 相机自身的矩阵不变。
+    /// 这一点是刻意的: 剔除视锥由 FSceneManager 从相机矩阵导出, 抖动若
+    /// 进了那里, 每帧的可见集合会在边界物体上反复跳变 —— 表现为画面边缘
+    /// 的物体闪烁, 而那看起来像是剔除的余量不够。
+    void SetTemporalJitterEnabled(bool enabled)
+    {
+        m_TemporalJitterEnabled = enabled;
+    }
+
+    LIMX_NODISCARD bool IsTemporalJitterEnabled() const
+    {
+        return m_TemporalJitterEnabled;
+    }
+
+    /// 本帧的亚像素偏移 (NDC 单位)
+    LIMX_NODISCARD FVector2 GetCurrentJitter() const
+    {
+        return m_CurrentJitter;
     }
 
     /// 设置场景渲染后回调 — 在所有场景 Pass 执行完毕、EndFrame 之前调用
@@ -565,14 +589,32 @@ private:
     /// 输出应当逐像素相同 —— 这正是 Day 2 的核心验收。
     bool                              m_ParallelRecording = true;
 
-    /// 上一帧的 Proj * View (已含抖动)
+    /// 上一帧的 Proj * View, 不含抖动
     ///
     /// 单个成员而非按帧索引的数组: 它要的是"上一次渲染的那一帧", 而不是
     /// "上一次用同一个 frameIndex 的那一帧" —— 后者在双缓冲下差了两帧。
-    FMatrix                           m_PrevViewProj = FMatrix::kIdentity;
+    FMatrix                           m_PrevViewProjNoJitter = FMatrix::kIdentity;
 
-    /// m_PrevViewProj 是否已经被填过 (决定第一帧怎么处理)
+    /// m_PrevViewProjNoJitter 是否已经被填过 (决定第一帧怎么处理)
     bool                              m_HasPrevViewProj = false;
+
+    /// 抖动序列的周期 (帧)
+    ///
+    /// 16 是 TAA 的常见取值: 太短则采样点不足以铺满像素, 表现为残留的
+    /// 锯齿; 太长则历史窗口内的采样点分布不均, 表现为收敛慢。Halton
+    /// 序列的任意前缀都均匀, 所以这个数只影响"最终能补多密", 不影响
+    /// 中途的均匀性。
+    static constexpr UInt64 kJitterPeriod = 16;
+
+    /// 是否启用 TAA 亚像素抖动
+    ///
+    /// 默认关闭。TAA 本身还没落地, 单开抖动只会让画面多一层每帧变化的
+    /// 亚像素噪声 —— 那是纯粹的画质倒退。这个开关现在的用途是让抖动通路
+    /// 可以被自检覆盖, 等 TAA 接上再默认打开。
+    bool                              m_TemporalJitterEnabled = false;
+
+    /// 本帧用的亚像素偏移 (NDC 单位) —— 自检要读
+    FVector2                          m_CurrentJitter = FVector2(0.0f, 0.0f);
 
     /// 单调递增的帧号 — 决定计时器用哪个环形槽位
     ///

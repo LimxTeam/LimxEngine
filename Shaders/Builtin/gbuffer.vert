@@ -46,7 +46,10 @@ void main()
     gl_Position  = ubo.viewProj * worldPos;
     fragTexCoord = inTexCoord0;
 
-    fragCurrentClip = gl_Position;
+    // 速度这一对必须**都**用无抖动矩阵, 而不是 gl_Position。
+    // 用 gl_Position 的话本帧含抖动、上一帧不含, 差值里就多出一个
+    // 每帧变化的亚像素偏移 —— 那是假运动。
+    fragCurrentClip = ubo.viewProjNoJitter * worldPos;
 
     // 上一帧位置用的是**同一个** pc.model —— 前提是物体在帧间不动。
     //
@@ -55,7 +58,7 @@ void main()
     // 而那放不进 push constant: 现在已用 68 字节, 再加一个 mat4 就是 132,
     // 超过 Vulkan 保证的 128 字节下限。届时的正确做法是把逐物体变换搬进
     // storage buffer, 而不是把 model 矩阵压缩成不等价的形式。
-    fragPrevClip = ubo.prevViewProj * worldPos;
+    fragPrevClip = ubo.prevViewProjNoJitter * worldPos;
 
     // 法线矩阵与 pbr.vert 逐字一致。
     //

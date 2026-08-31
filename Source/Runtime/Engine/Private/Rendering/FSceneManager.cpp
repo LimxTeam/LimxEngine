@@ -234,7 +234,14 @@ void FSceneManager::ResolveCamera(const LScene* scene, FFrustum& outFrustum)
     }
 
     // 视锥统一从渲染器最终采用的矩阵导出 —— 无论矩阵来自相机 Trait 还是
-    // 渲染器内置相机, 剔除依据都必须与实际绘制用的矩阵完全一致。
+    // 渲染器内置相机, 剔除依据都必须与实际绘制用的矩阵一致。
+    //
+    // 唯一刻意的例外是 TAA 的亚像素抖动: 它只作用在 FRenderer 写进 UBO 的
+    // 那份投影矩阵拷贝上, 不回写相机, 因此到不了这里。这是有意的 —— 抖动
+    // 若进了视锥, 每帧的可见集合会在恰好压着视锥边界的物体上反复跳变, 表
+    // 现为画面边缘物体闪烁, 而那看起来像是剔除余量不够。代价是抖动可能让
+    // 一个刚被剔除的物体露出半个像素, 但那半个像素远小于包围球本身带来的
+    // 保守余量。
     const FCamera& camera = m_Renderer->GetCamera();
 
     outFrustum = FFrustum::FromViewProjection(
