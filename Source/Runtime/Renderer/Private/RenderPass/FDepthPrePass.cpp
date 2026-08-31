@@ -7,7 +7,7 @@
 //          的深度信息写入共享深度缓冲区，为 FForwardPass 的 Equal
 //          深度测试提供精确的遮挡数据。
 // 功能描述：FDepthPrePass 完整实现 — 创建 depth-only RenderPass
-//          (无颜色附件)，使用 depth_only.vert/frag 着色器和共享深度视图
+//          (无颜色附件)，使用 gbuffer.vert/frag 着色器和共享深度视图
 //          创建单一 Framebuffer，渲染所有场景物体写入深度缓冲区。
 //          Execute 结束后插入管线屏障，确保深度写入完成前不进入
 //          后续 FForwardPass 的 EarlyFragmentTests 阶段。
@@ -26,7 +26,7 @@
 // │ CreateDepthRenderPass()     │ 创建仅含深度附件的渲染通道          │
 // │ CreateDepthFramebuffer()    │ 创建 depth-only 帧缓冲             │
 // │ DestroyDepthFramebuffer()   │ 销毁帧缓冲                        │
-// │ CreateShaders()             │ 加载 depth_only.vert/frag        │
+// │ CreateShaders()             │ 加载 gbuffer.vert/frag        │
 // │ CreateDepthPipeline()       │ 创建 depth-only 图形管线           │
 // │ DestroyPipelineResources()  │ 销毁管线和着色器                   │
 //
@@ -57,7 +57,16 @@ ERHIResult FDepthPrePass::Setup(const FPassSetupDesc& desc)
     m_SwapchainExtent     = desc.SwapchainExtent;
 
     // 1. 创建 depth-only 渲染通道
-    ERHIResult result = CreateDepthRenderPass(desc.Device);
+    // G-Buffer 附件必须先于渲染通道创建 —— 通道要用它们的格式,
+    // 帧缓冲要用它们的视图。
+    ERHIResult result = CreateGBufferTargets(desc.Device, desc.SwapchainExtent);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    result = CreateDepthRenderPass(desc.Device);
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Error,
@@ -265,6 +274,20 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
     clearDepth.Depth   = 1.0f;
     clearDepth.Stencil = 0;
 
+    // 法线清成 (0,0) —— 八面体解码后是 +Z, 一个合法方向。
+    //
+    // 不清成别的值是有讲究的: 天空区域没有几何写入, 后续 GTAO 会读到这里
+    // 的清除值。清成 (0,0) 至少是个单位向量; 若清成随便什么数, 解码出来的
+    // 法线长度不为 1, GTAO 的余弦加权会算出无意义的结果, 而那看起来像是
+    // "天空附近的 AO 参数没调好"。
+    //
+    // 速度清成 0 —— 天空不动。
+    FRHIClearColorValue clearColors[2] = {};
+    clearColors[0].R = 0.0f;
+    clearColors[0].G = 0.0f;
+    clearColors[1].R = 0.0f;
+    clearColors[1].G = 0.0f;
+
     // ================================================================
     // 开始深度渲染通道 (仅深度附件，无颜色)
     // ================================================================
@@ -274,8 +297,8 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
     beginInfo.Framebuffer       = m_DepthFramebuffer;
     beginInfo.RenderAreaOffset  = { 0, 0 };
     beginInfo.RenderAreaExtent  = context.SwapchainExtent;
-    beginInfo.ClearColors       = nullptr;
-    beginInfo.ClearColorCount   = 0;
+    beginInfo.ClearColors       = clearColors;
+    beginInfo.ClearColorCount   = 2;
     beginInfo.ClearDepthStencil = &clearDepth;
 
     // 并行录制时通道内容必须来自次级缓冲区
@@ -377,6 +400,19 @@ ERHIResult FDepthPrePass::OnResize(const FPassResizeDesc& desc)
 
     DestroyDepthFramebuffer(device);
 
+    // G-Buffer 尺寸随交换链变化, 必须一起重建。
+    //
+    // 顺序: 先销毁旧的帧缓冲 (它引用着旧视图), 再销毁并重建 G-Buffer,
+    // 最后建新帧缓冲。反过来会让帧缓冲短暂引用已销毁的视图。
+    DestroyGBufferTargets(device);
+
+    ERHIResult gbufferResult = CreateGBufferTargets(device, newExtent);
+
+    if (!IsRHISuccess(gbufferResult))
+    {
+        return gbufferResult;
+    }
+
     ERHIResult result = CreateDepthFramebuffer(device,
                                                 newExtent,
                                                 newSharedDepthView);
@@ -416,6 +452,7 @@ void FDepthPrePass::Shutdown(IRHIDevice* device)
 
     DestroyPipelineResources(device);
     DestroyDepthFramebuffer(device);
+    DestroyGBufferTargets(device);
     device->DestroyRenderPass(m_DepthRenderPass);
 
     LIMX_LOG(LogRenderer, Log, "[DepthPrePass] 已关闭");
@@ -427,39 +464,70 @@ void FDepthPrePass::Shutdown(IRHIDevice* device)
 
 ERHIResult FDepthPrePass::CreateDepthRenderPass(IRHIDevice* device)
 {
-    // 单一深度附件 — D32_SFLOAT, Clear→Store, Undefined→DepthStencilAttachment
-    FRHIAttachmentDesc depthAttachment = {};
-    depthAttachment.Format         = EPixelFormat::D32_SFLOAT;
-    depthAttachment.Samples        = ESampleCount::Count1;
-    depthAttachment.LoadOp         = ELoadOp::Clear;
-    depthAttachment.StoreOp        = EStoreOp::Store;
-    depthAttachment.StencilLoadOp  = ELoadOp::DontCare;
-    depthAttachment.StencilStoreOp = EStoreOp::DontCare;
-    depthAttachment.InitialLayout  = EImageLayout::Undefined;
-    depthAttachment.FinalLayout    = EImageLayout::DepthStencilAttachment;
+    // 三个附件, 顺序是 [0]=法线 [1]=速度 [2]=深度。
+    //
+    // **深度必须在最后。** BeginRenderPass 填清除值时先按顺序填全部颜色,
+    // 再无条件把深度追加到末尾; 顺序不对清除值就整体错位, 而数量仍然对得
+    // 上, 验证层不报错。FVulkanDevice::CreateRenderPass 里有一条硬检查会
+    // 拒绝错误的顺序 —— 那条检查就是为这里加的。
+    FRHIAttachmentDesc attachments[3] = {};
+
+    // [0] 世界空间法线, 八面体编码进两个通道
+    attachments[0].Format         = kGBufferNormalFormat;
+    attachments[0].Samples        = ESampleCount::Count1;
+    attachments[0].LoadOp         = ELoadOp::Clear;
+    attachments[0].StoreOp        = EStoreOp::Store;
+    attachments[0].StencilLoadOp  = ELoadOp::DontCare;
+    attachments[0].StencilStoreOp = EStoreOp::DontCare;
+    attachments[0].InitialLayout  = EImageLayout::Undefined;
+    attachments[0].FinalLayout    = EImageLayout::ShaderReadOnly;
+
+    // [1] 屏幕空间速度 (当前 NDC − 上一帧 NDC)
+    attachments[1] = attachments[0];
+    attachments[1].Format = kVelocityFormat;
+
+    // [2] 深度
+    attachments[2].Format         = EPixelFormat::D32_SFLOAT;
+    attachments[2].Samples        = ESampleCount::Count1;
+    attachments[2].LoadOp         = ELoadOp::Clear;
+    attachments[2].StoreOp        = EStoreOp::Store;
+    attachments[2].StencilLoadOp  = ELoadOp::DontCare;
+    attachments[2].StencilStoreOp = EStoreOp::DontCare;
+    attachments[2].InitialLayout  = EImageLayout::Undefined;
+    attachments[2].FinalLayout    = EImageLayout::DepthStencilAttachment;
+
+    FRHIAttachmentReference colorRefs[2] = {};
+    colorRefs[0].AttachmentIndex = 0;
+    colorRefs[0].Layout          = EImageLayout::ColorAttachment;
+    colorRefs[1].AttachmentIndex = 1;
+    colorRefs[1].Layout          = EImageLayout::ColorAttachment;
 
     FRHIAttachmentReference depthRef = {};
-    depthRef.AttachmentIndex = 0;
+    depthRef.AttachmentIndex = 2;
     depthRef.Layout          = EImageLayout::DepthStencilAttachment;
 
-    // 子通道: 无颜色附件，仅深度附件
     FRHISubpassDesc subpass = {};
-    subpass.ColorAttachments       = nullptr;
-    subpass.ColorAttachmentCount   = 0;
+    subpass.ColorAttachments       = colorRefs;
+    subpass.ColorAttachmentCount   = 2;
     subpass.DepthStencilAttachment = &depthRef;
 
-    // 子通道依赖: 外部 → 子通道 0 (深度附件写入)
+    // 子通道依赖: 外部 → 子通道 0。
+    //
+    // 现在既写深度也写颜色, 两个阶段都要等 —— 只等 EarlyFragmentTests
+    // 会让颜色附件的布局转换与写入之间缺一道同步。
     FRHISubpassDependency dependency = {};
     dependency.SrcSubpass    = 0xFFFFFFFF;
     dependency.DstSubpass    = 0;
     dependency.SrcStageMask  = EPipelineStageFlags::TopOfPipe;
-    dependency.DstStageMask  = EPipelineStageFlags::EarlyFragmentTests;
+    dependency.DstStageMask  = EPipelineStageFlags::EarlyFragmentTests
+                             | EPipelineStageFlags::ColorAttachmentOutput;
     dependency.SrcAccessMask = EAccessFlags::None;
-    dependency.DstAccessMask = EAccessFlags::DepthStencilAttachmentWrite;
+    dependency.DstAccessMask = EAccessFlags::DepthStencilAttachmentWrite
+                             | EAccessFlags::ColorAttachmentWrite;
 
     FRHIRenderPassDesc renderPassDesc = {};
-    renderPassDesc.Attachments     = &depthAttachment;
-    renderPassDesc.AttachmentCount = 1;
+    renderPassDesc.Attachments     = attachments;
+    renderPassDesc.AttachmentCount = 3;
     renderPassDesc.Subpasses       = &subpass;
     renderPassDesc.SubpassCount    = 1;
     renderPassDesc.Dependencies    = &dependency;
@@ -478,10 +546,18 @@ ERHIResult FDepthPrePass::CreateDepthFramebuffer(
     FRHIExtent2D          extent,
     FRHITextureViewHandle sharedDepthView)
 {
+    // 视图顺序必须与渲染通道的附件顺序一致 —— [0]=法线 [1]=速度 [2]=深度
+    const FRHITextureViewHandle views[3] =
+    {
+        m_NormalView,
+        m_VelocityView,
+        sharedDepthView,
+    };
+
     FRHIFramebufferDesc fbDesc = {};
     fbDesc.RenderPass      = m_DepthRenderPass;
-    fbDesc.Attachments     = &sharedDepthView;
-    fbDesc.AttachmentCount = 1;
+    fbDesc.Attachments     = views;
+    fbDesc.AttachmentCount = 3;
     fbDesc.Width           = extent.Width;
     fbDesc.Height          = extent.Height;
     fbDesc.Layers          = 1;
@@ -492,7 +568,8 @@ ERHIResult FDepthPrePass::CreateDepthFramebuffer(
     if (IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Log,
-                 "[DepthPrePass] Framebuffer 创建完成 — {}x{} (depth-only)",
+                 "[DepthPrePass] Framebuffer 创建完成 — {}x{} "
+                 "(法线 + 速度 + 深度)",
                  extent.Width, extent.Height);
     }
 
@@ -512,7 +589,7 @@ void FDepthPrePass::DestroyDepthFramebuffer(IRHIDevice* device)
 }
 
 // ============================================================================
-// CreateShaders — 加载 depth_only.vert / depth_only.frag
+// CreateShaders — 加载 gbuffer.vert / gbuffer.frag
 // ============================================================================
 
 ERHIResult FDepthPrePass::CreateShaders(IRHIDevice* device)
@@ -525,7 +602,7 @@ ERHIResult FDepthPrePass::CreateShaders(IRHIDevice* device)
 
     ERHIResult result = shaderManager.CreateShaderModule(
         device,
-        FString("Builtin/depth_only.vert"),
+        FString("Builtin/gbuffer.vert"),
         EShaderStage::Vertex,
         m_VertShader);
     if (!IsRHISuccess(result))
@@ -535,7 +612,7 @@ ERHIResult FDepthPrePass::CreateShaders(IRHIDevice* device)
 
     result = shaderManager.CreateShaderModule(
         device,
-        FString("Builtin/depth_only.frag"),
+        FString("Builtin/gbuffer.frag"),
         EShaderStage::Fragment,
         m_FragShader);
 
@@ -579,7 +656,7 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(
     // Location 不必连续 —— 保持与 FMeshVertex 在前向管线中的编号一致,
     // 两条管线用同一套 location 号能避免"同一个属性在不同 Pass 里编号不同"
     // 这种极易看漏的错。
-    FRHIVertexInputAttribute vertexAttributes[2] = {};
+    FRHIVertexInputAttribute vertexAttributes[3] = {};
 
     vertexAttributes[0].Location = 0;
     vertexAttributes[0].Binding  = 0;
@@ -587,16 +664,26 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(
     vertexAttributes[0].Offset   = static_cast<UInt32>(
         LIMX_OFFSET_OF(FMeshVertex, Position));
 
-    vertexAttributes[1].Location = 3;
+    // location 1 = 法线 —— G-Buffer 要输出它。
+    //
+    // location 编号必须与前向管线一致 (pbr.vert 用的也是 0/1/2/3/5),
+    // 因为两条管线共用同一份顶点数据布局。
+    vertexAttributes[1].Location = 1;
     vertexAttributes[1].Binding  = 0;
-    vertexAttributes[1].Format   = EPixelFormat::RG32_SFLOAT;
+    vertexAttributes[1].Format   = EPixelFormat::RGB32_SFLOAT;
     vertexAttributes[1].Offset   = static_cast<UInt32>(
+        LIMX_OFFSET_OF(FMeshVertex, Normal));
+
+    vertexAttributes[2].Location = 3;
+    vertexAttributes[2].Binding  = 0;
+    vertexAttributes[2].Format   = EPixelFormat::RG32_SFLOAT;
+    vertexAttributes[2].Offset   = static_cast<UInt32>(
         LIMX_OFFSET_OF(FMeshVertex, TexCoord0));
 
     pipelineDesc.VertexInput.Bindings       = &vertexBinding;
     pipelineDesc.VertexInput.BindingCount   = 1;
     pipelineDesc.VertexInput.Attributes     = vertexAttributes;
-    pipelineDesc.VertexInput.AttributeCount = 2;
+    pipelineDesc.VertexInput.AttributeCount = 3;
 
     // ---- 输入装配 ----
     pipelineDesc.InputAssembly.Topology                  = EPrimitiveTopology::TriangleList;
@@ -622,9 +709,20 @@ ERHIResult FDepthPrePass::CreateDepthPipeline(
     pipelineDesc.DepthStencil.IsDepthWriteEnabled = true;
     pipelineDesc.DepthStencil.DepthCompareOp      = ECompareOp::Less;
 
-    // ---- 颜色混合 — depth-only pass 无颜色附件，AttachmentCount=0 ----
-    pipelineDesc.ColorBlend.Attachments      = nullptr;
-    pipelineDesc.ColorBlend.AttachmentCount  = 0;
+    // ---- 颜色混合 — 两张 G-Buffer 附件, 都不混合 ----
+    //
+    // AttachmentCount 必须**恰好等于**子通道的 ColorAttachmentCount, 否则
+    // vkCreateGraphicsPipelines 直接失败 (这一条验证层会抓, 不是隐患)。
+    //
+    // 真正要小心的是生命周期: Attachments 存的是指针, 而这个数组是栈上的
+    // 局部量 —— 它必须活到 CreateGraphicsPipeline 返回。放在函数作用域里
+    // 声明就够, 但绝不能用临时对象。
+    FRHIColorBlendAttachmentDesc blendAttachments[2];
+    blendAttachments[0] = FRHIColorBlendAttachmentDesc::Opaque();
+    blendAttachments[1] = FRHIColorBlendAttachmentDesc::Opaque();
+
+    pipelineDesc.ColorBlend.Attachments      = blendAttachments;
+    pipelineDesc.ColorBlend.AttachmentCount  = 2;
     pipelineDesc.ColorBlend.IsLogicOpEnabled = false;
 
     // ---- 动态状态 ----
@@ -661,6 +759,95 @@ void FDepthPrePass::DestroyPipelineResources(IRHIDevice* device)
     }
     device->DestroyShader(m_FragShader);
     device->DestroyShader(m_VertShader);
+}
+
+// ============================================================================
+// G-Buffer 附件 — 法线与速度
+// ============================================================================
+//
+// 归本 Pass 所有而不是放进 FPassManager 的共享资源: 只有深度预通道**写**
+// 它们, 其它 Pass 只读。共享资源那一层管的是"多个 Pass 都要写"的东西
+// (深度、HDR 颜色), 把只有一个写者的资源放进去只会让所有权变模糊。
+
+ERHIResult FDepthPrePass::CreateGBufferTargets(IRHIDevice*  device,
+                                                FRHIExtent2D extent)
+{
+    struct FTargetSpec
+    {
+        EPixelFormat           Format;
+        FRHITextureHandle*     Texture;
+        FRHITextureViewHandle* View;
+        const AnsiChar*        DebugName;
+    };
+
+    const FTargetSpec specs[2] =
+    {
+        { kGBufferNormalFormat, &m_NormalTexture,   &m_NormalView,
+          "GBufferNormal" },
+        { kVelocityFormat,      &m_VelocityTexture, &m_VelocityView,
+          "GBufferVelocity" },
+    };
+
+    for (UInt32 i = 0; i < 2; ++i)
+    {
+        const FTargetSpec& spec = specs[i];
+
+        FRHITextureDesc texDesc = {};
+        texDesc.Type        = ETextureType::Texture2D;
+        texDesc.Format      = spec.Format;
+        texDesc.Extent      = { extent.Width, extent.Height, 1 };
+        texDesc.MipLevels   = 1;
+        texDesc.ArrayLayers = 1;
+        texDesc.Samples     = ESampleCount::Count1;
+        texDesc.Usage       = static_cast<ETextureUsage>(
+            static_cast<UInt32>(ETextureUsage::ColorAttachment) |
+            static_cast<UInt32>(ETextureUsage::Sampled));
+        texDesc.MemoryUsage = EMemoryUsage::GpuOnly;
+        texDesc.DebugName   = spec.DebugName;
+
+        ERHIResult result = device->CreateTexture(texDesc, *spec.Texture);
+
+        if (!IsRHISuccess(result))
+        {
+            LIMX_LOG(LogRenderer, Error,
+                     "[DepthPrePass] {} 创建失败 ({}x{})",
+                     spec.DebugName, extent.Width, extent.Height);
+            return result;
+        }
+
+        FRHITextureViewDesc viewDesc = {};
+        viewDesc.Texture         = *spec.Texture;
+        viewDesc.ViewType        = ETextureType::Texture2D;
+        viewDesc.Format          = spec.Format;
+        viewDesc.BaseMipLevel    = 0;
+        viewDesc.MipLevelCount   = 1;
+        viewDesc.BaseArrayLayer  = 0;
+        viewDesc.ArrayLayerCount = 1;
+
+        result = device->CreateTextureView(viewDesc, *spec.View);
+
+        if (!IsRHISuccess(result))
+        {
+            device->DestroyTexture(*spec.Texture);
+            return result;
+        }
+    }
+
+    LIMX_LOG(LogRenderer, Log,
+             "[DepthPrePass] G-Buffer 附件已创建 — {}x{} 法线 + 速度 "
+             "(各 RG16_SFLOAT, 共 {} KiB)",
+             extent.Width, extent.Height,
+             (extent.Width * extent.Height * 4 * 2) / 1024);
+
+    return ERHIResult::Success;
+}
+
+void FDepthPrePass::DestroyGBufferTargets(IRHIDevice* device)
+{
+    if (m_NormalView.IsValid())     { device->DestroyTextureView(m_NormalView); }
+    if (m_NormalTexture.IsValid())  { device->DestroyTexture(m_NormalTexture); }
+    if (m_VelocityView.IsValid())   { device->DestroyTextureView(m_VelocityView); }
+    if (m_VelocityTexture.IsValid()) { device->DestroyTexture(m_VelocityTexture); }
 }
 
 } // namespace Limx

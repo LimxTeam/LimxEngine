@@ -7,7 +7,7 @@ layer       = 5
 description = "Engine 模块单元测试 — 空间 Trait 层级、世界变换合成、销毁顺序安全性"
 
 [dependencies]
-public  = ["LimxCore", "LimxTesting", "LimxObject", "LimxEngine"]
+public  = ["LimxCore", "LimxTesting", "LimxObject", "LimxEngine", "LimxRenderCore"]
 private = []
 
 [sources]

@@ -77,6 +77,18 @@ public:
 
     ERHIResult Setup(const FPassSetupDesc& desc) override;
 
+    /// 法线附件视图 (八面体编码, RG16_SFLOAT)
+    LIMX_NODISCARD FRHITextureViewHandle GetNormalView() const
+    {
+        return m_NormalView;
+    }
+
+    /// 速度附件视图 (屏幕空间 NDC 差值, RG16_SFLOAT)
+    LIMX_NODISCARD FRHITextureViewHandle GetVelocityView() const
+    {
+        return m_VelocityView;
+    }
+
     /// 设置并行录制器 (可空 = 走内联路径)
     void SetRecorder(FParallelRecorder* recorder) { m_Recorder = recorder; }
 
@@ -148,6 +160,32 @@ private:
     // ====================================================================
 
     /// depth-only 渲染通道 (仅深度附件)
+    /// 法线与速度附件的格式
+    ///
+    /// 两者都用 RG16_SFLOAT:
+    ///   法线 —— 八面体编码后落在 [-1,1], 半精度浮点在这个区间的精度高于
+    ///           UNORM (UNORM 要先映射到 [0,1] 再量化, 白白丢掉一位),
+    ///           而且 R16G16_SFLOAT 是 Vulkan 规范强制要求的颜色附件格式,
+    ///           R16G16_UNORM 不是。同样 4 字节, 没有代价。
+    ///   速度 —— NDC 差值本来就带符号。
+    ///
+    /// 半精度在 [-1,1] 的精度约 5e-4, 1080p 下约半个像素 —— 对 TAA 的
+    /// 亚像素重投影是临界的。若将来出现"缓慢平移时轻微拖影", 第一个该查
+    /// 的是这里而不是 TAA 的钳制逻辑。
+    static constexpr EPixelFormat kGBufferNormalFormat =
+        EPixelFormat::RG16_SFLOAT;
+    static constexpr EPixelFormat kVelocityFormat = EPixelFormat::RG16_SFLOAT;
+
+    /// 法线与速度附件 (本 Pass 自有 — 只有它写)
+    FRHITextureHandle          m_NormalTexture;
+    FRHITextureViewHandle      m_NormalView;
+    FRHITextureHandle          m_VelocityTexture;
+    FRHITextureViewHandle      m_VelocityView;
+
+    /// 创建/销毁 G-Buffer 附件
+    ERHIResult CreateGBufferTargets(IRHIDevice* device, FRHIExtent2D extent);
+    void DestroyGBufferTargets(IRHIDevice* device);
+
     FRHIRenderPassHandle       m_DepthRenderPass;
 
     /// depth-only Framebuffer (共享深度视图)

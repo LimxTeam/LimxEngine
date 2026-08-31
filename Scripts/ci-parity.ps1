@@ -14,7 +14,10 @@
 # 本脚本从两个文件里各自抽出工具调用命令行, 做集合比对。它不需要 GPU,
 # 不需要网络, 因此属于无 GPU 层。
 #
-# 退出码: 0 一致 | 1 存在分歧
+# 退出码: 0 = 已逐条比对且一致 | 1 = 未能得出"一致"这个结论
+#
+# 注意 0 的含义是"比对做完了且没有分歧", 不是"没有报出分歧"。两者的差别
+# 就是下面 $RequiredKeys 那道闸门存在的理由 —— 见该处注释。
 # ============================================================
 
 [CmdletBinding()]
@@ -119,11 +122,88 @@ foreach ($c in $verifyCmds) {
     if ($k) { $verifyMap[$k] = $c }
 }
 
+$ciMap = @{}
+foreach ($c in $ciCmds) {
+    $k = Get-CommandKey $c
+    if ($k) { $ciMap[$k] = $c }
+}
+
+# ------------------------------------------------------------
+# 抽取有效性闸门 —— 必须在比对之前
+#
+# 下面的比对本质上是求交集。而空集与任何集合的交集都是空集: 抽取一旦落空,
+# "零处分歧"就会照常成立, 脚本退出 0。也就是说这个脚本最危险的失败形态不是
+# 报错, 是**一件都没比对却报告一致** —— 判据(有没有分歧)依赖一个在失败路径
+# 上取不到的值(抽出来的命令), 而取不到时默认落在"通过"那一侧。
+#
+# 抽取规则要求每行同时满足两条: 路径匹配 Binaries[\/](Tools|Development),
+# 且含字面量 .exe。ci.yml 只要换一种写法就同时不满足 —— 路径写成
+# ${{ env.TOOLS }}/lbt、或者用 working-directory 加裸命令名, 都会让 lbt 那
+# 几条一条也抽不出来。实测: 指向一份 ${{ env.TOOLS }}/lbt 写法、且去掉了
+# validate --strict 的 ci.yml, 修改前的脚本退出 0, 还打印"16 条命令参数
+# 一致" —— 而 --strict 分歧正是这个脚本存在的全部理由。
+#
+# 判据不用"抽到的条数够不够"这种阈值: 阈值只能证明抽到了东西, 证明不了抽到
+# 的是不是该抽的那几条 —— 上面那份 ci.yml 里 lsc 和测试程序仍是字面路径,
+# 条数看着不少, 而 lbt 三条全丢了。所以改成点名: 下面这几条是两边必须都跑
+# 的调用, 少一条只有两种可能, 要么抽取规则跟文件写法脱节了, 要么这条命令真
+# 的从某一边消失了 —— 两种都必须红, 都不能算作"没有分歧"。
+# ------------------------------------------------------------
+
+$RequiredKeys = @(
+    'lbt.exe check'
+    'lbt.exe validate'
+    'lbt.exe build'
+    'lsc.exe compile-all'
+    'lsc.exe validate'
+)
+
+$absent = @()
+foreach ($rk in $RequiredKeys) {
+    $inVerify = $verifyMap.ContainsKey($rk)
+    $inCi     = $ciMap.ContainsKey($rk)
+    if ($inVerify -and $inCi) { continue }
+
+    $absent += [PSCustomObject]@{
+        命令   = $rk
+        verify = $inVerify
+        ci     = $inCi
+    }
+}
+
+if ($absent.Count -gt 0) {
+    Write-Host '  本次没有比对成立的依据: 应当两边都出现的命令没有全部抽到。' -ForegroundColor Red
+    Write-Host ''
+    # 用 @() 包一层: 抽取结果为空时 Get-ToolCommands 返回的是 $null 而不是空
+    # 数组, 直接取 .Count 拿不到 0 —— 而 0 恰好是这里最需要打印出来的那个数。
+    Write-Host ("    verify.ps1 抽到 {0} 条, ci.yml 抽到 {1} 条" -f @($verifyCmds).Count, @($ciCmds).Count)
+    Write-Host ''
+    foreach ($a in $absent) {
+        $vMark = if ($a.verify) { '有' } else { '缺' }
+        $cMark = if ($a.ci)     { '有' } else { '缺' }
+        Write-Host ("    {0,-20} verify.ps1: {1}   ci.yml: {2}" -f $a.命令, $vMark, $cMark) -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host '  可能原因二选一:'
+    Write-Host '    1. 该命令真的从某一边被删了 —— 那边从此不跑这一步, 直接修文件。'
+    Write-Host '    2. 写法变了, Get-ToolCommands 抽不出来 —— 例如路径改成了'
+    Write-Host '       ${{ env.TOOLS }}/lbt, 或者改用 working-directory 加裸命令名。'
+    Write-Host '       此时必须同步改抽取规则, 否则这个脚本从此只会空转报绿。'
+    Write-Host ''
+    exit 1
+}
+
+# 真正逐字比对过的对数。报告里必须用这个数, 不能用 $verifyMap.Count ——
+# 后者是"verify.ps1 一侧抽出了多少条", 跟比对了多少对没有关系: ci.yml 一条
+# 都没抽到时它照样是 16, 于是一个让人放心的数字底下是零次比对。
+$compared = 0
 $mismatches = @()
 
 foreach ($c in $ciCmds) {
     $k = Get-CommandKey $c
     if (-not $k -or -not $verifyMap.ContainsKey($k)) { continue }
+
+    $compared++
 
     if ($verifyMap[$k] -ne $c) {
         $mismatches += [PSCustomObject]@{
@@ -160,7 +240,7 @@ foreach ($c in $ciCmds) {
 }
 
 if ($mismatches.Count -eq 0 -and $onlyInCi.Count -eq 0) {
-    Write-Host "  两边共有的 $($verifyMap.Count) 条工具命令参数一致" -ForegroundColor Green
+    Write-Host "  逐字比对了 $compared 对工具命令, 参数一致" -ForegroundColor Green
     Write-Host ''
     exit 0
 }

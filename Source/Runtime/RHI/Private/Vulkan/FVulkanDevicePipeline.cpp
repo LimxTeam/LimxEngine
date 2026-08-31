@@ -140,8 +140,33 @@ ERHIResult FVulkanDevice::CreateRenderPass(
         // 深度模板附件引用
         if (src.DepthStencilAttachment != nullptr)
         {
-            depthRefs[s].attachment =
+            const UInt32 depthIndex =
                 src.DepthStencilAttachment->AttachmentIndex;
+
+            // 深度必须是最后一个附件。
+            //
+            // 这不是风格偏好, 是 BeginRenderPass 填清除值的方式决定的:
+            // 它先按顺序填全部颜色清除值, 然后**无条件把深度清除值追加到
+            // 末尾** (见 FVulkanCommandBuffer::BeginRenderPass)。附件顺序
+            // 一旦不是 [颜色..., 深度], 清除值就整体错位。
+            //
+            // 而清除值的**数量**仍然是对的 —— 验证层不会报错。表现是深度
+            // 被当颜色清、某张颜色图被当深度清, 画面几乎全黑, 而人会先去
+            // 怀疑深度测试的比较函数。
+            //
+            // 在这里拒绝, 比在每个 Pass 里"记得放最后"可靠。
+            if (depthIndex + 1 != attachmentCount)
+            {
+                LIMX_LOG(LogRHI, Error,
+                    "[Vulkan] 渲染通道 '{}' 的深度附件在 {} 号, 但共有 {} 个"
+                    "附件 —— 深度必须是最后一个, 否则清除值会整体错位",
+                    (desc.DebugName != nullptr) ? desc.DebugName : "?",
+                    depthIndex, attachmentCount);
+
+                return ERHIResult::ErrorInvalidParameter;
+            }
+
+            depthRefs[s].attachment = depthIndex;
             depthRefs[s].layout =
                 ToVkImageLayout(src.DepthStencilAttachment->Layout);
             dst.pDepthStencilAttachment = &depthRefs[s];
