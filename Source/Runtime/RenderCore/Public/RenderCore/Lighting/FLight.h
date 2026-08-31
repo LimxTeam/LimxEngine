@@ -158,12 +158,21 @@ struct FCascadedShadowInfo
 //   偏移 1280:   LightCount     (vec4 的 .x) — 活跃光源数量
 //   偏移 1296:   CameraPosition (vec4 的 .xyz) — 相机世界空间位置
 //   偏移 1312:   AmbientColor   (vec4 的 .xyz) — 环境光颜色
-//   偏移 1328:   AmbientIntensity (同上 vec4 的 .w) — 环境光强度
-//   偏移 1344:   CascadeViewProj[3] (mat4×3) — 各级联的光源视图投影矩阵
-//   偏移 1536:   CascadeSplits  (vec4) — xyz=各级外边界的径向距离
-//   偏移 1552:   ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
+//                AmbientIntensity (同一个 vec4 的 .w, 即偏移 1324)
+//   偏移 1328:   CascadeViewProj[3] (mat4×3, 步长 64) — 级联视图投影矩阵
+//   偏移 1520:   CascadeSplits  (vec4) — xyz=各级外边界的径向距离
+//   偏移 1536:   ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
 //                                        z=阴影贴图边长, w=是否启用
+//   偏移 1552:   IblParams      (vec4) — x=是否启用, y=强度倍数,
+//                                        z=预滤波最高 mip 下标
 //   总计: 1568 字节
+//
+// 这份清单以 `lsc` 的 SPIR-V 反射为准 (pbr.frag 的 set 2 / binding 0),
+// 不是照着 C++ 结构体读出来的。它此前有两处错: AmbientIntensity 被单列成
+// 偏移 1328 (其实是上一个 vec4 的 .w, 在 1324), 于是后面全部顺移了 16
+// 字节; IblParams 整个 vec4 没有出现。
+//
+// 注释错了不会有任何症状 —— 直到有人照着它加字段。
 //
 // 阴影数据放在光照 UBO 而非另建一个: 它逻辑上就是"主方向光的属性",
 // 且与光源数据在同一个更新时机。单独一个 UBO 意味着多一次绑定、

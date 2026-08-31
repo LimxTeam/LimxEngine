@@ -513,6 +513,74 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 // ============================================================================
 
 // ============================================================================
+// FErrorCountingSink — 统计 Error 及以上级别的日志条数
+//
+// 存在的理由是一整类"报了错但退出码是 0"的情况。最典型的是显存泄漏:
+// 检测发生在 renderContext.Shutdown() 里面, 而各条自检的 passed 值早在
+// 那之前就算完并 return 了 —— 泄漏于是只在日志里留一行 Error, 而 CI 看
+// 的是退出码。
+//
+// 专门给泄漏加一个访问器也能解决那一条, 但下一条同类问题还会再出现一次。
+// 数 Error 覆盖的是整个类别: 验证层报错、资源管理器抱怨、关闭顺序不对、
+// 以及所有还没写出来的。
+//
+// 只在自检模式下参与判定。普通运行不判 —— 那些场合下 Error 可能是"用户
+// 给的路径不存在"之类的正常反馈, 拿它决定退出码会制造假失败。
+// ============================================================================
+class FErrorCountingSink final : public ILogSink
+{
+public:
+    void Write(const LogCategory& category,
+               LogVerbosity       verbosity,
+               const AnsiChar*    message) override
+    {
+        (void)category;
+        (void)message;
+
+        if (verbosity == LogVerbosity::Error || verbosity == LogVerbosity::Fatal)
+        {
+            ++m_Count;
+        }
+    }
+
+    LIMX_NODISCARD UInt32 GetCount() const { return m_Count; }
+
+private:
+    UInt32 m_Count = 0;
+};
+
+/// 自检的最终退出码 —— 把"关闭阶段才冒出来的 Error"并进判定
+///
+/// selfCheckCode 是自检自身失败时该返回的码; 关闭阶段出错另给一个码,
+/// 好让日志里一眼看出是哪一类问题。
+static int FinalizeSelfCheck(bool                     passed,
+                             int                      selfCheckCode,
+                             const FErrorCountingSink& errorSink,
+                             UInt32                   errorsBeforeShutdown)
+{
+    // 自检本身的失败优先报告 —— 它比"关闭阶段有 Error"更具体。
+    // 反过来的顺序会让一个失败的自检因为顺带有泄漏而只报 8, 丢掉信息。
+    if (!passed)
+    {
+        return selfCheckCode;
+    }
+
+    const UInt32 shutdownErrors = errorSink.GetCount() - errorsBeforeShutdown;
+
+    if (shutdownErrors > 0)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[自检] 自检项全部通过, 但关闭阶段出现 {} 条 Error —— "
+                 "判定为失败 (显存泄漏、资源未回收一类的问题只在这个阶段"
+                 "才会暴露)",
+                 shutdownErrors);
+        return 8;
+    }
+
+    return 0;
+}
+
+// ============================================================================
 // FGBufferCapture — 法线与速度附件的回读
 //
 // 与 FScreenshotCapture 分开而不是共用: 那个读的是交换链图像 (布局
@@ -2714,6 +2782,10 @@ int WINAPI wWinMain(
     // ================================================================
 
     FPlatformFile::CreateDirectoryTree(FString("Logs"));
+    // 必须在设备创建之前装上 —— 关闭阶段的 Error 要数, 启动阶段的也要
+    FErrorCountingSink errorSink;
+    FLog::AddSink(&errorSink);
+
     FileLogSink fileLogSink;
     if (fileLogSink.Open("Logs/LimxEngine.log"))
     {
@@ -2802,7 +2874,8 @@ int WINAPI wWinMain(
     // 4c. 通过资源管理器创建场景网格, 挂到 LScene 的 LNode+LMeshTrait
     if (launchOptions.FurnaceCheck)
     {
-        const bool passed = RunFurnaceSelfTest(&renderContext);
+        const bool   passed               = RunFurnaceSelfTest(&renderContext);
+        const UInt32 errorsBeforeShutdown = errorSink.GetCount();
 
         LRegistry::Get().Destroy(scene);
         FSceneManager::Get().Shutdown();
@@ -2810,10 +2883,14 @@ int WINAPI wWinMain(
         renderContext.Shutdown();
         window.Destroy();
 
+        const int code =
+            FinalizeSelfCheck(passed, 5, errorSink, errorsBeforeShutdown);
+
         FLog::RemoveSink(&fileLogSink);
+        FLog::RemoveSink(&errorSink);
         fileLogSink.Close();
 
-        return passed ? 0 : 5;
+        return code;
     }
 
     if (launchOptions.ReloadTest)
@@ -2821,16 +2898,22 @@ int WINAPI wWinMain(
         const bool passed =
             RunReloadTest(&renderContext, &renderer, launchOptions);
 
+        const UInt32 errorsBeforeShutdown = errorSink.GetCount();
+
         LRegistry::Get().Destroy(scene);
         FSceneManager::Get().Shutdown();
         renderer.Shutdown();
         renderContext.Shutdown();
         window.Destroy();
 
+        const int code =
+            FinalizeSelfCheck(passed, 4, errorSink, errorsBeforeShutdown);
+
         FLog::RemoveSink(&fileLogSink);
+        FLog::RemoveSink(&errorSink);
         fileLogSink.Close();
 
-        return passed ? 0 : 4;
+        return code;
     }
 
     if (!launchOptions.ScenePath.IsEmpty())
@@ -3022,6 +3105,9 @@ int WINAPI wWinMain(
     // 6. 关闭 (逆序: 场景→桥接→渲染器→上下文→窗口)
     // ================================================================
 
+    // 关闭之前记下 Error 计数 —— 之后新增的都算在关闭阶段头上
+    const UInt32 errorsBeforeShutdown = errorSink.GetCount();
+
     LIMX_LOG(LogLaunch, Log,
         "[Launch] 正在关闭...");
 
@@ -3071,19 +3157,21 @@ int WINAPI wWinMain(
     LIMX_LOG(LogLaunch, Log,
         "[Launch] Limx Engine 已关闭");
 
-    // 移除文件日志 Sink 并关闭
-    FLog::RemoveSink(&fileLogSink);
-    fileLogSink.Close();
-
-    // 自检的判定必须放在**全部关闭之后**返回。
+    // 自检的判定必须放在**全部关闭之后**。
     //
     // 这一点看着无所谓, 其实是本项目栽过的坑: 判定值若在关闭之前就算完并
     // 直接 return, 那么关闭阶段才发现的问题 (显存泄漏、资源未回收) 永远
     // 影响不到退出码, 而它们只在日志里留一行 Error —— CI 看的是退出码。
-    if (launchOptions.GBufferCheck && !gbufferCheckPassed)
-    {
-        return 7;
-    }
+    const int selfCheckCode =
+        launchOptions.GBufferCheck
+            ? FinalizeSelfCheck(gbufferCheckPassed, 7, errorSink,
+                                errorsBeforeShutdown)
+            : 0;
 
-    return 0;
+    // 移除日志 Sink 并关闭
+    FLog::RemoveSink(&fileLogSink);
+    FLog::RemoveSink(&errorSink);
+    fileLogSink.Close();
+
+    return selfCheckCode;
 }

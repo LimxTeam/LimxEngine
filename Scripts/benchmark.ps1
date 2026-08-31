@@ -189,7 +189,17 @@ foreach ($config in $Configurations) {
     # 判定放在这里而不是只打印: 漏埋的表现是某个 Pass 的时间凭空消失,
     # 不报错、不崩溃, 而逐 Pass 表看起来依然完整。
     if ($unaccountedPct -lt 0) {
-        Write-Host '      未取到 GPU 计时' -ForegroundColor Yellow
+        # 取不到就是失败, 不是警告。
+        #
+        # 这一项存在的意义是"抓住某个 Pass 漏了计时"。而 GPU 计时整个取不
+        # 到时, 它连一个数都没有 —— 那是比"某个 Pass 漏埋"更严重的情况,
+        # 却被写成了黄字警告放行。也就是说这道闸门在最该拦的时候自己关掉
+        # 了自己。
+        #
+        # 真实触发路径不止一条: 查询池创建失败、设备不支持时间戳、日志格式
+        # 改动导致正则不匹配。任何一条都会让整个 GPU 侧判定静默失效。
+        Write-Host '      未取到 GPU 计时 — 无法判定是否有 Pass 漏埋' -ForegroundColor Red
+        $Failed = $true
     }
     elseif ($unaccountedPct -gt $UnaccountedBudgetPct) {
         Write-Host ("      未埋点 {0:N1}% 超出上限 {1:N1}% — 可能有 Pass 漏了计时" -f `
