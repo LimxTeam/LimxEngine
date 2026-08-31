@@ -195,13 +195,13 @@ jobs:
 
       # 退出码非 0 即判定失败, 无需解析输出文本
       - name: Core 单元测试
-        run: .\Binaries\Development\Win64\LimxCoreTests.exe
+        run: .\Binaries\Development\Win64\LimxCoreTests.exe --min-cases 406
 
       - name: RHI 单元测试
-        run: .\Binaries\Development\Win64\LimxRHITests.exe
+        run: .\Binaries\Development\Win64\LimxRHITests.exe --min-cases 58
 
       - name: 资产管线单元测试
-        run: .\Binaries\Development\Win64\LimxAssetTests.exe
+        run: .\Binaries\Development\Win64\LimxAssetTests.exe --min-cases 200
 
       # 引擎层测试逐套件跑。
       #
@@ -233,6 +233,29 @@ jobs:
 
       - name: 引擎层测试 · TranslucentSort
         run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite TranslucentSort
+
+      - name: 引擎层测试 · ClusterGrid
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite ClusterGrid
+
+      - name: 引擎层测试 · CompressedTextureFormat
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite CompressedTextureFormat
+
+      - name: 引擎层测试 · Octahedral
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite Octahedral
+
+      - name: 引擎层测试 · ShadowAtlas
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --suite ShadowAtlas
+
+      # 用例数下限 —— 防的是"套件悄悄消失"。
+      #
+      # 上面每一条都是手写的套件名。新加一个套件而忘了补一行, 它就永远不会
+      # 被执行, 而"没执行"与"全过"在退出码上完全一样。ClusterGrid、
+      # Octahedral、ShadowAtlas 三个就是这么漏掉的。
+      #
+      # 判据放在二进制里而不是脚本里: 脚本要判断就得解析输出文本, 而解析
+      # 失败会退化成"没发现问题" —— 又一个落在"通过"上的失效。
+      - name: 引擎层测试 · 用例数下限
+        run: .\Binaries\Development\Win64\LimxEngineTests.exe --min-cases 78
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

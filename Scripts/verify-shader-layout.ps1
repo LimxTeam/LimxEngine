@@ -59,6 +59,44 @@ $structs = @(
     }
 )
 
+# storage buffer 走另一张表 —— 反射里它们在 storage_buffers 而不是
+# uniform_buffers, 而且比的是**元素步长**不是块大小: 运行期定长数组的块
+# 大小是 0, 只有 array_stride 是确定的。
+#
+# 步长其实比块大小更有力: 结构体里加一个字段、改一处对齐, 步长立刻不同,
+# 而块大小对定长数组根本没有意义。
+#
+# 标记必须连 set/binding 一起写。同一个 C++ 结构体在不同着色器里绑在不同
+# 位置 —— FLightData 在 pbr.frag 是 set2/binding5, 在 light_cull.comp 是
+# set0/binding1。只匹配 'buffer LightBuffer' 的话, 两个文件都会被拿去和
+# 同一组 set/binding 比, 于是恒红。
+$storageStructs = @(
+    @{
+        Name    = 'FLightData'
+        Header  = 'Source/Runtime/RenderCore/Public/RenderCore/Lighting/FLight.h'
+        Set     = 2
+        Binding = 5
+        Marker  = 'set\s*=\s*2,\s*binding\s*=\s*5\)\s*readonly\s+buffer\s+LightBuffer'
+        MinShaders = 1
+    }
+    @{
+        Name    = 'FLightData'
+        Header  = 'Source/Runtime/RenderCore/Public/RenderCore/Lighting/FLight.h'
+        Set     = 0
+        Binding = 1
+        Marker  = 'set\s*=\s*0,\s*binding\s*=\s*1\)\s*readonly\s+buffer\s+LightBuffer'
+        MinShaders = 1
+    }
+    @{
+        Name    = 'FSpotShadowData'
+        Header  = 'Source/Runtime/RenderCore/Public/RenderCore/Lighting/FShadowAtlas.h'
+        Set     = 2
+        Binding = 9
+        Marker  = 'set\s*=\s*2,\s*binding\s*=\s*9\)\s*readonly\s+buffer\s+SpotShadowBuffer'
+        MinShaders = 1
+    }
+)
+
 # push constant 单独一条 —— 它不是描述符, 反射里也在另一个字段上
 $pushHeader = 'Source/Runtime/Renderer/Public/Renderer/Renderer/FRenderer.h'
 
@@ -98,11 +136,20 @@ foreach ($s in $structs)
     if ($expected[$s.Name] -lt 0) { exit 1 }
 }
 
+foreach ($s in $storageStructs)
+{
+    $expected[$s.Name] = Get-ExpectedSize -Path $s.Header -Name $s.Name
+
+    if ($expected[$s.Name] -lt 0) { exit 1 }
+}
+
 $offenders   = New-Object System.Collections.ArrayList
 $checkedPush = 0
 $checkedByStruct = @{}
 
-$allShaders = Get-ChildItem -Path Shaders -Recurse -Include *.vert, *.frag
+# 计算着色器也在内 —— FLightData 被 light_cull.comp 读, 而它此前完全没有
+# 被这个脚本覆盖过。
+$allShaders = Get-ChildItem -Path Shaders -Recurse -Include *.vert, *.frag, *.comp
 
 foreach ($s in $structs)
 {
@@ -163,6 +210,68 @@ foreach ($s in $structs)
     }
 }
 
+# ---- storage buffer: 比元素步长 ----
+#
+# 计数用 "名字/set/binding" 作键而不是名字: FLightData 在两个着色器里绑在
+# 不同位置, 只按名字计数的话, 其中一处一个都没查到也会被另一处的计数掩盖。
+$checkedByStorage = @{}
+
+foreach ($s in $storageStructs)
+{
+    $key = "$($s.Name)/$($s.Set)/$($s.Binding)"
+    $checkedByStorage[$key] = 0
+
+    $shaders = $allShaders |
+               Where-Object { (Get-Content $_.FullName -Raw) -match $s.Marker }
+
+    foreach ($shader in $shaders)
+    {
+        $relative = $shader.FullName.Substring((Get-Location).Path.Length + 1)
+        $json = 'Binaries/' + $relative.Replace([char]92, [char]47) + '.json'
+
+        if (-not (Test-Path $json))
+        {
+            [void]$offenders.Add("$($shader.Name): 找不到反射文件 $json")
+            continue
+        }
+
+        $reflection = Get-Content $json -Raw | ConvertFrom-Json
+
+        $ssbo = $reflection.storage_buffers |
+                Where-Object { $_.set -eq $s.Set -and $_.binding -eq $s.Binding }
+
+        if ($null -eq $ssbo)
+        {
+            [void]$offenders.Add(
+                "$($shader.Name): 反射里没有 set $($s.Set) / binding $($s.Binding) 的 storage buffer ($($s.Name))")
+            continue
+        }
+
+        $stride = $ssbo.members[0].array_stride
+
+        $checkedByStorage[$key]++
+
+        if ($stride -ne $expected[$s.Name])
+        {
+            [void]$offenders.Add(
+                "$($shader.Name): set$($s.Set)/binding$($s.Binding) 元素步长 $stride 字节, C++ 侧 $($s.Name) 是 $($expected[$s.Name])")
+        }
+    }
+}
+
+foreach ($s in $storageStructs)
+{
+    $key = "$($s.Name)/$($s.Set)/$($s.Binding)"
+
+    if ($checkedByStorage[$key] -lt $s.MinShaders)
+    {
+        Write-Host ("只检查到 {0} 个着色器的 {1} (set{2}/binding{3}, 预期至少 {4} 个) — 判定无效" -f `
+            $checkedByStorage[$key], $s.Name, $s.Set, $s.Binding, $s.MinShaders) -ForegroundColor Red
+        foreach ($offender in $offenders) { Write-Host "  $offender" }
+        exit 1
+    }
+}
+
 # 一个都没查到就是"什么都没发生", 而那与"全部通过"在结果上无法区分。
 # 反射文件缺失、目录改名、Where-Object 写错 —— 都会走到这里。
 foreach ($s in $structs)
@@ -192,5 +301,15 @@ $summary = ($structs | ForEach-Object {
     "{0}×{1}={2}B" -f $checkedByStruct[$_.Name], $_.Name, $expected[$_.Name]
 }) -join ', '
 
+# storage buffer 也要出现在这一行。加了检查却不报出来的话, 它哪天悄悄退化成
+# "一个着色器都没匹配到"就没人看得见 —— 而 MinShaders 那道闸只在计数为零时
+# 才拦得住, 拦不住"本该三处只查了一处"。
+$storageSummary = ($storageStructs | ForEach-Object {
+    "{0}×{1}[s{2}b{3}]步长{4}B" -f `
+        $checkedByStorage["$($_.Name)/$($_.Set)/$($_.Binding)"], `
+        $_.Name, $_.Set, $_.Binding, $expected[$_.Name]
+}) -join ', '
+
 Write-Host "布局一致: $summary, push×$checkedPush=$($expected['FModelPushConstant'])B" -ForegroundColor Green
+Write-Host "         $storageSummary" -ForegroundColor Green
 exit 0

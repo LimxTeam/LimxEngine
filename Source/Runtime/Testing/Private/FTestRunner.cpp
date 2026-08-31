@@ -407,6 +407,7 @@ Int32 FTestRunner::Main(Int32 argc, AnsiChar** argv)
             WriteLine("  --list               只列举匹配的用例, 不执行");
             WriteLine("  --verbose            打印每个用例的结果行");
             WriteLine("  --stop-on-failure    首个失败后停止");
+            WriteLine("  --min-cases <N>      执行的用例少于 N 就判失败");
             WriteLine("  --help               显示本帮助");
             WriteLine();
             WriteLine("退出码: 0 全部通过 | 1 存在失败 | 2 参数错误");
@@ -455,6 +456,41 @@ Int32 FTestRunner::Main(Int32 argc, AnsiChar** argv)
             continue;
         }
 
+        if (AreCStringsEqual(argument, "--min-cases"))
+        {
+            if (i + 1 >= argc)
+            {
+                WriteLine("错误: --min-cases 需要一个参数");
+                return 2;
+            }
+
+            const AnsiChar* text = argv[++i];
+
+            UInt32 value  = 0;
+            bool   anyDigit = false;
+
+            for (const AnsiChar* cursor = text; *cursor != 0; ++cursor)
+            {
+                if (*cursor < '0' || *cursor > '9')
+                {
+                    WriteLine("错误: --min-cases 需要一个非负整数");
+                    return 2;
+                }
+
+                value    = value * 10u + static_cast<UInt32>(*cursor - '0');
+                anyDigit = true;
+            }
+
+            if (!anyDigit)
+            {
+                WriteLine("错误: --min-cases 需要一个非负整数");
+                return 2;
+            }
+
+            options.MinTests = value;
+            continue;
+        }
+
         WriteLine(StringFormat("错误: 无法识别的参数 '{}'", argument).GetCStr());
         WriteLine("使用 --help 查看可用选项");
         return 2;
@@ -468,6 +504,18 @@ Int32 FTestRunner::Main(Int32 argc, AnsiChar** argv)
         WriteLine("");
         WriteLine("错误: 没有任何用例被执行 — 过滤器写错了, 还是套件改名了?");
         WriteLine("      用 --list 看当前注册了哪些套件。");
+    }
+
+    // 用例数下限。--list 不执行任何用例, 因此不适用。
+    if (!options.ListOnly && options.MinTests > 0 &&
+        summary.TotalTests < options.MinTests)
+    {
+        WriteLine("");
+        WriteLine(StringFormat(
+            "错误: 只执行了 {} 个用例, 少于要求的 {} 个 — "
+            "是不是有套件没被链接进来, 或者被过滤掉了?",
+            summary.TotalTests, options.MinTests).GetCStr());
+        return 1;
     }
 
     return summary.IsSuccess() ? 0 : 1;
