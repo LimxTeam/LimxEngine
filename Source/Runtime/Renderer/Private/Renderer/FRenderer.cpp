@@ -70,6 +70,7 @@
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
+#include "Renderer/RenderPass/FBloomPass.h"
 #include "Renderer/RenderPass/FSkyPass.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
 #include "Renderer/RenderPass/FPostProcessPass.h"
@@ -236,11 +237,13 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_TaaPass          = MakeUnique<FTaaPass>();
     m_GtaoPass         = MakeUnique<FGtaoPass>();
+    m_BloomPass        = MakeUnique<FBloomPass>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
     m_PassManager->RegisterPass(m_GtaoPass.Get());
     m_PassManager->RegisterPass(m_TaaPass.Get());
+    m_PassManager->RegisterPass(m_BloomPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
@@ -1636,10 +1639,36 @@ void FRenderer::SetTaaEnabled(bool enabled)
 
     m_TaaPass->SetEnabled(enabled);
 
-    // 后处理采样谁: 开 TAA 时采解析目标, 关时直接采前向通道的 HDR 输出。
-    //
-    // 只在开关翻转时改一次描述符, 不逐帧改 —— 改一个正在被上一帧使用的
-    // 描述符集是验证层错误。翻转时调用方保证已经 WaitIdle (见调用点)。
+    RefreshPostProcessChain();
+}
+
+// ============================================================================
+// SetBloomEnabled
+// ============================================================================
+
+void FRenderer::SetBloomEnabled(bool enabled)
+{
+    m_BloomEnabled = enabled;
+
+    if (m_BloomPass)
+    {
+        m_BloomPass->SetEnabled(enabled);
+    }
+
+    RefreshPostProcessChain();
+}
+
+// ============================================================================
+// RefreshPostProcessChain — 按开关状态重接整条链
+// ============================================================================
+
+void FRenderer::RefreshPostProcessChain()
+{
+    if (!m_PostProcessPass || !m_PassManager || m_Context == nullptr)
+    {
+        return;
+    }
+
     IRHIDevice* const device = m_Context->GetDevice();
 
     if (device == nullptr)
@@ -1647,12 +1676,31 @@ void FRenderer::SetTaaEnabled(bool enabled)
         return;
     }
 
+    // 链: HDR 目标 → [TAA] → [泛光] → 色调映射
+    //
+    // 逐级往下传"上一级的输出", 关掉的那一级直接跳过。这样加第四级时只要
+    // 在这里插一段, 而不必去改每一个开关的 Setter。
+    FRHITextureViewHandle current = m_PassManager->GetSharedColorView();
+
+    if (m_TaaPass && m_TaaPass->IsEnabled())
+    {
+        current = m_TaaPass->GetResolveView();
+    }
+
+    // 泛光的**输入**是它前一级的输出, 而不是固定的 HDR 目标 —— 开着 TAA
+    // 时泛光要在消过锯齿的图上做, 否则锯齿边缘的高频会被放大成一圈爬行的
+    // 亮边, 而 TAA 已经在它之前跑完, 无从补救。
+    if (m_BloomPass && m_BloomPass->IsEnabled())
+    {
+        m_BloomPass->SetSourceView(current);
+        current = m_BloomPass->GetOutputView();
+    }
+
+    // 只在开关翻转时改一次描述符, 不逐帧改 —— 改一个正在被上一帧使用的
+    // 描述符集是验证层错误。
     device->WaitIdle();
 
-    m_PostProcessPass->UpdateSourceDescriptor(
-        device,
-        enabled ? m_TaaPass->GetResolveView()
-                : m_PassManager->GetSharedColorView());
+    m_PostProcessPass->UpdateSourceDescriptor(device, current);
 }
 
 // ============================================================================

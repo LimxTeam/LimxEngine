@@ -92,6 +92,7 @@ class FDepthPrePass;
 class FClusterLightPass;
 class FTaaPass;
 class FGtaoPass;
+class FBloomPass;
 class FSkyPass;
 class FPostProcessPass;
 class FEnvironmentMap;
@@ -495,6 +496,17 @@ public:
     /// GTAO 通道 —— 自检要用
     LIMX_NODISCARD FGtaoPass* GetGtaoPass() const { return m_GtaoPass.Get(); }
 
+    /// 泛光通道 —— 自检要用
+    LIMX_NODISCARD FBloomPass* GetBloomPass() const
+    {
+        return m_BloomPass.Get();
+    }
+
+    /// 泛光开关
+    void SetBloomEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsBloomEnabled() const { return m_BloomEnabled; }
+
     /// 屏幕空间环境光遮蔽开关
     void SetGtaoEnabled(bool enabled);
 
@@ -533,6 +545,15 @@ public:
     {
         return m_CurrentJitter;
     }
+
+    /// 重新接线后处理链的输入
+    ///
+    /// 链是 HDR 目标 → [TAA] → [泛光] → 色调映射, 中间两级各自可关。
+    /// 每个开关翻转时都要重算一次 —— 写成一个函数而不是在每个 Setter 里
+    /// 各接一次, 因为"接线"这件事的正确性取决于**整条链**而非单个开关:
+    /// 只改自己那一段的话, 关掉 TAA 会让泛光的输入停在 TAA 的解析目标上,
+    /// 而那张图从此不再更新。
+    void RefreshPostProcessChain();
 
     /// 设置场景渲染后回调 — 在所有场景 Pass 执行完毕、EndFrame 之前调用
     /// 用于 UI 渲染叠加等需要录制到同一命令缓冲区的操作
@@ -674,6 +695,10 @@ private:
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FTaaPass>              m_TaaPass;
     TUniquePtr<FGtaoPass>             m_GtaoPass;
+    TUniquePtr<FBloomPass>            m_BloomPass;
+
+    /// 泛光是否启用 (默认关 —— 它有真实开销, 由调用方决定)
+    bool                              m_BloomEnabled = false;
 
     /// GTAO 是否启用 (默认关 —— 它有真实开销, 由调用方决定)
     bool                              m_GtaoEnabled = false;

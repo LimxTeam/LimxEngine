@@ -54,6 +54,7 @@
 #include "RenderCore/Lighting/FClusterGrid.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
+#include "Renderer/RenderPass/FBloomPass.h"
 
 namespace Limx
 {
@@ -158,8 +159,23 @@ struct FLaunchOptions
     /// 启用屏幕空间环境光遮蔽
     bool Gtao = false;
 
+    /// 启用泛光
+    bool Bloom = false;
+
+    /// 泛光的亮度阈值
+    Float32 BloomThreshold = 1.0f;
+
+    /// 泛光的合成强度
+    Float32 BloomIntensity = 0.05f;
+
     /// 构建直角墙角场景 (GTAO 自检的解析基准)
     bool CornerScene = false;
+
+    /// 构建单点光源场景 (泛光自检的点扩散基准)
+    bool BloomScene = false;
+
+    /// 泛光自检: 断言点扩散函数的对称性与能量守恒, 以退出码报告
+    bool BloomCheck = false;
 
     /// GTAO 的采样半径 (世界单位)
     Float32 AoRadius = 0.8f;
@@ -381,7 +397,12 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --taa            启用时域抗锯齿 (Halton 2,3 抖动 + 解析通道)
 ///   --taa-check      TAA 自检: 与多帧平均比对, 以退出码报告
 ///   --gtao           启用屏幕空间环境光遮蔽
+///   --bloom          启用泛光
+///   --bloom-threshold T  泛光的亮度阈值 (默认 1.0)
+///   --bloom-intensity I  泛光的合成强度 (默认 0.05)
 ///   --corner-scene   构建直角墙角场景 (GTAO 自检的解析基准)
+///   --bloom-scene    构建单点自发光场景 (泛光自检的点扩散基准)
+///   --bloom-check    泛光自检: 点扩散的对称性与能量守恒, 以退出码报告
 ///   --ao-check       GTAO 自检: 断言墙角处的解析值, 以退出码报告
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
 ///   --no-clustered   关闭分簇, 强制暴力遍历全部光源 (性能对照用)
@@ -543,9 +564,29 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.Gtao = true;
         }
+        else if (WideEquals(arg, L"--bloom"))
+        {
+            options.Bloom = true;
+        }
+        else if (WideEquals(arg, L"--bloom-threshold") && (i + 1) < tokenCount)
+        {
+            options.BloomThreshold = ParseFloat32(tokens[++i], 1.0f);
+        }
+        else if (WideEquals(arg, L"--bloom-intensity") && (i + 1) < tokenCount)
+        {
+            options.BloomIntensity = ParseFloat32(tokens[++i], 0.05f);
+        }
         else if (WideEquals(arg, L"--corner-scene"))
         {
             options.CornerScene = true;
+        }
+        else if (WideEquals(arg, L"--bloom-scene"))
+        {
+            options.BloomScene = true;
+        }
+        else if (WideEquals(arg, L"--bloom-check"))
+        {
+            options.BloomCheck = true;
         }
         else if (WideEquals(arg, L"--ao-radius") && (i + 1) < tokenCount)
         {
@@ -1655,6 +1696,548 @@ private:
     bool             m_IsPending   = false;
     bool             m_IsRecorded  = false;
 };
+
+namespace
+{
+
+/// 回读一张 RGBA16_SFLOAT 纹理, 返回逐像素亮度
+///
+/// 泛光自检要读两张 (泛光链首级与合成结果), 而两次读的动作完全一样 ——
+/// 复制一遍的话总会有一份忘了转布局, 而那是验证层错误而不是数值错误,
+/// 排查方向完全不同。
+static bool ReadTextureLuminance(FRenderContext*   context,
+                                 FRenderer&        renderer,
+                                 FRHITextureHandle texture,
+                                 FRHIExtent2D      extent,
+                                 TArray<Float32>&  outLuminance)
+{
+    IRHIDevice* const device = context->GetDevice();
+
+    if (device == nullptr || !texture.IsValid())
+    {
+        return false;
+    }
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle readback;
+
+    FRHIBufferDesc desc = {};
+    desc.Size        = pixelCount * 8u;   // RGBA16_SFLOAT
+    desc.Usage       = EBufferUsage::TransferDst;
+    desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    desc.DebugName   = "BloomCheck.Readback";
+
+    if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+    {
+        return false;
+    }
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, readback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            cmd->TransitionImageLayout(
+                texture,
+                EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead,
+                EAccessFlags::TransferRead);
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                texture,
+                EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead,
+                EAccessFlags::ShaderRead);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    if (!recorded)
+    {
+        device->DestroyBuffer(readback);
+        return false;
+    }
+
+    device->WaitIdle();
+
+    void* mapped = nullptr;
+
+    if (!IsRHISuccess(device->MapBuffer(readback, &mapped)) ||
+        mapped == nullptr)
+    {
+        device->DestroyBuffer(readback);
+        return false;
+    }
+
+    const Float16Bits* src = static_cast<const Float16Bits*>(mapped);
+
+    outLuminance.Clear();
+    outLuminance.Reserve(pixelCount);
+
+    for (SizeType i = 0; i < pixelCount; ++i)
+    {
+        const Float32 r = Float16ToFloat32(src[i * 4 + 0]);
+        const Float32 g = Float16ToFloat32(src[i * 4 + 1]);
+        const Float32 b = Float16ToFloat32(src[i * 4 + 2]);
+
+        outLuminance.Add(0.2126f * r + 0.7152f * g + 0.0722f * b);
+    }
+
+    device->UnmapBuffer(readback);
+    device->DestroyBuffer(readback);
+
+    return true;
+}
+
+/// 求和
+static Float64 SumOf(const TArray<Float32>& values)
+{
+    Float64 total = 0.0;
+
+    for (SizeType i = 0; i < values.GetSize(); ++i)
+    {
+        total += static_cast<Float64>(values[i]);
+    }
+
+    return total;
+}
+
+} // namespace
+
+// ============================================================================
+// RunBloomChecks — 泛光的点扩散函数
+//
+// 一个孤立的亮点经过降采样-升采样链之后应当得到**径向对称、单调衰减**的
+// 光晕。那就是这条链的点扩散函数 (PSF), 而它的性质完全由核决定, 与场景无关。
+//
+// 为什么非要量它: 降采样/升采样链最典型的缺陷是**半纹素偏移**。核的采样坐标
+// 算错半个纹素, 每一级都把图像往同一个方向挪一点点, 六级累积下来光晕整体
+// 偏离光源好几个像素。而画面上那仍然是"一团发光的东西" —— 没人看得出来它
+// 偏了, 除非拿对称性去量。
+//
+// 三条判据:
+//   1. **对称性** — 沿四个轴向, 距中心等距的两点亮度必须接近。这一条直接
+//      抓半纹素偏移。
+//   2. **单调衰减** — 亮度随距离单调下降。不单调说明某一级的核不是低通的。
+//   3. **扩散范围** — 落在光源之外的能量占比。不模糊的实现几乎全部能量都
+//      留在光源那几个像素里。
+//   4. **多尺度累加** — sum(mip0)/(4*sum(mip1))。6 级链的理论值是 1.2, 与
+//      半径、阈值这些可调参数无关。升采样若改成覆盖写, 它掉到 1.0。
+//   5. **合成能量** — 合成增量必须等于 强度 x sum(泛光) x 4。一个算出了完美
+//      PSF 却根本没合成到画面上的实现, 前四条全部通过。
+//
+// ── 已知没能覆盖的一种缺陷 ──
+//
+// 升采样的帐篷偏移若取**源**那一级的纹素尺寸而非目标那一级 (两者差一倍),
+// 泛光会比设定的半径糊一倍。实测核外能量占比 0.391 对基线 0.3435 —— 只差
+// 14%, 而这个量本身又随 m_FilterRadius 这个可调参数移动。要卡到能抓住它的
+// 窄带, 就会在别人正常调半径时误报。
+//
+// 那是一个 CPU 侧的下标算术错误, 更适合在那一层验; 这里如实记下, 而不是
+// 用一个会误报的阈值假装覆盖了它。
+// ============================================================================
+static bool RunBloomChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FBloomPass* const bloom = renderer.GetBloomPass();
+
+    if (bloom == nullptr || !bloom->IsEnabled())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 泛光未启用 — 自检无从判定 (加 --bloom)");
+        return false;
+    }
+
+    const FRHIExtent2D extent = bloom->GetBloomExtent();
+
+    // 读链的第 0 级 (半分辨率)。那是升采样把全部级别加回来之后的结果, 也就是
+    // 完整的 PSF —— 合成之后的图里混着原始场景, 分不出哪部分是泛光。
+    TArray<Float32> luminance;
+
+    if (!ReadTextureLuminance(context, renderer, bloom->GetBloomTexture(),
+                              extent, luminance))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Bloom] 泛光缓冲回读失败");
+        return false;
+    }
+
+    // ---- 亮度质心 ----
+    //
+    // 用质心而非"最亮的那个像素"定中心: 最亮点在方块内部是一片平顶, 具体
+    // 落在哪个像素取决于浮点的最后一位。质心是稳定的, 而且它本身就是对称性
+    // 的一个陈述 —— PSF 对称时质心必然在光源中心。
+    Float64 sumWeight = 0.0;
+    Float64 sumX      = 0.0;
+    Float64 sumY      = 0.0;
+
+    Float32 peak = 0.0f;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const Float32 value =
+                luminance[static_cast<SizeType>(y) * extent.Width + x];
+
+            peak = FMath::Max(peak, value);
+
+            sumWeight += static_cast<Float64>(value);
+            sumX      += static_cast<Float64>(value) * x;
+            sumY      += static_cast<Float64>(value) * y;
+        }
+    }
+
+    if (sumWeight < 1.0e-3 || peak < 1.0e-3)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 泛光缓冲几乎全黑 (总亮度 {}, 峰值 {}) —— "
+                 "阈值是不是太高, 或者链根本没跑?",
+                 sumWeight, peak);
+        return false;
+    }
+
+    const Int32 centerX = static_cast<Int32>(sumX / sumWeight + 0.5);
+    const Int32 centerY = static_cast<Int32>(sumY / sumWeight + 0.5);
+
+    const auto Sample = [&luminance, extent](Int32 x, Int32 y) -> Float32
+    {
+        if (x < 0 || y < 0 ||
+            x >= static_cast<Int32>(extent.Width) ||
+            y >= static_cast<Int32>(extent.Height))
+        {
+            return -1.0f;
+        }
+
+        return luminance[static_cast<SizeType>(y) * extent.Width + x];
+    };
+
+    bool passed = true;
+
+    // 剖面总是打印 —— 判定通过与否都要能看到形状。只在失败时打的话, 通过
+    // 的那次就没有可对照的基线, 下一次数值漂移了也无从发现。
+    for (Int32 d = 0; d <= 48; d += 8)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[Bloom] 距 {}: -x {} +x {} | -y {} +y {}",
+                 d,
+                 Sample(centerX - d, centerY), Sample(centerX + d, centerY),
+                 Sample(centerX, centerY - d), Sample(centerX, centerY + d));
+    }
+
+    // ---- 1. 光晕是否居中 ----
+    //
+    // 判据不是"距中心等距的两点亮度相等"。那样量出来的主要是**光源自己的
+    // 硬边**: 方块边缘处亮度从 33 掉到 12, 半个像素的位置差就是 20% 的相对
+    // 差异, 而那与泛光的核毫无关系。第一版就是这么写的, 于是它在一个完全
+    // 正确的实现上报了 22.7% 的"不对称"。
+    //
+    // 改成比较两个质心:
+    //   - **平台质心**: 亮度高于峰值 80% 的区域 —— 那就是光源本身的位置
+    //   - **光晕质心**: 亮度在峰值 0.5% 到 30% 之间的区域 —— 那是扩散出去
+    //     的部分
+    //
+    // 正确的核是对称的, 于是光晕必然以光源为中心, 两个质心重合。而降采样
+    // 或升采样里任何半纹素的坐标偏差都会让每一级往同一个方向挪一点, 六级
+    // 累积下来光晕整体偏离光源好几个像素 —— 质心之差直接把它量出来。
+    //
+    // 这个判据对"中心取整到哪个像素"完全不敏感, 而逐点比较对它很敏感。
+    Float64 plateauWeight = 0.0;
+    Float64 plateauX      = 0.0;
+    Float64 plateauY      = 0.0;
+
+    Float64 haloWeight = 0.0;
+    Float64 haloX      = 0.0;
+    Float64 haloY      = 0.0;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const Float32 value =
+                luminance[static_cast<SizeType>(y) * extent.Width + x];
+
+            if (value > peak * 0.8f)
+            {
+                plateauWeight += static_cast<Float64>(value);
+                plateauX      += static_cast<Float64>(value) * x;
+                plateauY      += static_cast<Float64>(value) * y;
+            }
+            else if (value > peak * 0.005f && value < peak * 0.3f)
+            {
+                haloWeight += static_cast<Float64>(value);
+                haloX      += static_cast<Float64>(value) * x;
+                haloY      += static_cast<Float64>(value) * y;
+            }
+        }
+    }
+
+    if (plateauWeight < 1.0e-3 || haloWeight < 1.0e-3)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 分不出光源与光晕 (平台权重 {}, 光晕权重 {}) —— "
+                 "要么泛光没扩散, 要么整张图都是平的",
+                 plateauWeight, haloWeight);
+        return false;
+    }
+
+    const Float64 offsetX = haloX / haloWeight - plateauX / plateauWeight;
+    const Float64 offsetY = haloY / haloWeight - plateauY / plateauWeight;
+
+    const Float64 centroidOffset =
+        FMath::Sqrt(offsetX * offsetX + offsetY * offsetY);
+
+    // 1.5 像素。光源是个方块而非圆点, 透视又让它不完全对称, 所以两个质心
+    // 不会严格重合。而每级半纹素的偏移累积到第 0 级是 6 个像素量级 ——
+    // 两者差得很开。
+    if (centroidOffset > 1.5)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 光晕质心偏离光源 {} 像素 (dx {}, dy {}) —— "
+                 "降采样或升采样的采样坐标有半纹素偏移",
+                 centroidOffset, offsetX, offsetY);
+        passed = false;
+    }
+
+    // ---- 2. 单调衰减 ----
+    Float32  previous   = -1.0f;
+    SizeType inversions = 0;
+
+    for (Int32 d = 0; d <= 60; d += 4)
+    {
+        // 四个轴向取平均, 抹掉光源本身不是圆形带来的方向性
+        Float32  sum   = 0.0f;
+        SizeType count = 0;
+
+        const Float32 taps[4] =
+        {
+            Sample(centerX - d, centerY), Sample(centerX + d, centerY),
+            Sample(centerX, centerY - d), Sample(centerX, centerY + d),
+        };
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            if (taps[i] >= 0.0f)
+            {
+                sum += taps[i];
+                ++count;
+            }
+        }
+
+        if (count == 0)
+        {
+            continue;
+        }
+
+        const Float32 mean = sum / static_cast<Float32>(count);
+
+        // 容差按峰值的百分之一给 —— 远处的半精度量化本身就有抖动
+        if (previous >= 0.0f && mean > previous + peak * 0.01f)
+        {
+            ++inversions;
+        }
+
+        previous = mean;
+    }
+
+    if (inversions > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 亮度沿半径出现 {} 处回升 —— 某一级的核不是低通的",
+                 inversions);
+        passed = false;
+    }
+
+    // ---- 3. 扩散范围 ----
+    //
+    // 判据是**落在光源之外的能量占比**, 而不是"亮度降到峰值 10% 的半径"。
+    //
+    // 后者第一版用过, 但它量的是 PSF 的**核**而不是尾巴: 点光源的泛光峰值
+    // 很高 (98) 而尾巴很低 (0.05), 10% 的门槛在离中心 5 像素处就跨过了 ——
+    // 哪怕尾巴一直延伸到 48 像素之外。一个完全正确的实现会因此被判失败。
+    //
+    // 能量占比直接回答"泛光有没有把光散开": 不模糊的实现几乎全部能量都留在
+    // 光源那几个像素里, 而正确的链会把三成以上推到 12 像素之外。
+    constexpr Int32 kCoreRadius = 12;
+
+    Float64 totalEnergy   = 0.0;
+    Float64 outsideEnergy = 0.0;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const Float32 value =
+                luminance[static_cast<SizeType>(y) * extent.Width + x];
+
+            const Int32 dx = static_cast<Int32>(x) - centerX;
+            const Int32 dy = static_cast<Int32>(y) - centerY;
+
+            totalEnergy += static_cast<Float64>(value);
+
+            if (dx * dx + dy * dy > kCoreRadius * kCoreRadius)
+            {
+                outsideEnergy += static_cast<Float64>(value);
+            }
+        }
+    }
+
+    const Float64 outsideRatio =
+        (totalEnergy > 1.0e-6) ? (outsideEnergy / totalEnergy) : 0.0;
+
+    // ---- 多尺度累加的直接证据 ----
+    //
+    // 升采样把第 i+1 级**加回**第 i 级。于是
+    //     sum(mip0) = sum(降采样的 mip0) + 4 * sum(mip1)
+    // 明显大于 4*sum(mip1)。若升采样改成覆盖写, 两者相等 —— 而画面上两者
+    // 都只是"一团光", 区别仅在于泛光失去了细尺度的层次。
+    TArray<Float32> mip1;
+
+    Float64 accumulationRatio = 0.0;
+
+    if (ReadTextureLuminance(context, renderer, bloom->GetMipTexture(1),
+                             bloom->GetMipExtent(1), mip1))
+    {
+        const Float64 mip1Sum = SumOf(mip1);
+
+        accumulationRatio =
+            (mip1Sum > 1.0e-6) ? (totalEnergy / (4.0 * mip1Sum)) : 0.0;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Bloom] 诊断: 核外能量占比 {}, 累加比 sum(mip0)/(4*sum(mip1)) = {}",
+             outsideRatio, accumulationRatio);
+
+    // 6 级链的理论值是 1.2, 与级数有关而与半径、阈值等可调参数**无关**:
+    //   降采样每级总能量减为 1/4, 升采样的帐篷核保持密度, 于是
+    //   sum(mip_i) = (6-i)/4^i * S, 代入得 sum(mip0)/(4*sum(mip1)) = 6/5。
+    // 实测基线 1.1994, 改成覆盖写是 0.9997 —— 两者差得很开, 而且不会因为
+    // 有人调半径或阈值而漂移。
+    if (accumulationRatio < 1.1)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 累加比只有 {} (6 级链应为 1.2) —— "
+                 "升采样没有把各级**加回**上一级, 泛光失去了细尺度的层次",
+                 accumulationRatio);
+        passed = false;
+    }
+
+    // 0.2: 实测正确实现是 0.3 以上, 而不模糊的实现几乎是 0。
+    if (outsideRatio < 0.2)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 只有 {} 的能量落在光源 {} 像素之外 —— "
+                 "泛光链没有真的在扩散",
+                 outsideRatio, kCoreRadius);
+        passed = false;
+    }
+
+    // ---- 4. 合成是否真的把泛光加了上去 ----
+    //
+    // 前三条验的都是**泛光缓冲**本身。一个算出了完美 PSF 却根本没合成到画面
+    // 上的实现, 前三条全部通过 —— 而画面上只是"没有泛光", 与关掉它没有区别。
+    //
+    // 判据: 合成结果 = 场景 + 强度 x 泛光。把强度设成 0 再渲一次拿到纯场景,
+    // 两者之差应当等于 强度 x sum(泛光) x 4 —— 4 是因为泛光是半分辨率,
+    // 每个泛光纹素在全分辨率上覆盖 4 个像素。
+    const Float64 bloomSum = SumOf(luminance);
+
+    const Float32 intensity = bloom->GetIntensity();
+
+    TArray<Float32> composite;
+    TArray<Float32> sceneOnly;
+
+    const FRHIExtent2D fullExtent = context->GetSwapchainExtent();
+
+    bool compositeOk =
+        ReadTextureLuminance(context, renderer, bloom->GetOutputTexture(),
+                             fullExtent, composite);
+
+    bloom->SetIntensity(0.0f);
+
+    compositeOk = compositeOk &&
+        ReadTextureLuminance(context, renderer, bloom->GetOutputTexture(),
+                             fullExtent, sceneOnly);
+
+    bloom->SetIntensity(intensity);
+
+    if (!compositeOk)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Bloom] 合成结果回读失败");
+        return false;
+    }
+
+    const Float64 delta = SumOf(composite) - SumOf(sceneOnly);
+
+    const Float64 expected =
+        static_cast<Float64>(intensity) * bloomSum * 4.0;
+
+    if (expected < 1.0e-3)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Bloom] 预期的合成增量只有 {} —— 强度或泛光总量为零, "
+                 "这条判据无从判定",
+                 expected);
+        passed = false;
+    }
+    else
+    {
+        const Float64 ratio = delta / expected;
+
+        // 容差 ±8%。双线性放大不是严格的能量守恒 (边缘像素的权重与内部不同),
+        // 而半精度在这个量级上还有量化误差。任何"没合成"或"强度没生效"的
+        // 情况给出的比值是 0, "加了两次"是 2 —— 都远在容差之外。
+        if (ratio < 0.92 || ratio > 1.08)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Bloom] 合成增量 {} 与预期 {} 之比是 {} —— "
+                     "泛光没有按强度加到画面上",
+                     delta, expected, ratio);
+            passed = false;
+        }
+        else if (passed)
+        {
+            LIMX_LOG(LogLaunch, Log,
+                     "[Bloom] 点扩散: 中心 ({},{}), 峰值 {}, "
+                     "光晕质心偏离 {} 像素, 核外能量占比 {}; "
+                     "合成增量/预期 = {}",
+                     centerX, centerY, peak, centroidOffset, outsideRatio,
+                     ratio);
+        }
+    }
+
+    return passed;
+}
 
 // ============================================================================
 // RunAoChecks — GTAO 的解析判据
@@ -3768,6 +4351,97 @@ static void BuildCornerScene(LScene* scene, FRenderContext* context,
 }
 
 // ============================================================================
+// BuildBloomScene — 黑背景上的一个自发光小方块
+//
+// 泛光的验收基准。一个孤立的亮点经过降采样-升采样链之后应当得到一个**径向
+// 对称、单调衰减**的光晕 —— 那就是这条链的点扩散函数 (PSF)。
+//
+// 为什么非要这样验: 降采样/升采样链最典型的缺陷是**半纹素偏移**。核的采样
+// 坐标算错半个纹素, 每一级都把图像往同一个方向挪一点点, 六级累积下来光晕
+// 整体偏离光源几个像素。而画面上那仍然是"一团发光的东西", 没人看得出来它
+// 偏了 —— 除非拿对称性去量。
+//
+// 场景刻意做到最简: 一个方块, 一盏都没有的光, 黑背景。多任何一样东西, 光晕
+// 就不再是单个 PSF 的叠加, 对称性判据也就不成立了。
+// ============================================================================
+static void BuildBloomScene(LScene* scene, FRenderContext* context,
+                            FRenderer* renderer)
+{
+    LIMX_CHECK(scene != nullptr);
+    LIMX_CHECK(context != nullptr);
+    LIMX_CHECK(renderer != nullptr);
+
+    FRenderResourceManager& resources = context->GetResourceManager();
+
+    // 自发光材质。用自发光而不是"用一盏很亮的光去照"是因为后者的亮度分布
+    // 取决于衰减公式与法线, 方块表面不会是均匀的 —— 而 PSF 的对称性判据
+    // 要求光源本身对称。
+    FMaterial* emissive =
+        FMaterialManager::Get().CreateMaterial("BloomEmissive");
+
+    if (emissive == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 泛光场景的自发光材质创建失败");
+        return;
+    }
+
+    // 基色全黑 —— 方块的亮度**只**来自自发光, 不受任何光照影响。
+    // 有基色的话它会被环境光照亮, 而环境光是各向同性的, 方块的边缘会因为
+    // 法线变化而略有明暗差 —— 那点差异足以破坏对称性判据。
+    emissive->SetBaseColor(FVector4(0.0f, 0.0f, 0.0f, 1.0f));
+    // 光源缩小之后总能量随面积平方下降, 自发光相应调高 —— 阈值之上要留
+    // 足够的信号, 否则泛光缓冲接近全黑, 判据无从判定。
+    emissive->SetEmissiveColor(FVector3(60.0f, 60.0f, 60.0f));
+    emissive->SetMetallic(0.0f);
+    emissive->SetRoughness(1.0f);
+
+    // **接近点光源**的小立方体。
+    //
+    // 第一版用了 0.4 单位 (半分辨率下约 60 像素宽), 而那让整套判据失效:
+    // 一个大光源的"泛光"主要由它自己的形状决定, 而不是由核决定。实测下
+    // 把降采样退化成单点采样 (完全不模糊)、或者整条升采样链跳过, 光晕仍然
+    // 有 30 像素宽 —— 判据全绿, 而泛光其实什么都没做。
+    //
+    // 点扩散函数只有在光源接近一个点时才是"函数本身"。0.03 单位在半分辨率
+    // 下约 4 像素, 而光晕有 40 像素 —— 十倍的差距, 核的贡献才占主导。
+    FMeshData cubeMesh = FGeometryGenerator::GenerateCube();
+
+    FMeshResourceHandle meshHandle =
+        resources.CreateMesh(cubeMesh, FName("BloomCube"));
+
+    if (!meshHandle.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 泛光场景的网格上传失败");
+        return;
+    }
+
+    FTransform nodeTransform;
+    nodeTransform.Translation = FVector3(0.0f, 0.0f, 0.0f);
+    nodeTransform.Scale3D     = FVector3(0.03f, 0.03f, 0.03f);
+
+    LNode* node = scene->SpawnNode<LNode>(FName("BloomCube"), nodeTransform);
+
+    LMeshTrait* meshTrait = node->AddTrait<LMeshTrait>(FName("Mesh"));
+    meshTrait->SetMesh(&resources, meshHandle);
+    meshTrait->SetMaterial(emissive);
+    meshTrait->SetVisible(true);
+
+    resources.ReleaseMeshReference(meshHandle);
+
+    // 关掉全部直接光。方块的亮度只来自自发光, 而背景必须是黑的 ——
+    // 背景有亮度的话它也会进阈值, 光晕就不再是单个 PSF。
+    FLightManager::Get().ClearAllLights();
+
+    // 相机正对方块。yaw 0 是朝 -Z, 所以相机放在 +Z 一侧。
+    renderer->GetCamera().SetPosition(FVector3(0.0f, 0.0f, 3.0f));
+    renderer->GetCamera().SetRotation(0.0f, 0.0f);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Launch] 泛光场景已构建 — 黑背景上一个 0.03 单位的自发光方块 "
+             "(自发光 60.0, 无直接光) —— 接近点光源, 使点扩散函数由核主导");
+}
+
+// ============================================================================
 // BuildMaterialGrid — 粗糙度 × 金属度 的球体阵列
 //
 // 这是验证 IBL 的标准场景, 理由是它把两个自由度摊平成一张图:
@@ -4646,6 +5320,10 @@ int WINAPI wWinMain(
     {
         BuildCornerScene(scene, &renderContext, &renderer);
     }
+    else if (launchOptions.BloomScene)
+    {
+        BuildBloomScene(scene, &renderContext, &renderer);
+    }
     else if (launchOptions.MaterialGrid > 0)
     {
         BuildMaterialGrid(scene, &renderContext, &renderer,
@@ -4705,6 +5383,21 @@ int WINAPI wWinMain(
                  "[Launch] 屏幕空间环境光遮蔽已启用 "
                  "(GTAO, 4 方向 x 8 步进, 半径 {})",
                  launchOptions.AoRadius);
+    }
+
+    if (launchOptions.Bloom)
+    {
+        if (renderer.GetBloomPass() != nullptr)
+        {
+            renderer.GetBloomPass()->SetThreshold(launchOptions.BloomThreshold);
+            renderer.GetBloomPass()->SetIntensity(launchOptions.BloomIntensity);
+        }
+
+        renderer.SetBloomEnabled(true);
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Launch] 泛光已启用 (阈值 {}, 强度 {}, 6 级链)",
+                 launchOptions.BloomThreshold, launchOptions.BloomIntensity);
     }
 
     if (launchOptions.TemporalAA)
@@ -4779,6 +5472,7 @@ int WINAPI wWinMain(
     bool    lightCullCheckPassed = true;
     bool    taaCheckPassed = true;
     bool    aoCheckPassed = true;
+    bool    bloomCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -4842,6 +5536,11 @@ int WINAPI wWinMain(
             if (launchOptions.AoCheck)
             {
                 aoCheckPassed = RunAoChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.BloomCheck)
+            {
+                bloomCheckPassed = RunBloomChecks(&renderContext, renderer);
             }
 
             if (launchOptions.TaaCheck)
@@ -4963,6 +5662,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.AoCheck)
     {
         selfCheckCode = FinalizeSelfCheck(aoCheckPassed, 12, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.BloomCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(bloomCheckPassed, 13, errorSink,
                                           errorsBeforeShutdown);
     }
 
