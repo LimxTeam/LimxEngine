@@ -99,6 +99,13 @@ private:
                            const FRenderPassContext& context);
 
     /// 录制不透明批次的 [begin, end) 区间
+    /// GPU 驱动路径 —— 逐组下 DrawIndexedIndirect (只覆盖不透明批次)
+    ///
+    /// 半透明仍走逐物体绘制: 它必须严格由远及近, 而那个顺序是 CPU 排出来的,
+    /// 间接命令的顺序表达不了"按距离"这件事。
+    void RecordIndirect(IRHICommandBuffer*        commandBuffer,
+                        const FRenderPassContext& context);
+
     void RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
                            const FRenderPassContext& context,
                            SizeType                  begin,

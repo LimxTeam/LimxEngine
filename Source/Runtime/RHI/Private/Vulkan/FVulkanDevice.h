@@ -389,6 +389,7 @@ public:
     EFormatFeature GetFormatFeatures(EPixelFormat format) const override;
     bool IsRayTracingSupported() const override;
     bool IsMeshShaderSupported() const override;
+    bool IsDrawIndirectFirstInstanceSupported() const override;
 
     // ====================================================================
     // Vulkan 内部访问 (供 FVulkanCommandBuffer 使用)

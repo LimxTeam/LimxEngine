@@ -56,6 +56,7 @@
 #include "Renderer/RenderPass/FGtaoPass.h"
 #include "Renderer/RenderPass/FBloomPass.h"
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
+#include "Renderer/RenderPass/FGpuCullPass.h"
 
 namespace Limx
 {
@@ -183,6 +184,12 @@ struct FLaunchOptions
 
     /// 阴影自检: 断言阴影边界落在相似三角形算出的位置, 以退出码报告
     bool ShadowCheck = false;
+
+    /// 启用 GPU 驱动的剔除与间接绘制
+    bool GpuDriven = false;
+
+    /// GPU 驱动自检: 与逐物体绘制逐像素比对, 以退出码报告
+    bool GpuDrivenCheck = false;
 
     /// 阴影场景里投影聚光灯的总数 (含被测的两盏)
     ///
@@ -421,6 +428,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --bloom-check    泛光自检: 点扩散的对称性与能量守恒, 以退出码报告
 ///   --shadow-scene   构建聚光灯阴影场景 (阴影图集自检的相似三角形基准)
 ///   --shadow-check   阴影自检: 断言阴影边界的解析位置, 以退出码报告
+///   --gpu-driven     GPU 驱动的剔除与间接绘制 (相机通道)
+///   --gpu-driven-check GPU 驱动自检: 与逐物体绘制逐像素比对, 以退出码报告
 ///   --shadow-lights N 阴影场景里投影聚光灯的总数 (默认 2, 上限 128)
 ///                     超过 64 时多出来的拿不到图集的块, 按无遮挡处理
 ///   --ao-check       GTAO 自检: 断言墙角处的解析值, 以退出码报告
@@ -615,6 +624,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--shadow-check"))
         {
             options.ShadowCheck = true;
+        }
+        else if (WideEquals(arg, L"--gpu-driven"))
+        {
+            options.GpuDriven = true;
+        }
+        else if (WideEquals(arg, L"--gpu-driven-check"))
+        {
+            options.GpuDrivenCheck = true;
         }
         else if (WideEquals(arg, L"--shadow-lights") && (i + 1) < tokenCount)
         {
@@ -3753,6 +3770,315 @@ static bool RunLightCullChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunGpuDrivenChecks — GPU 驱动路径与逐物体绘制逐像素比对
+//
+// 判据是"两条路径画出来的东西**完全一样**"。这一条比"看起来对"强得多:
+// GPU 驱动错了的表现高度趋同 —— 剔除多剔了几个 (画面上少几个物体)、
+// firstInstance 没接上 (整个场景挤在一个变换上)、分组的起点算错 (某一组画
+// 成了另一组的几何)。这三种都不崩、不报错。
+//
+// 能这样比的前提是**两条路径走的是同一份着色器代码**: 顶点着色器只有一条
+// 路径, 总是从 set 3 的 storage buffer 取模型矩阵与材质下标; 逐物体绘制
+// 那条路径只是把物体下标经 firstInstance 传进去。两份着色器变体的话, 比出
+// 来的差异里就混进了"编译器对两份代码的不同优化"这个因素。分簇光照那一天
+// 是同一个理由。
+//
+// 另外两条判据:
+//   - GPU 剔除必须**真的剔掉了东西**。可见数等于总数的话, 一个什么都不做
+//     的剔除实现同样能得到正确画面 —— 判据形同虚设。
+//   - 可见数必须 >= CPU 剔除后的数量。包围球外接于包围盒, 所以 GPU 保留的
+//     一定是 CPU 保留的超集; 反过来就是画面上少东西。
+// ============================================================================
+static bool RunGpuDrivenChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FGpuCullPass* const cull = renderer.GetGpuCullPass();
+
+    if (cull == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[GPU驱动] 剔除通道不存在");
+        return false;
+    }
+
+    if (!cull->IsSupported())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] 本设备不支持 drawIndirectFirstInstance — "
+                 "自检无从判定");
+        return false;
+    }
+
+    const bool originalMode = cull->IsEnabled();
+
+    const auto CaptureFrame = [&](bool gpuDriven,
+                                  TArray<UInt8>& outPixels) -> bool
+    {
+        cull->SetEnabled(gpuDriven);
+
+        FScreenshotCapture shot;
+
+        if (!shot.Request(context))
+        {
+            return false;
+        }
+
+        renderer.SetPostSceneRenderCallback(
+            [&shot, context]() { shot.RecordCopy(context); });
+
+        renderer.RenderFrame();
+
+        // 立刻摘掉回调 —— shot 是栈上的
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        const bool ok = shot.ReadPixels(context, outPixels);
+
+        shot.Release(context->GetDevice());
+
+        return ok;
+    };
+
+    TArray<UInt8> cpuImage;
+    TArray<UInt8> gpuImage;
+
+    if (!CaptureFrame(false, cpuImage))
+    {
+        cull->SetEnabled(originalMode);
+        LIMX_LOG(LogLaunch, Error, "[GPU驱动] 逐物体路径回读失败");
+        return false;
+    }
+
+    if (!CaptureFrame(true, gpuImage))
+    {
+        cull->SetEnabled(originalMode);
+        LIMX_LOG(LogLaunch, Error, "[GPU驱动] 间接路径回读失败");
+        return false;
+    }
+
+    // 可见数的回读隔着并行帧数。
+    //
+    // 计数器是每帧拷进一份**按帧下标编号**的回读缓冲区的, 而读的是同一个
+    // 下标上一轮写的值。所以要拿到刚才那次 GPU 驱动的计数, 必须让帧下标
+    // 转回来 —— 再渲 MaxFramesInFlight 帧, 期间 GPU 驱动保持开启。
+    //
+    // 只渲一帧是不够的: 那读的是**另一个**帧下标的回读缓冲区, 而那一格上
+    // 一轮是逐物体路径写的 (其实根本没写), 于是读出 0。
+    // 第一版就是这么错的, 而 0 恰好通不过后面"可见数必须大于零"那条 ——
+    // 若那条判据当初写成"可见数不能等于总数", 这个错误会一直留着。
+    for (UInt32 warm = 0; warm < context->GetMaxFramesInFlight() + 1u; ++warm)
+    {
+        renderer.RenderFrame();
+    }
+
+    const UInt32 objectCount  = cull->GetObjectCount();
+    const UInt32 visibleCount = cull->GetVisibleCount();
+    const UInt32 groupCount   =
+        static_cast<UInt32>(cull->GetGroups().GetSize());
+
+    cull->SetEnabled(originalMode);
+
+    bool passed = true;
+
+    // ---- 1. 逐像素一致 ----
+    if (cpuImage.GetSize() != gpuImage.GetSize() || cpuImage.GetSize() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] 两次回读的尺寸不同 ({} vs {})",
+                 cpuImage.GetSize(), gpuImage.GetSize());
+        return false;
+    }
+
+    SizeType overTolerance = 0;
+    UInt32   maxDiff       = 0;
+    SizeType nonBlack      = 0;
+
+    for (SizeType i = 0; i < cpuImage.GetSize(); ++i)
+    {
+        const UInt32 a = cpuImage[i];
+        const UInt32 b = gpuImage[i];
+
+        const UInt32 diff = (a > b) ? (a - b) : (b - a);
+
+        maxDiff = FMath::Max(maxDiff, diff);
+
+        if (diff > 1u)
+        {
+            ++overTolerance;
+        }
+
+        if (a > 8u)
+        {
+            ++nonBlack;
+        }
+    }
+
+    // 全黑画面下两张图当然一致 —— 那证明不了任何事。
+    if (nonBlack * 10 < cpuImage.GetSize())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] 画面几乎全黑 ({} / {} 个通道有值) —— "
+                 "比对无意义, 判定无效",
+                 nonBlack, cpuImage.GetSize());
+        passed = false;
+    }
+
+    if (overTolerance > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] {} / {} 个通道的差异超过 1/255 (最大 {}) —— "
+                 "剔除多剔了, 还是 firstInstance 没接上?",
+                 overTolerance, cpuImage.GetSize(), maxDiff);
+        passed = false;
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[GPU驱动] 两条路径逐像素一致 ({} 个通道, 最大差异 {}/255)",
+                 cpuImage.GetSize(), maxDiff);
+    }
+
+    // ---- 2. 剔除必须真的剔掉了东西 ----
+    LIMX_LOG(LogLaunch, Display,
+             "[GPU驱动] 上传 {} 个物体, GPU 判可见 {} 个, 分成 {} 组",
+             objectCount, visibleCount, groupCount);
+
+    if (objectCount == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] 一个物体都没上传 — 判定无效");
+        passed = false;
+    }
+    else if (visibleCount == 0)
+    {
+        // 画面明明画出了东西, 计数却是 0 —— 那说明计数这条路本身断了,
+        // 而不是"真的一个都不可见"。断了的计数会让下面那条"不能一个都不剔"
+        // 的判据永远成立, 于是它形同虚设。
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] 可见数为 0 而画面有内容 —— 计数器回读断了, "
+                 "后面的判据不可信");
+        passed = false;
+    }
+    else if (visibleCount >= objectCount)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] 可见 {} 个 / 总共 {} 个 —— 一个都没剔掉。"
+                 "一个什么都不做的剔除实现也会给出正确画面, 这条判据因此"
+                 "无从判定。换一个有物体在视锥外的相机角度。",
+                 visibleCount, objectCount);
+        passed = false;
+    }
+
+    // ---- 3. 分组必须与物体列表严格对应 ----
+    //
+    // 逐像素比对抓不到这一条: 分组条件漏掉"单双面"时, 封闭几何用错剔除模式
+    // 画出来的图往往完全一样 (背面被正面挡住, 深度测试兜住了)。而错误是实在
+    // 的 —— 换成薄片几何 (叶子、旗帜) 立刻现形, 那时半边会消失。
+    //
+    // 所以这一条直接核结构: 分组必须连续覆盖整个列表, 且同一组里每个物体的
+    // 顶点/索引缓冲区、索引宽度、单双面都要与组一致。
+    {
+        const TArray<FRenderObject>& source = renderer.GetShadowCasterObjects();
+        const TArray<FDrawGroup>&    groups = cull->GetGroups();
+
+        UInt32   cursor     = 0;
+        SizeType mismatches = 0;
+
+        // 双面物体的数量决定"分组漏看单双面"这条变异抓不抓得住。
+        //
+        // 一个都没有的话, 分组条件写不写那一项产出的分组完全一样 —— 判据
+        // 无从判定, 而它照样返回通过。所以数目要报出来: 通过与"没东西可判"
+        // 必须能分开。
+        SizeType doubleSidedCount = 0;
+
+        for (SizeType i = 0; i < source.GetSize(); ++i)
+        {
+            if (source[i].IsDoubleSided)
+            {
+                ++doubleSidedCount;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[GPU驱动] 源列表 {} 个物体, 其中双面 {} 个",
+                 source.GetSize(), doubleSidedCount);
+
+        if (doubleSidedCount == 0 || doubleSidedCount == source.GetSize())
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GPU驱动] 场景里单双面没有混合 —— "
+                     "分组是否漏看单双面这一条无从判定");
+            passed = false;
+        }
+
+        for (SizeType g = 0; g < groups.GetSize(); ++g)
+        {
+            const FDrawGroup& group = groups[g];
+
+            if (group.FirstCommand != cursor)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[GPU驱动] 第 {} 组的起点是 {}, 应当是 {} —— 分组不连续",
+                         g, group.FirstCommand, cursor);
+                passed = false;
+                break;
+            }
+
+            for (UInt32 k = 0; k < group.CommandCount; ++k)
+            {
+                const SizeType index = static_cast<SizeType>(cursor) + k;
+
+                if (index >= source.GetSize())
+                {
+                    break;
+                }
+
+                const FRenderObject& obj = source[index];
+
+                if (obj.VertexBuffer.Packed != group.VertexBuffer.Packed ||
+                    obj.IndexBuffer.Packed  != group.IndexBuffer.Packed ||
+                    obj.IndexType           != group.IndexType ||
+                    obj.IsDoubleSided       != group.IsDoubleSided)
+                {
+                    ++mismatches;
+                }
+            }
+
+            cursor += group.CommandCount;
+        }
+
+        if (mismatches > 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GPU驱动] {} 个物体与所属分组的绑定状态不符 —— "
+                     "分组条件漏了一项?",
+                     mismatches);
+            passed = false;
+        }
+
+        if (cursor != objectCount)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GPU驱动] 分组一共覆盖 {} 个物体, 上传了 {} 个",
+                     cursor, objectCount);
+            passed = false;
+        }
+    }
+
+    // ---- 4. 分组必须真的合并了绘制 ----
+    //
+    // 组数等于物体数意味着分组完全没起作用 —— 那时间接绘制的下发次数与逐
+    // 物体绘制一样多, CPU 一点也没省。而画面依然完全正确。
+    if (objectCount > 0 && groupCount >= objectCount)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU驱动] {} 个物体分成了 {} 组 —— 分组没起作用, "
+                 "批次列表是不是没按状态聚类?",
+                 objectCount, groupCount);
+        passed = false;
+    }
+
+    return passed;
+}
+
+// ============================================================================
 // RunClusterChecks — 分簇剔除的数值自检
 //
 // 判据是"GPU 算出的簇表与 CPU 参照实现**完全一致**"。这比"看起来对"强得多:
@@ -5456,6 +5782,17 @@ static void BuildStressScene(LScene* scene, FRenderContext* context,
             FVector4(0.2f + 0.7f * t, 0.5f, 0.9f - 0.7f * t, 1.0f));
         materials[i]->SetMetallic(t);
         materials[i]->SetRoughness(0.15f + 0.7f * (1.0f - t));
+
+        // 一半材质设成双面。
+        //
+        // 不是为了好看 —— 是为了让"绘制分组漏看单双面"这类缺陷有得抓。全部
+        // 单面的场景里, 分组条件写不写这一项产出的分组完全一样, 于是
+        // --gpu-driven-check 的结构判据无从判定 (实测那条变异在没有双面物体
+        // 时逃掉了)。
+        //
+        // 单双面还决定管线变体, 所以这也顺带覆盖了"一组里混着两种剔除模式"
+        // 这条路径。
+        materials[i]->SetDoubleSided((i % 2u) == 1u);
     }
 
     // ---- 铺开节点 ----
@@ -6250,6 +6587,33 @@ int WINAPI wWinMain(
                  "[Launch] 时域抗锯齿已启用 (Halton 2,3 抖动 + 方差裁剪解析)");
     }
 
+    if (launchOptions.GpuDriven)
+    {
+        FGpuCullPass* const cull = renderer.GetGpuCullPass();
+
+        if (cull == nullptr)
+        {
+            LIMX_LOG(LogLaunch, Error, "[Launch] GPU 驱动通道不存在");
+        }
+        else if (!cull->IsSupported())
+        {
+            // 不支持时明确报出来而不是悄悄退回。
+            //
+            // 悄悄退回的表现是"开了 --gpu-driven 却一点也没变快", 而那与
+            // "GPU 驱动本来就没用"分不开 —— 后者是个完全错误的结论。
+            LIMX_LOG(LogLaunch, Error,
+                     "[Launch] 本设备不支持 drawIndirectFirstInstance — "
+                     "GPU 驱动路径不可用, 仍走逐物体绘制");
+        }
+        else
+        {
+            cull->SetEnabled(true);
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Launch] GPU 驱动的剔除与间接绘制已启用 (相机通道)");
+        }
+    }
+
     // 4f. 环境贴图 — 必须在渲染器初始化之后 (天空 Pass 的描述符集才存在)
     //
     // 声明在主循环之外: 它拥有立方体贴图的显存, 一旦析构天空 Pass 的
@@ -6316,6 +6680,7 @@ int WINAPI wWinMain(
     bool    aoCheckPassed = true;
     bool    bloomCheckPassed = true;
     bool    shadowCheckPassed = true;
+    bool    gpuDrivenCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -6384,6 +6749,12 @@ int WINAPI wWinMain(
             if (launchOptions.BloomCheck)
             {
                 bloomCheckPassed = RunBloomChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.GpuDrivenCheck)
+            {
+                gpuDrivenCheckPassed =
+                    RunGpuDrivenChecks(&renderContext, renderer);
             }
 
             if (launchOptions.ShadowCheck)
@@ -6527,6 +6898,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.ShadowCheck)
     {
         selfCheckCode = FinalizeSelfCheck(shadowCheckPassed, 14, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.GpuDrivenCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(gpuDrivenCheckPassed, 15, errorSink,
                                           errorsBeforeShutdown);
     }
 

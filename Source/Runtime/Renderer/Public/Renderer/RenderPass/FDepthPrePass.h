@@ -136,6 +136,10 @@ private:
                            const FRenderPassContext& context);
 
     /// 录制 [begin, end) 区间的深度绘制
+    /// GPU 驱动路径 —— 逐组下 DrawIndexedIndirect
+    void RecordIndirect(IRHICommandBuffer*        commandBuffer,
+                        const FRenderPassContext& context);
+
     void RecordRange(IRHICommandBuffer*        commandBuffer,
                      const FRenderPassContext& context,
                      SizeType                  begin,

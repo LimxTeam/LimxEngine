@@ -1177,6 +1177,14 @@ bool FVulkanDevice::IsRayTracingSupported() const
     return false;
 }
 
+bool FVulkanDevice::IsDrawIndirectFirstInstanceSupported() const
+{
+    // 报的是**物理设备支持不支持**, 而不是"创建逻辑设备时启用了没有"。
+    // 两者本该一致 —— 创建时是无条件把查到的值填进去的 —— 但把它们绑成
+    // 同一个来源就没有"启用了却报不支持"这种可能。
+    return m_DeviceFeatures.drawIndirectFirstInstance != VK_FALSE;
+}
+
 bool FVulkanDevice::IsMeshShaderSupported() const
 {
     UInt32 extensionCount = 0;

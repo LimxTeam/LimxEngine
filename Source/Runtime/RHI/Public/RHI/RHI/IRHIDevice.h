@@ -461,6 +461,17 @@ public:
     // 是否支持 Mesh Shader
     virtual bool IsMeshShaderSupported() const = 0;
 
+    /// 间接绘制能否使用非零的 firstInstance
+    ///
+    /// GPU 驱动的绘制用 firstInstance 把"第几号物体"传给顶点着色器 —— 那是
+    /// gl_InstanceIndex 的基址, 顶点着色器据此去 storage buffer 里取自己的
+    /// 模型矩阵与材质下标。
+    ///
+    /// 不支持时 firstInstance 必须恒为 0, 于是每个实例都读到 0 号物体的数据:
+    /// **整个场景挤在同一个变换上**。那不是崩溃, 是画面全错, 而且只有开着
+    /// 验证层才会报。所以这一条必须查询, 不支持时退回逐物体绘制。
+    virtual bool IsDrawIndirectFirstInstanceSupported() const = 0;
+
 protected:
     IRHIDevice() = default;
     LIMX_NON_COPYABLE(IRHIDevice);

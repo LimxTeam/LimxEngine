@@ -38,9 +38,116 @@
 #include "Renderer/RenderPass/FForwardPass.h"
 #include "Renderer/RenderPass/FPassManager.h"
 #include "RenderCore/Shaders/FShaderManager.h"
+#include "Renderer/RenderPass/FGpuCullPass.h"
+
 
 namespace Limx
 {
+
+namespace
+{
+
+/// 逐组下 DrawIndexedIndirect
+///
+/// 深度预通道与前向通道用的是同一段代码。抄两遍的话, 其中一处改了另一处
+/// 没改的表现是"深度预通道与前向通道画的东西不一样" —— 而前向通道的深度
+/// 测试是 Equal, 那会让整片几何直接消失。
+///
+/// 返回下发的组数, 供统计。
+static UInt32 RecordIndirectGroups(
+    IRHICommandBuffer*        commandBuffer,
+    const FRenderPassContext& context,
+    const FGpuCullPass&       cull,
+    FRHIGraphicsPipelineHandle singleSided,
+    FRHIGraphicsPipelineHandle doubleSided)
+{
+    const FRHIBufferHandle indirect =
+        cull.GetIndirectBuffer(context.FrameIndex);
+
+    if (!indirect.IsValid())
+    {
+        return 0;
+    }
+
+    const TArray<FDrawGroup>& groups = cull.GetGroups();
+
+    FRHIGraphicsPipelineHandle boundPipeline;
+    FRHIBufferHandle           boundVertexBuffer;
+    FRHIBufferHandle           boundIndexBuffer;
+    EIndexType                 boundIndexType = EIndexType::UInt32;
+
+    for (SizeType g = 0; g < groups.GetSize(); ++g)
+    {
+        const FDrawGroup& group = groups[g];
+
+        if (group.CommandCount == 0)
+        {
+            continue;
+        }
+
+        const FRHIGraphicsPipelineHandle pipeline =
+            group.IsDoubleSided ? doubleSided : singleSided;
+
+        if (pipeline.Packed != boundPipeline.Packed)
+        {
+            commandBuffer->BindGraphicsPipeline(pipeline);
+            boundPipeline = pipeline;
+        }
+
+        if (group.VertexBuffer.Packed != boundVertexBuffer.Packed)
+        {
+            commandBuffer->BindVertexBuffer(0, group.VertexBuffer, 0);
+            boundVertexBuffer = group.VertexBuffer;
+        }
+
+        if (group.IndexBuffer.Packed != boundIndexBuffer.Packed ||
+            group.IndexType != boundIndexType)
+        {
+            commandBuffer->BindIndexBuffer(group.IndexBuffer, 0,
+                                           group.IndexType);
+            boundIndexBuffer = group.IndexBuffer;
+            boundIndexType   = group.IndexType;
+        }
+
+        // 一次下发整组。被剔除的那些命令 instanceCount 是 0, 命令处理器
+        // 直接跳过 —— 不会走到顶点着色器。
+        commandBuffer->DrawIndexedIndirect(
+            indirect,
+            static_cast<UInt64>(group.FirstCommand) *
+                sizeof(FDrawIndexedIndirectCommand),
+            group.CommandCount,
+            static_cast<UInt32>(sizeof(FDrawIndexedIndirectCommand)));
+    }
+
+    return static_cast<UInt32>(groups.GetSize());
+}
+
+/// 绑 set 3 —— 逐物体数据
+///
+/// **两条路径都要绑。** 顶点着色器只有一条代码路径, 它总是从这里取模型矩阵
+/// 与材质下标; 逐物体绘制那条路径只是把物体下标经 firstInstance 传进去。
+static void BindDrawObjectSet(IRHICommandBuffer*        commandBuffer,
+                              const FRenderPassContext& context)
+{
+    if (context.GpuCull == nullptr)
+    {
+        return;
+    }
+
+    const FRHIDescriptorSetHandle set =
+        context.GpuCull->GetDrawObjectSet(context.FrameIndex);
+
+    if (!set.IsValid())
+    {
+        return;
+    }
+
+    commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
+                                     context.PipelineLayout, 3, set,
+                                     nullptr, 0);
+}
+
+} // namespace
 
 LIMX_DECLARE_LOG_CATEGORY(LogRenderer)
 
@@ -198,9 +305,26 @@ void FForwardPass::RecordCommonState(IRHICommandBuffer*        commandBuffer,
     );
 
     // ================================================================
-    // 遍历所有渲染物体: 绑定材质 → BindVBO/IBO → Push Model → DrawIndexed
+    // 绑定描述符集 (set 3 — 逐物体数据)
     // ================================================================
+    //
+    // **两条路径都要绑。** 顶点着色器只有一条代码路径, 它总是从这里取模型
+    // 矩阵与材质下标; 逐物体绘制那条路径只是把物体下标经 firstInstance 传
+    // 进去。不绑的表现是读到未定义内容 —— 整个场景的变换全是垃圾。
+    BindDrawObjectSet(commandBuffer, context);
+}
 
+void FForwardPass::RecordIndirect(IRHICommandBuffer*        commandBuffer,
+                                  const FRenderPassContext& context)
+{
+    if (context.GpuCull == nullptr)
+    {
+        return;
+    }
+
+    RecordIndirectGroups(commandBuffer, context, *context.GpuCull,
+                         SelectPipeline(false, false),
+                         SelectPipeline(false, true));
 }
 
 void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
@@ -258,24 +382,15 @@ void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
                 boundIndexType   = obj.IndexType;
             }
 
-            FModelPushConstant pushData;
-            pushData.Model         = obj.Transform.ToMatrix();
-            pushData.MaterialIndex = obj.BindlessMaterialIndex;
-
-            commandBuffer->PushConstants(
-                context.PipelineLayout,
-                EShaderStage::Vertex | EShaderStage::Fragment,
-                0,
-                sizeof(FModelPushConstant),
-                &pushData
-            );
-
+            // 模型矩阵与材质下标在 set 3 的 storage buffer 里 —— 这里传的
+            // 是**物体下标**, 经 firstInstance 进到 gl_InstanceIndex。
+            // 与间接路径完全同一个机制。
             commandBuffer->DrawIndexed(
                 obj.IndexCount,
                 1,
                 obj.IndexOffset,
                 0,
-                0
+                static_cast<UInt32>(i)
             );
         }
     }
@@ -342,20 +457,16 @@ void FForwardPass::RecordTranslucent(IRHICommandBuffer*        commandBuffer,
                 boundIndexType   = obj.IndexType;
             }
 
-            FModelPushConstant pushData;
-            pushData.Model         = obj.Transform.ToMatrix();
-            pushData.MaterialIndex = obj.BindlessMaterialIndex;
-
-            commandBuffer->PushConstants(
-                context.PipelineLayout,
-                EShaderStage::Vertex | EShaderStage::Fragment,
-                0,
-                sizeof(FModelPushConstant),
-                &pushData
-            );
+            // 半透明的条目接在不透明后面 —— 下标要加上那个基址。
+            //
+            // 忘了加的话玻璃会读到某个不透明物体的变换, 长在别人的位置上。
+            // 而"某块玻璃跑到了奇怪的地方"看着像场景数据错了。
+            const UInt32 base =
+                (context.GpuCull != nullptr)
+                    ? context.GpuCull->GetTranslucentBase() : 0u;
 
             commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
-                                       0, 0);
+                                       0, base + static_cast<UInt32>(i));
         }
     }
 
@@ -395,8 +506,11 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
     // 这不是可选优化: 声明为 INLINE 的通道里调用 vkCmdExecuteCommands 是
     // 非法的, 反过来声明为 SECONDARY 的通道里直接录绘制命令也是非法的。
     // 因此一旦走并行路径, 视口与描述符集也必须进次级缓冲区。
+    const bool gpuDriven =
+        (context.GpuCull != nullptr) && context.GpuCull->IsEnabled();
+
     const bool useParallel =
-        (m_Recorder != nullptr) && m_Recorder->IsInitialized();
+        !gpuDriven && (m_Recorder != nullptr) && m_Recorder->IsInitialized();
 
     beginInfo.UseSecondaryCommandBuffers = useParallel;
 
@@ -407,7 +521,19 @@ void FForwardPass::Execute(IRHICommandBuffer*        commandBuffer,
             ? context.RenderObjects->GetSize()
             : 0;
 
-    if (useParallel)
+    if (gpuDriven)
+    {
+        // 间接路径不分段并行录制 —— 一共十几条命令, 分给四个线程之后每段
+        // 只剩三四条, 而次级缓冲区的分配与 vkCmdExecuteCommands 本身就要好
+        // 几微秒。并行在这里是净亏。
+        //
+        // 半透明照旧逐物体绘制: 它必须严格由远及近, 而间接命令的顺序表达
+        // 不了"按距离"这件事。
+        RecordCommonState(commandBuffer, context);
+        RecordIndirect(commandBuffer, context);
+        RecordTranslucent(commandBuffer, context);
+    }
+    else if (useParallel)
     {
         FRHICommandBufferInheritance inheritance;
         inheritance.RenderPass  = m_RenderPass;

@@ -30,15 +30,25 @@ layout(location = 5) in vec4 inColor;
 // FMatrix.h 的注释即以"与着色器 row_major 一致"为前提。
 #include "view_common.h"
 
-// ── Push Constant: 逐物体 Model 矩阵 ──
-// push constant 里多了材质下标。
+#include "gpu_draw_common.h"
+
+// ── 逐物体数据 (set 3, binding 0) ──
 //
-// 顶点着色器用不到它, 但 push constant 的布局在整条管线上是共享的 ——
-// 片段着色器要读, 这里就必须声明出同样的布局, 否则偏移对不上。
-layout(row_major, push_constant) uniform PushConstants {
-    mat4 model;
-    uint materialIndex;
-} pc;
+// 模型矩阵与材质下标从 push constant 搬到了这里。搬的理由不是"更现代",
+// 是**间接绘制根本没有逐 draw 推送 push constant 这回事** —— 一次
+// DrawIndexedIndirect 覆盖几百个物体, 而 push constant 在整次调用里是常量。
+//
+// 定位靠 gl_InstanceIndex: 每条间接命令的 firstInstance 写的是物体下标,
+// 而 gl_InstanceIndex 是 firstInstance + 实例号 (这里实例数恒为 1)。
+// 逐物体绘制那条路径同样把物体下标传给 firstInstance, 所以**两条路径读的
+// 是同一处数据、走的是同一份代码** —— 逐像素比对时比出来的差异只可能来自
+// 剔除与命令下发, 不会混进"两份着色器本来就不一样"这个因素。
+//
+// row_major 与 C++ 侧 FMatrix 一致。漏掉的话矩阵整体转置, 物体会出现在
+// 完全无关的位置。
+layout(row_major, std430, set = 3, binding = 0) readonly buffer ObjectBuffer {
+    DrawObject objects[];
+} objectBuffer;
 
 // ── 顶点着色器输出 → 片段着色器输入 ──
 layout(location = 0) out vec3 fragWorldPos;
@@ -54,10 +64,20 @@ layout(location = 4) out vec4 fragWorldTangent;
 // 透视校正的, 所以结果与逐像素重算完全一致。
 layout(location = 5) out float fragViewDepth;
 
+// bindless 材质下标 —— flat, 因为它是整数且逐物体恒定, 插值没有意义
+//
+// 从顶点着色器传而不是让片段着色器自己去读 objectBuffer: 片段着色器拿不到
+// gl_InstanceIndex (那是顶点阶段的内建量)。
+layout(location = 6) flat out uint fragMaterialIndex;
+
 void main()
 {
+    DrawObject obj = objectBuffer.objects[gl_InstanceIndex];
+
+    fragMaterialIndex = obj.drawParams.w;
+
     // 世界空间位置
-    vec4 worldPos = pc.model * vec4(inPosition, 1.0);
+    vec4 worldPos = obj.model * vec4(inPosition, 1.0);
     fragWorldPos  = worldPos.xyz;
 
     // 裁剪空间位置
@@ -71,12 +91,12 @@ void main()
     // 世界空间法线 (使用 model 矩阵的逆转置 3x3 子矩阵)
     // 对于等比缩放场景，mat3(model) 等价于法线矩阵
     // 非等比缩放时需要 transpose(inverse(mat3(model)))
-    mat3 normalMatrix = transpose(inverse(mat3(pc.model)));
+    mat3 normalMatrix = transpose(inverse(mat3(obj.model)));
     fragWorldNormal   = normalMatrix * inNormal;
 
     // 切线按 model 变换而非法线矩阵 —— 切线是切空间向量, 随表面一同拉伸,
     // 用逆转置会在非等比缩放下把它推离表面。手性 w 原样传递。
-    fragWorldTangent = vec4(mat3(pc.model) * inTangent.xyz, inTangent.w);
+    fragWorldTangent = vec4(mat3(obj.model) * inTangent.xyz, inTangent.w);
 
     // 直传顶点颜色和 UV
     fragColor    = inColor.rgb;

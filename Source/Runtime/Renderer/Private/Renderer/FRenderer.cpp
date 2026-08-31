@@ -69,6 +69,7 @@
 #include "Renderer/RenderPass/FShadowPass.h"
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
+#include "Renderer/RenderPass/FGpuCullPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
 #include "Renderer/RenderPass/FBloomPass.h"
@@ -220,6 +221,13 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
             8.0f));
 
     // 创建管线布局 (set 0 + set 1 材质 + set 2 光照 + Push Constant)
+    result = CreateDrawObjectSetLayout();
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error, "[Renderer] 逐物体描述符集布局创建失败");
+        return result;
+    }
+
     result = CreatePipelineLayout();
     if (!IsRHISuccess(result))
     {
@@ -237,12 +245,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager  = MakeUnique<FPassManager>();
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
+    m_GpuCullPass      = MakeUnique<FGpuCullPass>();
     m_TaaPass          = MakeUnique<FTaaPass>();
     m_GtaoPass         = MakeUnique<FGtaoPass>();
     m_BloomPass        = MakeUnique<FBloomPass>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_ShadowAtlasPass.Get());
+    m_PassManager->RegisterPass(m_GpuCullPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
     m_PassManager->RegisterPass(m_GtaoPass.Get());
     m_PassManager->RegisterPass(m_TaaPass.Get());
@@ -276,6 +286,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     setupInfo.SwapchainImageCount = imageCount;
     setupInfo.PipelineLayout      = m_PipelineLayout;
     setupInfo.ViewProjSetLayout   = m_DescSetLayout;
+    setupInfo.DrawObjectSetLayout = m_DrawObjectSetLayout;
     setupInfo.MaxFramesInFlight   = m_Context->GetMaxFramesInFlight();
 
     result = m_PassManager->SetupAll(setupInfo);
@@ -385,6 +396,7 @@ void FRenderer::Shutdown()
     m_ForwardPass.Reset();
     m_SkyPass.Reset();
     m_DepthPrePass.Reset();
+    m_GpuCullPass.Reset();
     m_ShadowAtlasPass.Reset();
     m_ShadowPass.Reset();
 
@@ -392,6 +404,7 @@ void FRenderer::Shutdown()
     if (device != nullptr)
     {
         device->DestroyPipelineLayout(m_PipelineLayout);
+        device->DestroyDescSetLayout(m_DrawObjectSetLayout);
     }
 
     // 3. 关闭材质系统
@@ -584,6 +597,20 @@ void FRenderer::RenderFrame()
         }
     }
 
+    // GPU 驱动剔除的视锥 —— 用**不含抖动**的投影矩阵
+    //
+    // 抖动每帧改变亚像素偏移, 用它算出的视锥边界会逐帧漂移。漂移本身无害
+    // (远小于一个物体), 但会让"GPU 路径与 CPU 路径一致"这条判据变成逐帧
+    // 不同, 无法比对。
+    //
+    // FCamera::GetProjectionMatrix() 本来就是不含抖动的 —— 抖动只加在
+    // UpdateUniformBuffer 里的一份拷贝上, 相机自己那份从不被改。
+    if (m_GpuCullPass)
+    {
+        m_GpuCullPass->SetFrustum(FFrustum::FromViewProjection(
+            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix()));
+    }
+
     // 分簇参数必须在 UploadLightData **之前**设 —— 那一步会把它们打包进 UBO
     {
         const FRHIExtent2D clusterExtent = m_Context->GetSwapchainExtent();
@@ -646,6 +673,7 @@ void FRenderer::RenderFrame()
         execInfo.RenderObjects         = &m_RenderObjects;
         execInfo.TranslucentObjects    = &m_TranslucentObjects;
         execInfo.ShadowCasterObjects   = &m_ShadowCasterObjects;
+        execInfo.GpuCull               = m_GpuCullPass.Get();
         execInfo.ViewProjDescriptorSet = m_DescriptorSets[frameIndex];
         execInfo.PipelineLayout        = m_PipelineLayout;
         execInfo.LightingDescriptorSet = m_LightDescriptorSets[frameIndex];
@@ -1433,6 +1461,27 @@ ERHIResult FRenderer::CreateDescriptorResources()
 // set 0: ViewProj UBO + 纹理  |  set 1: 材质  |  set 2: 光照 UBO
 // ============================================================================
 
+ERHIResult FRenderer::CreateDrawObjectSetLayout()
+{
+    // 顶点着色器读模型矩阵与材质下标; 片段着色器不读 (材质下标经 flat
+    // varying 传下去)。StageFlags 只写 Vertex 就够 —— 多写一个阶段不会出错,
+    // 但那等于对着色器的实际用法撒谎, 下一个人照着它加代码会以为片段阶段
+    // 也能直接索引, 而片段阶段拿不到 gl_InstanceIndex。
+    FRHIDescriptorBinding binding = {};
+    binding.Binding    = 0;
+    binding.Type       = EDescriptorType::StorageBuffer;
+    binding.Count      = 1;
+    binding.StageFlags = EShaderStage::Vertex;
+
+    FRHIDescSetLayoutDesc layoutDesc = {};
+    layoutDesc.Bindings     = &binding;
+    layoutDesc.BindingCount = 1;
+    layoutDesc.DebugName    = "DrawObjectSetLayout_Set3";
+
+    return m_Context->GetDevice()->CreateDescSetLayout(layoutDesc,
+                                                       m_DrawObjectSetLayout);
+}
+
 ERHIResult FRenderer::CreatePipelineLayout()
 {
     IRHIDevice* device = m_Context->GetDevice();
@@ -1457,16 +1506,25 @@ ERHIResult FRenderer::CreatePipelineLayout()
     // set 1 从"每材质一个描述符集"换成了一个全局集: 绘制时只绑一次,
     // 材质靠 push constant 里的下标区分。这是 GPU 驱动渲染的前提 ——
     // 间接绘制没有"逐 draw 绑描述符集"这回事。
-    FRHIDescSetLayoutHandle setLayouts[3] =
+    // set 3 = 逐物体数据 (模型矩阵 + 包围球 + 材质下标)
+    //
+    // 从 push constant 搬到这里的理由不是"更现代", 是**间接绘制根本没有逐
+    // draw 推送 push constant 这回事** —— 一次 DrawIndexedIndirect 覆盖几百
+    // 个物体, 而 push constant 在整次调用里是常量。
+    //
+    // 四套集正好是 Vulkan 保证的 maxBoundDescriptorSets 下限。再加就要查询
+    // 设备上限了。
+    FRHIDescSetLayoutHandle setLayouts[4] =
     {
         m_DescSetLayout,
         m_BindlessTable.GetLayout(),
-        FLightManager::Get().GetDescSetLayout()
+        FLightManager::Get().GetDescSetLayout(),
+        m_DrawObjectSetLayout
     };
 
     FRHIPipelineLayoutDesc layoutDesc = {};
     layoutDesc.SetLayouts             = setLayouts;
-    layoutDesc.SetLayoutCount         = 3;
+    layoutDesc.SetLayoutCount         = 4;
     layoutDesc.PushConstantRanges     = &pushConstantRange;
     layoutDesc.PushConstantRangeCount = 1;
     layoutDesc.DebugName              = "PBRPipelineLayout";
@@ -1476,7 +1534,8 @@ ERHIResult FRenderer::CreatePipelineLayout()
     if (IsRHISuccess(result))
     {
         LIMX_LOG(LogRenderer, Log,
-                 "[Renderer] PBR 管线布局创建完成 (set0=ViewProj, set1=材质, set2=光照)");
+                 "[Renderer] PBR 管线布局创建完成 "
+                 "(set0=ViewProj, set1=材质, set2=光照, set3=逐物体)");
     }
 
     return result;

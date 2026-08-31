@@ -45,6 +45,8 @@
 namespace Limx
 {
 
+class FGpuCullPass;
+
 // ============================================================================
 // FPassSetupDesc — Pass 初始化描述符
 // 由 FPassManager 在 SetupAll 时构建并传递给各 Pass 的 Setup()。
@@ -97,6 +99,12 @@ struct FPassSetupDesc
     /// 自建管线布局的 Pass 需要它来共享场景的 set 0 —— Vulkan 按布局
     /// **对象**判定描述符集兼容性, 结构相同但对象不同并不算兼容。
     FRHIDescSetLayoutHandle  ViewProjSetLayout;
+
+    /// set 3 (逐物体数据) 的描述符集布局
+    ///
+    /// 与 set 0 同理: 由 FRenderer 在建管线布局时一并创建, 因为管线布局要
+    /// 先于任何 Pass 存在。持有它的 Pass 据此分配自己的描述符集。
+    FRHIDescSetLayoutHandle  DrawObjectSetLayout;
 
     /// 最大并行帧数
     ///
@@ -191,6 +199,13 @@ struct FRenderPassContext
 
     /// set 1 — bindless 材质表 (全场景共享, 每帧一份)
     FRHIDescriptorSetHandle BindlessDescriptorSet;
+
+    /// GPU 驱动剔除的产物 —— 空表示走逐物体绘制
+    ///
+    /// 图形通道**无论走哪条路径**都要绑它的 set 3: 顶点着色器只有一条路径,
+    /// 它总是从那个 storage buffer 取模型矩阵与材质下标。空指针意味着 GPU
+    /// 驱动通道自己都没建起来, 那时只能不画。
+    const FGpuCullPass* GpuCull = nullptr;
 };
 
 // ============================================================================

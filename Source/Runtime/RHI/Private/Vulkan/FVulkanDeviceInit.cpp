@@ -783,6 +783,18 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
         m_DeviceFeatures.tessellationShader;
     deviceFeatures.multiDrawIndirect =
         m_DeviceFeatures.multiDrawIndirect;
+
+    // GPU 驱动的间接绘制要用 firstInstance 把"第几号物体"传给顶点着色器 ——
+    // 那是 gl_InstanceIndex 的基址, 而顶点着色器据此去 storage buffer 里取
+    // 自己的模型矩阵与材质下标。
+    //
+    // 没有这个特性时 firstInstance 必须恒为 0, 于是所有实例都读到 0 号物体
+    // 的数据: 整个场景挤在一个变换上。**不是崩溃, 是画面全错**, 而校验层只
+    // 在开了验证时才报。所以启用与否要显式记下来 (见 FVulkanDevice 的
+    // SupportsDrawIndirectFirstInstance), GPU 驱动路径据此决定要不要退回
+    // 逐物体绘制。
+    deviceFeatures.drawIndirectFirstInstance =
+        m_DeviceFeatures.drawIndirectFirstInstance;
     deviceFeatures.fragmentStoresAndAtomics =
         m_DeviceFeatures.fragmentStoresAndAtomics;
     deviceFeatures.vertexPipelineStoresAndAtomics =

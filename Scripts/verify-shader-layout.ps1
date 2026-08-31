@@ -88,6 +88,25 @@ $storageStructs = @(
         MinShaders = 1
     }
     @{
+        Name    = 'FGpuDrawObject'
+        Header  = 'Source/Runtime/RenderCore/Public/RenderCore/Culling/FGpuDraw.h'
+        Set     = 3
+        Binding = 0
+        Marker  = 'set\s*=\s*3,\s*binding\s*=\s*0\)\s*readonly\s+buffer\s+ObjectBuffer'
+        # 两个: pbr.vert 与 gbuffer.vert。深度预通道与前向通道读的必须是同一
+        # 份逐物体数据 —— 前向的深度测试是 Equal, 两处的模型矩阵差一点点整片
+        # 几何就消失。
+        MinShaders = 2
+    }
+    @{
+        Name    = 'FGpuDrawObject'
+        Header  = 'Source/Runtime/RenderCore/Public/RenderCore/Culling/FGpuDraw.h'
+        Set     = 0
+        Binding = 0
+        Marker  = 'set\s*=\s*0,\s*binding\s*=\s*0\)\s*readonly\s+buffer\s+ObjectBuffer'
+        MinShaders = 1
+    }
+    @{
         Name    = 'FSpotShadowData'
         Header  = 'Source/Runtime/RenderCore/Public/RenderCore/Lighting/FShadowAtlas.h'
         Set     = 2
@@ -197,9 +216,21 @@ foreach ($s in $structs)
     # (只有 mat4 model), 与 FModelPushConstant 无关 —— 把它们一起比会得到
     # 一个恒红的检查, 而恒红的检查最终会被人注释掉。
     #
-    # 判据用源码里有没有 materialIndex: 那是 FModelPushConstant 相对于旧
-    # 布局多出来的那个字段, 声明了它就是在用这个结构体。
-    if ($s.Set -eq 0 -and (Get-Content $shader.FullName -Raw) -match 'materialIndex') {
+    # 判据必须精确到**声明**。
+    #
+    # 原来用的是"源码里有没有 materialIndex"。GPU 驱动那天 pbr.vert 与
+    # gbuffer.vert 把模型矩阵搬进了 storage buffer, push constant 整块删掉了,
+    # 但它们新增了一个叫 fragMaterialIndex 的 flat varying —— 子串照样命中,
+    # 于是脚本去比一个根本不存在的 push constant, 报"是 (空) 字节"。
+    #
+    # 这与本文件顶上那条注释是同一个教训: **标记是文本搜索, 而变量名也是文本**。
+    #
+    # 两个条件缺一不可: 只匹配块名的话 triangle.vert 会被算进来 —— 它是遗留
+    # 的演示管线, 自有一个 64 字节的同名块 (只有 mat4 model), 与
+    # FModelPushConstant 无关。把它们一起比会得到一个恒红的检查, 而恒红的
+    # 检查最终会被人注释掉。
+    if ($s.Set -eq 0 -and
+        (Get-Content $shader.FullName -Raw) -match 'push_constant\)\s*uniform\s+PushConstants\s*\{[^}]*materialIndex') {
         $checkedPush++
 
         if ($reflection.push_constants.size -ne $expected['FModelPushConstant']) {
@@ -285,7 +316,15 @@ foreach ($s in $structs)
     }
 }
 
-if ($checkedPush -lt 3) {
+# 下限从 3 降到 1。
+#
+# 曾经是 3 (depth_only.vert / gbuffer.vert / pbr.vert)。后两者在 GPU 驱动
+# 那天把 push constant 整块删了 —— 逐物体数据搬进了 set 3 的 storage buffer,
+# 因为间接绘制根本没有逐 draw 推送 push constant 这回事。
+#
+# 覆盖面并没有变窄: 上面新增的 storage buffer 那张表把 FGpuDrawObject 在
+# 三个着色器里的元素步长都钉住了, 而那正是原来 push constant 承担的角色。
+if ($checkedPush -lt 1) {
     Write-Host "只检查到 $checkedPush 个 push constant (预期至少 3 个) — 判定无效" -ForegroundColor Red
     foreach ($offender in $offenders) { Write-Host "  $offender" }
     exit 1

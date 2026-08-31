@@ -29,17 +29,13 @@
 // ── 片段着色器输入 (来自顶点着色器) ──
 // 与 pbr.vert 里的声明必须逐字段一致 —— push constant 的布局在整条管线上
 // 是共享的, 两边不一致时偏移会错开。
-layout(row_major, push_constant) uniform PushConstants {
-    mat4 model;
-    uint materialIndex;
-} pc;
-
 layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragWorldNormal;
 layout(location = 2) in vec3 fragColor;
 layout(location = 3) in vec2 fragTexCoord;
 layout(location = 4) in vec4 fragWorldTangent;   // xyz = 切线, w = 手性 (±1)
 layout(location = 5) in float fragViewDepth;     // 视空间深度 (正值)
+layout(location = 6) flat in uint fragMaterialIndex;  // bindless 材质下标
 
 // ── 材质参数 (set 1, binding 0) — 必须匹配 FMaterialParams std140 布局 ──
 // ── 材质表 (set 1) ──
@@ -772,7 +768,7 @@ void main()
     // 必须在任何使用 material 的代码之前 —— 它是全局变量, 未赋值时内容
     // 未定义。放在 main 的第一行而不是散在各处, 是因为一旦漏赋值, 表现
     // 是整个物体的材质参数全是垃圾, 而不是某一项不对。
-    material = materials[pc.materialIndex];
+    material = materials[fragMaterialIndex];
 
     // ---- 表面参数 (set 1 材质系统) ----
     vec4 baseColor = material.BaseColor;

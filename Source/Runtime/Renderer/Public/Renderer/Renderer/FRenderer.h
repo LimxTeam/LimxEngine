@@ -91,6 +91,7 @@ class FShadowPass;
 class FShadowAtlasPass;
 class FDepthPrePass;
 class FClusterLightPass;
+class FGpuCullPass;
 class FTaaPass;
 class FGtaoPass;
 class FBloomPass;
@@ -398,6 +399,15 @@ public:
     LIMX_NODISCARD const TArray<FRenderObject>& GetRenderObjects() const { return m_RenderObjects; }
 
     /// 获取半透明批次列表 (只读)
+    /// 阴影投射体 (未经相机剔除的不透明与蒙版批次) —— GPU 驱动自检要用
+    ///
+    /// GPU 驱动路径上传的就是这一份, 自检据此核对分组是不是真的把"能共用
+    /// 同一次绑定"的物体归到了一起。
+    LIMX_NODISCARD const TArray<FRenderObject>& GetShadowCasterObjects() const
+    {
+        return m_ShadowCasterObjects;
+    }
+
     LIMX_NODISCARD const TArray<FRenderObject>& GetTranslucentObjects() const
     {
         return m_TranslucentObjects;
@@ -463,6 +473,12 @@ public:
     }
 
     /// 分簇剔除通道 —— 回读校验用
+    /// GPU 驱动剔除通道 —— 自检与开关要用
+    LIMX_NODISCARD FGpuCullPass* GetGpuCullPass() const
+    {
+        return m_GpuCullPass.Get();
+    }
+
     LIMX_NODISCARD FClusterLightPass* GetClusterLightPass() const
     {
         return m_ClusterLightPass.Get();
@@ -606,6 +622,14 @@ private:
     /// 创建管线布局 (set 0 + set 1 材质 + set 2 光照 + Push Constant)
     ERHIResult CreatePipelineLayout();
 
+    /// 创建 set 3 (逐物体数据) 的描述符集布局
+    ///
+    /// 必须早于 CreatePipelineLayout —— 管线布局要引用它。放在 FRenderer 而
+    /// 不是 FGpuCullPass 里, 是因为 Pass 的 Setup 发生在管线布局之后, 而布局
+    /// 对象的身份决定了描述符集的兼容性 (Vulkan 按布局**对象**判定, 结构相同
+    /// 但对象不同并不兼容)。
+    ERHIResult CreateDrawObjectSetLayout();
+
     /// 创建 set 2 光照描述符集 (每帧一个，绑定 FLightingUBO)
     ERHIResult CreateLightingDescriptorSets();
 
@@ -701,6 +725,10 @@ private:
     TUniquePtr<FShadowAtlasPass>      m_ShadowAtlasPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
+    TUniquePtr<FGpuCullPass>          m_GpuCullPass;
+
+    /// set 3 (逐物体数据) 的描述符集布局 —— 由本类持有, 供 Pass 分配
+    FRHIDescSetLayoutHandle           m_DrawObjectSetLayout;
     TUniquePtr<FTaaPass>              m_TaaPass;
     TUniquePtr<FGtaoPass>             m_GtaoPass;
     TUniquePtr<FBloomPass>            m_BloomPass;

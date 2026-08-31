@@ -136,6 +136,7 @@ ERHIResult FPassManager::SetupAll(const FPassSetupInfo& info)
     setupDesc.SharedColorFormat      = kSharedColorFormat;
     setupDesc.SharedDepthFormat      = kSharedDepthFormat;
     setupDesc.ViewProjSetLayout      = info.ViewProjSetLayout;
+    setupDesc.DrawObjectSetLayout    = info.DrawObjectSetLayout;
     setupDesc.MaxFramesInFlight      = info.MaxFramesInFlight;
 
     for (SizeType i = 0; i < m_Passes.GetSize(); ++i)
@@ -180,6 +181,7 @@ void FPassManager::ExecuteAll(IRHICommandBuffer*     commandBuffer,
     context.PipelineLayout         = info.PipelineLayout;
     context.LightingDescriptorSet  = info.LightingDescriptorSet;
     context.BindlessDescriptorSet  = info.BindlessDescriptorSet;
+    context.GpuCull                = info.GpuCull;
     context.SharedDepthTexture     = m_SharedDepthTexture;
     context.SharedDepthTextureView = m_SharedDepthTextureView;
 

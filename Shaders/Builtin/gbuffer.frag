@@ -21,15 +21,11 @@
 #include "material_common.h"
 #include "gbuffer_common.h"
 
-layout(row_major, push_constant) uniform PushConstants {
-    mat4 model;
-    uint materialIndex;
-} pc;
-
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 1) in vec3 fragWorldNormal;
 layout(location = 2) in vec4 fragCurrentClip;
 layout(location = 3) in vec4 fragPrevClip;
+layout(location = 4) flat in uint fragMaterialIndex;
 
 // 顺序必须与渲染通道的附件顺序一致: [0]=法线 [1]=速度
 layout(location = 0) out vec2 outNormal;
@@ -37,7 +33,7 @@ layout(location = 1) out vec2 outVelocity;
 
 void main()
 {
-    MaterialData mat = materials[pc.materialIndex];
+    MaterialData mat = materials[fragMaterialIndex];
 
     // alpha 测试放在写输出之前。
     //

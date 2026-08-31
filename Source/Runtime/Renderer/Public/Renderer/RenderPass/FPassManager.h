@@ -52,6 +52,8 @@
 namespace Limx
 {
 
+class FGpuCullPass;
+
 // ============================================================================
 /// 共享 HDR 颜色目标的格式
 ///
@@ -88,6 +90,9 @@ struct FPassSetupInfo
 
     /// set 0 (view/proj) 的描述符集布局 —— 供自建管线布局的 Pass 复用
     FRHIDescSetLayoutHandle  ViewProjSetLayout;
+
+    /// set 3 (逐物体数据) 的描述符集布局 —— GPU 驱动路径用
+    FRHIDescSetLayoutHandle  DrawObjectSetLayout;
 
     /// 最大并行帧数 —— 持有每帧独立资源的 Pass 需要
     UInt32                   MaxFramesInFlight   = 0;
@@ -128,6 +133,9 @@ struct FPassExecuteInfo
 
     /// set 1 — bindless 材质表 (对应当前 FrameIndex)
     FRHIDescriptorSetHandle BindlessDescriptorSet;
+
+    /// GPU 驱动剔除的产物 —— 空表示图形通道走逐物体绘制
+    const FGpuCullPass* GpuCull = nullptr;
 
     /// GPU 计时器 (可空)
     ///
