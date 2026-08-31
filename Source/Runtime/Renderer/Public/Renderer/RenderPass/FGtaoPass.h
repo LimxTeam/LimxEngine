@@ -84,7 +84,14 @@ public:
                    FRHITextureViewHandle normalView);
 
     /// 每帧的相机参数
-    void SetCameraParams(const FMatrix& view, const FMatrix& projectionNoJitter);
+    ///
+    /// 近远平面显式传入而不是从投影矩阵反解。反解在数学上可行
+    /// (near = M[2][3]/M[2][2]), 但那是两个接近的数相除, 远平面较大时相对
+    /// 误差会放大到千分之几 —— 而线性深度的公式里 far 出现在分母上。
+    void SetCameraParams(const FMatrix& view,
+                         const FMatrix& projectionNoJitter,
+                         Float32        nearPlane,
+                         Float32        farPlane);
 
     void SetEnabled(bool enabled) { m_Enabled = enabled; }
 
@@ -137,6 +144,11 @@ private:
     bool                       m_Enabled   = false;
     Float32                    m_Radius    = 0.8f;
     Float32                    m_Intensity = 1.0f;
+
+    /// 近远平面。着色器目前不用它们 (视空间位置走逆投影矩阵), 但接口留着
+    /// —— 半分辨率 AO 的双边上采样需要按深度加权, 那时会用到。
+    Float32                    m_NearPlane   = 0.1f;
+    Float32                    m_FarPlane    = 100.0f;
 
     /// 关闭状态下是否已经把 AO 清成 1
     ///

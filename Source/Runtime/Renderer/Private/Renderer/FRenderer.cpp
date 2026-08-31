@@ -606,7 +606,9 @@ void FRenderer::RenderFrame()
     if (m_GtaoPass)
     {
         m_GtaoPass->SetCameraParams(m_Camera.GetViewMatrix(),
-                                    m_Camera.GetProjectionMatrix());
+                                    m_Camera.GetProjectionMatrix(),
+                                    m_Camera.GetNearPlane(),
+                                    m_Camera.GetFarPlane());
     }
 
     const Float64 recordBegin = FPlatformTime::Seconds();

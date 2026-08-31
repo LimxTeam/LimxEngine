@@ -324,10 +324,14 @@ void FGtaoPass::SetInputs(FRHITextureHandle     depthTexture,
 }
 
 void FGtaoPass::SetCameraParams(const FMatrix& view,
-                                const FMatrix& projectionNoJitter)
+                                const FMatrix& projectionNoJitter,
+                                Float32        nearPlane,
+                                Float32        farPlane)
 {
     m_View              = view;
     m_InverseProjection = projectionNoJitter.Inverse();
+    m_NearPlane         = nearPlane;
+    m_FarPlane          = farPlane;
 }
 
 // ============================================================================
