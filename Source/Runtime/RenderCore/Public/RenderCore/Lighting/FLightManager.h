@@ -252,6 +252,13 @@ private:
     /// 本帧分配出去的阴影块 (下标即块下标)
     TArray<FSpotShadowData>     m_SpotShadowCasters;
 
+    /// 上一次报过"图集不够用"时的请求数 —— 只在数目变化时才再报一次
+    ///
+    /// 初值取一个不可能的数, 保证第一帧一定会走一次判断。用 0 的话, 场景
+    /// 一开始就没有投影灯时会被当成"和上次一样"而跳过 —— 那一次跳过没有
+    /// 后果, 但这类"初值恰好等于合法值"的写法迟早会有。
+    UInt32                      m_LastShadowRequestCount = 0xFFFFFFFFu;
+
     /// 上一次 UploadLightData 写进去的活跃光源数
     UInt32                      m_ActiveLightCount = 0;
 

@@ -448,10 +448,12 @@ void FShadowAtlasPass::RecordTile(IRHICommandBuffer*        commandBuffer,
     // 4096², 交换链常见 1280×720, 于是横坐标超过 1280 的块 (第 3 列往后)
     // 会被整块裁掉。
     //
-    // 已知盲点: --shadow-check 只用两块, 都落在 1280×720 之内, 所以把这行
-    // 注释掉它依然通过 (实测退出码 0)。抓这一条要一个用满一行八块的场景,
-    // 而那不是这个自检的目的。写在这里, 是因为"检查通过"不等于"这行可以
-    // 删"。
+    // 曾经的盲点, 现已补上: 默认的 --shadow-check 只用两块, 都落在
+    // 1280×720 之内, 把这行注释掉它照样通过 (实测退出码 0)。
+    //
+    // --shadow-lights 64 用填充灯把被测的两盏顶到第 62/63 块 (纹素 x 是
+    // 3072 与 3584), 那时同一个变异会被抓住 (退出码 14)。两个规模都跑,
+    // 因为它们抓的不是同一类东西。
     FRHIScissorRect scissor = {};
     scissor.X      = static_cast<Int32>(rect.X);
     scissor.Y      = static_cast<Int32>(rect.Y);

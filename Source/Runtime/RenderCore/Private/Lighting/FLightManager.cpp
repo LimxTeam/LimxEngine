@@ -553,12 +553,21 @@ void FLightManager::UploadLightData(
     //
     // 静默丢弃的表现是"有些灯没有影子", 而那与"这盏灯本来就没开阴影"在
     // 画面上完全一样 —— 于是没人会去查图集满没满。
-    if (shadowRequestCount > kShadowTileCount)
+    //
+    // 只在数目**变化**时报一次。每帧都报的话, 一个场景跑十秒就是六百行同样
+    // 的警告 —— 而淹在六百行里的东西与没报没有区别, 后面真正要紧的日志也一
+    // 起被冲掉了。
+    if (shadowRequestCount != m_LastShadowRequestCount)
     {
-        LIMX_LOG(LogLighting, Warning,
-                 "[LightManager] 请求阴影的聚光灯 {} 盏, 超过图集的 {} 块 — "
-                 "其余按无遮挡处理",
-                 shadowRequestCount, kShadowTileCount);
+        if (shadowRequestCount > kShadowTileCount)
+        {
+            LIMX_LOG(LogLighting, Warning,
+                     "[LightManager] 请求阴影的聚光灯 {} 盏, 超过图集的 {} 块 — "
+                     "其余按无遮挡处理",
+                     shadowRequestCount, kShadowTileCount);
+        }
+
+        m_LastShadowRequestCount = shadowRequestCount;
     }
 
     UploadSpotShadowData(frameIndex);

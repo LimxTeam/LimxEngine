@@ -184,6 +184,15 @@ struct FLaunchOptions
     /// 阴影自检: 断言阴影边界落在相似三角形算出的位置, 以退出码报告
     bool ShadowCheck = false;
 
+    /// 阴影场景里投影聚光灯的总数 (含被测的两盏)
+    ///
+    /// 多出来的都是**填充灯**, 放在相机视野之外。它们的作用是把被测的两盏
+    /// 顶到图集的高列上 —— 块下标 62/63 对应纹素 x = 3072 与 3584, 远超
+    /// 交换链的宽度。只用两块的话它们都落在 (0,0)-(1024,512) 里, 而那一片
+    /// 恰好被上一个 Pass 留下的裁剪矩形覆盖着, 于是"忘了设裁剪矩形"这类
+    /// 缺陷根本暴露不出来。
+    UInt32 ShadowLights = 2;
+
     /// GTAO 的采样半径 (世界单位)
     Float32 AoRadius = 0.8f;
 
@@ -412,6 +421,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --bloom-check    泛光自检: 点扩散的对称性与能量守恒, 以退出码报告
 ///   --shadow-scene   构建聚光灯阴影场景 (阴影图集自检的相似三角形基准)
 ///   --shadow-check   阴影自检: 断言阴影边界的解析位置, 以退出码报告
+///   --shadow-lights N 阴影场景里投影聚光灯的总数 (默认 2, 上限 128)
+///                     超过 64 时多出来的拿不到图集的块, 按无遮挡处理
 ///   --ao-check       GTAO 自检: 断言墙角处的解析值, 以退出码报告
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
 ///   --no-clustered   关闭分簇, 强制暴力遍历全部光源 (性能对照用)
@@ -604,6 +615,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--shadow-check"))
         {
             options.ShadowCheck = true;
+        }
+        else if (WideEquals(arg, L"--shadow-lights") && (i + 1) < tokenCount)
+        {
+            options.ShadowLights = ParseUInt32(tokens[++i], 2u);
         }
         else if (WideEquals(arg, L"--ao-radius") && (i + 1) < tokenCount)
         {
@@ -2219,7 +2234,8 @@ static Float32 MeanLuminanceInRect(const TArray<UInt8>& pixels,
 
 } // namespace
 
-static bool RunShadowChecks(FRenderContext* context, FRenderer& renderer)
+static bool RunShadowChecks(FRenderContext* context, FRenderer& renderer,
+                            UInt32 expectedTiles)
 {
     // ---- 抓一帧 ----
     FScreenshotCapture shot;
@@ -2445,13 +2461,14 @@ static bool RunShadowChecks(FRenderContext* context, FRenderer& renderer)
     const UInt32 tileCount =
         (atlas != nullptr) ? atlas->GetRenderedTileCount() : 0u;
 
-    LIMX_LOG(LogLaunch, Display, "[阴影] 图集本帧绘制 {} 块", tileCount);
+    LIMX_LOG(LogLaunch, Display,
+             "[阴影] 图集本帧绘制 {} 块 (预期 {})", tileCount, expectedTiles);
 
-    if (tileCount != 2u)
+    if (tileCount != expectedTiles)
     {
         LIMX_LOG(LogLaunch, Error,
-                 "[阴影] 图集应当绘制 2 块, 实际 {} —— 块分配出了问题",
-                 tileCount);
+                 "[阴影] 图集应当绘制 {} 块, 实际 {} —— 块分配出了问题",
+                 expectedTiles, tileCount);
         passed = false;
     }
 
@@ -5059,7 +5076,7 @@ static void BuildBloomScene(LScene* scene, FRenderContext* context,
 // 上下对称的话, 阴影贴图上下翻转这种缺陷会完全看不出来。
 // ============================================================================
 static void BuildShadowScene(LScene* scene, FRenderContext* context,
-                             FRenderer* renderer)
+                             FRenderer* renderer, UInt32 lightCount)
 {
     LIMX_CHECK(scene != nullptr);
     LIMX_CHECK(context != nullptr);
@@ -5168,12 +5185,81 @@ static void BuildShadowScene(LScene* scene, FRenderContext* context,
         FLightManager::Get().AddLight(static_cast<FLight&&>(light));
     };
 
-    // 主灯先加 —— 它必须拿到 0 号块, 自检据此判断第二块也确实画了
-    AddSpot("ShadowSpotMain", 0.0f,
-            ShadowScene::kSpotInnerDeg, ShadowScene::kSpotOuterDeg);
+    // ---- 填充灯 ----
+    //
+    // 先加, 于是被测的两盏拿到**最后**两块。
+    //
+    // 这不是凑数: 块下标 0 与 1 在图集里是 (0,0) 与 (512,0), 而上一个 Pass
+    // 留下的裁剪矩形通常就是交换链大小 (1280×720) —— 那两块正好在里面,
+    // 于是"图集 Pass 忘了设裁剪矩形"这类缺陷完全暴露不出来。用满 64 块时
+    // 被测的两盏落在下标 62/63, 纹素 x 是 3072 与 3584, 远在交换链之外。
+    //
+    // 填充灯放在相机视野之外 (|y| ≈ 9, 而相机只看到 ±5.8), 所以它们既不
+    // 影响被测区域的亮度, 也不影响解析判据。它们照的是同一堵墙, 因此图集
+    // 里那些块是有内容的 —— 空块的话这一步就退化成"多分配了几个下标"。
+    // 上限刻意开到块数的两倍 —— 要能构造出"要块的灯比块多"的局面, 否则
+    // FLightManager 里那句"超过图集容量"的警告永远不会执行到, 而没执行过的
+    // 错误路径与不存在没有区别。
+    const UInt32 clampedCount =
+        FMath::Clamp(lightCount, 2u, static_cast<UInt32>(kShadowTileCount) * 2u);
 
-    AddSpot("ShadowSpotSecond", ShadowScene::kLight2X,
-            ShadowScene::kLight2InnerDeg, ShadowScene::kLight2OuterDeg);
+    const UInt32 fillerCount = clampedCount - 2u;
+
+    // 灯多过块时, 被测的两盏必须**先**加 —— 否则它们排在后面, 拿不到块,
+    // 自检量的就是"没有影子"。块不够时谁被丢掉是个先到先得的事实, 这里
+    // 顺序的选择只是让自检有东西可量。
+    const bool measuredFirst =
+        (clampedCount > static_cast<UInt32>(kShadowTileCount));
+
+    if (measuredFirst)
+    {
+        AddSpot("ShadowSpotMain", 0.0f,
+                ShadowScene::kSpotInnerDeg, ShadowScene::kSpotOuterDeg);
+
+        AddSpot("ShadowSpotSecond", ShadowScene::kLight2X,
+                ShadowScene::kLight2InnerDeg, ShadowScene::kLight2OuterDeg);
+    }
+
+    for (UInt32 i = 0; i < fillerCount; ++i)
+    {
+        // 上下两排, 沿 x 铺开。范围保持在墙的 ±20 之内。
+        const Float32 row = (i % 2u == 0u) ? 9.0f : -9.0f;
+        const Float32 col = -18.0f + 1.2f * static_cast<Float32>(i / 2u);
+
+        // 填充灯的衰减距离刻意压到刚够照到墙 (灯在 z=6, 墙在 z=0)。
+        //
+        // 沿用被测灯的 30 会把分簇的光源索引表撑爆: 剔除按**包围球**做,
+        // 半径 30 的球几乎覆盖整个簇网格, 64 盏就是 64×18432 条索引, 而
+        // 容量只有 589824。溢出之后被丢掉的是排在后面的光源 —— 也就是被测
+        // 的那两盏, 于是画面整片只剩环境光。
+        //
+        // 这一条是实测撞出来的: 第一版用了 30, 表现是"阴影自检突然全黑",
+        // 而真正的原因在分簇剔除里, 隔着两层。
+        FLight light = FLight::CreateSpot(
+            FVector3(col, row, ShadowScene::kLightZ),
+            FVector3(0.0f, 0.0f, -1.0f),
+            FLinearColor(1.0f, 1.0f, 1.0f, 1.0f),
+            ShadowScene::kLightIntensity,
+            ShadowScene::kLight2InnerDeg,
+            ShadowScene::kLight2OuterDeg,
+            7.0f);
+
+        light.SetAttenuation(1.0f, 0.0f, 0.0f);
+        light.SetCastsShadow(true);
+        light.SetDebugName("ShadowSpotFiller");
+
+        FLightManager::Get().AddLight(static_cast<FLight&&>(light));
+    }
+
+    // 被测的两盏最后加 —— 拿到最高的两块 (灯多过块时已经先加过了)
+    if (!measuredFirst)
+    {
+        AddSpot("ShadowSpotMain", 0.0f,
+                ShadowScene::kSpotInnerDeg, ShadowScene::kSpotOuterDeg);
+
+        AddSpot("ShadowSpotSecond", ShadowScene::kLight2X,
+                ShadowScene::kLight2InnerDeg, ShadowScene::kLight2OuterDeg);
+    }
 
     // ---- 相机 ----
     //
@@ -5184,9 +5270,12 @@ static void BuildShadowScene(LScene* scene, FRenderContext* context,
 
     LIMX_LOG(LogLaunch, Display,
              "[Launch] 阴影场景已构建 — 墙在 z={}, 薄板在 z={}, "
-             "主灯在 z={} (相机轴上), 两盏聚光灯各占图集一块",
+             "主灯在 z={} (相机轴上), 投影聚光灯 {} 盏 (其中 {} 盏是填充), "
+             "被测的两盏在图集的第 {} 与 {} 块",
              ShadowScene::kWallZ, ShadowScene::kOccluderZ,
-             ShadowScene::kLightZ);
+             ShadowScene::kLightZ, clampedCount, fillerCount,
+             measuredFirst ? 0u : clampedCount - 2u,
+             measuredFirst ? 1u : clampedCount - 1u);
 }
 
 // ============================================================================
@@ -6074,7 +6163,8 @@ int WINAPI wWinMain(
     }
     else if (launchOptions.ShadowScene)
     {
-        BuildShadowScene(scene, &renderContext, &renderer);
+        BuildShadowScene(scene, &renderContext, &renderer,
+                         launchOptions.ShadowLights);
     }
     else if (launchOptions.MaterialGrid > 0)
     {
@@ -6298,7 +6388,12 @@ int WINAPI wWinMain(
 
             if (launchOptions.ShadowCheck)
             {
-                shadowCheckPassed = RunShadowChecks(&renderContext, renderer);
+                shadowCheckPassed = RunShadowChecks(
+                    &renderContext, renderer,
+                    FMath::Min(FMath::Clamp(
+                                   launchOptions.ShadowLights, 2u,
+                                   static_cast<UInt32>(kShadowTileCount) * 2u),
+                               static_cast<UInt32>(kShadowTileCount)));
             }
 
             if (launchOptions.TaaCheck)

@@ -522,6 +522,18 @@ Invoke-Step '聚光灯阴影自检 (相似三角形的解析边界)' -RequiresGp
     Invoke-Engine '--shadow-scene --frames 20 --warmup 5 --shadow-check'
 }
 
+# 同一套判据, 但用满 64 块。
+#
+# 两个规模抓的不是同一类东西。两块时它们都落在图集的左上角, 而那一片恰好被
+# 上一个 Pass 留下的裁剪矩形罩着 —— "图集 Pass 忘了设裁剪矩形"这类缺陷完全
+# 暴露不出来 (实测把那行注释掉, 两块的版本退出码仍是 0)。
+#
+# 64 块时被测的两盏在第 62/63 块, 纹素 x 是 3072 与 3584, 远在交换链宽度之外,
+# 同一个变异立刻被抓住。
+Invoke-Step '聚光灯阴影自检 (用满 64 块图集)' -RequiresGpu {
+    Invoke-Engine '--shadow-scene --shadow-lights 64 --frames 20 --warmup 5 --shadow-check'
+}
+
 # TAA 自检 —— 需要真实 GPU。
 #
 # TAA 最危险的失效方式是**看起来正常但什么都没做**: 裁剪范围取小了历史每帧
