@@ -9,7 +9,8 @@
 #   这一层全绿是一个**可信的完整结论**, 而不是"有几步跑不了"。
 #
 # 需 GPU 层 (gpu-checks)
-#   显存回收自检、IBL 白炉自检、资产导入回归哨兵。
+#   显存回收自检、IBL 白炉自检、G-Buffer 自检 (法线编码 + 速度矢量)、
+#   交换链重建自检、资产导入回归哨兵。
 #   它们要创建真实 VkDevice 并提交命令 —— 托管运行器只有软件光栅化器
 #   (甚至没有 Vulkan 设备), 跑不了。该作业指定 self-hosted + gpu 标签,
 #   在没有这类运行器时不会排队阻塞, 也不会伪装成通过。
@@ -277,6 +278,13 @@ jobs:
       - name: 严格校验
         run: .\Binaries\Tools\lsc.exe validate -s Shaders --vulkan-version 1.4 --strict
 
+      # C++ 结构体与 SPIR-V 布局的一致性。放在这个作业是因为它要的两样
+      # 东西都在这里: 刚产出的反射 JSON, 和仓库里的 C++ 头文件。
+      #
+      # 与 verify.ps1 调的是同一个脚本, 不是两份各写一遍的判据。
+      - name: C++ 结构体与 SPIR-V 布局一致
+        run: pwsh Scripts/verify-shader-layout.ps1
+
       # gpu-checks 要跑真实引擎, 而引擎需要编译好的 SPIR-V。
       # engine 作业用 --skip-shaders 构建, 所以着色器只能从这里来。
       - name: 上传着色器
@@ -335,7 +343,8 @@ jobs:
           name: limx-shaders
           path: Binaries/Shaders
 
-      # 显存回收自检 + IBL 白炉自检 + 资产导入回归哨兵
+      # 清单见文件头的"需 GPU 层"一节。不在这里重复列举 —— 重复的清单
+      # 只会有一份跟得上实际, 而看的人分不出哪份是对的。
       - name: GPU 自检
         run: pwsh Scripts/verify.ps1 -OnlyGpu
 

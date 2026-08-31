@@ -298,6 +298,19 @@ Invoke-Step '矩阵存储序约定 (uniform/push_constant 必须 row_major)' {
     }
 }
 
+# C++ 侧的 static_assert 与 SPIR-V 反射必须对上。
+#
+# 两侧各自都有保障: C++ 的 static_assert 钉住结构体大小, 着色器统一从
+# view_common.h 取声明。缺的是**跨语言那一跳** —— 有人改了 C++ 结构体
+# 却没改 GLSL 头 (或反过来) 时, 两边各自都编得过, 只有画面会错, 而且
+# 错法是矩阵整体错位、全黑无报错。
+#
+# 期望值从 static_assert 里读, 不写死在这个脚本里 —— 写死的话它自己
+# 就会与 C++ 侧漂移, 而漂移之后它照样报"通过"。
+Invoke-Step 'C++ 结构体与 SPIR-V 布局一致' {
+    powershell -NoProfile -ExecutionPolicy Bypass -File Scripts/verify-shader-layout.ps1
+}
+
 # ------------------------------------------------------------
 # 3. 源码规则
 # ------------------------------------------------------------
@@ -407,6 +420,18 @@ Invoke-Step '显存回收自检' -RequiresGpu {
 # 的映射错位、归一化除错了分母 —— 画面上一律只表现为"环境光有点不对"。
 Invoke-Step 'IBL 白炉自检' -RequiresGpu {
     Invoke-Engine '--furnace-check'
+}
+
+# G-Buffer 自检 —— 需要真实 GPU。
+#
+# 速度矢量的正确性没有任何 CPU 侧的办法可验: 它是"本帧裁剪坐标减上一帧
+# 裁剪坐标", 而两者都只存在于 GPU 上。错法又特别安静 —— 上一帧矩阵保存
+# 晚了一步, 速度就恒为零; 画面完全正常, 只有 TAA 接上以后才表现为拖影。
+#
+# 三阶段: 静止建立基准 → 只转偏航角 (速度必须逐像素等于 CPU 预测值) →
+# 保持不动 (速度必须精确为零)。顺序不能换, 详见 RunGBufferChecks 的注释。
+Invoke-Step 'G-Buffer 自检 (法线编码 + 速度矢量)' -RequiresGpu {
+    Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check'
 }
 
 # 交换链重建自检 —— 需要真实 GPU。
