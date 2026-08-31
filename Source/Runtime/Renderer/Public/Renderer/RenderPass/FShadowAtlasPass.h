@@ -17,11 +17,15 @@
  *     一次 tile 内存的搬运。而清屏只需要在开头做一次: 没分出去的块保持
  *     深度 1.0, 比较采样对它恒判无遮挡, 语义上正好是"这块没有灯"。
  *
- *   光源矩阵不走 UBO, 而是**预乘进 push constant 的 model 矩阵** —
- *     depth_only.vert 算的是 proj * view * model * pos。把 view/proj 都设为
- *     单位阵、model 传 (阴影矩阵 × 物体变换), 结果完全相同, 而换来的是
- *     整个 Pass 只需要一个描述符集: 否则每块每帧一份 UBO, 3 帧 × 64 块 =
- *     192 个描述符集, 只为了搬同一个矩阵。
+ *   光源矩阵不走 UBO, 而是**直接当 push constant 推** — 每块一次。
+ *     否则每块每帧一份 UBO, 3 帧 × 64 块 = 192 个描述符集, 只为了搬同一个
+ *     矩阵。视图矩阵逐块、模型矩阵逐物体, 两者的粒度不同, 所以一个在 push
+ *     constant 里、一个在 set 3 的 storage buffer 里。
+ *
+ *     (这里曾经是另一种写法: 把阴影矩阵**预乘进 model** 再推 push constant,
+ *      而 set 0 的 view/proj 填单位阵。那是逐物体数据还在 push constant 里
+ *      时的权宜之计; GPU 驱动把 model 搬进 storage buffer 之后, push constant
+ *      腾出来的 64 字节正好装视图矩阵, 权宜之计也就不需要了。)
  *
  *   块的分配不在这里做, 在 FLightManager 打包光源时做 — 分块下标必须同时
  *     写进光源数据 (给片段着色器) 与阴影数据 (给本 Pass), 两处各分一次
@@ -107,21 +111,6 @@ public:
         return m_AtlasSampler;
     }
 
-    /// 创建与 set 0 布局兼容的单位矩阵描述符集
-    ///
-    /// depth_only.vert 从 set 0 binding 0 读 view/proj。本 Pass 把阴影矩阵
-    /// 预乘进 model, 所以这里放的是**单位阵** —— 整个 Pass 生命期内不变,
-    /// 因此只需要一份, 不必每帧一份。
-    ///
-    /// @param viewProjLayout     set 0 的描述符集布局
-    /// @param fillerTextureView  binding 1 的占位纹理 (着色器不采样它,
-    ///                           但描述符必须有效)
-    /// @param fillerSampler      占位采样器
-    ERHIResult CreateIdentityUniform(IRHIDevice*             device,
-                                     FRHIDescSetLayoutHandle viewProjLayout,
-                                     FRHITextureViewHandle   fillerTextureView,
-                                     FRHISamplerHandle       fillerSampler);
-
     /// 上一帧实际绘制的块数 —— 自检与统计用
     LIMX_NODISCARD UInt32 GetRenderedTileCount() const
     {
@@ -167,10 +156,6 @@ private:
     FRHIGraphicsPipelineHandle m_Pipelines[kPipelineVariantCount];
 
     FRHIPipelineLayoutHandle   m_PipelineLayout;
-
-    /// 单位矩阵 UBO 与描述符集 —— 全生命期一份
-    FRHIBufferHandle           m_IdentityBuffer;
-    FRHIDescriptorSetHandle    m_IdentityDescriptorSet;
 
     UInt32                     m_RenderedTileCount = 0;
 };

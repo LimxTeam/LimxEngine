@@ -20,6 +20,16 @@
 // buffer 里取自己的模型矩阵 —— 那是这条路径唯一的"我是谁"来源。设备不支持
 // drawIndirectFirstInstance 时它恒为 0, 整个场景会挤在 0 号物体的变换上;
 // 所以 C++ 侧必须查询那个特性, 不支持就退回逐物体绘制。
+//
+// ── 多视图 ──
+//
+// 一次分派处理一个视图, 视图下标经 push constant 传进来。相机是视图 0, 三级
+// 级联是视图 1~3。每个视图在命令缓冲区里占固定长度的一段。
+//
+// 分派 N 次而不是在着色器里循环 N 遍: 每个视图的视锥平面不同, 而平面在 push
+// constant 里 —— 循环的话六个平面要变成 N×6 个, 128 字节的 push constant
+// 装不下第二个视图。改用 UBO 也行, 但那多一次绑定与一次每帧写入, 而分派本身
+// 只要几微秒 (实测整个剔除通道 0.012 ms)。
 // ============================================================================
 
 #include "gpu_draw_common.h"
@@ -53,7 +63,7 @@ layout(std430, set = 0, binding = 1) writeonly buffer DrawBuffer {
 // 有它才能回答"剔除到底跑没跑"。没有的话, 一个把所有 instanceCount 都写成 1
 // 的实现 (即完全没剔除) 在画面上与正确实现完全一样, 只是慢。
 layout(std430, set = 0, binding = 2) buffer CounterBuffer {
-    uint visibleCount;
+    uint visibleCount[];
 } counterBuffer;
 
 layout(push_constant) uniform Params {
@@ -61,7 +71,8 @@ layout(push_constant) uniform Params {
     // 约定与 C++ 侧 FPlane 一致: dot(n, p) + d < 0 表示在平面背面。
     vec4  planes[6];
 
-    // x = 物体总数, yzw 保留
+    // x = 物体总数, y = 视图下标, z = 每个视图占的命令条数,
+    // w = 投射体段在逐物体缓冲区里的起点
     uvec4 params;
 } pc;
 
@@ -74,7 +85,9 @@ void main()
         return;
     }
 
-    DrawObject obj = objectBuffer.objects[index];
+    // 逐物体缓冲区分三段, 剔除只处理**投射体**那一段 (未经相机剔除的
+    // 不透明与蒙版批次)。段的起点经 push constant 传进来。
+    DrawObject obj = objectBuffer.objects[pc.params.w + index];
 
     // 球心到每个平面的有符号距离小于 -半径 → 整个球在该平面背面 → 不可见。
     //
@@ -92,14 +105,22 @@ void main()
         }
     }
 
-    drawBuffer.draws[index].indexCount    = obj.drawParams.x;
-    drawBuffer.draws[index].instanceCount = visible ? 1u : 0u;
-    drawBuffer.draws[index].firstIndex    = obj.drawParams.y;
-    drawBuffer.draws[index].vertexOffset  = int(obj.drawParams.z);
-    drawBuffer.draws[index].firstInstance = index;
+    // 每个视图在命令缓冲区里占固定的一段 —— 起点是视图下标乘以**段长**,
+    // 而不是乘以本帧的实际物体数。用实际数的话, 物体数一变每段的起点都跟着
+    // 变, 而图形通道那边存的是"本视图内的偏移"; 两处一旦不同步, 某个级联就
+    // 会去画另一个级联的命令。
+    uint slot = pc.params.y * pc.params.z + index;
+
+    drawBuffer.draws[slot].indexCount    = obj.drawParams.x;
+    drawBuffer.draws[slot].instanceCount = visible ? 1u : 0u;
+    drawBuffer.draws[slot].firstIndex    = obj.drawParams.y;
+    drawBuffer.draws[slot].vertexOffset  = int(obj.drawParams.z);
+    // firstInstance 要写**缓冲区里的绝对下标** —— 顶点着色器拿它当
+    // gl_InstanceIndex 直接索引整个缓冲区, 不知道分段这回事。
+    drawBuffer.draws[slot].firstInstance = pc.params.w + index;
 
     if (visible)
     {
-        atomicAdd(counterBuffer.visibleCount, 1u);
+        atomicAdd(counterBuffer.visibleCount[pc.params.y], 1u);
     }
 }

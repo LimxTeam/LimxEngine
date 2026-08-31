@@ -142,30 +142,33 @@ static_assert(sizeof(FViewProjUBO) == 320,
               "与 Shaders/Builtin/view_common.h 的 ViewProjUBO 块一致");
 
 // ============================================================================
-// FModelPushConstant — 逐物体 Model 矩阵 Push Constant 数据 (64 bytes)
+// FViewPushConstant — 逐**视图**的视图投影矩阵 Push Constant (64 字节)
 // ============================================================================
 
-struct FModelPushConstant
+/// 一次绘制调用里恒定的那个矩阵
+///
+/// 这里原本是逐物体的 model 矩阵 (FModelPushConstant, mat4 + 材质下标)。
+/// GPU 驱动之后 model 逐物体、进了 storage buffer, 而剩下的逐**通道**量正是
+/// 视图矩阵: 阴影的每一级级联、阴影图集的每一块各一个。
+///
+/// push constant 恰好是这个粒度 —— 一次 DrawIndexedIndirect 覆盖几百个物体,
+/// 而它在整次调用里是常量。
+///
+/// 相机通道的顶点着色器 (pbr.vert / gbuffer.vert) 不读它: 它们的视图矩阵在
+/// set 0 的 UBO 里, 还要用到无抖动与上一帧那两份。
+struct FViewPushConstant
 {
-    FMatrix Model;
-
-    /// 材质在 bindless 表里的下标
-    ///
-    /// 顶点着色器用不到, 但 push constant 的布局在整条管线上是共享的 ——
-    /// pbr.vert 与 pbr.frag 必须声明出同样的结构, 否则偏移对不上。
-    UInt32  MaterialIndex = 0;
+    FMatrix ViewProj;
 };
 
-/// push constant 的大小必须与三个顶点着色器里的声明一致。
+/// 大小必须与 depth_only.vert 里的声明一致。
 ///
-/// 加字段而不超过 128 字节上限时, vkCreatePipelineLayout 不会报错, 多出
-/// 的字节被静默推进去而着色器只读前面那些 —— 无声无息。这条断言是唯一
-/// 会在编译期拦住它的东西。
-///
-/// 改这个数之前先改 pbr.vert / depth_only.vert / triangle.vert。
-static_assert(sizeof(FModelPushConstant) == 68,
-              "FModelPushConstant 必须是 68 字节 (mat4 + uint) — "
-              "与 pbr.vert / depth_only.vert 的 push_constant 块一致");
+/// 加字段而不超过 128 字节上限时, vkCreatePipelineLayout 不会报错, 多出的
+/// 字节被静默推进去而着色器只读前面那些 —— 无声无息。这条断言是唯一会在
+/// 编译期拦住它的东西。
+static_assert(sizeof(FViewPushConstant) == 64,
+              "FViewPushConstant 必须是 64 字节 (mat4) — "
+              "与 depth_only.vert 的 push_constant 块一致");
 
 // ============================================================================
 // FRenderObject — 一次绘制批次 (渲染视图, 非资源所有者)

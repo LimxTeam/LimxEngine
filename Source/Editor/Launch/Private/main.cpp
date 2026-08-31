@@ -3937,8 +3937,26 @@ static bool RunGpuDrivenChecks(FRenderContext* context, FRenderer& renderer)
 
     // ---- 2. 剔除必须真的剔掉了东西 ----
     LIMX_LOG(LogLaunch, Display,
-             "[GPU驱动] 上传 {} 个物体, GPU 判可见 {} 个, 分成 {} 组",
-             objectCount, visibleCount, groupCount);
+             "[GPU驱动] 上传 {} 个物体, 相机视图判可见 {} 个, 分成 {} 组, "
+             "共 {} 个视图",
+             objectCount, visibleCount, groupCount, cull->GetViewCount());
+
+    // 逐视图都报。只报相机那一个的话, 级联视图整段没写过 (计数为 0) 这种
+    // 情况看不出来 —— 而那正是"拿未初始化的显存当间接命令"。
+    for (UInt32 view = 1; view < cull->GetViewCount(); ++view)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[GPU驱动]   视图 {} 判可见 {} 个",
+                 view, cull->GetVisibleCount(view));
+
+        if (cull->GetVisibleCount(view) == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[GPU驱动] 视图 {} 一个可见物体都没有 —— "
+                     "那一段间接命令从没被写过?", view);
+            passed = false;
+        }
+    }
 
     if (objectCount == 0)
     {
@@ -5821,6 +5839,29 @@ static void BuildStressScene(LScene* scene, FRenderContext* context,
             meshTrait->SetMaterial(materials[linear % kMaterialCount]);
             meshTrait->SetVisible(true);
         }
+    }
+
+    // ---- 地面 ----
+    //
+    // 不是布景。没有地面时级联阴影**落在虚空里** —— 阴影贴图照画, 画面上
+    // 一个像素都不受影响, 于是 --gpu-driven-check 那条逐像素判据对整条阴影
+    // 路径完全无从判定。
+    //
+    // 实测: 加地面之前, "阴影通道用相机的视图下标""三级级联全用第 0 级的
+    // 视锥""阴影通道的逐物体路径不加段起点"这三条变异一条都抓不住。
+    {
+        FTransform groundTransform;
+        groundTransform.Translation = FVector3(0.0f, -1.0f, 0.0f);
+        groundTransform.Scale3D     =
+            FVector3(halfSpan * 2.5f + 8.0f, 0.5f, halfSpan * 2.5f + 8.0f);
+
+        LNode* ground =
+            scene->SpawnNode<LNode>(FName("StressGround"), groundTransform);
+
+        LMeshTrait* groundMesh = ground->AddTrait<LMeshTrait>(FName("Mesh"));
+        groundMesh->SetMesh(&resources, meshHandles[0]);
+        groundMesh->SetMaterial(materials[0]);
+        groundMesh->SetVisible(true);
     }
 
     // 交出创建时的所有权 —— 每个节点都已各自加过引用

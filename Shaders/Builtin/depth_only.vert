@@ -15,21 +15,46 @@
 layout(location = 0) in vec3 inPosition;
 layout(location = 3) in vec2 inTexCoord0;
 
-// ── Uniform Buffer: 视图+投影矩阵 (set 0 binding 0) ──
-#include "view_common.h"
+// ── 逐物体数据 (set 3, binding 0) ──
+//
+// 模型矩阵与材质下标从 push constant 搬到了这里, 与 pbr.vert / gbuffer.vert
+// 同一份声明。搬家的硬性理由是间接绘制: 一次 DrawIndexedIndirect 覆盖几百个
+// 物体, 而 push constant 在整次调用里是常量。
+#include "gpu_draw_common.h"
 
-// ── Push Constant: 逐物体 Model 矩阵 ──
-// 与 pbr.vert 逐字段一致 —— push constant 的布局在整条管线上共享,
-// 而深度预通道、阴影通道、前向通道用的是同一个 m_PipelineLayout。
-layout(row_major, push_constant) uniform PushConstants {
-    mat4 model;
-    uint materialIndex;
+layout(row_major, std430, set = 3, binding = 0) readonly buffer ObjectBuffer {
+    DrawObject objects[];
+} objectBuffer;
+
+// ── Push Constant: 逐**视图**的视图投影矩阵 ──
+//
+// 原来这里是逐物体的 model 矩阵, 而 set 0 的 UBO 提供 view/proj。现在反过来:
+// model 逐物体所以进了 storage buffer, 而视图矩阵逐**通道**(阴影的每一级级联、
+// 阴影图集的每一块) —— 那正是 push constant 最合适的粒度, 一次绘制里它是常量。
+//
+// 这样安排还消掉了两个东西:
+//   阴影通道原本每帧每级一份 UBO 加一个描述符集 (3 帧 × 3 级 = 9 套);
+//   阴影图集通道原本把块矩阵**预乘进 model** 再传 push constant —— 那个技巧
+//   在 model 搬进 storage buffer 之后就没法用了。
+//
+// row_major 与 C++ 侧 FMatrix 的行主序一致。
+layout(row_major, push_constant) uniform ViewPushConstants {
+    mat4 viewProj;
 } pc;
 
 layout(location = 0) out vec2 fragTexCoord;
 
+// bindless 材质下标 —— flat, 逐物体恒定
+//
+// 片段着色器拿不到 gl_InstanceIndex (那是顶点阶段的内建量), 所以由这里传。
+layout(location = 1) flat out uint fragMaterialIndex;
+
 void main()
 {
-    gl_Position  = ubo.proj * ubo.view * pc.model * vec4(inPosition, 1.0);
+    DrawObject obj = objectBuffer.objects[gl_InstanceIndex];
+
+    fragMaterialIndex = obj.drawParams.w;
+
+    gl_Position  = pc.viewProj * obj.model * vec4(inPosition, 1.0);
     fragTexCoord = inTexCoord0;
 }

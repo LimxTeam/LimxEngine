@@ -48,11 +48,12 @@ layout(std430, set = 1, binding = 0) readonly buffer MaterialBuffer {
 // 数组大小必须与 C++ 侧 FBindlessTable::kMaxTextures 一致
 layout(set = 1, binding = 1) uniform sampler2D bindlessTextures[1024];
 
-// 与 depth_only.vert 逐字段一致
-layout(row_major, push_constant) uniform PushConstants {
-    mat4 model;
-    uint materialIndex;
-} pc;
+// 材质下标由顶点着色器经 flat varying 传下来 —— push constant 里已经没有它了
+// (逐物体数据搬进了 set 3 的 storage buffer)。
+//
+// 片段着色器不再声明 push constant: 它一个字段都不用, 而声明了不用会让反射
+// 报出一块用不着的范围。
+layout(location = 1) flat in uint fragMaterialIndex;
 
 
 const uint TEX_ALBEDO   = 1u << 0;
@@ -62,7 +63,7 @@ void main()
 {
     // 只有 Masked 需要取样 —— 不透明材质在这里读贴图纯属浪费带宽,
     // 而深度预 Pass 覆盖的正是全场景的每一个像素。
-    MaterialData mat = materials[pc.materialIndex];
+    MaterialData mat = materials[fragMaterialIndex];
 
     if (mat.BlendMode != BLEND_MASKED)
     {

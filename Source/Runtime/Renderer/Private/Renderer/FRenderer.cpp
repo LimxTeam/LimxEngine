@@ -296,29 +296,6 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
         return result;
     }
 
-    // 阴影 Pass 需要一份与 set 0 布局兼容的描述符集来放光源矩阵。
-    // 必须在 SetupAll 之后 —— 那时阴影贴图才存在; 也必须在
-    // CreateLightingDescriptorSets 之前, 后者要写入阴影贴图视图。
-    result = m_ShadowPass->CreateLightUniforms(
-        device, m_DescSetLayout, m_TextureView, m_Sampler, frameCount);
-
-    if (!IsRHISuccess(result))
-    {
-        LIMX_LOG(LogRenderer, Error, "[Renderer] 阴影光源 UBO 创建失败");
-        return result;
-    }
-
-    // 图集 Pass 只要一份单位矩阵的 set 0 —— 阴影矩阵走 push constant,
-    // 所以它不随帧变化, 不必每帧一份。
-    result = m_ShadowAtlasPass->CreateIdentityUniform(
-        device, m_DescSetLayout, m_TextureView, m_Sampler);
-
-    if (!IsRHISuccess(result))
-    {
-        LIMX_LOG(LogRenderer, Error, "[Renderer] 阴影图集单位矩阵 UBO 创建失败");
-        return result;
-    }
-
     // IBL 占位图必须在光照描述符集之前建好 —— 后者的 binding 2/3/4 要写它
     result = CreateFallbackCubeMap();
     if (!IsRHISuccess(result))
@@ -567,8 +544,6 @@ void FRenderer::RenderFrame()
 
         if (m_ShadowPass->HasValidLight())
         {
-            m_ShadowPass->UpdateLightUniform(m_Context->GetDevice(),
-                                             frameIndex);
 
             FCascadedShadowInfo shadowInfo;
 
@@ -607,8 +582,31 @@ void FRenderer::RenderFrame()
     // UpdateUniformBuffer 里的一份拷贝上, 相机自己那份从不被改。
     if (m_GpuCullPass)
     {
-        m_GpuCullPass->SetFrustum(FFrustum::FromViewProjection(
-            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix()));
+        m_GpuCullPass->SetViewFrustum(
+            FGpuCullPass::kCameraView,
+            FFrustum::FromViewProjection(m_Camera.GetProjectionMatrix() *
+                                         m_Camera.GetViewMatrix()));
+
+        // 三级级联各占一个视图。阴影通道没有有效光源时它们的视锥是上一帧
+        // 留下的 —— 无所谓, 那时阴影通道只清不画, 没人读那几段命令。
+        UInt32 viewCount = FGpuCullPass::kFirstCascadeView;
+
+        if (m_ShadowPass && m_ShadowPass->HasValidLight())
+        {
+            for (UInt32 cascade = 0; cascade < FShadowPass::kCascadeCount;
+                 ++cascade)
+            {
+                m_GpuCullPass->SetViewFrustum(
+                    FGpuCullPass::kFirstCascadeView + cascade,
+                    FFrustum::FromViewProjection(
+                        m_ShadowPass->GetCascadeViewProj(cascade)));
+            }
+
+            viewCount = FGpuCullPass::kFirstCascadeView +
+                        FShadowPass::kCascadeCount;
+        }
+
+        m_GpuCullPass->SetViewCount(viewCount);
     }
 
     // 分簇参数必须在 UploadLightData **之前**设 —— 那一步会把它们打包进 UBO
@@ -1489,14 +1487,17 @@ ERHIResult FRenderer::CreatePipelineLayout()
     // Push Constant: 逐物体 Model 矩阵 (mat4 = 64 bytes, 顶点着色器可见)
     FRHIPushConstantRange pushConstantRange = {};
 
-    // 片段着色器要读材质下标, 因此可见阶段必须包含它。
+    // 只有顶点阶段读它。
     //
-    // 只写 Vertex 的话着色器编译能过 (SPIR-V 里就是声明了一块 push
-    // constant), 但绘制时片段阶段读到的是未定义内容 —— 表现为材质随机,
-    // 而验证层会报 push constant 范围与着色器声明不符。
-    pushConstantRange.StageFlags = EShaderStage::Vertex | EShaderStage::Fragment;
+    // 材质下标原本也在 push constant 里, 片段阶段要读, 所以可见阶段得含
+    // Fragment。GPU 驱动之后材质下标随模型矩阵一起进了 set 3 的 storage
+    // buffer, 由顶点着色器经 flat varying 传给片段阶段 —— 片段阶段不再
+    // 声明 push constant, 这里就不该再写 Fragment。
+    //
+    // 多写一个阶段不会出错, 但那等于对着色器的实际用法撒谎。
+    pushConstantRange.StageFlags = EShaderStage::Vertex;
     pushConstantRange.Offset     = 0;
-    pushConstantRange.Size       = sizeof(FModelPushConstant);
+    pushConstantRange.Size       = sizeof(FViewPushConstant);
 
     // 3 套描述符集布局:
     //   set 0 = m_DescSetLayout       (ViewProj UBO + 棋盘格纹理)

@@ -31,11 +31,47 @@
 
 #include "RenderCore/Lighting/FLightManager.h"
 #include "RenderCore/Shaders/FShaderManager.h"
+#include "Renderer/RenderPass/FGpuCullPass.h"
 
 namespace Limx
 {
 
 LIMX_DECLARE_LOG_CATEGORY(LogRenderer)
+
+namespace
+{
+
+/// 绑 set 3 (逐物体数据) 并推本块的矩阵
+///
+/// 与 FShadowPass 里那个同名函数逐字相同。抄两遍而不是抽到公共头里, 是因为
+/// 它只有十几行且两处的调用点相隔很远; 真正要紧的是**两处的语义必须一致**,
+/// 而那由 --gpu-driven-check 与阴影自检一起兜住。
+static void BindViewState(IRHICommandBuffer*        commandBuffer,
+                          const FRenderPassContext& context,
+                          const FMatrix&            viewProj)
+{
+    if (context.GpuCull != nullptr)
+    {
+        const FRHIDescriptorSetHandle set =
+            context.GpuCull->GetDrawObjectSet(context.FrameIndex);
+
+        if (set.IsValid())
+        {
+            commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
+                                             context.PipelineLayout, 3, set,
+                                             nullptr, 0);
+        }
+    }
+
+    FViewPushConstant push;
+    push.ViewProj = viewProj;
+
+    commandBuffer->PushConstants(context.PipelineLayout,
+                                 EShaderStage::Vertex, 0,
+                                 sizeof(FViewPushConstant), &push);
+}
+
+} // namespace
 
 // ============================================================================
 // Setup
@@ -350,69 +386,6 @@ ERHIResult FShadowAtlasPass::CreatePipeline(
 }
 
 // ============================================================================
-// CreateIdentityUniform — 单位矩阵的 set 0 描述符集
-// ============================================================================
-
-ERHIResult FShadowAtlasPass::CreateIdentityUniform(
-    IRHIDevice* device, FRHIDescSetLayoutHandle viewProjLayout,
-    FRHITextureViewHandle fillerTextureView, FRHISamplerHandle fillerSampler)
-{
-    FRHIBufferDesc bufferDesc = FRHIBufferDesc::Uniform(sizeof(FViewProjUBO));
-    bufferDesc.DebugName = "ShadowAtlasIdentityUBO";
-
-    ERHIResult result = device->CreateBuffer(bufferDesc, m_IdentityBuffer);
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    // 内容写一次就不再动。阴影矩阵在 push constant 里逐块给, 这里的五个
-    // 矩阵全是单位阵 —— depth_only.vert 只读 view 与 proj, 其余三个是
-    // view_common.h 里给别的着色器用的, 但结构必须完整。
-    FViewProjUBO uboData;
-    uboData.View                 = FMatrix::Identity();
-    uboData.Proj                 = FMatrix::Identity();
-    uboData.ViewProj             = FMatrix::Identity();
-    uboData.ViewProjNoJitter     = FMatrix::Identity();
-    uboData.PrevViewProjNoJitter = FMatrix::Identity();
-
-    void* mapped = nullptr;
-    if (IsRHISuccess(device->MapBuffer(m_IdentityBuffer, &mapped)) &&
-        mapped != nullptr)
-    {
-        Memory::MemCopy(mapped, &uboData, sizeof(FViewProjUBO));
-        device->UnmapBuffer(m_IdentityBuffer);
-    }
-    else
-    {
-        LIMX_LOG(LogRenderer, Error,
-                 "[ShadowAtlas] 单位矩阵 UBO 映射失败");
-        return ERHIResult::ErrorUnknown;
-    }
-
-    result = device->AllocateDescriptorSet(viewProjLayout,
-                                           m_IdentityDescriptorSet);
-    if (!IsRHISuccess(result))
-    {
-        return result;
-    }
-
-    FRHIDescriptorWrite writes[2];
-
-    writes[0] = FRHIDescriptorWrite::UniformBuffer(
-        m_IdentityDescriptorSet, 0, m_IdentityBuffer, 0,
-        sizeof(FViewProjUBO));
-
-    writes[1] = FRHIDescriptorWrite::CombinedImageSampler(
-        m_IdentityDescriptorSet, 1, fillerTextureView, fillerSampler,
-        EImageLayout::ShaderReadOnly);
-
-    device->UpdateDescriptorSets(writes, 2);
-
-    return ERHIResult::Success;
-}
-
-// ============================================================================
 // RecordTile — 绘制一块
 // ============================================================================
 
@@ -461,6 +434,12 @@ void FShadowAtlasPass::RecordTile(IRHICommandBuffer*        commandBuffer,
     scissor.Height = rect.Size;
 
     commandBuffer->SetScissor(scissor);
+
+    // 本块的阴影矩阵进 push constant, 逐物体数据在 set 3。
+    //
+    // 视图矩阵逐块、模型矩阵逐物体 —— 两者的粒度不同, 所以放在不同的地方。
+    // 原先把两者乘在一起塞进 push constant 是因为那时没有逐物体缓冲区。
+    BindViewState(commandBuffer, context, shadowData.ViewProj);
 
     const TArray<FRenderObject>* casters =
         (context.ShadowCasterObjects != nullptr) ? context.ShadowCasterObjects
@@ -515,25 +494,17 @@ void FShadowAtlasPass::RecordTile(IRHICommandBuffer*        commandBuffer,
             boundIndexType   = obj.IndexType;
         }
 
-        // **阴影矩阵在这里预乘进 model。**
+        // 模型矩阵与材质下标在 set 3 的 storage buffer 里, 本块的阴影矩阵
+        // 在 push constant 里 (已在本块开头推过一次)。这里只传物体下标。
         //
-        // depth_only.vert 算的是 proj * view * model * pos, 而 set 0 里的
-        // view/proj 都是单位阵 —— 于是结果恰好是 shadowVP * model * pos。
-        //
-        // 这样做的收益是整个 Pass 只需要一个描述符集: 否则每块每帧一份
-        // UBO, 3 帧 × 64 块 = 192 个描述符集, 全为了搬同一个矩阵。
-        FModelPushConstant pushData;
-        pushData.Model         = shadowData.ViewProj * obj.Transform.ToMatrix();
-        pushData.MaterialIndex = obj.BindlessMaterialIndex;
+        // 原先的做法是把阴影矩阵**预乘进 model** 再当 push constant 推 ——
+        // 那个技巧在 model 搬进 storage buffer 之后就没法用了, 而换成
+        // "push constant 装视图矩阵"反而更直接: 视图矩阵本来就是逐块的量。
+        const UInt32 base =
+            (context.GpuCull != nullptr) ? context.GpuCull->GetCullBase() : 0u;
 
-        commandBuffer->PushConstants(
-            context.PipelineLayout,
-            EShaderStage::Vertex | EShaderStage::Fragment,
-            0,
-            sizeof(FModelPushConstant),
-            &pushData);
-
-        commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset, 0, 0);
+        commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset, 0,
+                                   base + static_cast<UInt32>(i));
     }
 }
 
@@ -576,15 +547,6 @@ void FShadowAtlasPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     if (!casters.IsEmpty())
     {
-        // set 0 = 单位矩阵 (阴影矩阵走 push constant)
-        commandBuffer->BindDescriptorSet(
-            EPipelineBindPoint::Graphics,
-            context.PipelineLayout,
-            0,
-            m_IdentityDescriptorSet,
-            nullptr,
-            0);
-
         // set 1 = bindless 材质表 —— Masked 材质的 alpha 测试要读 albedo
         commandBuffer->BindDescriptorSet(
             EPipelineBindPoint::Graphics,
@@ -631,8 +593,6 @@ void FShadowAtlasPass::Shutdown(IRHIDevice* device)
     {
         return;
     }
-
-    device->DestroyBuffer(m_IdentityBuffer);
 
     for (SizeType variant = 0; variant < kPipelineVariantCount; ++variant)
     {

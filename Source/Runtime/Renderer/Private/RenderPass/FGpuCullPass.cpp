@@ -42,20 +42,20 @@ struct FCullPushConstants
 {
     Float32 Planes[6][4] = {};
 
-    UInt32 ObjectCount = 0;
-    UInt32 Pad0        = 0;
-    UInt32 Pad1        = 0;
-    UInt32 Pad2        = 0;
+    UInt32 ObjectCount   = 0;
+    UInt32 ViewIndex     = 0;
+    UInt32 ViewStride    = 0;   // 每个视图占多少条命令
+    UInt32 CullBase      = 0;   // 投射体段在逐物体缓冲区里的起点
 };
 
 static_assert(sizeof(FCullPushConstants) == 112,
     "FCullPushConstants 必须为 112 字节 — 与 draw_cull.comp 的 push constant "
     "一致");
 
-/// 可见计数器
+/// 可见计数器 —— 每个视图一格
 struct FVisibleCounter
 {
-    UInt32 VisibleCount = 0;
+    UInt32 VisibleCount[kMaxCullViews] = {};
 };
 
 constexpr UInt32 kCullWorkgroupSize = 64;
@@ -153,9 +153,11 @@ ERHIResult FGpuCullPass::CreateBuffers(IRHIDevice* device, UInt32 frameCount)
         // 而关掉验证层就是未定义行为。
         {
             FRHIBufferDesc bufferDesc = {};
+            // 按**视图数 × 物体数**开。每个视图占固定长度的一段, 段长是
+            // 常量而不是本帧的物体数 —— 用物体数的话每段的起点逐帧变化。
             bufferDesc.Size =
                 static_cast<UInt64>(sizeof(FDrawIndexedIndirectCommand)) *
-                kMaxGpuDrawObjects;
+                kMaxGpuDrawObjects * kMaxCullViews;
             bufferDesc.Usage = static_cast<EBufferUsage>(
                 static_cast<UInt32>(EBufferUsage::StorageBuffer) |
                 static_cast<UInt32>(EBufferUsage::IndirectBuffer));
@@ -284,7 +286,7 @@ ERHIResult FGpuCullPass::CreateDescriptors(
         writes[1] = FRHIDescriptorWrite::StorageBuffer(
             cullSet, 1, m_IndirectBuffers[i], 0,
             static_cast<UInt64>(sizeof(FDrawIndexedIndirectCommand)) *
-                kMaxGpuDrawObjects);
+                kMaxGpuDrawObjects * kMaxCullViews);
 
         writes[2] = FRHIDescriptorWrite::StorageBuffer(
             cullSet, 2, m_Counters[i], 0, sizeof(FVisibleCounter));
@@ -367,15 +369,123 @@ ERHIResult FGpuCullPass::CreatePipeline(IRHIDevice* device)
 // UploadObjects — 写逐物体数据, 同时算出分组
 // ============================================================================
 
-void FGpuCullPass::UploadObjects(const TArray<FRenderObject>* opaque,
+UInt32 FGpuCullPass::WriteSegment(FGpuDrawObject*              destination,
+                                  const TArray<FRenderObject>* source,
+                                  UInt32                       writeCursor,
+                                  bool                         buildGroups)
+{
+    if (source == nullptr)
+    {
+        return 0;
+    }
+
+    UInt32 written = 0;
+
+    for (SizeType i = 0; i < source->GetSize(); ++i)
+    {
+        if (writeCursor + written >= kMaxGpuDrawObjects)
+        {
+            break;
+        }
+
+        const FRenderObject& obj = (*source)[i];
+
+        FGpuDrawObject& gpu = destination[writeCursor + written];
+
+        gpu.Model = obj.Transform.ToMatrix();
+
+        const FVector4 sphere = BoundingSphereFromBox(obj.WorldBounds);
+
+        gpu.BoundsCenterX = sphere.X;
+        gpu.BoundsCenterY = sphere.Y;
+        gpu.BoundsCenterZ = sphere.Z;
+        gpu.BoundsRadius  = sphere.W;
+
+        gpu.IndexCount    = obj.IndexCount;
+        gpu.FirstIndex    = obj.IndexOffset;
+        gpu.VertexOffset  = 0;
+        gpu.MaterialIndex = obj.BindlessMaterialIndex;
+
+        if (buildGroups)
+        {
+            // ---- 分组 ----
+            //
+            // 分组的依据是"下一条命令能不能与上一条共用同一次绑定": 顶点
+            // 缓冲区、索引缓冲区、索引宽度、以及管线变体 (单面/双面)。
+            //
+            // 列表已按状态聚类过 (FSceneManager 的 FBatchStateLess), 所以组数
+            // 远小于物体数 —— 压力场景 576 个物体 24 组。没排序过的话这里会
+            // 退化成"每个物体一组", 那时 GPU 驱动一点也不比逐物体绘制快。
+            //
+            // 四项里有三项在**当前的排序下是冗余的**, 变异验证逐条量过:
+            //   只去掉顶点缓冲区那一条 —— 每个网格自带一对顶点/索引缓冲区,
+            //     索引那一条照样把组切开, 结果完全一样。
+            //   只去掉单双面那一条 —— FBatchStateLess 的首要键就是单双面,
+            //     分组最多跨过那一个边界, 而边界两侧的网格恰好不同。
+            //   把整个条件拿掉才构造得出缺陷 (--gpu-driven-check 立刻报错)。
+            //
+            // 四项一个都不能删。它们冗余是**排序器当前键顺序的副产品**, 而
+            // 分组不该依赖那个顺序 —— 排序换个写法, 冗余立刻消失。
+            const bool startsNewGroup =
+                m_Groups.IsEmpty() ||
+                m_Groups[m_Groups.GetSize() - 1].VertexBuffer.Packed !=
+                    obj.VertexBuffer.Packed ||
+                m_Groups[m_Groups.GetSize() - 1].IndexBuffer.Packed !=
+                    obj.IndexBuffer.Packed ||
+                m_Groups[m_Groups.GetSize() - 1].IndexType != obj.IndexType ||
+                m_Groups[m_Groups.GetSize() - 1].IsDoubleSided !=
+                    obj.IsDoubleSided;
+
+            if (startsNewGroup)
+            {
+                FDrawGroup group;
+                group.VertexBuffer  = obj.VertexBuffer;
+                group.IndexBuffer   = obj.IndexBuffer;
+                group.IndexType     = obj.IndexType;
+                group.IsDoubleSided = obj.IsDoubleSided;
+
+                // 段内偏移, 不是缓冲区里的绝对下标 —— 间接命令那一段是按
+                // 视图独立编号的, 而分组描述的正是那一段。
+                group.FirstCommand  = written;
+                group.CommandCount  = 0;
+
+                m_Groups.Add(group);
+            }
+
+            ++m_Groups[m_Groups.GetSize() - 1].CommandCount;
+        }
+
+        ++written;
+    }
+
+    return written;
+}
+
+// ============================================================================
+// UploadObjects — 三段写进同一个缓冲区
+//
+// 分三段是因为索引它的有三份不同的列表, 而它们的下标毫无对应关系:
+// 相机列表经过了相机剔除, 投射体列表没有; 两者还由 FSceneManager 各自排序,
+// 而排序不稳定 —— 比较相等的物体在两份列表里的先后可以不同。
+//
+// 这一点是踩出来的: 先前只上传一份, 阴影通道按投射体列表的下标去索引, 而
+// 缓冲区里装的是相机列表 —— 表现是**某一盏灯的阴影整个消失**, 另一盏却完全
+// 正确 (那个场景里两份列表恰好只在那一处不同)。不崩、不报错。
+// ============================================================================
+
+void FGpuCullPass::UploadObjects(const TArray<FRenderObject>* cameraObjects,
+                                 const TArray<FRenderObject>* casters,
                                  const TArray<FRenderObject>* translucent,
                                  UInt32                       frameIndex)
 {
     m_Groups.Clear();
+
+    m_CameraCount     = 0;
+    m_CullBase        = 0;
     m_ObjectCount     = 0;
     m_TranslucentBase = 0;
 
-    if (frameIndex >= m_ObjectBuffers.GetSize() || opaque == nullptr)
+    if (frameIndex >= m_ObjectBuffers.GetSize())
     {
         return;
     }
@@ -393,134 +503,43 @@ void FGpuCullPass::UploadObjects(const TArray<FRenderObject>* opaque,
 
     FGpuDrawObject* const gpuObjects = static_cast<FGpuDrawObject*>(mapped);
 
-    const SizeType total = opaque->GetSize();
+    UInt32 cursor = 0;
 
-    bool truncated = false;
+    // 段一: 相机列表 (已剔除) —— 相机通道的逐物体路径按它的下标索引
+    m_CameraCount = WriteSegment(gpuObjects, cameraObjects, cursor, false);
+    cursor += m_CameraCount;
 
-    for (SizeType i = 0; i < total; ++i)
-    {
-        if (m_ObjectCount >= kMaxGpuDrawObjects)
-        {
-            // 超上限时明确报出来。静默截断的表现是"场景里少了一部分东西",
-            // 而那与资源加载失败长得一样。
-            truncated = true;
-            break;
-        }
+    // 段二: 投射体列表 (未剔除) —— GPU 剔除的输入, 也是阴影通道逐物体路径
+    //       的索引依据。分组只在这一段上算。
+    m_CullBase    = cursor;
+    m_ObjectCount = WriteSegment(gpuObjects, casters, cursor, true);
+    cursor += m_ObjectCount;
 
-        const FRenderObject& obj = (*opaque)[i];
+    // 段三: 半透明 —— 走的是同一个 pbr.vert, 不给它们条目的话
+    //       gl_InstanceIndex 会落到别人的数据上, 玻璃会长在别人的位置上。
+    //       不参与剔除: 它必须严格由远及近, 而间接命令的顺序表达不了距离。
+    m_TranslucentBase = cursor;
 
-        FGpuDrawObject& gpu = gpuObjects[m_ObjectCount];
+    const UInt32 translucentCount =
+        WriteSegment(gpuObjects, translucent, cursor, false);
 
-        gpu.Model = obj.Transform.ToMatrix();
-
-        const FVector4 sphere = BoundingSphereFromBox(obj.WorldBounds);
-
-        gpu.BoundsCenterX = sphere.X;
-        gpu.BoundsCenterY = sphere.Y;
-        gpu.BoundsCenterZ = sphere.Z;
-        gpu.BoundsRadius  = sphere.W;
-
-        gpu.IndexCount    = obj.IndexCount;
-        gpu.FirstIndex    = obj.IndexOffset;
-        gpu.VertexOffset  = 0;
-        gpu.MaterialIndex = obj.BindlessMaterialIndex;
-
-        // ---- 分组 ----
-        //
-        // 分组的依据是"下一条命令能不能与上一条共用同一次绑定": 顶点缓冲区、
-        // 索引缓冲区、索引宽度、以及管线变体 (单面/双面)。任何一项变了就得
-        // 换一组。
-        //
-        // 列表已按状态聚类过 (FSceneManager 的 FBatchStateLess), 所以组数远
-        // 小于物体数 —— 压力场景 576 个物体 24 组。没排序过的话这里会退化成
-        // "每个物体一组", 那时 GPU 驱动一点也不比逐物体绘制快。
-        //
-        // 四项里有三项在**当前的排序下是冗余的**, 变异验证逐条量过:
-        //   - 只去掉顶点缓冲区那一条: 每个网格自带一对顶点/索引缓冲区, 索引
-        //     那一条照样把组切开, 结果完全一样。
-        //   - 只去掉单双面那一条: FBatchStateLess 的首要键就是单双面, 分组
-        //     最多跨过那一个边界, 而边界两侧的网格恰好不同。
-        //   把整个条件拿掉才构造得出缺陷 (--gpu-driven-check 立刻报错)。
-        //
-        // 四项一个都不能删。它们冗余是**排序器当前键顺序的副产品**, 而分组
-        // 不该依赖那个顺序 —— 排序换个写法, 冗余立刻消失。
-        const bool startsNewGroup =
-            m_Groups.IsEmpty() ||
-            m_Groups[m_Groups.GetSize() - 1].VertexBuffer.Packed !=
-                obj.VertexBuffer.Packed ||
-            m_Groups[m_Groups.GetSize() - 1].IndexBuffer.Packed !=
-                obj.IndexBuffer.Packed ||
-            m_Groups[m_Groups.GetSize() - 1].IndexType != obj.IndexType ||
-            m_Groups[m_Groups.GetSize() - 1].IsDoubleSided != obj.IsDoubleSided;
-
-        if (startsNewGroup)
-        {
-            FDrawGroup group;
-            group.VertexBuffer  = obj.VertexBuffer;
-            group.IndexBuffer   = obj.IndexBuffer;
-            group.IndexType     = obj.IndexType;
-            group.IsDoubleSided = obj.IsDoubleSided;
-            group.FirstCommand  = m_ObjectCount;
-            group.CommandCount  = 0;
-
-            m_Groups.Add(group);
-        }
-
-        ++m_Groups[m_Groups.GetSize() - 1].CommandCount;
-        ++m_ObjectCount;
-    }
-
-    // ---- 半透明 ----
-    //
-    // 接在不透明后面, 不参与分组也不参与剔除。它们走的是同一个 pbr.vert,
-    // 而那个着色器只有一条路径 —— 不给它们条目的话, gl_InstanceIndex 会落到
-    // 不透明物体的数据上, 玻璃会长在别人的位置上。
-    //
-    // 不参与剔除是因为半透明必须严格由远及近绘制, 而那个顺序是 CPU 排出来
-    // 的; 间接命令的顺序表达不了"按距离"这件事。
-    m_TranslucentBase = m_ObjectCount;
-
-    UInt32 written = m_ObjectCount;
-
-    if (translucent != nullptr)
-    {
-        for (SizeType i = 0; i < translucent->GetSize(); ++i)
-        {
-            if (written >= kMaxGpuDrawObjects)
-            {
-                truncated = true;
-                break;
-            }
-
-            const FRenderObject& obj = (*translucent)[i];
-
-            FGpuDrawObject& gpu = gpuObjects[written];
-
-            gpu.Model = obj.Transform.ToMatrix();
-
-            const FVector4 sphere = BoundingSphereFromBox(obj.WorldBounds);
-
-            gpu.BoundsCenterX = sphere.X;
-            gpu.BoundsCenterY = sphere.Y;
-            gpu.BoundsCenterZ = sphere.Z;
-            gpu.BoundsRadius  = sphere.W;
-
-            gpu.IndexCount    = obj.IndexCount;
-            gpu.FirstIndex    = obj.IndexOffset;
-            gpu.VertexOffset  = 0;
-            gpu.MaterialIndex = obj.BindlessMaterialIndex;
-
-            ++written;
-        }
-    }
+    cursor += translucentCount;
 
     m_Device->UnmapBuffer(m_ObjectBuffers[frameIndex]);
 
-    if (truncated)
+    const SizeType requested =
+        (cameraObjects != nullptr ? cameraObjects->GetSize() : 0) +
+        (casters != nullptr ? casters->GetSize() : 0) +
+        (translucent != nullptr ? translucent->GetSize() : 0);
+
+    if (requested > cursor)
     {
+        // 超上限时明确报出来。静默截断的表现是"场景里少了一部分东西",
+        // 而那与资源加载失败长得一样。
         LIMX_LOG(LogRenderer, Warning,
-                 "[GpuCull] 物体数超过上限 {} — 其余被忽略, 画面上会少东西",
-                 kMaxGpuDrawObjects);
+                 "[GpuCull] 三段合计 {} 个物体超过上限 {} — 只写进了 {} 个, "
+                 "画面上会少东西",
+                 static_cast<UInt64>(requested), kMaxGpuDrawObjects, cursor);
     }
 
     m_HasUploaded = true;
@@ -535,19 +554,11 @@ void FGpuCullPass::Execute(IRHICommandBuffer*        commandBuffer,
 {
     m_HasUploaded = false;
 
-    // 上传哪份列表取决于开关, 而**图形通道迭代的是同一份** —— 两者的下标
-    // 必须对得上, 因为顶点着色器靠 gl_InstanceIndex 去这个缓冲区取数据。
-    //
-    //   开: 取剔除前的 ShadowCasterObjects ("未经相机视锥剔除的不透明与蒙版
-    //       批次", 排序规则与主列表相同)。用剔除后的列表的话, GPU 剔除永远
-    //       剔不掉任何东西 —— 一个什么都不做的剔除实现会得到完全正确的画面,
-    //       判据也就无从判定。
-    //   关: 取 CPU 已经剔过的 RenderObjects, 图形通道逐个绘制时传的
-    //       firstInstance 就是它在这份列表里的下标。
-    const TArray<FRenderObject>* source =
-        IsEnabled() ? context.ShadowCasterObjects : context.RenderObjects;
-
-    if (source == nullptr)
+    // 三份列表都要上传, 与开关无关 —— 索引它们的通道各不相同:
+    //   相机通道的逐物体路径读 RenderObjects (已剔除);
+    //   阴影通道的逐物体路径与 GPU 剔除都读 ShadowCasterObjects (未剔除);
+    //   前向通道的半透明读 TranslucentObjects。
+    if (context.ShadowCasterObjects == nullptr)
     {
         return;
     }
@@ -558,7 +569,8 @@ void FGpuCullPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     // 上传与分组**无论开关都做** —— 图形通道的顶点着色器只有一条路径, 它
     // 总是从 set 3 取模型矩阵。开关只决定命令是 CPU 逐个下的还是 GPU 写的。
-    UploadObjects(source, context.TranslucentObjects, context.FrameIndex);
+    UploadObjects(context.RenderObjects, context.ShadowCasterObjects,
+                  context.TranslucentObjects, context.FrameIndex);
 
     if (!IsEnabled() || m_ObjectCount == 0)
     {
@@ -602,25 +614,73 @@ void FGpuCullPass::Execute(IRHICommandBuffer*        commandBuffer,
     // 抖动每帧改变亚像素偏移, 用它算出的视锥边界会逐帧漂移 —— 那本身无害
     // (漂移量远小于一个物体), 但会让"GPU 路径与 CPU 路径一致"这条判据变成
     // 逐帧不同, 无法比对。CPU 侧的剔除用的也是不含抖动的矩阵。
-    FCullPushConstants push;
-
-    for (Int32 p = 0; p < FFrustum::kPlaneCount; ++p)
-    {
-        push.Planes[p][0] = m_Frustum.Planes[p].Normal.X;
-        push.Planes[p][1] = m_Frustum.Planes[p].Normal.Y;
-        push.Planes[p][2] = m_Frustum.Planes[p].Normal.Z;
-        push.Planes[p][3] = m_Frustum.Planes[p].D;
-    }
-
-    push.ObjectCount = m_ObjectCount;
-
-    commandBuffer->PushConstants(m_CullPipelineLayout, EShaderStage::Compute,
-                                 0, sizeof(FCullPushConstants), &push);
-
     const UInt32 groupCount =
         (m_ObjectCount + kCullWorkgroupSize - 1u) / kCullWorkgroupSize;
 
-    commandBuffer->Dispatch(groupCount, 1, 1);
+    // 逐视图各分派一次。
+    //
+    // 在着色器里循环 N 遍也行, 但每个视图的视锥平面不同而平面在 push constant
+    // 里 —— 循环的话六个平面要变成 N×6 个, 128 字节装不下第二个视图。改用
+    // UBO 又多一次绑定与一次每帧写入, 而整个剔除通道实测只有 0.012 ms。
+    // **每个视图都分派, 包括本帧用不到的那些。**
+    //
+    // 用不到的视图那一段命令若从来没被写过, 就是一整段未初始化的显存 ——
+    // 而 vkCmdDrawIndexedIndirect 拿它当命令读是未定义行为: indexCount 可能
+    // 是任意大的数, 读到索引缓冲区之外, 轻则画面出现荒谬的几何, 重则设备
+    // 复位。而这不会有任何报错。
+    //
+    // 给用不到的视图一个"全拒"视锥 (法线朝任意方向、常数项极大的负数), 于是
+    // 那些段被老老实实写成 instanceCount = 0。多出来的几次分派各约一微秒。
+    //
+    // 这比"在图形通道那边判一下别用"更靠得住: 判漏一处就回到未定义行为, 而
+    // 这里做完之后, **任何一段都可以安全地读**。
+    //
+    // ── 这一条不受任何画面判据保护 ──
+    //
+    // 实测过: 把这里与 FShadowPass 那个"本级有没有被剔除过"的判断同时拆掉,
+    // --gpu-driven-check 与 --shadow-check 仍然都返回 0。因为那个场景构造
+    // 不出来 —— 没有有效方向光时 ShadowEnabled 是 0, 片段着色器压根不采样
+    // 级联贴图, 往里画什么都看不见。
+    //
+    // 但风险是实在的, 只是不在画面上: 未初始化的 indexCount 可能是几十亿,
+    // 那是读到索引缓冲区之外。删掉它不会有任何检查变红 —— 所以这段话写在
+    // 这里。
+    for (UInt32 view = 0; view < kMaxCullViews; ++view)
+    {
+        const bool isActive = (view < m_ViewCount);
+
+        FCullPushConstants push;
+
+        for (Int32 p = 0; p < FFrustum::kPlaneCount; ++p)
+        {
+            if (isActive)
+            {
+                push.Planes[p][0] = m_Frusta[view].Planes[p].Normal.X;
+                push.Planes[p][1] = m_Frusta[view].Planes[p].Normal.Y;
+                push.Planes[p][2] = m_Frusta[view].Planes[p].Normal.Z;
+                push.Planes[p][3] = m_Frusta[view].Planes[p].D;
+            }
+            else
+            {
+                // 全拒: 任何包围球都落在这个平面的背面
+                push.Planes[p][0] = 0.0f;
+                push.Planes[p][1] = 1.0f;
+                push.Planes[p][2] = 0.0f;
+                push.Planes[p][3] = -1.0e30f;
+            }
+        }
+
+        push.ObjectCount = m_ObjectCount;
+        push.ViewIndex   = view;
+        push.ViewStride  = kMaxGpuDrawObjects;
+        push.CullBase    = m_CullBase;
+
+        commandBuffer->PushConstants(m_CullPipelineLayout,
+                                     EShaderStage::Compute, 0,
+                                     sizeof(FCullPushConstants), &push);
+
+        commandBuffer->Dispatch(groupCount, 1, 1);
+    }
 
     // ---- 屏障: 计算写 → 间接命令读 ----
     //
@@ -682,7 +742,10 @@ void FGpuCullPass::ResolveCounter(IRHIDevice* device, UInt32 frameIndex)
     const FVisibleCounter* const counter =
         static_cast<const FVisibleCounter*>(mapped);
 
-    m_LastVisible = counter->VisibleCount;
+    for (UInt32 view = 0; view < kMaxCullViews; ++view)
+    {
+        m_LastVisible[view] = counter->VisibleCount[view];
+    }
 
     device->UnmapBuffer(m_CounterReadbacks[frameIndex]);
 }

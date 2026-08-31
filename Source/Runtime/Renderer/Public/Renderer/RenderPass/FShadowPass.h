@@ -189,20 +189,6 @@ public:
     /// 是否已具备可用的光源信息
     LIMX_NODISCARD bool HasValidLight() const { return m_HasValidLight; }
 
-    /// 每帧的光源矩阵 UBO 与描述符集 (与 set 0 布局兼容)
-    ///
-    /// 阴影 Pass 复用 depth_only.vert，后者从 set 0 binding 0 读取
-    /// view/proj。因此这里需要一份自己的 set 0 描述符集，内容是光源矩阵
-    /// 而非相机矩阵。
-    ERHIResult CreateLightUniforms(IRHIDevice* device,
-                                   FRHIDescSetLayoutHandle viewProjLayout,
-                                   FRHITextureViewHandle fillerTextureView,
-                                   FRHISamplerHandle fillerSampler,
-                                   UInt32 frameCount);
-
-    /// 把本帧各级联的光源矩阵写入对应的 UBO
-    void UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex);
-
 private:
     /// 录制本级的公共状态 — 视口、裁剪、光源矩阵描述符集
     void RecordCascadeState(IRHICommandBuffer*        commandBuffer,
@@ -262,10 +248,6 @@ private:
     FRHIGraphicsPipelineHandle m_Pipelines[kPipelineVariantCount];
 
     FRHIPipelineLayoutHandle   m_PipelineLayout;
-
-    /// 每帧的光源矩阵 UBO 与描述符集
-    TArray<FRHIBufferHandle>        m_LightUniformBuffers;
-    TArray<FRHIDescriptorSetHandle> m_LightDescriptorSets;
 
     FMatrix  m_CascadeViewProj[kCascadeCount];
 

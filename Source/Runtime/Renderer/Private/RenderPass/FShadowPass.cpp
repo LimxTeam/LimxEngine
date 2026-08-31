@@ -30,11 +30,113 @@
 #include "Renderer/RenderPass/FShadowPass.h"
 #include "Renderer/Renderer/FRenderer.h"
 #include "RenderCore/Shaders/FShaderManager.h"
+#include "Renderer/RenderPass/FGpuCullPass.h"
 
 namespace Limx
 {
 
 LIMX_DECLARE_LOG_CATEGORY(LogRenderer)
+
+namespace
+{
+
+/// 绑 set 3 (逐物体数据) 并推本视图的矩阵
+///
+/// 两条路径都要绑 set 3: depth_only.vert 只有一条代码路径, 它总是从那里取
+/// 模型矩阵与材质下标。逐物体绘制那条只是把物体下标经 firstInstance 传进去。
+static void BindViewState(IRHICommandBuffer*        commandBuffer,
+                          const FRenderPassContext& context,
+                          const FMatrix&            viewProj)
+{
+    if (context.GpuCull != nullptr)
+    {
+        const FRHIDescriptorSetHandle set =
+            context.GpuCull->GetDrawObjectSet(context.FrameIndex);
+
+        if (set.IsValid())
+        {
+            commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
+                                             context.PipelineLayout, 3, set,
+                                             nullptr, 0);
+        }
+    }
+
+    FViewPushConstant push;
+    push.ViewProj = viewProj;
+
+    commandBuffer->PushConstants(context.PipelineLayout,
+                                 EShaderStage::Vertex, 0,
+                                 sizeof(FViewPushConstant), &push);
+}
+
+/// 逐组下 DrawIndexedIndirect —— 取本视图那一段
+static void RecordIndirectView(IRHICommandBuffer*        commandBuffer,
+                               const FRenderPassContext& context,
+                               const FGpuCullPass&       cull,
+                               UInt32                    viewIndex,
+                               FRHIGraphicsPipelineHandle singleSided,
+                               FRHIGraphicsPipelineHandle doubleSided)
+{
+    const FRHIBufferHandle indirect =
+        cull.GetIndirectBuffer(context.FrameIndex);
+
+    if (!indirect.IsValid())
+    {
+        return;
+    }
+
+    const TArray<FDrawGroup>& groups = cull.GetGroups();
+
+    FRHIGraphicsPipelineHandle boundPipeline;
+    FRHIBufferHandle           boundVertexBuffer;
+    FRHIBufferHandle           boundIndexBuffer;
+    EIndexType                 boundIndexType = EIndexType::UInt32;
+
+    for (SizeType g = 0; g < groups.GetSize(); ++g)
+    {
+        const FDrawGroup& group = groups[g];
+
+        if (group.CommandCount == 0)
+        {
+            continue;
+        }
+
+        const FRHIGraphicsPipelineHandle pipeline =
+            group.IsDoubleSided ? doubleSided : singleSided;
+
+        if (pipeline.Packed != boundPipeline.Packed)
+        {
+            commandBuffer->BindGraphicsPipeline(pipeline);
+            boundPipeline = pipeline;
+        }
+
+        if (group.VertexBuffer.Packed != boundVertexBuffer.Packed)
+        {
+            commandBuffer->BindVertexBuffer(0, group.VertexBuffer, 0);
+            boundVertexBuffer = group.VertexBuffer;
+        }
+
+        if (group.IndexBuffer.Packed != boundIndexBuffer.Packed ||
+            group.IndexType != boundIndexType)
+        {
+            commandBuffer->BindIndexBuffer(group.IndexBuffer, 0,
+                                           group.IndexType);
+            boundIndexBuffer = group.IndexBuffer;
+            boundIndexType   = group.IndexType;
+        }
+
+        commandBuffer->DrawIndexedIndirect(
+            indirect,
+            (static_cast<UInt64>(FGpuCullPass::ViewCommandBase(viewIndex)) +
+             group.FirstCommand) *
+                sizeof(FDrawIndexedIndirectCommand),
+            group.CommandCount,
+            static_cast<UInt32>(sizeof(FDrawIndexedIndirectCommand)));
+    }
+}
+
+} // namespace
+
 
 // ============================================================================
 // Setup — 创建阴影贴图与全部 GPU 资源
@@ -394,61 +496,6 @@ ERHIResult FShadowPass::CreateShadowPipeline(
 }
 
 // ============================================================================
-// CreateLightUniforms — 每帧一份光源矩阵 UBO 与 set 0 兼容描述符集
-// ============================================================================
-
-ERHIResult FShadowPass::CreateLightUniforms(
-    IRHIDevice* device, FRHIDescSetLayoutHandle viewProjLayout,
-    FRHITextureViewHandle fillerTextureView, FRHISamplerHandle fillerSampler,
-    UInt32 frameCount)
-{
-    const UInt32 totalCount = frameCount * kCascadeCount;
-
-    m_LightUniformBuffers.Reserve(totalCount);
-    m_LightDescriptorSets.Reserve(totalCount);
-
-    for (UInt32 i = 0; i < totalCount; ++i)
-    {
-        FRHIBufferDesc bufferDesc =
-            FRHIBufferDesc::Uniform(sizeof(FViewProjUBO));
-        bufferDesc.DebugName = "ShadowLightViewProjUBO";
-
-        FRHIBufferHandle buffer;
-        ERHIResult result = device->CreateBuffer(bufferDesc, buffer);
-        if (!IsRHISuccess(result))
-        {
-            return result;
-        }
-
-        FRHIDescriptorSetHandle descSet;
-        result = device->AllocateDescriptorSet(viewProjLayout, descSet);
-        if (!IsRHISuccess(result))
-        {
-            return result;
-        }
-
-        // binding 0 = 光源矩阵。binding 1 是 set 0 布局里的纹理槽位,
-        // depth_only.frag 并不采样它, 但描述符集不该留空 —— 填一张
-        // 现成的纹理比依赖"未被静态使用的描述符无需有效"这条规则更稳妥。
-        FRHIDescriptorWrite writes[2];
-
-        writes[0] = FRHIDescriptorWrite::UniformBuffer(
-            descSet, 0, buffer, 0, sizeof(FViewProjUBO));
-
-        writes[1] = FRHIDescriptorWrite::CombinedImageSampler(
-            descSet, 1, fillerTextureView, fillerSampler,
-            EImageLayout::ShaderReadOnly);
-
-        device->UpdateDescriptorSets(writes, 2);
-
-        m_LightUniformBuffers.Add(buffer);
-        m_LightDescriptorSets.Add(descSet);
-    }
-
-    return ERHIResult::Success;
-}
-
-// ============================================================================
 // ComputeCascadeSplits — 对数与均匀的加权切分
 // ============================================================================
 
@@ -636,44 +683,6 @@ void FShadowPass::SetLightAndBounds(const FVector3& lightDirection,
 // UpdateLightUniform
 // ============================================================================
 
-void FShadowPass::UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex)
-{
-    // 每帧每级一份 UBO —— 下标按 (帧 × 级数 + 级) 展开
-    for (UInt32 cascade = 0; cascade < kCascadeCount; ++cascade)
-    {
-        const SizeType index =
-            static_cast<SizeType>(frameIndex) * kCascadeCount + cascade;
-
-        if (index >= m_LightUniformBuffers.GetSize())
-        {
-            return;
-        }
-
-        // depth_only.vert 读的是 view 与 proj 两个矩阵并相乘。这里把合成好
-        // 的矩阵放进 proj, view 置为单位阵 —— 相乘结果不变, 而阴影贴图与
-        // 片段着色器用的是**同一个** m_CascadeViewProj, 不存在两处各算一遍
-        // 而出现细微差异的可能。
-        FViewProjUBO uboData;
-        uboData.View = FMatrix::Identity();
-        uboData.Proj = m_CascadeViewProj[cascade];
-
-        // 阴影通道不算速度, depth_only.vert 也不读这个字段。填成与本帧
-        // 相同的矩阵 (语义上"没有运动") 而不是留着不管 —— 万一以后阴影
-        // 通道也要输出速度, 默认值至少是有意义的那一个。
-        uboData.ViewProj             = m_CascadeViewProj[cascade];
-        uboData.ViewProjNoJitter     = m_CascadeViewProj[cascade];
-        uboData.PrevViewProjNoJitter = m_CascadeViewProj[cascade];
-
-        void* mapped = nullptr;
-        if (IsRHISuccess(device->MapBuffer(m_LightUniformBuffers[index],
-                                           &mapped)))
-        {
-            Memory::MemCopy(mapped, &uboData, sizeof(FViewProjUBO));
-            device->UnmapBuffer(m_LightUniformBuffers[index]);
-        }
-    }
-}
-
 // ============================================================================
 // Execute — 从光源视角绘制场景深度
 // ============================================================================
@@ -708,21 +717,6 @@ void FShadowPass::RecordCascadeState(IRHICommandBuffer*        commandBuffer,
 
     commandBuffer->SetScissor(scissor);
 
-    // set 0 = 本级的光源矩阵 (而非相机矩阵)
-    const SizeType uniformIndex =
-        static_cast<SizeType>(context.FrameIndex) * kCascadeCount + cascade;
-
-    if (uniformIndex < m_LightDescriptorSets.GetSize())
-    {
-        commandBuffer->BindDescriptorSet(
-            EPipelineBindPoint::Graphics,
-            context.PipelineLayout,
-            0,
-            m_LightDescriptorSets[uniformIndex],
-            nullptr,
-            0);
-    }
-
     // set 1 = bindless 材质表 —— Masked 材质的 alpha 测试要读 albedo
     commandBuffer->BindDescriptorSet(
         EPipelineBindPoint::Graphics,
@@ -731,6 +725,14 @@ void FShadowPass::RecordCascadeState(IRHICommandBuffer*        commandBuffer,
         context.BindlessDescriptorSet,
         nullptr,
         0);
+
+    // set 3 + 本级的光源矩阵。
+    //
+    // 原来是"每帧每级一份 UBO 加一个描述符集"(3 帧 × 3 级 = 9 套) 放在 set 0。
+    // 逐物体的 model 搬进 storage buffer 之后, push constant 那 64 字节空了
+    // 出来 —— 而视图矩阵恰好就是逐级的量, 一次绘制里它是常量。9 套 UBO 与
+    // 描述符集因此整个消失。
+    BindViewState(commandBuffer, context, m_CascadeViewProj[cascade]);
 }
 
 void FShadowPass::RecordCasterRange(IRHICommandBuffer*           commandBuffer,
@@ -795,19 +797,17 @@ void FShadowPass::RecordCasterRange(IRHICommandBuffer*           commandBuffer,
                 boundIndexType   = obj.IndexType;
             }
 
-            FModelPushConstant pushData;
-            pushData.Model         = obj.Transform.ToMatrix();
-            pushData.MaterialIndex = obj.BindlessMaterialIndex;
-
-            commandBuffer->PushConstants(
-                context.PipelineLayout,
-                EShaderStage::Vertex | EShaderStage::Fragment,
-                0,
-                sizeof(FModelPushConstant),
-                &pushData);
+            // 模型矩阵与材质下标在 set 3 的 storage buffer 里 —— 这里传的
+            // 是**物体下标**, 经 firstInstance 进到 gl_InstanceIndex。
+            //
+            // 下标是相对**投射体段**的, 要加上那一段在缓冲区里的起点。
+            // 缓冲区分三段 (相机 / 投射体 / 半透明), 而这里索引的是第二段。
+            const UInt32 base =
+                (context.GpuCull != nullptr) ? context.GpuCull->GetCullBase()
+                                             : 0u;
 
             commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
-                                       0, 0);
+                                       0, base + static_cast<UInt32>(i));
         }
     }
 
@@ -850,9 +850,23 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
     beginInfo.ClearColorCount   = 0;
     beginInfo.ClearDepthStencil = &clearDepth;
 
+    // GPU 驱动路径还要求**本级的视图确实被剔除过**。
+    //
+    // 没有有效光源时剔除通道只跑相机那一个视图, 级联那几段命令从来没被写过
+    // —— 那是一整段未初始化的显存, 拿它当间接命令是未定义行为。表现不是崩溃,
+    // 是画面上多出一堆位置荒谬的几何, 而那看着像"阴影矩阵算错了"。
+    //
+    // 这一条是踩出来的: 第一版只判了开关, --gpu-driven-check 立刻报出
+    // 30% 的通道不一致。
+    const bool gpuDriven =
+        (context.GpuCull != nullptr) && context.GpuCull->IsEnabled() &&
+        m_HasValidLight &&
+        context.GpuCull->GetViewCount() >=
+            FGpuCullPass::kFirstCascadeView + kCascadeCount;
+
     // 并行录制时通道内容必须来自次级缓冲区 —— 与前向 Pass 同一约束
     const bool useParallel =
-        (m_Recorder != nullptr) && m_Recorder->IsInitialized();
+        !gpuDriven && (m_Recorder != nullptr) && m_Recorder->IsInitialized();
 
     beginInfo.UseSecondaryCommandBuffers = useParallel;
 
@@ -874,7 +888,20 @@ void FShadowPass::Execute(IRHICommandBuffer*        commandBuffer,
     const SizeType casterCount =
         (hasCasters && casters != nullptr) ? casters->GetSize() : 0;
 
-    if (useParallel)
+    if (gpuDriven)
+    {
+        // 本级的视锥剔除已经在剔除通道里做过了 —— 三级级联各占一个视图,
+        // 各自一段间接命令。这里只按分组下发。
+        //
+        // 不分段并行录制: 一共十几条命令, 分给四个线程之后每段只剩三四条,
+        // 而次级缓冲区的分配与 vkCmdExecuteCommands 本身就要好几微秒。
+        RecordCascadeState(commandBuffer, context, cascade);
+
+        RecordIndirectView(commandBuffer, context, *context.GpuCull,
+                           FGpuCullPass::kFirstCascadeView + cascade,
+                           SelectPipeline(false), SelectPipeline(true));
+    }
+    else if (useParallel)
     {
         FRHICommandBufferInheritance inheritance;
         inheritance.RenderPass  = m_RenderPass;
@@ -967,13 +994,6 @@ void FShadowPass::Shutdown(IRHIDevice* device)
     {
         return;
     }
-
-    for (SizeType i = 0; i < m_LightUniformBuffers.GetSize(); ++i)
-    {
-        device->DestroyBuffer(m_LightUniformBuffers[i]);
-    }
-    m_LightUniformBuffers.Clear();
-    m_LightDescriptorSets.Clear();
 
     for (SizeType variant = 0; variant < kPipelineVariantCount; ++variant)
     {

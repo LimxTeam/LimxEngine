@@ -45,7 +45,10 @@ $structs = @(
         # UBO"。同样的错在 FLightingUBO 那条上已经犯过一次 —— 标记是文本搜索,
         # 而注释也是文本。
         Marker = '#include\s+"view_common\.h"'
-        MinShaders = 5
+        # 5 → 4: depth_only.vert 在 GPU 驱动那天不再读 set 0 的 view/proj
+        # (视图矩阵改走 push constant, 模型矩阵改走 set 3), 于是它不再 include
+        # 这个头。
+        MinShaders = 4
     }
     @{
         Name   = 'FLightingUBO'
@@ -93,10 +96,10 @@ $storageStructs = @(
         Set     = 3
         Binding = 0
         Marker  = 'set\s*=\s*3,\s*binding\s*=\s*0\)\s*readonly\s+buffer\s+ObjectBuffer'
-        # 两个: pbr.vert 与 gbuffer.vert。深度预通道与前向通道读的必须是同一
-        # 份逐物体数据 —— 前向的深度测试是 Equal, 两处的模型矩阵差一点点整片
-        # 几何就消失。
-        MinShaders = 2
+        # 三个: pbr.vert / gbuffer.vert / depth_only.vert。深度预通道、前向
+        # 通道、阴影通道读的必须是同一份逐物体数据 —— 前向的深度测试是 Equal,
+        # 两处的模型矩阵差一点点整片几何就消失。
+        MinShaders = 3
     }
     @{
         Name    = 'FGpuDrawObject'
@@ -143,10 +146,10 @@ function Get-ExpectedSize
 
 $expected = @{}
 
-$expected['FModelPushConstant'] =
-    Get-ExpectedSize -Path $pushHeader -Name 'FModelPushConstant'
+$expected['FViewPushConstant'] =
+    Get-ExpectedSize -Path $pushHeader -Name 'FViewPushConstant'
 
-if ($expected['FModelPushConstant'] -lt 0) { exit 1 }
+if ($expected['FViewPushConstant'] -lt 0) { exit 1 }
 
 foreach ($s in $structs)
 {
@@ -211,33 +214,54 @@ foreach ($s in $structs)
             "$($shader.Name): set$($s.Set)/binding$($s.Binding) 是 $($ubo.size) 字节, C++ 侧 $($s.Name) 是 $($expected[$s.Name])")
     }
 
-    # push constant 的对照对象是 FModelPushConstant, 而不是"任何 push
-    # constant"。triangle.vert 是遗留的演示管线, 它自有一个 64 字节的布局
-    # (只有 mat4 model), 与 FModelPushConstant 无关 —— 把它们一起比会得到
-    # 一个恒红的检查, 而恒红的检查最终会被人注释掉。
-    #
-    # 判据必须精确到**声明**。
-    #
-    # 原来用的是"源码里有没有 materialIndex"。GPU 驱动那天 pbr.vert 与
-    # gbuffer.vert 把模型矩阵搬进了 storage buffer, push constant 整块删掉了,
-    # 但它们新增了一个叫 fragMaterialIndex 的 flat varying —— 子串照样命中,
-    # 于是脚本去比一个根本不存在的 push constant, 报"是 (空) 字节"。
-    #
-    # 这与本文件顶上那条注释是同一个教训: **标记是文本搜索, 而变量名也是文本**。
-    #
-    # 两个条件缺一不可: 只匹配块名的话 triangle.vert 会被算进来 —— 它是遗留
-    # 的演示管线, 自有一个 64 字节的同名块 (只有 mat4 model), 与
-    # FModelPushConstant 无关。把它们一起比会得到一个恒红的检查, 而恒红的
-    # 检查最终会被人注释掉。
-    if ($s.Set -eq 0 -and
-        (Get-Content $shader.FullName -Raw) -match 'push_constant\)\s*uniform\s+PushConstants\s*\{[^}]*materialIndex') {
-        $checkedPush++
-
-        if ($reflection.push_constants.size -ne $expected['FModelPushConstant']) {
-            [void]$offenders.Add(
-                "$($shader.Name): push constant 是 $($reflection.push_constants.size) 字节, C++ 侧 FModelPushConstant 是 $($expected['FModelPushConstant'])")
-        }
     }
+}
+
+
+# ---- push constant ----
+#
+# 单独扫一遍全部着色器, 不挂在 UBO 那张表下面。
+#
+# 原来它挂在 FViewProjUBO 那一条上 (即"包含 view_common.h 的着色器"), 而
+# GPU 驱动那天 depth_only.vert 不再读 set 0 的 view/proj、也就不再 include
+# 那个头 —— 于是唯一还在用 push constant 的着色器落到了扫描范围之外, 计数
+# 归零。那道下限闸把它拦成了失败, 但错误信息指的是"push constant 太少",
+# 而真正的原因在两条判据的耦合上。
+foreach ($shader in $allShaders)
+{
+    $source = Get-Content $shader.FullName -Raw
+
+    # 判据必须精确到**声明**, 而且要认块名。
+    #
+    # 曾经用的是"源码里有没有 materialIndex"—— pbr.vert 与 gbuffer.vert 删掉
+    # push constant 之后新增了一个叫 fragMaterialIndex 的 flat varying, 子串
+    # 照样命中, 于是脚本去比一个根本不存在的 push constant。
+    #
+    # 认块名还排除了遗留的 triangle.vert: 它自有一个 64 字节的 PushConstants
+    # 块 (只有 mat4 model), 与 FViewPushConstant 无关。把它们一起比会得到一个
+    # 恒红的检查, 而恒红的检查最终会被人注释掉。
+    if ($source -notmatch 'push_constant\)\s*uniform\s+ViewPushConstants')
+    {
+        continue
+    }
+
+    $relative = $shader.FullName.Substring((Get-Location).Path.Length + 1)
+    $json = 'Binaries/' + $relative.Replace([char]92, [char]47) + '.json'
+
+    if (-not (Test-Path $json))
+    {
+        [void]$offenders.Add("$($shader.Name): 找不到反射文件 $json")
+        continue
+    }
+
+    $reflection = Get-Content $json -Raw | ConvertFrom-Json
+
+    $checkedPush++
+
+    if ($reflection.push_constants.size -ne $expected['FViewPushConstant'])
+    {
+        [void]$offenders.Add(
+            "$($shader.Name): push constant 是 $($reflection.push_constants.size) 字节, C++ 侧 FViewPushConstant 是 $($expected['FViewPushConstant'])")
     }
 }
 
@@ -325,7 +349,7 @@ foreach ($s in $structs)
 # 覆盖面并没有变窄: 上面新增的 storage buffer 那张表把 FGpuDrawObject 在
 # 三个着色器里的元素步长都钉住了, 而那正是原来 push constant 承担的角色。
 if ($checkedPush -lt 1) {
-    Write-Host "只检查到 $checkedPush 个 push constant (预期至少 3 个) — 判定无效" -ForegroundColor Red
+    Write-Host "只检查到 $checkedPush 个 push constant (预期至少 1 个) — 判定无效" -ForegroundColor Red
     foreach ($offender in $offenders) { Write-Host "  $offender" }
     exit 1
 }
@@ -349,6 +373,6 @@ $storageSummary = ($storageStructs | ForEach-Object {
         $_.Name, $_.Set, $_.Binding, $expected[$_.Name]
 }) -join ', '
 
-Write-Host "布局一致: $summary, push×$checkedPush=$($expected['FModelPushConstant'])B" -ForegroundColor Green
+Write-Host "布局一致: $summary, push×$checkedPush=$($expected['FViewPushConstant'])B" -ForegroundColor Green
 Write-Host "         $storageSummary" -ForegroundColor Green
 exit 0

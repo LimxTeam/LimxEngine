@@ -85,14 +85,23 @@ public:
         return "GpuCullPass";
     }
 
-    /// 90 — 深度预通道 (100) 之前
+    /// 10 — **所有**图形通道之前, 包括阴影 (50) 与阴影图集 (60)
     ///
-    /// 必须早于任何消费间接命令的图形通道。放在 90 而不是更早, 是因为它要读
-    /// 本帧的物体列表, 而那份列表在 ExecuteAll 之前就已经填好了 —— 早晚无关,
-    /// 只要在消费方之前。
+    /// 必须早于任何消费间接命令的通道。第一版放在 90 (深度预通道之前), 那时
+    /// 只有相机通道用间接绘制, 看着够用 —— 级联阴影接上之后就错了: 阴影通道
+    /// 在 50, 它录下的 DrawIndexedIndirect 在 GPU 上**先于**这个通道的计算
+    /// 着色器执行, 读到的是上一次写进那一帧下标的命令。
+    ///
+    /// 静止场景里那些值恰好相同, 所以画面看不出问题 —— 直到
+    /// --gpu-driven-check 的第一帧: 之前所有帧都关着 GPU 驱动, 那一段命令
+    /// 从来没被写过, 于是阴影贴图里画的是未初始化的显存。判据立刻报出
+    /// 81675 个通道不一致。
+    ///
+    /// 教训是顺序不能"看着够用": 生产者必须排在**每一个**消费者之前, 而不是
+    /// 排在当时想得起来的那几个之前。
     LIMX_NODISCARD UInt32 GetOrder() const override
     {
-        return 90;
+        return 10;
     }
 
     ERHIResult Setup(const FPassSetupDesc& desc) override;
@@ -112,7 +121,18 @@ public:
     // ====================================================================
 
     /// 本帧的间接命令缓冲区
+    ///
+    /// 所有视图共用一个缓冲区, 视图 v 占 [v * kMaxGpuDrawObjects,
+    /// (v+1) * kMaxGpuDrawObjects) 这一段。段长是**常量**而不是本帧的物体数 ——
+    /// 用物体数的话每段的起点逐帧变化, 而图形通道存的是段内偏移, 两处一旦
+    /// 不同步, 某个级联就会去画另一个级联的命令。
     LIMX_NODISCARD FRHIBufferHandle GetIndirectBuffer(UInt32 frameIndex) const;
+
+    /// 视图 v 那一段的第一条命令在缓冲区里的下标
+    LIMX_NODISCARD static UInt32 ViewCommandBase(UInt32 viewIndex)
+    {
+        return viewIndex * kMaxGpuDrawObjects;
+    }
 
     /// set 3 的逐物体描述符集
     LIMX_NODISCARD FRHIDescriptorSetHandle GetDrawObjectSet(
@@ -124,8 +144,31 @@ public:
         return m_Groups;
     }
 
-    /// 本帧上传的不透明物体数 (也是间接命令的条数)
+    /// 本帧参与剔除的物体数 (也是每个视图的间接命令条数)
     LIMX_NODISCARD UInt32 GetObjectCount() const { return m_ObjectCount; }
+
+    /// 投射体段在逐物体缓冲区里的起点
+    ///
+    /// **缓冲区分三段, 因为索引它的有三份不同的列表。**
+    ///
+    ///   [0, CameraCount)                   相机通道的逐物体路径读 RenderObjects
+    ///                                      (已经过相机剔除)
+    ///   [CullBase, CullBase + ObjectCount) GPU 剔除的输入, 也是阴影通道逐物体
+    ///                                      路径读的 ShadowCasterObjects
+    ///                                      (未经相机剔除)
+    ///   [TranslucentBase, ...)             前向通道的半透明批次
+    ///
+    /// 三份列表**不能共用一段**: 相机列表是剔除后的, 投射体列表是剔除前的,
+    /// 两者的下标毫无对应关系。而且它们由 FSceneManager 各自排序 —— 排序不
+    /// 稳定, 比较相等的物体在两份列表里的先后可以不同。
+    ///
+    /// 这一点是踩出来的: 先前只上传一份, 阴影通道按投射体列表的下标去索引,
+    /// 而缓冲区里装的是相机列表 —— 表现是**某一盏灯的阴影整个消失**, 另一盏
+    /// 却完全正确 (两份列表恰好只在那一处不同)。
+    LIMX_NODISCARD UInt32 GetCullBase() const { return m_CullBase; }
+
+    /// 相机段的物体数
+    LIMX_NODISCARD UInt32 GetCameraCount() const { return m_CameraCount; }
 
     /// 半透明批次在逐物体缓冲区里的起始下标
     ///
@@ -140,11 +183,14 @@ public:
         return m_TranslucentBase;
     }
 
-    /// 上一次回读到的可见物体数 (诊断与自检用)
+    /// 上一次回读到的某视图可见物体数 (诊断与自检用)
     ///
     /// 没有它的话, 一个把所有 instanceCount 都写成 1 的实现 (即完全没剔除)
     /// 在画面上与正确实现完全一样, 只是慢。
-    LIMX_NODISCARD UInt32 GetVisibleCount() const { return m_LastVisible; }
+    LIMX_NODISCARD UInt32 GetVisibleCount(UInt32 viewIndex = kCameraView) const
+    {
+        return (viewIndex < kMaxCullViews) ? m_LastVisible[viewIndex] : 0u;
+    }
 
     // ====================================================================
     // 开关
@@ -165,13 +211,36 @@ public:
     /// 设备是否支持这条路径 (drawIndirectFirstInstance)
     LIMX_NODISCARD bool IsSupported() const { return m_IsSupported; }
 
-    /// 设置本帧的剔除视锥 —— 由 FRenderer 在录制之前调用
+    /// 相机视图的下标 —— 固定为 0
     ///
-    /// 必须来自**不含抖动**的投影矩阵。抖动每帧改变亚像素偏移, 用它算出的
-    /// 视锥边界会逐帧漂移 —— 漂移本身无害 (远小于一个物体), 但会让"GPU 路径
-    /// 与 CPU 路径一致"这条判据变成逐帧不同, 无法比对。CPU 侧的剔除用的也是
-    /// 不含抖动的矩阵。
-    void SetFrustum(const FFrustum& frustum) { m_Frustum = frustum; }
+    /// 固定而不是"谁先注册谁是 0": 图形通道要按下标取自己那一段命令, 而下标
+    /// 一旦随注册顺序浮动, 加一个通道就可能把相机那一段挪走 —— 表现是主画面
+    /// 突然画成了某级阴影的内容。
+    static constexpr UInt32 kCameraView = 0;
+
+    /// 方向光级联占的视图下标 —— 1, 2, 3
+    static constexpr UInt32 kFirstCascadeView = 1;
+
+    /// 设置某个视图的剔除视锥 —— 由 FRenderer 在录制之前调用
+    ///
+    /// 相机那一个必须来自**不含抖动**的投影矩阵。抖动每帧改变亚像素偏移, 用它
+    /// 算出的视锥边界会逐帧漂移 —— 漂移本身无害 (远小于一个物体), 但会让
+    /// "GPU 路径与 CPU 路径一致"这条判据变成逐帧不同, 无法比对。
+    void SetViewFrustum(UInt32 viewIndex, const FFrustum& frustum)
+    {
+        if (viewIndex < kMaxCullViews)
+        {
+            m_Frusta[viewIndex] = frustum;
+        }
+    }
+
+    /// 本帧要剔除的视图数 (含相机)
+    void SetViewCount(UInt32 count)
+    {
+        m_ViewCount = (count < kMaxCullViews) ? count : kMaxCullViews;
+    }
+
+    LIMX_NODISCARD UInt32 GetViewCount() const { return m_ViewCount; }
 
     /// 逐物体绘制路径也要用同一份物体数据 —— 上传与分组在这里做一次
     ///
@@ -188,10 +257,17 @@ private:
                                  FRHIDescSetLayoutHandle drawObjectLayout);
     ERHIResult CreatePipeline(IRHIDevice* device);
 
-    /// 把两份列表写进本帧的缓冲区, 同时算出不透明那部分的分组
-    void UploadObjects(const TArray<FRenderObject>*  opaque,
+    /// 把三份列表写进本帧的缓冲区, 同时算出投射体那一段的分组
+    void UploadObjects(const TArray<FRenderObject>*  cameraObjects,
+                       const TArray<FRenderObject>*  casters,
                        const TArray<FRenderObject>*  translucent,
                        UInt32                        frameIndex);
+
+    /// 往缓冲区写一段, 返回实际写进去的个数
+    UInt32 WriteSegment(FGpuDrawObject*              destination,
+                        const TArray<FRenderObject>* source,
+                        UInt32                       writeCursor,
+                        bool                         buildGroups);
 
     /// 回读上一帧的可见数
     void ResolveCounter(IRHIDevice* device, UInt32 frameIndex);
@@ -222,12 +298,16 @@ private:
     /// 本帧的分组
     TArray<FDrawGroup>              m_Groups;
 
-    /// 本帧的剔除视锥
-    FFrustum m_Frustum;
+    /// 每个视图的剔除视锥
+    FFrustum m_Frusta[kMaxCullViews];
 
+    UInt32   m_ViewCount = 1;
+
+    UInt32 m_CameraCount     = 0;
+    UInt32 m_CullBase        = 0;
     UInt32 m_ObjectCount     = 0;
     UInt32 m_TranslucentBase = 0;
-    UInt32 m_LastVisible  = 0;
+    UInt32 m_LastVisible[kMaxCullViews] = {};
     bool   m_Enabled      = false;
     bool   m_IsSupported  = false;
     bool   m_HasUploaded  = false;

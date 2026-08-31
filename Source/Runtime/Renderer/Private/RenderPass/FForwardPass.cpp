@@ -59,7 +59,8 @@ static UInt32 RecordIndirectGroups(
     const FRenderPassContext& context,
     const FGpuCullPass&       cull,
     FRHIGraphicsPipelineHandle singleSided,
-    FRHIGraphicsPipelineHandle doubleSided)
+    FRHIGraphicsPipelineHandle doubleSided,
+    UInt32                     viewIndex)
 {
     const FRHIBufferHandle indirect =
         cull.GetIndirectBuffer(context.FrameIndex);
@@ -113,7 +114,8 @@ static UInt32 RecordIndirectGroups(
         // 直接跳过 —— 不会走到顶点着色器。
         commandBuffer->DrawIndexedIndirect(
             indirect,
-            static_cast<UInt64>(group.FirstCommand) *
+            (static_cast<UInt64>(FGpuCullPass::ViewCommandBase(viewIndex)) +
+             group.FirstCommand) *
                 sizeof(FDrawIndexedIndirectCommand),
             group.CommandCount,
             static_cast<UInt32>(sizeof(FDrawIndexedIndirectCommand)));
@@ -324,7 +326,8 @@ void FForwardPass::RecordIndirect(IRHICommandBuffer*        commandBuffer,
 
     RecordIndirectGroups(commandBuffer, context, *context.GpuCull,
                          SelectPipeline(false, false),
-                         SelectPipeline(false, true));
+                         SelectPipeline(false, true),
+                         FGpuCullPass::kCameraView);
 }
 
 void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
