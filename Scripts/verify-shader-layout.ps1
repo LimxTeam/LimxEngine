@@ -40,8 +40,11 @@ $structs = @(
         Header = 'Source/Runtime/Renderer/Public/Renderer/Renderer/FRenderer.h'
         Set    = 0
         Binding = 0
-        # 谁 include 了这个头就查谁
-        Marker = 'view_common\.h'
+        # 必须精确到 include 指令本身。写成 'view_common\.h' 会把只在注释里
+        # 提到它的着色器也算进来 (taa.frag 就是), 于是永远报"反射里没有这个
+        # UBO"。同样的错在 FLightingUBO 那条上已经犯过一次 —— 标记是文本搜索,
+        # 而注释也是文本。
+        Marker = '#include\s+"view_common\.h"'
         MinShaders = 5
     }
     @{
