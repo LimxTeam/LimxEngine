@@ -216,9 +216,12 @@ public:
     // ====================================================================
 
     /// 完整 Vulkan 初始化: 实例→表面→物理设备→逻辑设备→队列→描述符池
-    /// @param nativeWindowHandle Win32 HWND 窗口句柄
-    /// @param enableValidation  是否启用 Vulkan 验证层
-    ERHIResult Initialize(void* nativeWindowHandle, bool enableValidation);
+    /// @param nativeWindowHandle   Win32 HWND 窗口句柄
+    /// @param enableValidation     是否启用 Vulkan 验证层
+    /// @param enableSyncValidation 是否额外启用同步验证 (需 enableValidation)
+    ERHIResult Initialize(void* nativeWindowHandle,
+                          bool enableValidation,
+                          bool enableSyncValidation = false);
 
     // ====================================================================
     // IRHIDevice 接口实现 — 缓冲区
@@ -572,6 +575,12 @@ private:
     // ====================================================================
 
     bool m_IsValidationEnabled = false;
+
+    // 同步验证 —— 验证层里对屏障/信号量做符号化建模的那一档。它能确定性地
+    // 指出"这次读没有被前面那次写的屏障覆盖", 与 GPU 实际调度无关, 因此是
+    // 唯一能把同步缺陷从"偶发数据撕裂"变成"必现报错"的手段。
+    // 代价是每条命令都要过一遍模型, 开销显著, 所以默认关闭, 由调用方按需开启。
+    bool m_IsSyncValidationEnabled = false;
 
     // ====================================================================
     // 厂商名称缓存

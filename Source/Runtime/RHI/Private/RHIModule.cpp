@@ -368,11 +368,13 @@ void ModuleShutdown()
 // ============================================================================
 
 TUniquePtr<IRHIDevice> CreateRHIDevice(void* nativeWindowHandle,
-                                        bool enableValidation)
+                                        bool enableValidation,
+                                        bool enableSyncValidation)
 {
     auto device = MakeUnique<FVulkanDevice>();
     ERHIResult result = device->Initialize(nativeWindowHandle,
-                                            enableValidation);
+                                            enableValidation,
+                                            enableSyncValidation);
     if (!IsRHISuccess(result))
     {
         LIMX_LOG(LogRHI, Error,

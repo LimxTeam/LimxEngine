@@ -142,9 +142,17 @@ FVulkanDevice::~FVulkanDevice()
 // ============================================================================
 
 ERHIResult FVulkanDevice::Initialize(void* nativeWindowHandle,
-                                      bool enableValidation)
+                                      bool enableValidation,
+                                      bool enableSyncValidation)
 {
-    m_IsValidationEnabled = enableValidation;
+    m_IsValidationEnabled     = enableValidation;
+    m_IsSyncValidationEnabled = enableValidation && enableSyncValidation;
+
+    if (enableSyncValidation && !enableValidation)
+    {
+        LIMX_LOG(LogRHI, Warning,
+            "[Vulkan] 请求了同步验证但未启用验证层 — 同步验证不会生效");
+    }
 
     ERHIResult result = CreateInstance();
     if (!IsRHISuccess(result))
@@ -287,10 +295,28 @@ ERHIResult FVulkanDevice::CreateInstance()
     createInfo.enabledExtensionCount   = extensionCount;
     createInfo.ppEnabledExtensionNames = instanceExtensions;
 
+    // 同步验证开关 —— 必须在实例创建时挂上 pNext, 建好之后无法再开。
+    const VkValidationFeatureEnableEXT enabledFeatures[] =
+    {
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+    };
+
+    VkValidationFeaturesEXT validationFeatures = {};
+    validationFeatures.sType =
+        VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+    validationFeatures.enabledValidationFeatureCount = 1;
+    validationFeatures.pEnabledValidationFeatures    = enabledFeatures;
+
     if (m_IsValidationEnabled)
     {
         createInfo.enabledLayerCount   = 1;
         createInfo.ppEnabledLayerNames = validationLayers;
+
+        if (m_IsSyncValidationEnabled)
+        {
+            createInfo.pNext = &validationFeatures;
+            LIMX_LOG(LogRHI, Log, "[Vulkan] 已启用同步验证");
+        }
     }
 
     VkResult vkResult = vkCreateInstance(&createInfo, nullptr, &m_Instance);

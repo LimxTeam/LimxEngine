@@ -11,6 +11,12 @@
 //          管线屏障支持内存/缓冲区/图像三种屏障类型的批量提交；
 //          调试标记通过 VK_EXT_debug_utils 扩展实现。
 //
+// 数量约定：本文件内的 kBarriersPerBatch / kMaxBatch / kInlineClearValues
+//          都是**批量大小或内联容量**，不是调用方能提交的数量上限。
+//          超出部分一律拆批下发或退到分配器，任何情况下都不丢弃元素 ——
+//          静默截断的后果是同步缺失或附件未清除，两者都不会崩溃、不会报错、
+//          验证层也看不出异常，只在运行期表现为偶发的数据撕裂与画面残影。
+//
 // ── 函数/方法表 ──────────────────────────────────────────────
 // │ 函数名                          │ 描述                      │
 // │────────────────────────────────│─────────────────────────│
@@ -57,6 +63,9 @@
 // │ 日期         │ 作者       │ 描述                           │
 // │─────────────│──────────│───────────────────────────────│
 // │ 2026-04-06  │ LimxTeam  │ 初始创建                        │
+// │ 2026-08-30  │ LimxTeam  │ 消除三处静默截断: 管线屏障改分批  │
+// │             │           │ 下发, 清除值改内联+分配器回退,    │
+// │             │           │ 无效次级缓冲区句柄改为出错日志    │
 // ============================================================
 
 #include "Vulkan/FVulkanCommandBuffer.h"
@@ -176,39 +185,54 @@ void FVulkanCommandBuffer::BeginRenderPass(
     vkBeginInfo.renderArea.extent.width  = beginInfo.RenderAreaExtent.Width;
     vkBeginInfo.renderArea.extent.height = beginInfo.RenderAreaExtent.Height;
 
-    // 转换清除值 — 颜色附件 + 可选深度模板附件
-    constexpr UInt32 kMaxClearValues = 16;
-    VkClearValue clearValues[kMaxClearValues];
-    UInt32 clearCount = 0;
+    // ------------------------------------------------------------------
+    // 清除值 — 颜色附件 + 可选深度模板附件
+    //
+    // 附件数量由渲染通道决定, 不受本函数约束, 因此这里不能有上限。
+    // 内联容量只是"绝大多数情况下不碰堆"的优化, 超出时退到分配器。
+    //
+    // 绝不截断: 少一个清除值时 clearValueCount 会小于最大的
+    // LOAD_OP_CLEAR 附件下标, 该附件读到的是未初始化内存 —— 表现为
+    // 偶发的画面残影, 而调用本身在 API 层面看不出任何异常。
+    // ------------------------------------------------------------------
+
+    constexpr SizeType kInlineClearValues = 16;
+    TSmallVector<VkClearValue, kInlineClearValues> clearValues;
+
+    UInt32 colorClearCount = beginInfo.ClearColorCount;
+    if (beginInfo.ClearColors == nullptr && colorClearCount > 0)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] BeginRenderPass: 清除颜色数组为空但计数为 {}",
+            colorClearCount);
+        colorClearCount = 0;
+    }
+
+    clearValues.Reserve(static_cast<SizeType>(colorClearCount) + 1);
 
     // 填充颜色清除值
-    for (UInt32 i = 0; i < beginInfo.ClearColorCount
-         && clearCount < kMaxClearValues; ++i)
+    for (UInt32 i = 0; i < colorClearCount; ++i)
     {
-        clearValues[clearCount].color.float32[0] =
-            beginInfo.ClearColors[i].R;
-        clearValues[clearCount].color.float32[1] =
-            beginInfo.ClearColors[i].G;
-        clearValues[clearCount].color.float32[2] =
-            beginInfo.ClearColors[i].B;
-        clearValues[clearCount].color.float32[3] =
-            beginInfo.ClearColors[i].A;
-        ++clearCount;
+        VkClearValue value = {};
+        value.color.float32[0] = beginInfo.ClearColors[i].R;
+        value.color.float32[1] = beginInfo.ClearColors[i].G;
+        value.color.float32[2] = beginInfo.ClearColors[i].B;
+        value.color.float32[3] = beginInfo.ClearColors[i].A;
+        clearValues.Add(value);
     }
 
     // 填充深度模板清除值 (如果有)
-    if (beginInfo.ClearDepthStencil != nullptr
-        && clearCount < kMaxClearValues)
+    if (beginInfo.ClearDepthStencil != nullptr)
     {
-        clearValues[clearCount].depthStencil.depth =
-            beginInfo.ClearDepthStencil->Depth;
-        clearValues[clearCount].depthStencil.stencil =
-            beginInfo.ClearDepthStencil->Stencil;
-        ++clearCount;
+        VkClearValue value = {};
+        value.depthStencil.depth   = beginInfo.ClearDepthStencil->Depth;
+        value.depthStencil.stencil = beginInfo.ClearDepthStencil->Stencil;
+        clearValues.Add(value);
     }
 
-    vkBeginInfo.clearValueCount = clearCount;
-    vkBeginInfo.pClearValues    = clearValues;
+    vkBeginInfo.clearValueCount =
+        static_cast<UInt32>(clearValues.GetSize());
+    vkBeginInfo.pClearValues    = clearValues.GetData();
 
     // 通道内容来自次级缓冲区时必须声明 SECONDARY_COMMAND_BUFFERS。
     //
@@ -224,11 +248,20 @@ void FVulkanCommandBuffer::BeginRenderPass(
 void FVulkanCommandBuffer::ExecuteCommands(
     const FRHICommandBufferHandle* buffers, UInt32 count)
 {
-    if (buffers == nullptr || count == 0)
+    if (count == 0)
     {
         return;
     }
 
+    if (buffers == nullptr)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] ExecuteCommands: 缓冲区数组为空但计数为 {}", count);
+        return;
+    }
+
+    // kMaxBatch 是一次 vkCmdExecuteCommands 的批量大小, 不是数量上限 ——
+    // 满一批就先交出去, 顺序保持不变。
     constexpr UInt32 kMaxBatch = 64;
 
     VkCommandBuffer native[kMaxBatch];
@@ -239,7 +272,6 @@ void FVulkanCommandBuffer::ExecuteCommands(
     {
         if (written >= kMaxBatch)
         {
-            // 满一批就先交出去, 保持顺序不变
             vkCmdExecuteCommands(m_CommandBuffer, written, native);
             written = 0;
         }
@@ -249,6 +281,12 @@ void FVulkanCommandBuffer::ExecuteCommands(
 
         if (handle == VK_NULL_HANDLE)
         {
+            // 无效句柄意味着这一段次级缓冲区录下的命令**不会执行**。
+            // 默默跳过等于凭空少画一批东西, 而 API 层面看不出异常 ——
+            // 必须出声。
+            LIMX_LOG(LogRHI, Error,
+                "[Vulkan] ExecuteCommands: 第 {} 个次级命令缓冲区句柄无效, "
+                "该段命令不会执行", i);
             continue;
         }
 
@@ -584,97 +622,173 @@ void FVulkanCommandBuffer::PipelineBarrier(
     const FRHIImageMemoryBarrier* imageBarriers,
     UInt32 imageBarrierCount)
 {
-    // 转换内存屏障
-    constexpr UInt32 kMaxBarriers = 16;
+    // ------------------------------------------------------------------
+    // 分批下发 — 屏障总数不设上限
+    //
+    // kBarriersPerBatch 是**一次 vkCmdPipelineBarrier 携带的批量大小**,
+    // 不是调用方能提交的屏障数量上限。超出批量的部分拆成多次调用下发,
+    // 一条都不丢。
+    //
+    // 为什么不直接把常量调大: 任何固定上限都只是把同一个坑挪远 —— 超限
+    // 时丢弃屏障不崩溃、不报错, 验证层看到的是一次合法的、只是少了几个
+    // 屏障的调用, 症状要到运行期才以偶发数据撕裂的形式出现。
+    //
+    // 拆分的语义等价性: 两次调用之间没有录制任何其它命令, 且两次用的是
+    // 同一对 srcStageMask/dstStageMask。第一次调用的第二同步作用域覆盖
+    // 其后的全部命令, 第二次调用的第一同步作用域覆盖其前的全部命令 ——
+    // 于是对任意"之前的命令 P"与"之后的命令 Q", 两种写法建立的依赖完全
+    // 相同, 各批次自身的内存依赖也逐条保留。
+    // ------------------------------------------------------------------
 
-    VkMemoryBarrier vkMemBarriers[kMaxBarriers];
-    UInt32 memCount = memoryBarrierCount;
-    if (memCount > kMaxBarriers)
+    constexpr UInt32 kBarriersPerBatch = 16;
+
+    VkMemoryBarrier       vkMemBarriers[kBarriersPerBatch];
+    VkBufferMemoryBarrier vkBufBarriers[kBarriersPerBatch];
+    VkImageMemoryBarrier  vkImgBarriers[kBarriersPerBatch];
+
+    // 数组为空却给了非零计数是调用方的错误。这里必须出声 —— 静默当作 0
+    // 处理正是"屏障没下发, 一切看起来却正常"的那条路径。
+    UInt32 memTotal = memoryBarrierCount;
+    if (memoryBarriers == nullptr && memTotal > 0)
     {
-        memCount = kMaxBarriers;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] PipelineBarrier: 内存屏障数组为空但计数为 {}", memTotal);
+        memTotal = 0;
     }
 
-    for (UInt32 i = 0; i < memCount; ++i)
+    UInt32 bufTotal = bufferBarrierCount;
+    if (bufferBarriers == nullptr && bufTotal > 0)
     {
-        MemZero(&vkMemBarriers[i], sizeof(VkMemoryBarrier));
-        vkMemBarriers[i].sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        vkMemBarriers[i].srcAccessMask = ToVkAccessFlags(
-            memoryBarriers[i].SrcAccessMask);
-        vkMemBarriers[i].dstAccessMask = ToVkAccessFlags(
-            memoryBarriers[i].DstAccessMask);
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] PipelineBarrier: 缓冲区屏障数组为空但计数为 {}", bufTotal);
+        bufTotal = 0;
     }
 
-    // 转换缓冲区屏障
-    VkBufferMemoryBarrier vkBufBarriers[kMaxBarriers];
-    UInt32 bufCount = bufferBarrierCount;
-    if (bufCount > kMaxBarriers)
+    UInt32 imgTotal = imageBarrierCount;
+    if (imageBarriers == nullptr && imgTotal > 0)
     {
-        bufCount = kMaxBarriers;
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] PipelineBarrier: 图像屏障数组为空但计数为 {}", imgTotal);
+        imgTotal = 0;
     }
 
-    for (UInt32 i = 0; i < bufCount; ++i)
+    const VkPipelineStageFlags vkSrcStage =
+        ToVkPipelineStageFlags(srcStageMask);
+    const VkPipelineStageFlags vkDstStage =
+        ToVkPipelineStageFlags(dstStageMask);
+
+    UInt32 memDone = 0;
+    UInt32 bufDone = 0;
+    UInt32 imgDone = 0;
+
+    // 三个计数全为 0 时仍要下发一次 —— 那是一次纯执行依赖
+    // (srcStage → dstStage), 调用方要的正是它。
+    bool isFirstBatch = true;
+
+    while (isFirstBatch
+           || memDone < memTotal
+           || bufDone < bufTotal
+           || imgDone < imgTotal)
     {
-        MemZero(&vkBufBarriers[i], sizeof(VkBufferMemoryBarrier));
-        vkBufBarriers[i].sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        vkBufBarriers[i].srcAccessMask       = ToVkAccessFlags(
-            bufferBarriers[i].SrcAccessMask);
-        vkBufBarriers[i].dstAccessMask       = ToVkAccessFlags(
-            bufferBarriers[i].DstAccessMask);
-        vkBufBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkBufBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkBufBarriers[i].buffer              = m_Device->GetVkBuffer(
-            bufferBarriers[i].Buffer);
-        vkBufBarriers[i].offset              = bufferBarriers[i].Offset;
-        vkBufBarriers[i].size                = bufferBarriers[i].Size;
+        isFirstBatch = false;
+
+        // ---------------- 内存屏障 ----------------
+        UInt32 memCount = memTotal - memDone;
+        if (memCount > kBarriersPerBatch)
+        {
+            memCount = kBarriersPerBatch;
+        }
+
+        for (UInt32 i = 0; i < memCount; ++i)
+        {
+            const FRHIMemoryBarrier& source = memoryBarriers[memDone + i];
+
+            MemZero(&vkMemBarriers[i], sizeof(VkMemoryBarrier));
+            vkMemBarriers[i].sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            vkMemBarriers[i].srcAccessMask =
+                ToVkAccessFlags(source.SrcAccessMask);
+            vkMemBarriers[i].dstAccessMask =
+                ToVkAccessFlags(source.DstAccessMask);
+        }
+
+        // ---------------- 缓冲区屏障 ----------------
+        UInt32 bufCount = bufTotal - bufDone;
+        if (bufCount > kBarriersPerBatch)
+        {
+            bufCount = kBarriersPerBatch;
+        }
+
+        for (UInt32 i = 0; i < bufCount; ++i)
+        {
+            const FRHIBufferMemoryBarrier& source =
+                bufferBarriers[bufDone + i];
+
+            MemZero(&vkBufBarriers[i], sizeof(VkBufferMemoryBarrier));
+            vkBufBarriers[i].sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            vkBufBarriers[i].srcAccessMask =
+                ToVkAccessFlags(source.SrcAccessMask);
+            vkBufBarriers[i].dstAccessMask =
+                ToVkAccessFlags(source.DstAccessMask);
+            vkBufBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkBufBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkBufBarriers[i].buffer = m_Device->GetVkBuffer(source.Buffer);
+            vkBufBarriers[i].offset = source.Offset;
+            vkBufBarriers[i].size   = source.Size;
+        }
+
+        // ---------------- 图像屏障 ----------------
+        UInt32 imgCount = imgTotal - imgDone;
+        if (imgCount > kBarriersPerBatch)
+        {
+            imgCount = kBarriersPerBatch;
+        }
+
+        for (UInt32 i = 0; i < imgCount; ++i)
+        {
+            const FRHIImageMemoryBarrier& source =
+                imageBarriers[imgDone + i];
+
+            MemZero(&vkImgBarriers[i], sizeof(VkImageMemoryBarrier));
+            vkImgBarriers[i].sType =
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            vkImgBarriers[i].srcAccessMask =
+                ToVkAccessFlags(source.SrcAccessMask);
+            vkImgBarriers[i].dstAccessMask =
+                ToVkAccessFlags(source.DstAccessMask);
+            vkImgBarriers[i].oldLayout = ToVkImageLayout(source.OldLayout);
+            vkImgBarriers[i].newLayout = ToVkImageLayout(source.NewLayout);
+            vkImgBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkImgBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkImgBarriers[i].image = m_Device->GetVkImage(source.Texture);
+
+            const EPixelFormat imgFormat =
+                m_Device->GetTextureFormat(source.Texture);
+            vkImgBarriers[i].subresourceRange.aspectMask =
+                GetVkImageAspectFlags(imgFormat);
+            vkImgBarriers[i].subresourceRange.baseMipLevel =
+                source.BaseMipLevel;
+            vkImgBarriers[i].subresourceRange.levelCount =
+                source.MipLevelCount;
+            vkImgBarriers[i].subresourceRange.baseArrayLayer =
+                source.BaseArrayLayer;
+            vkImgBarriers[i].subresourceRange.layerCount =
+                source.ArrayLayerCount;
+        }
+
+        vkCmdPipelineBarrier(
+            m_CommandBuffer,
+            vkSrcStage,
+            vkDstStage,
+            0,
+            memCount,   vkMemBarriers,
+            bufCount,   vkBufBarriers,
+            imgCount,   vkImgBarriers);
+
+        memDone += memCount;
+        bufDone += bufCount;
+        imgDone += imgCount;
     }
-
-    // 转换图像屏障
-    VkImageMemoryBarrier vkImgBarriers[kMaxBarriers];
-    UInt32 imgCount = imageBarrierCount;
-    if (imgCount > kMaxBarriers)
-    {
-        imgCount = kMaxBarriers;
-    }
-
-    for (UInt32 i = 0; i < imgCount; ++i)
-    {
-        MemZero(&vkImgBarriers[i], sizeof(VkImageMemoryBarrier));
-        vkImgBarriers[i].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        vkImgBarriers[i].srcAccessMask       = ToVkAccessFlags(
-            imageBarriers[i].SrcAccessMask);
-        vkImgBarriers[i].dstAccessMask       = ToVkAccessFlags(
-            imageBarriers[i].DstAccessMask);
-        vkImgBarriers[i].oldLayout           = ToVkImageLayout(
-            imageBarriers[i].OldLayout);
-        vkImgBarriers[i].newLayout           = ToVkImageLayout(
-            imageBarriers[i].NewLayout);
-        vkImgBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkImgBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkImgBarriers[i].image               = m_Device->GetVkImage(
-            imageBarriers[i].Texture);
-
-        EPixelFormat imgFormat = m_Device->GetTextureFormat(
-            imageBarriers[i].Texture);
-        vkImgBarriers[i].subresourceRange.aspectMask =
-            GetVkImageAspectFlags(imgFormat);
-        vkImgBarriers[i].subresourceRange.baseMipLevel =
-            imageBarriers[i].BaseMipLevel;
-        vkImgBarriers[i].subresourceRange.levelCount =
-            imageBarriers[i].MipLevelCount;
-        vkImgBarriers[i].subresourceRange.baseArrayLayer =
-            imageBarriers[i].BaseArrayLayer;
-        vkImgBarriers[i].subresourceRange.layerCount =
-            imageBarriers[i].ArrayLayerCount;
-    }
-
-    vkCmdPipelineBarrier(
-        m_CommandBuffer,
-        ToVkPipelineStageFlags(srcStageMask),
-        ToVkPipelineStageFlags(dstStageMask),
-        0,
-        memCount,   vkMemBarriers,
-        bufCount,   vkBufBarriers,
-        imgCount,   vkImgBarriers);
 }
 
 // ============================================================================

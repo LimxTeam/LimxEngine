@@ -43,9 +43,20 @@ namespace Limx
 ///
 /// @param nativeWindowHandle  原生窗口句柄 (Windows: HWND)
 /// @param enableValidation    是否启用 Vulkan 验证层 (Debug/Development 推荐开启)
+/// @param enableSyncValidation 是否额外启用同步验证
+///
+/// 同步验证是验证层里对屏障与信号量做符号化建模的那一档: 它能确定性地报出
+/// "这次读没有被前面那次写的屏障覆盖", 结论与 GPU 实际调度无关。同步缺陷
+/// 平时只表现为偶发的数据撕裂 —— 少一个屏障在绝大多数驱动上照样跑出正确
+/// 结果, 所以靠跑一遍看输出是抓不住的; 打开这一档才能让它必现。
+///
+/// 代价是每条命令都要过一遍模型, 开销显著, 因此默认关闭 —— 供测试与排查
+/// 同步问题时按需开启。需要 enableValidation 同时为 true 才会生效。
+///
 /// @return 初始化完成的设备实例; 失败返回空 TUniquePtr
 TUniquePtr<IRHIDevice> CreateRHIDevice(void* nativeWindowHandle,
-                                        bool enableValidation);
+                                        bool enableValidation,
+                                        bool enableSyncValidation = false);
 
 // ============================================================================
 // 命令缓冲区工厂

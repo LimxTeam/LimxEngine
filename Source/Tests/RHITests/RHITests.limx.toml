@@ -4,7 +4,7 @@ type        = "executable"
 namespace   = "Limx"
 api_macro   = ""
 layer       = 3
-description = "RHI 模块单元测试 — 显存子分配算法的正确性、对齐契约、粒度约束与随机压力回归"
+description = "RHI 模块单元测试 — 显存子分配算法的正确性/对齐契约/粒度约束, 以及真实 VkDevice 上的管线屏障批量下发验证"
 
 [dependencies]
 public  = ["LimxCore", "LimxTesting", "LimxRHI"]
@@ -21,7 +21,8 @@ features      = []
 flags         = []
 include_paths = []
 library_paths = []
-libraries     = ["kernel32"]
+# user32 — 屏障用例需要一个隐藏窗口来建 VkSurfaceKHR (设备初始化链路的必经一步)
+libraries     = ["kernel32", "user32"]
 
 [precompiled_header]
 enabled = true
