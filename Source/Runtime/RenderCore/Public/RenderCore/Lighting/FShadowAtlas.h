@@ -187,6 +187,112 @@ LIMX_NODISCARD inline FMatrix ComputeSpotShadowMatrix(
 }
 
 // ============================================================================
+// 点光源的立方体阴影
+// ============================================================================
+
+/// 立方体的面数
+inline constexpr UInt32 kCubeFaceCount = 6;
+
+/// 面下标 → 该面的朝向
+///
+/// 顺序与 Vulkan 立方体贴图的层序一致: +X, -X, +Y, -Y, +Z, -Z。
+///
+/// 顺序本身是**约定**, 但两处必须用同一个: C++ 这边按它算六个矩阵并按它
+/// 分配六块, 着色器那边按片段方向的主轴反查面下标。两处不一致的表现是
+/// "阴影出现在错误的那一面" —— 物体左边的影子跑到了右边, 而那看着像是
+/// 阴影矩阵算错了, 离真正的原因 (面的编号) 隔着一层。
+LIMX_NODISCARD inline FVector3 CubeFaceDirection(UInt32 face)
+{
+    switch (face)
+    {
+    case 0:  return FVector3( 1.0f,  0.0f,  0.0f);
+    case 1:  return FVector3(-1.0f,  0.0f,  0.0f);
+    case 2:  return FVector3( 0.0f,  1.0f,  0.0f);
+    case 3:  return FVector3( 0.0f, -1.0f,  0.0f);
+    case 4:  return FVector3( 0.0f,  0.0f,  1.0f);
+    default: return FVector3( 0.0f,  0.0f, -1.0f);
+    }
+}
+
+/// 每个面在 90 度之外多留的半角 (弧度)
+///
+/// **正好 90 度是不够的。**
+///
+/// 六个 90 度的面在数学上恰好拼满球面, 但阴影贴图不是数学: 面与面的交界
+/// 处, 遮挡物恰好落在两个视锥的**边界上**, 于是两边的深度图里它都只画到
+/// 一半; 再叠上 3x3 的 PCF (采样点会越过块边界, 被钳回块内), 交界处就出现
+/// 一条窄缝 —— 影子在那里断开。
+///
+/// 实测: 无余量时点光源的影子在 x=2 (正是面边界) 处断了约 0.036 世界单位,
+/// 约两三个像素。判据报的是"影子外缘只到 1.965, 解析值是 4.21"—— 因为找
+/// 暗区的函数遇到那条缝就停了。
+///
+/// 2 度的余量让相邻两面重叠约 7%, 远大于 PCF 的一个半纹素 (在块边缘约
+/// 0.22 度)。代价是每个面的有效分辨率降 7%。
+inline constexpr Float32 kCubeFaceFovPadRadians = 2.0f * FMath::kDegToRad;
+
+/// 点光源某一面的视图投影矩阵
+///
+/// 视场角 90 度**加两倍余量** —— 六个面因此重叠一圈, 交界处两边都有完整的
+/// 深度信息。正好 90 度的话交界处会出现一条断缝, 见 kCubeFaceFovPadRadians。
+///
+/// 上向量交给 ShadowUpVectorFor: ±Y 两个面的朝向恰好是竖直的, 那正是它
+/// 处理的退化情形。写死 (0,1,0) 的话那两个面的视图矩阵直接塌掉 —— 而
+/// 点光源**一定**有这两个面, 不是边角情形。
+LIMX_NODISCARD inline FMatrix ComputeCubeFaceShadowMatrix(
+    const FVector3& position,
+    UInt32          face,
+    Float32         range)
+{
+    const FVector3 forward = CubeFaceDirection(face);
+
+    const FVector3 target(position.X + forward.X,
+                          position.Y + forward.Y,
+                          position.Z + forward.Z);
+
+    const FMatrix view =
+        FMatrix::LookAt(position, target, ShadowUpVectorFor(forward));
+
+    const Float32 nearPlane = 0.05f;
+    const Float32 farPlane  = FMath::Max(range, nearPlane * 2.0f);
+
+    // 90 度加余量, 宽高比 1。余量让相邻两面重叠, 交界处不留缝。
+    const FMatrix projection = FMatrix::Perspective(
+        FMath::kPi * 0.5f + 2.0f * kCubeFaceFovPadRadians, 1.0f,
+        nearPlane, farPlane);
+
+    return projection * view;
+}
+
+/// 方向 → 立方体面下标
+///
+/// 取绝对值最大的那个轴, 再看符号。判据必须与 CubeFaceDirection 的编号
+/// 严格互逆 —— 这两个函数是同一个约定的两半, 而它们分处 C++ 与 GLSL,
+/// 没有任何编译期保障。所以用例里逐面往返验一遍。
+///
+/// 平局 (两个分量绝对值相等) 时的归属是任意的但必须**确定**: 立方体的棱上
+/// 两个面都能覆盖到, 选谁都对, 但 C++ 与着色器必须选同一个, 否则棱附近会
+/// 出现一条一像素宽的错误阴影。这里的 >= 链与着色器里的写法逐字对应。
+LIMX_NODISCARD inline UInt32 CubeFaceFromDirection(const FVector3& direction)
+{
+    const Float32 ax = FMath::Abs(direction.X);
+    const Float32 ay = FMath::Abs(direction.Y);
+    const Float32 az = FMath::Abs(direction.Z);
+
+    if (ax >= ay && ax >= az)
+    {
+        return (direction.X > 0.0f) ? 0u : 1u;
+    }
+
+    if (ay >= az)
+    {
+        return (direction.Y > 0.0f) ? 2u : 3u;
+    }
+
+    return (direction.Z > 0.0f) ? 4u : 5u;
+}
+
+// ============================================================================
 // 交给 GPU 的每块数据
 // ============================================================================
 

@@ -426,7 +426,7 @@ public:
     LIMX_NODISCARD bool IsEnabled() const { return m_IsEnabled; }
     void SetEnabled(bool isEnabled) { m_IsEnabled = isEnabled; }
 
-    /// 是否投射阴影 (当前仅聚光灯支持)
+    /// 是否投射阴影 (聚光灯占图集一块, 点光源占连续六块)
     ///
     /// 默认**关闭**, 需要显式打开。这与"阴影是常态"的直觉相反, 理由是代价:
     /// 每盏投影的灯都要把场景重画一遍进图集, 而图集只有 64 块。默认打开的话,

@@ -327,3 +327,259 @@ LIMX_TEST(ShadowAtlas, DegenerateConeCosineDoesNotProduceNaN)
         }
     }
 }
+
+// ============================================================================
+// 点光源的立方体面
+//
+// 这一组的判据全部围绕**面的编号与方向必须严格互逆**。
+//
+// C++ 按 CubeFaceDirection 的编号算六个矩阵、分配六块; 着色器按片段方向的
+// 主轴反查面下标去取块。两处分处不同语言, 没有任何编译期保障 —— 不一致的
+// 表现是"阴影出现在错误的那一面": 物体左边的影子跑到了右边, 而那看着像是
+// 阴影矩阵算错了, 离真正的原因隔着一层。
+// ============================================================================
+
+LIMX_TEST(ShadowAtlas, CubeFaceRoundTrip)
+{
+    // 逐面往返: 面的朝向反查回来必须是同一个面。
+    //
+    // 只验"六个方向互不相同"是不够的 —— 一个把编号整体循环移位的实现同样
+    // 满足那一条, 而它会让每一面的阴影都落到隔壁面上。
+    for (UInt32 face = 0; face < kCubeFaceCount; ++face)
+    {
+        const FVector3 direction = CubeFaceDirection(face);
+
+        LIMX_EXPECT_EQ(CubeFaceFromDirection(direction), face);
+    }
+}
+
+LIMX_TEST(ShadowAtlas, CubeFaceRoundTripOffAxis)
+{
+    // 偏离轴心但仍在该面 90 度锥内的方向, 也必须落回同一面。
+    //
+    // 沿两个横向各偏 0.5 (与轴的比值 0.5 < 1, 所以主轴不变)。这一条查的是
+    // 选面用的是不是"绝对值最大的分量"—— 一个只看符号的实现在轴上正确,
+    // 偏一点就错。
+    for (UInt32 face = 0; face < kCubeFaceCount; ++face)
+    {
+        const FVector3 axis = CubeFaceDirection(face);
+
+        // 与主轴正交的两个方向
+        const FVector3 side1 = CubeFaceDirection((face + 2u) % kCubeFaceCount);
+        const FVector3 side2 = CubeFaceDirection((face + 4u) % kCubeFaceCount);
+
+        const FVector3 tilted =
+            FVector3(axis.X + 0.5f * side1.X + 0.5f * side2.X,
+                     axis.Y + 0.5f * side1.Y + 0.5f * side2.Y,
+                     axis.Z + 0.5f * side1.Z + 0.5f * side2.Z)
+                .GetSafeNormal();
+
+        LIMX_EXPECT_EQ(CubeFaceFromDirection(tilted), face);
+    }
+}
+
+LIMX_TEST(ShadowAtlas, CubeFacesAreDistinctAndOpposite)
+{
+    // 六个方向两两成对相反, 相邻的对之间正交。
+    //
+    // 这一条钉的是"±X / ±Y / ±Z"这个顺序本身 —— 换成 +X,+Y,+Z,-X,-Y,-Z 的话
+    // 往返测试照样通过, 而着色器那边若沿用旧顺序, 每一面都会取到隔壁的块。
+    for (UInt32 face = 0; face < kCubeFaceCount; face += 2u)
+    {
+        const FVector3 positive = CubeFaceDirection(face);
+        const FVector3 negative = CubeFaceDirection(face + 1u);
+
+        LIMX_EXPECT_NEAR(FVector3::Dot(positive, negative), -1.0f, 1.0e-6f);
+    }
+
+    LIMX_EXPECT_NEAR(
+        FVector3::Dot(CubeFaceDirection(0), CubeFaceDirection(2)), 0.0f,
+        1.0e-6f);
+    LIMX_EXPECT_NEAR(
+        FVector3::Dot(CubeFaceDirection(0), CubeFaceDirection(4)), 0.0f,
+        1.0e-6f);
+    LIMX_EXPECT_NEAR(
+        FVector3::Dot(CubeFaceDirection(2), CubeFaceDirection(4)), 0.0f,
+        1.0e-6f);
+}
+
+LIMX_TEST(ShadowAtlas, CubeFaceMatrixMapsOwnAxisToCenter)
+{
+    // 每一面的轴向上的点必须落在该面 NDC 的中心, 且 w 为正。
+    //
+    // 偏了说明视图矩阵的朝向不对 —— 表现是那一面的阴影整体平移, 极易被
+    // 当成"深度偏移调大了"。
+    const FVector3 position(1.0f, 2.0f, -3.0f);
+
+    for (UInt32 face = 0; face < kCubeFaceCount; ++face)
+    {
+        const FMatrix viewProj =
+            ComputeCubeFaceShadowMatrix(position, face, 20.0f);
+
+        const FVector3 direction = CubeFaceDirection(face);
+
+        for (Float32 distance = 1.0f; distance <= 9.0f; distance += 2.0f)
+        {
+            const FVector3 onAxis(position.X + direction.X * distance,
+                                  position.Y + direction.Y * distance,
+                                  position.Z + direction.Z * distance);
+
+            const FVector4 clip = viewProj.TransformVector4(
+                FVector4(onAxis.X, onAxis.Y, onAxis.Z, 1.0f));
+
+            LIMX_EXPECT_TRUE(clip.W > 1.0e-6f);
+
+            LIMX_EXPECT_NEAR(clip.X / clip.W, 0.0f, 1.0e-4f);
+            LIMX_EXPECT_NEAR(clip.Y / clip.W, 0.0f, 1.0e-4f);
+        }
+    }
+}
+
+LIMX_TEST(ShadowAtlas, CubeFaceCoversNinetyDegreesWithMargin)
+{
+    // 每个面必须覆盖自己那 90 度的象限, **而且留出余量**。
+    //
+    // 正好 90 度不够: 面与面的交界处遮挡物恰好落在两个视锥的边界上, 两边的
+    // 深度图里它都只画到一半; 再叠上 3x3 的 PCF (采样点越过块边界被钳回),
+    // 交界处就出现一条窄缝, 影子在那里断开。实测断了约两三个像素。
+    //
+    // 判据分两半, 缺一不可:
+    //   与轴成 45 度的方向 (面的边界) 必须落在 NDC 之内, 且**离边界至少两个
+    //     纹素** —— 那是 PCF 足迹的宽度。
+    //   余量又不能太大, 否则白白浪费分辨率。
+    const FVector3 position(0.0f, 0.0f, 0.0f);
+
+    // 两个纹素在 NDC 里的宽度 (NDC 跨度是 2)
+    const Float32 twoTexels =
+        2.0f * 2.0f / static_cast<Float32>(kShadowTileSize);
+
+    for (UInt32 face = 0; face < kCubeFaceCount; ++face)
+    {
+        const FMatrix viewProj =
+            ComputeCubeFaceShadowMatrix(position, face, 20.0f);
+
+        const FVector3 forward = CubeFaceDirection(face);
+        const FVector3 up      = ShadowUpVectorFor(forward);
+
+        // 面内的"右" —— 与 FMatrix::LookAt 的构造一致
+        const FVector3 right = FVector3::Cross(forward, up).GetSafeNormal();
+
+        const Float32 distance = 5.0f;
+
+        const FVector3 edge(
+            position.X + (forward.X + right.X) * distance,
+            position.Y + (forward.Y + right.Y) * distance,
+            position.Z + (forward.Z + right.Z) * distance);
+
+        const FVector4 clip = viewProj.TransformVector4(
+            FVector4(edge.X, edge.Y, edge.Z, 1.0f));
+
+        LIMX_EXPECT_TRUE(clip.W > 1.0e-6f);
+
+        const Float32 ndc = FMath::Abs(clip.X / clip.W);
+
+        // 落在里面, 且离边界至少两个纹素
+        LIMX_EXPECT_TRUE(ndc < 1.0f - twoTexels);
+
+        // 余量别太大 —— 20% 已经是明显的分辨率浪费
+        LIMX_EXPECT_TRUE(ndc > 0.8f);
+    }
+}
+
+LIMX_TEST(ShadowAtlas, CubeFacesTogetherCoverEveryDirection)
+{
+    // 任意方向都必须被**选出来的那一面**覆盖到。
+    //
+    // 这一条把两个函数绑在一起: 选面的规则若与矩阵的朝向不一致, 就会存在
+    // 一些方向"选了 A 面, 却只有 B 面能看见它"—— 表现是某些角度下阴影突然
+    // 消失, 而那在真实场景里极难复现。
+    const FVector3 position(0.0f, 0.0f, 0.0f);
+
+    UInt32 outsideCount = 0;
+    UInt32 sampleCount  = 0;
+
+    for (Int32 iy = -6; iy <= 6; ++iy)
+    {
+        for (Int32 ix = -6; ix <= 6; ++ix)
+        {
+            for (Int32 iz = -6; iz <= 6; ++iz)
+            {
+                if (ix == 0 && iy == 0 && iz == 0)
+                {
+                    continue;
+                }
+
+                const FVector3 direction =
+                    FVector3(static_cast<Float32>(ix),
+                             static_cast<Float32>(iy),
+                             static_cast<Float32>(iz)).GetSafeNormal();
+
+                const UInt32 face = CubeFaceFromDirection(direction);
+
+                const FMatrix viewProj =
+                    ComputeCubeFaceShadowMatrix(position, face, 20.0f);
+
+                const FVector3 point(direction.X * 5.0f,
+                                     direction.Y * 5.0f,
+                                     direction.Z * 5.0f);
+
+                const FVector4 clip = viewProj.TransformVector4(
+                    FVector4(point.X, point.Y, point.Z, 1.0f));
+
+                ++sampleCount;
+
+                if (clip.W <= 1.0e-6f)
+                {
+                    ++outsideCount;
+                    continue;
+                }
+
+                const Float32 ndcX = clip.X / clip.W;
+                const Float32 ndcY = clip.Y / clip.W;
+
+                // 棱上的方向恰好落在边界上, 留一点点容差
+                if (FMath::Abs(ndcX) > 1.0001f ||
+                    FMath::Abs(ndcY) > 1.0001f)
+                {
+                    ++outsideCount;
+                }
+            }
+        }
+    }
+
+    // 采样数本身要断言。扫描范围写错时循环可能一次都不进, 而"零个方向落在
+    // 面外"同样成立 —— 那是个通过。
+    LIMX_EXPECT_TRUE(sampleCount > 2000u);
+    LIMX_EXPECT_EQ(outsideCount, 0u);
+}
+
+LIMX_TEST(ShadowAtlas, CubeFaceDepthSpansTheRange)
+{
+    // 每一面的近平面处深度为 0, 远平面处为 1。
+    //
+    // 反了的话深度比较的方向整个错误 —— "到处都是阴影"或"完全没有阴影",
+    // 而那两种都会先被归因到比较函数或偏移量上。
+    const FVector3 position(0.0f, 0.0f, 0.0f);
+
+    const Float32 range     = 20.0f;
+    const Float32 nearPlane = 0.05f;
+
+    for (UInt32 face = 0; face < kCubeFaceCount; ++face)
+    {
+        const FMatrix viewProj =
+            ComputeCubeFaceShadowMatrix(position, face, range);
+
+        const FVector3 direction = CubeFaceDirection(face);
+
+        const FVector4 nearClip = viewProj.TransformVector4(
+            FVector4(direction.X * nearPlane, direction.Y * nearPlane,
+                     direction.Z * nearPlane, 1.0f));
+
+        const FVector4 farClip = viewProj.TransformVector4(
+            FVector4(direction.X * range, direction.Y * range,
+                     direction.Z * range, 1.0f));
+
+        LIMX_EXPECT_NEAR(nearClip.Z / nearClip.W, 0.0f, 1.0e-4f);
+        LIMX_EXPECT_NEAR(farClip.Z / farClip.W, 1.0f, 1.0e-4f);
+    }
+}

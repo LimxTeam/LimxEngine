@@ -504,29 +504,62 @@ void FLightManager::UploadLightData(
 
                 // ---- 阴影块分配 ----
                 //
-                // 块下标就是"本帧第几盏投影灯", 与光源在缓冲区里的位置无关。
-                // 两者绑定的话, 方向光排在前面这件事就会把块 0~N 白白占掉。
-                if (m_Lights[i].GetType() == ELightType::Spot &&
-                    m_Lights[i].CastsShadow())
+                // 块下标就是"本帧第几块", 与光源在缓冲区里的位置无关。两者
+                // 绑定的话, 方向光排在前面这件事就会把块 0~N 白白占掉。
+                //
+                // 聚光灯占一块, 点光源占**连续的六块** (立方体的六个面)。
+                // 连续是着色器那边的前提: 它拿到的是第一面的块下标, 再加上
+                // 由片段方向算出的面下标。不连续的话每盏点光要传六个下标,
+                // 而 FLightData 里只有一个 float 的位置。
+                if (m_Lights[i].CastsShadow())
                 {
-                    ++shadowRequestCount;
+                    const bool isSpot =
+                        (m_Lights[i].GetType() == ELightType::Spot);
+                    const bool isPoint =
+                        (m_Lights[i].GetType() == ELightType::Point);
 
-                    const UInt32 tileIndex =
-                        static_cast<UInt32>(m_SpotShadowCasters.GetSize());
+                    const UInt32 needed =
+                        isSpot ? 1u : (isPoint ? kCubeFaceCount : 0u);
 
-                    if (tileIndex < kShadowTileCount)
+                    if (needed > 0u)
                     {
-                        const FMatrix viewProj = ComputeSpotShadowMatrix(
-                            m_Lights[i].GetPosition(),
-                            m_Lights[i].GetDirection(),
-                            lights[activeLightCount].SpotOuterCos,
-                            m_Lights[i].GetRange());
+                        shadowRequestCount += needed;
 
-                        m_SpotShadowCasters.Add(
-                            MakeSpotShadowData(tileIndex, viewProj));
+                        const UInt32 tileIndex =
+                            static_cast<UInt32>(m_SpotShadowCasters.GetSize());
 
-                        lights[activeLightCount].ShadowTileIndex =
-                            static_cast<Float32>(tileIndex);
+                        if (tileIndex + needed <= kShadowTileCount)
+                        {
+                            if (isSpot)
+                            {
+                                const FMatrix viewProj = ComputeSpotShadowMatrix(
+                                    m_Lights[i].GetPosition(),
+                                    m_Lights[i].GetDirection(),
+                                    lights[activeLightCount].SpotOuterCos,
+                                    m_Lights[i].GetRange());
+
+                                m_SpotShadowCasters.Add(
+                                    MakeSpotShadowData(tileIndex, viewProj));
+                            }
+                            else
+                            {
+                                for (UInt32 face = 0; face < kCubeFaceCount;
+                                     ++face)
+                                {
+                                    const FMatrix viewProj =
+                                        ComputeCubeFaceShadowMatrix(
+                                            m_Lights[i].GetPosition(), face,
+                                            m_Lights[i].GetRange());
+
+                                    m_SpotShadowCasters.Add(
+                                        MakeSpotShadowData(tileIndex + face,
+                                                           viewProj));
+                                }
+                            }
+
+                            lights[activeLightCount].ShadowTileIndex =
+                                static_cast<Float32>(tileIndex);
+                        }
                     }
                 }
 

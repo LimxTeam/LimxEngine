@@ -191,6 +191,9 @@ struct FLaunchOptions
     /// GPU 驱动自检: 与逐物体绘制逐像素比对, 以退出码报告
     bool GpuDrivenCheck = false;
 
+    /// 阴影场景换成单盏点光源 (立方体阴影)
+    bool PointShadow = false;
+
     /// 阴影场景里投影聚光灯的总数 (含被测的两盏)
     ///
     /// 多出来的都是**填充灯**, 放在相机视野之外。它们的作用是把被测的两盏
@@ -430,6 +433,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --shadow-check   阴影自检: 断言阴影边界的解析位置, 以退出码报告
 ///   --gpu-driven     GPU 驱动的剔除与间接绘制 (相机通道)
 ///   --gpu-driven-check GPU 驱动自检: 与逐物体绘制逐像素比对, 以退出码报告
+///   --point-shadow   阴影场景换成单盏点光源 (立方体阴影, 影子横跨面边界)
 ///   --shadow-lights N 阴影场景里投影聚光灯的总数 (默认 2, 上限 128)
 ///                     超过 64 时多出来的拿不到图集的块, 按无遮挡处理
 ///   --ao-check       GTAO 自检: 断言墙角处的解析值, 以退出码报告
@@ -632,6 +636,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--gpu-driven-check"))
         {
             options.GpuDrivenCheck = true;
+        }
+        else if (WideEquals(arg, L"--point-shadow"))
+        {
+            options.PointShadow = true;
         }
         else if (WideEquals(arg, L"--shadow-lights") && (i + 1) < tokenCount)
         {
@@ -1807,6 +1815,38 @@ inline constexpr Float32 kOccluder2CenterY = 0.5f;
 inline constexpr Float32 kOccluder2HalfX   = 0.3f;
 inline constexpr Float32 kOccluder2HalfY   = 0.2f;
 
+// ── 点光源模式 ──
+//
+// 灯离墙很近 (z=2), 于是墙上离灯轴超过 2 单位的地方, "从灯指向片段"的主轴
+// 就从 -Z 翻到 ±X 或 ±Y —— 影子会**横跨立方体的面边界**。
+//
+// 那正是这一组要验的东西: 面选错的表现是影子在某条线上突然断开或错位, 而
+// 那条线的位置取决于灯到墙的距离, 不是任何一个显眼的地方。灯放远一点 (比如
+// 和聚光灯一样 z=6) 的话, 可见范围内根本不会跨面, 整条选面逻辑就无从判定。
+
+/// 点光源到墙的距离
+inline constexpr Float32 kPointLightZ = 2.0f;
+
+/// 点光源的遮挡板
+inline constexpr Float32 kPointOccluderZ       = 1.4f;
+inline constexpr Float32 kPointOccluderCenterX = 0.85f;
+inline constexpr Float32 kPointOccluderHalfX   = 0.35f;
+inline constexpr Float32 kPointOccluderHalfY   = 0.2f;
+
+inline constexpr Float32 kPointLightRange = 30.0f;
+
+/// 点光源模式下的相似三角形放大率
+LIMX_NODISCARD inline Float32 PointShadowScale(Float32 occluderZ)
+{
+    return kPointLightZ / (kPointLightZ - occluderZ);
+}
+
+/// 点光源模式下遮挡物在画面上的放大率
+LIMX_NODISCARD inline Float32 PointImageScale(Float32 occluderZ)
+{
+    return kCameraZ / (kCameraZ - occluderZ);
+}
+
 /// 相似三角形: 灯在 (0,0,h), 遮挡物边缘在 z=ze, 接收面在 z=0
 ///
 /// 边缘坐标 e 投到墙上是 e * h / (h - ze)。薄板有厚度, 靠灯的那一面放大
@@ -2100,7 +2140,8 @@ static FShadowSpan FindShadowSpan(const TArray<UInt8>& pixels,
                                   UInt32 width, UInt32 height,
                                   const FMatrix& viewProj,
                                   Int32 axis, Float32 fixedCoord,
-                                  Float32 from, Float32 to, Float32 step)
+                                  Float32 from, Float32 to, Float32 step,
+                                  Float32 thresholdFraction = 0.5f)
 {
     FShadowSpan span;
 
@@ -2149,7 +2190,19 @@ static FShadowSpan FindShadowSpan(const TArray<UInt8>& pixels,
         return span;
     }
 
-    const Float32 threshold = (minValue + maxValue) * 0.5f;
+    // 阈值取"从最暗往最亮走多少比例"。
+    //
+    // 0.5 (中点) 对聚光灯那一组是对的: 测量区很小, 亮处的亮度基本一致。
+    //
+    // 点光源那一组不行 —— 灯离墙只有 2 单位, 而测量区横跨 5 单位, 于是
+    // N·L 从 1 掉到 0.37, 亮处最暗的地方比中点还暗, 会被判成影子。那时
+    // "两端都必须是亮的"这一条直接不成立, 判据报的却是"没找到完整的暗区"。
+    //
+    // 0.2 对点光源是有物理含义的: 影子区**只有环境光**, 而亮区哪怕衰减到
+    // 三分之一也仍然带着直接光。阈值卡在"离环境光两成"的位置, 分的正是
+    // "有没有直接光"这件事, 与 N·L 掉多少无关。
+    const Float32 threshold =
+        minValue + (maxValue - minValue) * thresholdFraction;
 
     // 两端都必须是亮的 —— 扫描线要完整跨过影子。有一端就在影子里的话,
     // 量到的"边界"只是扫描范围的端点, 而那与影子的位置无关。
@@ -2250,6 +2303,248 @@ static Float32 MeanLuminanceInRect(const TArray<UInt8>& pixels,
 }
 
 } // namespace
+
+// ============================================================================
+// RunPointShadowChecks — 点光源立方体阴影
+//
+// 两条判据, 抓的是完全不同的失效方式:
+//
+//   1. **影子边界落在相似三角形算出的位置上。** 与聚光灯那一组同一个公式,
+//      验的是六个面的矩阵、块的连续分配、以及采样的整条链路。
+//
+//   2. **影子横跨立方体的面边界时不能断。** 灯离墙只有 2 单位, 所以墙上
+//      |x| 超过 2 的地方, "从灯指向片段"的主轴就从 -Z 翻到 ±X —— 那一线
+//      两侧取的是**不同的两块**。选面的规则若与 C++ 侧算矩阵时的编号不一致,
+//      影子会在那条线上突然断开或错位。
+//
+//      这一条没法靠边界位置发现: 断开处离两条边界都很远, 而边界本身仍然
+//      正确。必须专门去量那一段的连续性。
+//
+// 灯放在相机轴上, 理由与聚光灯那一组相同 —— 遮挡物在画面上的像一定落在它
+// 自己影子之外, 边界才不会被自己挡住。
+// ============================================================================
+static bool RunPointShadowChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FScreenshotCapture shot;
+
+    if (!shot.Request(context))
+    {
+        LIMX_LOG(LogLaunch, Error, "[点光阴影] 回读缓冲区准备失败");
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(
+        [&shot, context]() { shot.RecordCopy(context); });
+
+    renderer.RenderFrame();
+
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    TArray<UInt8> pixels;
+
+    if (!shot.ReadPixels(context, pixels))
+    {
+        shot.Release(context->GetDevice());
+        LIMX_LOG(LogLaunch, Error, "[点光阴影] 画面回读失败");
+        return false;
+    }
+
+    shot.Release(context->GetDevice());
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const FMatrix viewProj = renderer.GetCamera().GetProjectionMatrix() *
+                             renderer.GetCamera().GetViewMatrix();
+
+    // ---- 解析值 ----
+    const Float32 scaleFront =
+        ShadowScene::PointShadowScale(ShadowScene::kPointOccluderZ +
+                                      ShadowScene::kOccluderHalfThick);
+    const Float32 scaleBack =
+        ShadowScene::PointShadowScale(ShadowScene::kPointOccluderZ -
+                                      ShadowScene::kOccluderHalfThick);
+
+    const Float32 occluderXMin =
+        ShadowScene::kPointOccluderCenterX - ShadowScene::kPointOccluderHalfX;
+    const Float32 occluderXMax =
+        ShadowScene::kPointOccluderCenterX + ShadowScene::kPointOccluderHalfX;
+
+    // 板子整个在灯轴的 +x 一侧: 内缘用背光面 (放大得少), 外缘用靠灯面
+    const Float32 expectedXMin = occluderXMin * scaleBack;
+    const Float32 expectedXMax = occluderXMax * scaleFront;
+
+    const Float32 imageFront =
+        ShadowScene::PointImageScale(ShadowScene::kPointOccluderZ +
+                                     ShadowScene::kOccluderHalfThick);
+
+    const Float32 imageYMax = ShadowScene::kPointOccluderHalfY * imageFront;
+    const Float32 shadowYMax = ShadowScene::kPointOccluderHalfY * scaleFront;
+
+    // 横扫的 y: 落在影子的上下缘之内, 又要避开板子自己在画面上的像
+    const Float32 scanY = -(imageYMax + shadowYMax) * 0.5f;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[点光阴影] 解析值 — 影子 x [{}, {}] y ±{}; 板子的像 y ±{}",
+             expectedXMin, expectedXMax, shadowYMax, imageYMax);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[点光阴影] 横扫 y={}, 面边界在 x=±{}",
+             scanY, ShadowScene::kPointLightZ);
+
+    bool passed = true;
+
+    // ---- 1. 左右边界 ----
+    // 扫描范围收在 [-1.2, 5.0]。
+    //
+    // 再往外 N·L 掉到 0.3 以下, 亮区与环境光已经分不清了 —— 那不是判据的
+    // 问题, 是那里本来就没有多少直接光。范围写死而不是取整个视野, 是因为
+    // "判据在哪一段有效"必须是明确的。
+    const FShadowSpan span = FindShadowSpan(
+        pixels, extent.Width, extent.Height, viewProj,
+        0, scanY, -1.2f, 5.0f, 0.004f, 0.2f);
+
+    if (!span.Found)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[点光阴影] 横扫没有找到完整的暗区 (最亮 {}, 最暗 {}) —— "
+                 "六块是不是没分出来?",
+                 span.LitLevel, span.ShadowLevel);
+        passed = false;
+    }
+    else
+    {
+        const Float32 errMin = FMath::Abs(span.Enter - expectedXMin);
+        const Float32 errMax = FMath::Abs(span.Exit - expectedXMax);
+
+        // 容差按影子的宽度取。
+        //
+        // 实测误差: 内缘 0.021, 外缘 0.103。外缘那 0.103 里约 0.083 有确切
+        // 来源 —— 法线偏移把接收点推离墙面约 0.039 单位, 而这一组的相似三角
+        // 形放大率高达 3.5, 于是外缘内移 0.083。放大率高是刻意的 (灯离墙只有
+        // 2 单位, 影子才跨得过面边界), 代价就是偏移被放大得更明显。
+        //
+        // 上限由"必须抓住什么"定: 面边界断缝那个缺陷量出来的误差是 2.25,
+        // 法线偏移大十倍约 1.0。6% = 0.157 卡在 0.103 与 1.0 之间。
+        const Float32 tolerance =
+            FMath::Abs(expectedXMax - expectedXMin) * 0.06f;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[点光阴影] 左右边界 — 实测 [{}, {}] 解析 [{}, {}] "
+                 "误差 [{}, {}] 容差 {}",
+                 span.Enter, span.Exit, expectedXMin, expectedXMax,
+                 errMin, errMax, tolerance);
+
+        if (errMin > tolerance || errMax > tolerance)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[点光阴影] 边界偏离解析值超过容差");
+            passed = false;
+        }
+    }
+
+    // ---- 2. 跨面连续性 ----
+    //
+    // 面边界在 x = ±kPointLightZ。取边界两侧各一段仍在影子里的区间, 逐点
+    // 采样, 断言全都是暗的。
+    //
+    // 选面错了的话, 边界一侧会去取另一块 —— 那一块画的是别的方向上的几何,
+    // 于是那一侧要么没有影子 (亮), 要么影子的形状完全不同。
+    const Float32 boundary = ShadowScene::kPointLightZ;
+
+    if (span.Found && expectedXMin < boundary && boundary < expectedXMax)
+    {
+        const Float32 from = FMath::Max(expectedXMin + 0.15f,
+                                        boundary - 0.8f);
+        const Float32 to   = FMath::Min(expectedXMax - 0.15f,
+                                        boundary + 0.8f);
+
+        // 与上面同一个阈值 —— 两处用不同的阈值的话, "边界在这里"与
+        // "这一段是暗的"可能互相矛盾。
+        const Float32 threshold =
+            span.ShadowLevel + (span.LitLevel - span.ShadowLevel) * 0.2f;
+
+        UInt32 total = 0;
+        UInt32 dark  = 0;
+
+        for (Float32 x = from; x <= to; x += 0.004f)
+        {
+            const Float32 value = SampleWorldPoint(
+                pixels, extent.Width, extent.Height, viewProj,
+                FVector3(x, scanY, ShadowScene::kWallZ));
+
+            if (value < 0.0f)
+            {
+                continue;
+            }
+
+            ++total;
+
+            if (value < threshold)
+            {
+                ++dark;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[点光阴影] 跨面区间 x [{}, {}] — {} / {} 个采样点是暗的",
+                 from, to, dark, total);
+
+        // 采样数本身要断言: 区间算错时循环可能一次都不进, 而"零个亮点"
+        // 同样成立 —— 那是个通过。
+        if (total < 100u)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[点光阴影] 跨面区间只取到 {} 个采样点 — 判定无效",
+                     total);
+            passed = false;
+        }
+        else if (dark * 100u < total * 98u)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[点光阴影] 跨面区间里有 {} / {} 个点是亮的 —— "
+                     "面边界两侧取到了不同的块?",
+                     total - dark, total);
+            passed = false;
+        }
+    }
+    else if (span.Found)
+    {
+        // 影子没跨过面边界的话, 第二条判据什么也没验。那不是通过。
+        LIMX_LOG(LogLaunch, Error,
+                 "[点光阴影] 影子 [{}, {}] 没有跨过面边界 {} —— "
+                 "选面这一条无从判定",
+                 expectedXMin, expectedXMax, boundary);
+        passed = false;
+    }
+
+    // ---- 3. 图集必须画了六块 ----
+    FShadowAtlasPass* const atlas = renderer.GetShadowAtlasPass();
+
+    const UInt32 tileCount =
+        (atlas != nullptr) ? atlas->GetRenderedTileCount() : 0u;
+
+    LIMX_LOG(LogLaunch, Display, "[点光阴影] 图集本帧绘制 {} 块", tileCount);
+
+    if (tileCount != kCubeFaceCount)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[点光阴影] 图集应当绘制 {} 块 (立方体六个面), 实际 {}",
+                 kCubeFaceCount, tileCount);
+        passed = false;
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[点光阴影] 通过 — 边界落在解析位置, 且跨过面边界不断");
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Error, "[点光阴影] 失败");
+    }
+
+    return passed;
+}
 
 static bool RunShadowChecks(FRenderContext* context, FRenderer& renderer,
                             UInt32 expectedTiles)
@@ -5420,7 +5715,8 @@ static void BuildBloomScene(LScene* scene, FRenderContext* context,
 // 上下对称的话, 阴影贴图上下翻转这种缺陷会完全看不出来。
 // ============================================================================
 static void BuildShadowScene(LScene* scene, FRenderContext* context,
-                             FRenderer* renderer, UInt32 lightCount)
+                             FRenderer* renderer, UInt32 lightCount,
+                             bool pointShadow)
 {
     LIMX_CHECK(scene != nullptr);
     LIMX_CHECK(context != nullptr);
@@ -5482,6 +5778,51 @@ static void BuildShadowScene(LScene* scene, FRenderContext* context,
     SpawnBox(FName("ShadowWall"),
              FVector3(0.0f, 0.0f, ShadowScene::kWallZ - kWallHalfThick),
              FVector3(20.0f, 20.0f, kWallHalfThick));
+
+    if (pointShadow)
+    {
+        // ---- 点光源模式 ----
+        //
+        // 只有一盏灯、一块板。与聚光灯那两盏共存的话, 点光源会照亮它们的
+        // 影子区, 而那会把"亮/暗"的对比度压下去 —— 判据量的是边界位置,
+        // 但边界是靠亮暗中点定的, 中点一挪边界跟着挪。
+        SpawnBox(FName("PointOccluder"),
+                 FVector3(ShadowScene::kPointOccluderCenterX, 0.0f,
+                          ShadowScene::kPointOccluderZ),
+                 FVector3(ShadowScene::kPointOccluderHalfX,
+                          ShadowScene::kPointOccluderHalfY,
+                          ShadowScene::kOccluderHalfThick));
+
+        resources.ReleaseMeshReference(meshHandle);
+
+        FLightManager::Get().ClearAllLights();
+
+        FLight light = FLight::CreatePoint(
+            FVector3(0.0f, 0.0f, ShadowScene::kPointLightZ),
+            FLinearColor(1.0f, 1.0f, 1.0f, 1.0f),
+            ShadowScene::kLightIntensity,
+            ShadowScene::kPointLightRange);
+
+        // 衰减关掉 —— 理由与聚光灯那边相同: 判据量的是边界的位置, 亮度的
+        // 渐变会让"亮/暗"的中点随位置漂移。
+        light.SetAttenuation(1.0f, 0.0f, 0.0f);
+        light.SetCastsShadow(true);
+        light.SetDebugName("PointShadowLight");
+
+        FLightManager::Get().AddLight(static_cast<FLight&&>(light));
+
+        renderer->GetCamera().SetPosition(
+            FVector3(0.0f, 0.0f, ShadowScene::kCameraZ));
+        renderer->GetCamera().SetRotation(0.0f, 0.0f);
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Launch] 阴影场景已构建 (点光源模式) — 墙在 z={}, "
+                 "薄板在 z={}, 灯在 z={} (相机轴上), 占图集连续六块; "
+                 "影子在 |x|={} 处跨过立方体的面边界",
+                 ShadowScene::kWallZ, ShadowScene::kPointOccluderZ,
+                 ShadowScene::kPointLightZ, ShadowScene::kPointLightZ);
+        return;
+    }
 
     // ---- 主灯的遮挡板 ----
     SpawnBox(FName("ShadowOccluder"),
@@ -6542,7 +6883,8 @@ int WINAPI wWinMain(
     else if (launchOptions.ShadowScene)
     {
         BuildShadowScene(scene, &renderContext, &renderer,
-                         launchOptions.ShadowLights);
+                         launchOptions.ShadowLights,
+                         launchOptions.PointShadow);
     }
     else if (launchOptions.MaterialGrid > 0)
     {
@@ -6798,7 +7140,12 @@ int WINAPI wWinMain(
                     RunGpuDrivenChecks(&renderContext, renderer);
             }
 
-            if (launchOptions.ShadowCheck)
+            if (launchOptions.ShadowCheck && launchOptions.PointShadow)
+            {
+                shadowCheckPassed =
+                    RunPointShadowChecks(&renderContext, renderer);
+            }
+            else if (launchOptions.ShadowCheck)
             {
                 shadowCheckPassed = RunShadowChecks(
                     &renderContext, renderer,

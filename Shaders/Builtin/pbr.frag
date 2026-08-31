@@ -98,7 +98,8 @@ struct LightData {
     vec4 directionAndRange;    // xyz=方向, w=衰减距离
     vec4 colorAndIntensity;    // xyz=颜色, w=强度
     vec4 attenuationParams;    // x=常量, y=线性, z=二次, w=保留
-    vec4 spotParams;           // x=内锥角余弦, y=外锥角余弦, z=阴影块下标
+    vec4 spotParams;           // x=内锥角余弦, y=外锥角余弦,
+                               // z=阴影块下标 (点光源为第一面的块)
 };
 
 // ── 光照 UBO (set 2, binding 0) ──
@@ -592,6 +593,34 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
 //      上的 0.0015 等于把采样点沿光线推开一整个世界单位, 阴影整片脱离
 //      物体; 而画面上那看起来像"这盏灯根本没有阴影"。
 // ============================================================
+// 方向 → 立方体面下标
+//
+// **必须与 C++ 侧 CubeFaceFromDirection 逐字一致。** 两处分处不同语言, 没有
+// 任何编译期保障 —— 不一致的表现是"阴影出现在错误的那一面": 物体左边的影子
+// 跑到了右边, 而那看着像阴影矩阵算错了, 离真正的原因隔着一层。
+//
+// 平局 (两个分量绝对值相等) 时选谁都对 (棱上两个面都能覆盖到), 但两处必须
+// 选同一个, 否则棱附近会出现一条一像素宽的错误阴影。>= 链的写法因此也要
+// 逐字对应。
+int CubeFaceFromDirection(vec3 direction)
+{
+    float ax = abs(direction.x);
+    float ay = abs(direction.y);
+    float az = abs(direction.z);
+
+    if (ax >= ay && ax >= az)
+    {
+        return (direction.x > 0.0) ? 0 : 1;
+    }
+
+    if (ay >= az)
+    {
+        return (direction.y > 0.0) ? 2 : 3;
+    }
+
+    return (direction.z > 0.0) ? 4 : 5;
+}
+
 float ComputeSpotShadow(vec3 worldPos, vec3 normal, vec3 lightDir,
                         int tileIndex)
 {
@@ -738,11 +767,14 @@ vec3 ShadeOneLight(LightData light, int lightIndex,
 
     float NdotL = max(dot(N, L), 0.0);
 
-    // 阴影。两条来源:
+    // 阴影。三条来源:
     //   主方向光 (第 0 盏) 走级联贴图;
-    //   聚光灯若拿到了图集里的一块, 走图集。
+    //   聚光灯若拿到了图集里的一块, 走图集;
+    //   点光源若拿到了六块, 按片段方向选面, 走图集。
     //
-    // 点光源仍按无遮挡处理 —— 它需要六面立方体阴影, 是另一件事。
+    // 三者共用同一个 ComputeSpotShadow —— 它只要一个"世界 → 该视图裁剪空间"
+    // 的矩阵与一块 UV, 而那对透视阴影是通用的。点光源与聚光灯的差别只在
+    // "取哪一块"。
     //
     // 块下标从光源数据里读而非另建一张表: 两者只要有一处漂移, 这盏灯就会
     // 采到另一盏灯的块, 而那是个"有影子、但形状完全不对"的结果。
@@ -756,6 +788,21 @@ vec3 ShadeOneLight(LightData light, int lightIndex,
     {
         shadow = ComputeSpotShadow(fragWorldPos, N, L,
                                    int(light.spotParams.z));
+    }
+    else if (int(light.positionAndType.w) == 1 && light.spotParams.z >= 0.0)
+    {
+        // 点光源: 六个面各一块, 连续排列。块下标存的是**第一面**的,
+        // 面下标由片段相对光源的方向算出。
+        //
+        // 取的是"从光源指向片段"的方向, 与 C++ 侧算六个矩阵时的朝向一致。
+        // 取反的话每一面都会去看对面那一块 —— 而对面那一块画的是背后的
+        // 几何, 于是阴影出现在完全无关的位置。
+        vec3 toFragment = fragWorldPos - light.positionAndType.xyz;
+
+        int face = CubeFaceFromDirection(toFragment);
+
+        shadow = ComputeSpotShadow(fragWorldPos, N, L,
+                                   int(light.spotParams.z) + face);
     }
 
     return (diffuse + specular) * radiance * NdotL * shadow;
