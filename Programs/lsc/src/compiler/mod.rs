@@ -267,7 +267,7 @@ impl ShaderCompiler {
             .map_err(|e| anyhow::anyhow!("编译失败: {}", e))?;
 
         // 收集警告
-        let warnings: Vec<String> = if result.get_num_warnings() > 0 {
+        let mut warnings: Vec<String> = if result.get_num_warnings() > 0 {
             result
                 .get_warning_messages()
                 .lines()
@@ -280,8 +280,17 @@ impl ShaderCompiler {
         let spirv_binary = result.as_binary_u8().to_vec();
 
         // 生成反射信息
+        //
+        // 反射失败不能用 .ok() 吞掉: 那样 compile-all 照常报成功, 只是 .json
+        // 悄悄缺席, 下游拿不到绑定信息却看不出是哪一步断的
         let reflection = if options.generate_reflection {
-            self.reflect_spirv(&spirv_binary).ok()
+            match self.reflect_spirv(&spirv_binary) {
+                Ok(reflection) => Some(reflection),
+                Err(e) => {
+                    warnings.push(format!("反射信息提取失败: {}", e));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -495,10 +504,23 @@ impl ShaderCompiler {
                 }
 
                 // 写入反射信息
+                //
+                // 写失败也要留痕 —— 原先序列化和写盘的错误都被丢弃, 结果是
+                // 一次报"成功"但产物里没有 .json 的编译, 事后无从追查
+                let mut warnings = result.warnings;
                 if let Some(ref reflection) = result.reflection {
                     let reflection_path = output_path.with_extension("json");
-                    if let Ok(json) = serde_json::to_string_pretty(reflection) {
-                        let _ = std::fs::write(&reflection_path, json);
+                    let written = serde_json::to_string_pretty(reflection)
+                        .map_err(|e| e.to_string())
+                        .and_then(|json| {
+                            std::fs::write(&reflection_path, json).map_err(|e| e.to_string())
+                        });
+                    if let Err(e) = written {
+                        warnings.push(format!(
+                            "无法写入反射文件 {}: {}",
+                            reflection_path.display(),
+                            e
+                        ));
                     }
                 }
 
@@ -508,7 +530,7 @@ impl ShaderCompiler {
                     success: true,
                     output_size: result.spirv_binary.len(),
                     errors: Vec::new(),
-                    warnings: result.warnings,
+                    warnings,
                     duration_ms: start.elapsed().as_millis() as u64,
                 }
             }
