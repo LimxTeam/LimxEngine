@@ -161,6 +161,12 @@ struct FLaunchOptions
     /// 横向扫粗糙度、纵向扫金属度的球体阵列 —— 验证 IBL 的标准场景。
     UInt32 MaterialGrid = 0;
 
+    /// 在场景上叠加 N×N 盏点光源 (0 = 不叠加)
+    ///
+    /// 分簇剔除要有东西可剔才验得了。这个开关是**叠加**而非替换场景 ——
+    /// 光源得照到几何上才看得出剔除对不对。
+    UInt32 LightGrid = 0;
+
     /// 是否输出 BRDF 查找表的采样网格
     ///
     /// 这张表有一条硬性质可以自查: F0=1 时 A+B 应当 ≤1 且在低粗糙度下
@@ -341,6 +347,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --probe-irradiance 输出辐照度贴图六个面的中心值 (数值校验用)
 ///   --probe-brdf     输出 BRDF 查找表的采样网格 (数值校验用)
 ///   --material-grid N  构建 N×N 球体阵列 (横向粗糙度, 纵向金属度)
+///   --light-grid N   在场景上叠加 N×N 盏点光源 (分簇剔除的压力源)
 ///   --furnace        白炉测试: 合成均匀环境 + 关闭直接光
 ///   --furnace-check  白炉自检: 断言 IBL 各级预计算, 以退出码报告
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
@@ -477,6 +484,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--material-grid") && (i + 1) < tokenCount)
         {
             options.MaterialGrid = ParseUInt32(tokens[++i], 0);
+        }
+        else if (WideEquals(arg, L"--light-grid") && (i + 1) < tokenCount)
+        {
+            options.LightGrid = ParseUInt32(tokens[++i], 0);
         }
         else if (WideEquals(arg, L"--furnace"))
         {
@@ -2054,6 +2065,82 @@ static bool RunFurnaceSelfTest(FRenderContext* context)
 }
 
 // ============================================================================
+// BuildLightGrid — 在场景上方铺一层 N×N 的点光源
+//
+// 位置与颜色都是**确定的** (由下标算出, 不用随机数)。分簇剔除的验收判据是
+// "分簇结果与暴力法逐像素一致", 那要求同一命令行两次运行产出同一个场景 ——
+// 随机光源会让两次的光源集合不同, 于是比较的是两张不同的图, 而差异会被
+// 当成剔除的 bug。
+//
+// 衰减距离取得比格距小: 相邻光源的影响范围重叠但不覆盖全场, 于是每个簇
+// 只落进少数几盏光。全部覆盖全场的话分簇不剔除任何东西, 测试就退化成了
+// "两条路径都跑了全部光源", 那证明不了剔除是对的。
+// ============================================================================
+
+static void BuildLightGrid(UInt32 gridSize)
+{
+    if (gridSize == 0)
+    {
+        return;
+    }
+
+    FLightManager& lights = FLightManager::Get();
+
+    // 场景大致占据 [-6, 6] 的范围 (地面 10×10, 立方体与球在中间)
+    constexpr Float32 kExtent  = 6.0f;
+    constexpr Float32 kHeight  = 2.5f;
+
+    const Float32 step =
+        (gridSize > 1) ? (2.0f * kExtent / static_cast<Float32>(gridSize - 1))
+                       : 0.0f;
+
+    // 衰减距离取格距的 1.5 倍 —— 相邻光源重叠, 但远处的簇碰不到
+    const Float32 range = (step > 0.0f) ? (step * 1.5f) : 4.0f;
+
+    UInt32 added = 0;
+
+    for (UInt32 z = 0; z < gridSize; ++z)
+    {
+        for (UInt32 x = 0; x < gridSize; ++x)
+        {
+            const Float32 px =
+                -kExtent + step * static_cast<Float32>(x);
+            const Float32 pz =
+                -kExtent + step * static_cast<Float32>(z);
+
+            // 颜色按下标在色相上铺开 —— 剔除错了 (某盏光该亮没亮/不该亮却
+            // 亮了) 时颜色差异比亮度差异显眼得多。
+            const UInt32 index = z * gridSize + x;
+
+            const Float32 hue =
+                static_cast<Float32>(index % 6u) / 6.0f;
+
+            const FLinearColor color(
+                0.35f + 0.65f * FMath::Abs(FMath::Cos(hue * 2.0f * FMath::kPi)),
+                0.35f + 0.65f * FMath::Abs(FMath::Cos((hue + 0.333f) * 2.0f * FMath::kPi)),
+                0.35f + 0.65f * FMath::Abs(FMath::Cos((hue + 0.667f) * 2.0f * FMath::kPi)),
+                1.0f);
+
+            const UInt32 handle = lights.AddLight(
+                FLight::CreatePoint(FVector3(px, kHeight, pz), color, 2.0f,
+                                    range));
+
+            if (handle == 0xFFFFFFFFu)
+            {
+                break;
+            }
+
+            ++added;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Launch] 光源阵列: {}×{} = {} 盏点光源已添加 "
+             "(间距 {}, 衰减距离 {})",
+             gridSize, gridSize, added, step, range);
+}
+
+// ============================================================================
 // BuildMaterialGrid — 粗糙度 × 金属度 的球体阵列
 //
 // 这是验证 IBL 的标准场景, 理由是它把两个自由度摊平成一张图:
@@ -3008,6 +3095,12 @@ int WINAPI wWinMain(
     {
         LoadEnvironmentMap(environmentMap, &renderContext, &renderer,
                            launchOptions);
+    }
+
+    // 光源阵列 —— 叠加在已构建的场景之上, 不进上面那条互斥的分派链
+    if (launchOptions.LightGrid > 0)
+    {
+        BuildLightGrid(launchOptions.LightGrid);
     }
 
     // 4d. 场景开始播放 — 驱动所有节点和 Trait 的 OnBegin()
