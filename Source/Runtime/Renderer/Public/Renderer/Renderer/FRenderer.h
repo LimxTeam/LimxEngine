@@ -466,9 +466,12 @@ public:
 
     /// 分簇光照开关
     ///
-    /// 剔除通道**始终执行** (它的产出要能被自检回读比对), 这个开关只决定
-    /// 片段着色器走哪条路径。这样 --light-cull-check 可以在同一次运行里
-    /// 渲两帧再逐像素比对, 而两帧之间除了这一个布尔值什么都没变。
+    /// 同时控制剔除通道是否分派与片段着色器走哪条路径 —— 两者必须一致,
+    /// 否则要么白付剔除的开销 (关着色但跑通道), 要么读到过期的簇表
+    /// (开着色但不跑通道)。
+    ///
+    /// --light-cull-check 就是靠翻转这一个布尔值在同一次运行里渲两帧再
+    /// 逐像素比对, 两帧之间别的什么都没变。
     void SetClusteredLighting(bool enabled) { m_ClusteredLighting = enabled; }
 
     LIMX_NODISCARD bool IsClusteredLighting() const
@@ -645,8 +648,15 @@ private:
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
 
-    /// 片段着色器是否走分簇路径 (默认关 —— 先让暴力法作为基准可比)
-    bool                              m_ClusteredLighting = false;
+    /// 是否启用分簇光照
+    ///
+    /// **默认开。** 它与暴力法逐像素等价 (--light-cull-check 实测 2764800
+    /// 个通道最大差异 0/255), 而在任何多光源场景里都快一个数量级以上。
+    ///
+    /// 唯一的代价是极少光源时的固定开销: 2 盏光下前向 Pass 0.066 → 0.073 ms。
+    /// 那 0.007 ms 不值得为它引入一个"光源多少才切换"的自适应阈值 ——
+    /// 阈值意味着行为随场景内容跳变, 而跳变前后的性能差异恰恰最难归因。
+    bool                              m_ClusteredLighting = true;
     TUniquePtr<FSkyPass>              m_SkyPass;
     TUniquePtr<FForwardPass>          m_ForwardPass;
     TUniquePtr<FPostProcessPass>      m_PostProcessPass;

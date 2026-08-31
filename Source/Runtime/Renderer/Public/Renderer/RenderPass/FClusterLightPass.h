@@ -121,6 +121,9 @@ public:
     /// 设置本帧的活跃光源数与光源缓冲区
     void SetLightSource(FRHIBufferHandle lightBuffer, UInt32 lightCount);
 
+    /// 是否分派。关闭时 Execute 直接返回 —— 簇表没人读, 跑了是白付。
+    void SetEnabled(bool enabled) { m_Enabled = enabled; }
+
 private:
     ERHIResult CreateBuffers(IRHIDevice* device, UInt32 frameCount);
     ERHIResult CreateDescriptors(IRHIDevice* device, UInt32 frameCount);
@@ -167,6 +170,7 @@ private:
     Float32                     m_FarPlane           = 100.0f;
     FRHIBufferHandle            m_LightBuffer;
     UInt32                      m_LightCount         = 0;
+    bool                        m_Enabled            = true;
 
     // ---- 诊断 ----
     UInt32                      m_LastAllocated      = 0;

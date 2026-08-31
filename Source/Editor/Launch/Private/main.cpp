@@ -154,8 +154,8 @@ struct FLaunchOptions
     /// 分簇剔除自检: 回读簇表与 CPU 参照逐簇比对, 以退出码报告
     bool ClusterCheck = false;
 
-    /// 片段着色器走分簇路径
-    bool Clustered = false;
+    /// 关闭分簇, 强制走暴力法 (性能对照用)
+    bool NoClustered = false;
 
     /// 分簇着色自检: 分簇与暴力法逐像素比对, 以退出码报告
     bool LightCullCheck = false;
@@ -364,7 +364,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
 ///   --jitter         启用 TAA 亚像素抖动 (Halton 2,3, 周期 16 帧)
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
-///   --clustered      片段着色器走分簇路径 (默认走暴力法)
+///   --no-clustered   关闭分簇, 强制暴力遍历全部光源 (性能对照用)
 ///   --light-cull-check 分簇着色自检: 与暴力法逐像素比对, 以退出码报告
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
@@ -507,9 +507,9 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.Furnace = true;
         }
-        else if (WideEquals(arg, L"--clustered"))
+        else if (WideEquals(arg, L"--no-clustered"))
         {
-            options.Clustered = true;
+            options.NoClustered = true;
         }
         else if (WideEquals(arg, L"--light-cull-check"))
         {
@@ -3810,11 +3810,12 @@ int WINAPI wWinMain(
                  launchOptions.CameraYaw, launchOptions.CameraPitch);
     }
 
-    if (launchOptions.Clustered)
+    if (launchOptions.NoClustered)
     {
-        renderer.SetClusteredLighting(true);
+        renderer.SetClusteredLighting(false);
 
-        LIMX_LOG(LogLaunch, Display, "[Launch] 分簇光照已启用");
+        LIMX_LOG(LogLaunch, Display,
+                 "[Launch] 分簇光照已关闭 — 暴力遍历全部光源");
     }
 
     if (launchOptions.TemporalJitter)

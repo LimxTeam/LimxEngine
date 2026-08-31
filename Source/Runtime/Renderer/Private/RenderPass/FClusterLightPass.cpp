@@ -488,6 +488,16 @@ void FClusterLightPass::Execute(IRHICommandBuffer*        commandBuffer,
         return;
     }
 
+    if (!m_Enabled)
+    {
+        // 分簇关闭时不分派。片段着色器那边走的是暴力法, 簇表没人读 ——
+        // 跑了就是白付 0.05~0.2 ms。
+        //
+        // 开关与着色路径共用同一个布尔值 (见 FRenderer::SetClusteredLighting)。
+        // 两者不一致的话, 要么白付开销, 要么读到过期的簇表。
+        return;
+    }
+
     if (!m_LightBuffer.IsValid())
     {
         LIMX_LOG(LogRenderer, Error,

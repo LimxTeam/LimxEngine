@@ -578,6 +578,8 @@ void FRenderer::RenderFrame()
         m_ClusterLightPass->SetLightSource(
             FLightManager::Get().GetLightStorageBuffer(frameIndex),
             FLightManager::Get().GetActiveLightCount());
+
+        m_ClusterLightPass->SetEnabled(m_ClusteredLighting);
     }
 
     const Float64 recordBegin = FPlatformTime::Seconds();
