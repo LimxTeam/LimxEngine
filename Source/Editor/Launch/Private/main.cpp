@@ -51,6 +51,8 @@
 #include "Renderer/RenderPass/FDepthPrePass.h"
 #include "Core/Math/FFloat16.h"
 #include "RenderCore/Profiling/FOctahedral.h"
+#include "RenderCore/Lighting/FClusterGrid.h"
+#include "Renderer/RenderPass/FClusterLightPass.h"
 
 namespace Limx
 {
@@ -148,6 +150,9 @@ struct FLaunchOptions
 
     /// 启用 TAA 亚像素抖动 (默认关 —— TAA 本身尚未落地)
     bool TemporalJitter = false;
+
+    /// 分簇剔除自检: 回读簇表与 CPU 参照逐簇比对, 以退出码报告
+    bool ClusterCheck = false;
 
     /// 白炉测试 —— 用各方向恒为 1 的合成环境替代 HDRI, 并关掉全部直接光
     ///
@@ -352,6 +357,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --furnace-check  白炉自检: 断言 IBL 各级预计算, 以退出码报告
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
 ///   --jitter         启用 TAA 亚像素抖动 (Halton 2,3, 周期 16 帧)
+///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -492,6 +498,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--furnace"))
         {
             options.Furnace = true;
+        }
+        else if (WideEquals(arg, L"--cluster-check"))
+        {
+            options.ClusterCheck = true;
         }
         else if (WideEquals(arg, L"--jitter"))
         {
@@ -1304,6 +1314,534 @@ static FImageData BuildFurnaceEnvironment()
 }
 
 // ============================================================================
+// ============================================================================
+// FClusterCapture — 回读簇表
+//
+// 三个缓冲区: 簇包围盒、每簇的 (起点,数量)、全局光源索引表。它们都是
+// GpuOnly + TransferSrc, 拷进 GpuToCpu 的回读缓冲区之后在 CPU 上比对。
+// ============================================================================
+class FClusterCapture
+{
+public:
+    bool Request(FRenderContext* context)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr)
+        {
+            return false;
+        }
+
+        Release(device);
+
+        const UInt64 sizes[3] =
+        {
+            static_cast<UInt64>(kClusterCount) * 2u * 16u,
+            static_cast<UInt64>(kClusterCount) * 8u,
+            static_cast<UInt64>(kClusterLightIndexCapacity) * 4u,
+        };
+
+        const char* const names[3] =
+        {
+            "ClusterCheck.Bounds",
+            "ClusterCheck.Grid",
+            "ClusterCheck.Indices",
+        };
+
+        for (UInt32 i = 0; i < 3; ++i)
+        {
+            FRHIBufferDesc desc = {};
+            desc.Size        = sizes[i];
+            desc.Usage       = EBufferUsage::TransferDst;
+            desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+            desc.DebugName   = names[i];
+
+            if (!IsRHISuccess(device->CreateBuffer(desc, m_Readback[i])))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Cluster] 回读缓冲区创建失败: {}", names[i]);
+                Release(device);
+                return false;
+            }
+
+            m_Sizes[i] = sizes[i];
+        }
+
+        m_IsPending = true;
+        return true;
+    }
+
+    void RecordCopy(FRenderContext* context, FClusterLightPass* pass)
+    {
+        if (!m_IsPending || pass == nullptr)
+        {
+            return;
+        }
+
+        IRHICommandBuffer* commandBuffer = context->GetCurrentCommandBuffer();
+
+        if (commandBuffer == nullptr)
+        {
+            return;
+        }
+
+        const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+        const FRHIBufferHandle sources[3] =
+        {
+            pass->GetClusterBoundsBuffer(frameIndex),
+            pass->GetClusterGridBuffer(frameIndex),
+            pass->GetLightIndexBuffer(frameIndex),
+        };
+
+        for (UInt32 i = 0; i < 3; ++i)
+        {
+            if (!sources[i].IsValid())
+            {
+                LIMX_LOG(LogLaunch, Error, "[Cluster] 第 {} 个源缓冲区无效", i);
+                return;
+            }
+
+            // 计算通道写完之后要等它可读。分簇通道内部已经下了一道
+            // ComputeShader → FragmentShader 的屏障, 但那道屏障的目的阶段
+            // 不含 Transfer —— 拷贝需要自己的一道。
+            FRHIBufferMemoryBarrier barrier = {};
+            barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+            barrier.DstAccessMask = EAccessFlags::TransferRead;
+            barrier.Buffer        = sources[i];
+
+            commandBuffer->PipelineBarrier(
+                EPipelineStageFlags::ComputeShader,
+                EPipelineStageFlags::Transfer,
+                nullptr, 0, &barrier, 1, nullptr, 0);
+
+            FRHIBufferCopyRegion region = {};
+            region.SrcOffset = 0;
+            region.DstOffset = 0;
+            region.Size      = m_Sizes[i];
+
+            commandBuffer->CopyBuffer(sources[i], m_Readback[i], region);
+        }
+
+        m_IsPending  = false;
+        m_IsRecorded = true;
+    }
+
+    bool Resolve(FRenderContext* context)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr || !m_IsRecorded)
+        {
+            LIMX_LOG(LogLaunch, Error, "[Cluster] 拷贝命令未录制");
+            return false;
+        }
+
+        device->WaitIdle();
+
+        m_Bounds.Clear();
+        m_Grid.Clear();
+        m_Indices.Clear();
+
+        // 包围盒: 每簇两个 vec4
+        {
+            void* mapped = nullptr;
+
+            if (!IsRHISuccess(device->MapBuffer(m_Readback[0], &mapped)) ||
+                mapped == nullptr)
+            {
+                return false;
+            }
+
+            const Float32* source = static_cast<const Float32*>(mapped);
+
+            m_Bounds.Reserve(static_cast<SizeType>(kClusterCount) * 8u);
+
+            for (SizeType i = 0; i < static_cast<SizeType>(kClusterCount) * 8u;
+                 ++i)
+            {
+                m_Bounds.Add(source[i]);
+            }
+
+            device->UnmapBuffer(m_Readback[0]);
+        }
+
+        // 每簇 (起点, 数量)
+        {
+            void* mapped = nullptr;
+
+            if (!IsRHISuccess(device->MapBuffer(m_Readback[1], &mapped)) ||
+                mapped == nullptr)
+            {
+                return false;
+            }
+
+            const UInt32* source = static_cast<const UInt32*>(mapped);
+
+            m_Grid.Reserve(static_cast<SizeType>(kClusterCount) * 2u);
+
+            for (SizeType i = 0; i < static_cast<SizeType>(kClusterCount) * 2u;
+                 ++i)
+            {
+                m_Grid.Add(source[i]);
+            }
+
+            device->UnmapBuffer(m_Readback[1]);
+        }
+
+        // 索引表
+        {
+            void* mapped = nullptr;
+
+            if (!IsRHISuccess(device->MapBuffer(m_Readback[2], &mapped)) ||
+                mapped == nullptr)
+            {
+                return false;
+            }
+
+            const UInt32* source = static_cast<const UInt32*>(mapped);
+
+            m_Indices.Reserve(kClusterLightIndexCapacity);
+
+            for (SizeType i = 0; i < kClusterLightIndexCapacity; ++i)
+            {
+                m_Indices.Add(source[i]);
+            }
+
+            device->UnmapBuffer(m_Readback[2]);
+        }
+
+        m_IsRecorded = false;
+        return true;
+    }
+
+    void Release(IRHIDevice* device)
+    {
+        if (device == nullptr)
+        {
+            return;
+        }
+
+        for (UInt32 i = 0; i < 3; ++i)
+        {
+            if (m_Readback[i].IsValid())
+            {
+                device->DestroyBuffer(m_Readback[i]);
+                m_Readback[i] = {};
+            }
+        }
+
+        m_IsPending  = false;
+        m_IsRecorded = false;
+    }
+
+    LIMX_NODISCARD const TArray<Float32>& GetBounds() const { return m_Bounds; }
+    LIMX_NODISCARD const TArray<UInt32>&  GetGrid() const { return m_Grid; }
+    LIMX_NODISCARD const TArray<UInt32>&  GetIndices() const { return m_Indices; }
+
+private:
+    FRHIBufferHandle m_Readback[3] = {};
+    UInt64           m_Sizes[3]    = {};
+    TArray<Float32>  m_Bounds;
+    TArray<UInt32>   m_Grid;
+    TArray<UInt32>   m_Indices;
+    bool             m_IsPending   = false;
+    bool             m_IsRecorded  = false;
+};
+
+// ============================================================================
+// RunClusterChecks — 分簇剔除的数值自检
+//
+// 判据是"GPU 算出的簇表与 CPU 参照实现**完全一致**"。这比"看起来对"强得多:
+// 分簇错了的表现是某些角度下某些光不亮, 而那在真实场景里极难复现。
+//
+// 两份实现 (FClusterGrid.h 与 cluster_common.h + 两个 .comp) 逐行对应, 但
+// 没有编译期保障。这条检查就是那个保障。
+// ============================================================================
+static bool RunClusterChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FClusterLightPass* const pass = renderer.GetClusterLightPass();
+
+    if (pass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Cluster] 分簇通道不存在");
+        return false;
+    }
+
+    FLightManager& lights = FLightManager::Get();
+
+    if (lights.GetLightCount() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Cluster] 场景里没有光源 — 自检无从判定 "
+                 "(用 --light-grid N 造一批)");
+        return false;
+    }
+
+    FClusterCapture capture;
+
+    if (!capture.Request(context))
+    {
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(
+        [&capture, context, pass]()
+        {
+            capture.RecordCopy(context, pass);
+        });
+
+    renderer.RenderFrame();
+
+    if (!capture.Resolve(context))
+    {
+        capture.Release(context->GetDevice());
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    // ---- CPU 参照 ----
+    //
+    // 用与 GPU 完全相同的输入: 同一个相机矩阵、同一批光源、同一套网格常量。
+    const FCamera& camera = renderer.GetCamera();
+
+    const FMatrix view       = camera.GetViewMatrix();
+    const FMatrix projection = camera.GetProjectionMatrix();
+    const FMatrix inverse    = projection.Inverse();
+
+    const Float32 nearPlane = camera.GetNearPlane();
+    const Float32 farPlane  = camera.GetFarPlane();
+
+    const TArray<Float32>& gpuBounds  = capture.GetBounds();
+    const TArray<UInt32>&  gpuGrid    = capture.GetGrid();
+    const TArray<UInt32>&  gpuIndices = capture.GetIndices();
+
+    bool passed = true;
+
+    // ---- 1. 簇包围盒 ----
+    SizeType boundsMismatch = 0;
+    Float32  maxBoundsError = 0.0f;
+
+    for (UInt32 cz = 0; cz < kClusterGridZ; ++cz)
+    {
+        for (UInt32 cy = 0; cy < kClusterGridY; ++cy)
+        {
+            for (UInt32 cx = 0; cx < kClusterGridX; ++cx)
+            {
+                const UInt32 index = ClusterLinearIndex(cx, cy, cz);
+
+                const FClusterBounds expected = ComputeClusterBounds(
+                    cx, cy, cz, inverse, nearPlane, farPlane);
+
+                const Float32 actual[6] =
+                {
+                    gpuBounds[index * 8u + 0u],
+                    gpuBounds[index * 8u + 1u],
+                    gpuBounds[index * 8u + 2u],
+                    gpuBounds[index * 8u + 4u],
+                    gpuBounds[index * 8u + 5u],
+                    gpuBounds[index * 8u + 6u],
+                };
+
+                const Float32 want[6] =
+                {
+                    expected.Min.X, expected.Min.Y, expected.Min.Z,
+                    expected.Max.X, expected.Max.Y, expected.Max.Z,
+                };
+
+                // 容差按包围盒尺度给 —— 远处的簇跨越几十米, 绝对容差
+                // 在那里没有意义。
+                const Float32 scale = FMath::Max(
+                    FMath::Max(FMath::Abs(want[3] - want[0]),
+                               FMath::Abs(want[5] - want[2])),
+                    1.0f);
+
+                bool mismatched = false;
+
+                for (UInt32 k = 0; k < 6; ++k)
+                {
+                    const Float32 error = FMath::Abs(actual[k] - want[k]);
+
+                    maxBoundsError = FMath::Max(maxBoundsError,
+                                                error / scale);
+
+                    if (error > scale * 1.0e-4f)
+                    {
+                        mismatched = true;
+                    }
+                }
+
+                if (mismatched)
+                {
+                    if (boundsMismatch < 3)
+                    {
+                        LIMX_LOG(LogLaunch, Error,
+                                 "[Cluster] 簇 ({},{},{}) 包围盒不符: "
+                                 "GPU min=({},{},{}) CPU min=({},{},{})",
+                                 cx, cy, cz,
+                                 actual[0], actual[1], actual[2],
+                                 want[0], want[1], want[2]);
+                    }
+
+                    ++boundsMismatch;
+                }
+            }
+        }
+    }
+
+    if (boundsMismatch > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Cluster] {} / {} 个簇的包围盒与 CPU 参照不符",
+                 boundsMismatch, kClusterCount);
+        passed = false;
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[Cluster] 包围盒: {} 个簇全部吻合 (最大相对偏差 {})",
+                 kClusterCount, maxBoundsError);
+    }
+
+    // ---- 2. 光源分配 ----
+    //
+    // 逐簇比对光源集合。GPU 与 CPU 都按光源下标升序遍历并追加, 所以两侧
+    // 的序列必须**逐项相同**, 不只是集合相同。
+    SizeType assignMismatch = 0;
+    SizeType totalAssigned  = 0;
+    SizeType nonEmpty       = 0;
+
+    for (UInt32 cz = 0; cz < kClusterGridZ; ++cz)
+    {
+        for (UInt32 cy = 0; cy < kClusterGridY; ++cy)
+        {
+            for (UInt32 cx = 0; cx < kClusterGridX; ++cx)
+            {
+                const UInt32 index = ClusterLinearIndex(cx, cy, cz);
+
+                const UInt32 offset = gpuGrid[index * 2u];
+                const UInt32 count  = gpuGrid[index * 2u + 1u];
+
+                const FClusterBounds bounds = ComputeClusterBounds(
+                    cx, cy, cz, inverse, nearPlane, farPlane);
+
+                // CPU 侧重算这个簇该拿到哪些光
+                UInt32 expectedCount = 0;
+                bool   sequenceOk    = true;
+
+                UInt32 activeIndex = 0;
+
+                for (UInt32 l = 0; l < lights.GetLightCount(); ++l)
+                {
+                    const FLight& light = lights.GetLight(l);
+
+                    if (!light.IsEnabled())
+                    {
+                        continue;
+                    }
+
+                    const UInt32 gpuLightIndex = activeIndex;
+                    ++activeIndex;
+
+                    // 方向光不参与分簇
+                    if (light.GetType() == ELightType::Directional)
+                    {
+                        continue;
+                    }
+
+                    const FVector3 worldPos = light.GetPosition();
+
+                    const FVector4 viewPos4 = view.TransformVector4(
+                        FVector4(worldPos.X, worldPos.Y, worldPos.Z, 1.0f));
+
+                    const FVector3 viewPos(viewPos4.X, viewPos4.Y, viewPos4.Z);
+
+                    if (!SphereIntersectsAABB(viewPos, light.GetRange(),
+                                              bounds.Min, bounds.Max))
+                    {
+                        continue;
+                    }
+
+                    if (expectedCount < count)
+                    {
+                        if (gpuIndices[offset + expectedCount] != gpuLightIndex)
+                        {
+                            sequenceOk = false;
+                        }
+                    }
+
+                    ++expectedCount;
+                }
+
+                totalAssigned += count;
+
+                if (count > 0)
+                {
+                    ++nonEmpty;
+                }
+
+                if (expectedCount != count || !sequenceOk)
+                {
+                    if (assignMismatch < 3)
+                    {
+                        LIMX_LOG(LogLaunch, Error,
+                                 "[Cluster] 簇 ({},{},{}) 光源分配不符: "
+                                 "GPU {} 盏, CPU 参照 {} 盏, 序列一致={}",
+                                 cx, cy, cz, count, expectedCount,
+                                 sequenceOk ? 1 : 0);
+                    }
+
+                    ++assignMismatch;
+                }
+            }
+        }
+    }
+
+    if (assignMismatch > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Cluster] {} / {} 个簇的光源分配与 CPU 参照不符",
+                 assignMismatch, kClusterCount);
+        passed = false;
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[Cluster] 光源分配: {} 个簇全部吻合 "
+                 "(其中 {} 个非空, 共 {} 条索引)",
+                 kClusterCount, nonEmpty, totalAssigned);
+    }
+
+    // ---- 3. 判定有效性 ----
+    //
+    // 一个"什么都不分配"的实现会让上面两条全部通过 —— CPU 参照也算出零盏,
+    // 逐簇比对完美一致。必须确认真的分配出了东西。
+    //
+    // 5% 这个下限远低于任何真实场景: 演示场景只有一盏点光 (range 8) 时非空
+    // 簇就有 12340 / 18432 = 67%。它拦的不是"光源太少", 是"计算通道根本没
+    // 执行" —— 那种情况下缓冲区里是未初始化的内容。
+    if (nonEmpty * 20 < kClusterCount)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Cluster] 只有 {} / {} 个簇拿到了光源 (不足 5%) —— "
+                 "样本不足, 判定无效。计算通道是不是没执行?",
+                 nonEmpty, kClusterCount);
+        passed = false;
+    }
+
+    if (pass->HasOverflowed())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Cluster] 索引表曾经溢出 — 有光源被丢弃");
+        passed = false;
+    }
+
+    capture.Release(context->GetDevice());
+
+    return passed;
+}
+
 // ============================================================================
 // RunGBufferChecks — G-Buffer 的数值自检
 //
@@ -3121,6 +3659,7 @@ int WINAPI wWinMain(
     // 自检结果。初值为 true 但只在 --gbuffer-check 打开时才会被真正赋值,
     // 而退出码那里也判了同一个开关 —— 没开自检时它不参与任何判断。
     bool    gbufferCheckPassed = true;
+    bool    clusterCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -3169,6 +3708,11 @@ int WINAPI wWinMain(
                          static_cast<UInt64>(launchOptions.FrameLimit))
         {
             LogBenchmarkReport(launchOptions, renderer, &renderContext);
+
+            if (launchOptions.ClusterCheck)
+            {
+                clusterCheckPassed = RunClusterChecks(&renderContext, renderer);
+            }
 
             // G-Buffer 自检: 会自己再渲三帧并改动相机朝向, 所以必须放在
             // 截屏之前 —— 否则截到的是自检最后那一帧的朝向。
@@ -3255,11 +3799,19 @@ int WINAPI wWinMain(
     // 这一点看着无所谓, 其实是本项目栽过的坑: 判定值若在关闭之前就算完并
     // 直接 return, 那么关闭阶段才发现的问题 (显存泄漏、资源未回收) 永远
     // 影响不到退出码, 而它们只在日志里留一行 Error —— CI 看的是退出码。
-    const int selfCheckCode =
-        launchOptions.GBufferCheck
-            ? FinalizeSelfCheck(gbufferCheckPassed, 7, errorSink,
-                                errorsBeforeShutdown)
-            : 0;
+    int selfCheckCode = 0;
+
+    if (launchOptions.GBufferCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(gbufferCheckPassed, 7, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.ClusterCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(clusterCheckPassed, 9, errorSink,
+                                          errorsBeforeShutdown);
+    }
 
     // 移除日志 Sink 并关闭
     FLog::RemoveSink(&fileLogSink);

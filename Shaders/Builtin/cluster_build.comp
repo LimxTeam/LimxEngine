@@ -1,0 +1,148 @@
+// ============================================================================
+// cluster_build.comp — 计算每个簇在视空间的包围盒
+//
+// 每帧执行一次。理论上只在投影矩阵变化时才需要重算 (相机旋转与平移都不影响
+// 视空间的簇边界, 只有 FOV / 宽高比 / 近远平面会), 但"投影是否变了"是一个
+// 需要跟踪的状态, 而跟踪错了的表现是包围盒过期 —— 剔除依据与实际视锥不符,
+// 某些方向的光被整片漏掉。
+//
+// 每帧无条件重算把这个状态消掉了。代价是 18432 个线程做十几次乘加, 实测
+// 不到 0.01 ms —— 远低于维护一个"脏"标志的风险。
+//
+// 与 Source/Runtime/RenderCore/Public/RenderCore/Lighting/FClusterGrid.h 的
+// ComputeClusterBounds 逐行对应。
+// ============================================================================
+
+#version 450
+
+#include "cluster_common.h"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 簇包围盒 —— 每簇两个 vec4 (min.xyz / max.xyz, w 未用)
+//
+// 用 vec4 而不是 vec3: std430 里 vec3 的对齐是 16 字节, 声明成 vec3 数组会
+// 让每个元素占 16 字节而"看起来"只有 12 —— C++ 侧照 12 字节算偏移就整体
+// 错位。用 vec4 让两侧的算法都不必记住这条规则。
+layout(std430, set = 0, binding = 0) writeonly buffer ClusterBounds {
+    vec4 bounds[];   // [i*2] = min, [i*2+1] = max
+} clusterBounds;
+
+// row_major 与 C++ 侧 FMatrix 的行主序存储一致。不加的话 GLSL 按列主序
+// 解读同一段字节 —— 等于把矩阵整体转置。转置的投影逆矩阵算出的簇边界
+// 在 x/y 上差一个数量级而 z 恰好不变 (z 是显式写的 -depth), 于是每个簇
+// 都拿到错误的光源集合, 而画面上依然"有光", 只是分布不对。
+//
+// Scripts/verify.ps1 的"矩阵存储序约定"那一步会拦住漏写, --cluster-check
+// 的逐簇比对也会。这条注释是第三道 —— 前两道都是事后的。
+layout(row_major, push_constant) uniform Params {
+    // 投影矩阵的逆 —— **必须是未抖动的那一个**
+    //
+    // 抖动每帧改变亚像素偏移, 用它算出的簇边界会逐帧漂移不到一个像素。
+    // 那本身无害, 但会让"分簇结果与暴力法一致"这条验收判据变成逐帧不同,
+    // 无法比对。
+    mat4  inverseProjection;
+
+    // x = 近平面, y = 远平面, z/w 保留
+    vec4  depthRange;
+} params;
+
+// 把 NDC 的一点反投影到视空间的远平面上
+//
+// 与 FClusterGrid.h 的 UnprojectToViewRay 逐行对应, 包括那次透视除法 ——
+// 调用方随后会按深度重新缩放, 均匀缩放会抵消它的影响, 但函数的契约是
+// "远平面上的点"而不是"某个方向", CPU 那侧有专门的用例钉住这一点。
+vec3 UnprojectToViewRay(float ndcX, float ndcY)
+{
+    vec4 clip = vec4(ndcX, ndcY, 1.0, 1.0);
+    vec4 view = params.inverseProjection * clip;
+
+    if (abs(view.w) < 1.0e-9)
+    {
+        return vec3(0.0, 0.0, -1.0);
+    }
+
+    return view.xyz / view.w;
+}
+
+/// 切片下标 → 该片的近端深度 (视空间绝对值)
+float SliceNearDepth(uint slice, float nearPlane, float farPlane)
+{
+    float t = float(slice) / float(CLUSTER_GRID_Z);
+
+    return nearPlane * pow(farPlane / nearPlane, t);
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+
+    // 分派规模向上取整到 64 的倍数, 尾部的线程越界 —— 必须显式返回。
+    // 不返回的话它们会写到缓冲区之外, 而那在 Vulkan 里是未定义行为:
+    // 可能什么都不发生, 可能踩到相邻的分配。
+    if (index >= uint(CLUSTER_COUNT))
+    {
+        return;
+    }
+
+    uint clusterX = index % uint(CLUSTER_GRID_X);
+    uint clusterY = (index / uint(CLUSTER_GRID_X)) % uint(CLUSTER_GRID_Y);
+    uint clusterZ = index / uint(CLUSTER_GRID_X * CLUSTER_GRID_Y);
+
+    float nearPlane = params.depthRange.x;
+    float farPlane  = params.depthRange.y;
+
+    // 簇在 NDC 的横纵范围。Vulkan 的 NDC: x,y ∈ [-1,1], y 向下。
+    float minNdcX = float(clusterX)      / float(CLUSTER_GRID_X) * 2.0 - 1.0;
+    float maxNdcX = float(clusterX + 1u) / float(CLUSTER_GRID_X) * 2.0 - 1.0;
+    float minNdcY = float(clusterY)      / float(CLUSTER_GRID_Y) * 2.0 - 1.0;
+    float maxNdcY = float(clusterY + 1u) / float(CLUSTER_GRID_Y) * 2.0 - 1.0;
+
+    vec3 rays[4];
+    rays[0] = UnprojectToViewRay(minNdcX, minNdcY);
+    rays[1] = UnprojectToViewRay(maxNdcX, minNdcY);
+    rays[2] = UnprojectToViewRay(minNdcX, maxNdcY);
+    rays[3] = UnprojectToViewRay(maxNdcX, maxNdcY);
+
+    float nearDepth = SliceNearDepth(clusterZ,      nearPlane, farPlane);
+    float farDepth  = SliceNearDepth(clusterZ + 1u, nearPlane, farPlane);
+
+    vec3 boundsMin = vec3( 3.402823466e+38);
+    vec3 boundsMax = vec3(-3.402823466e+38);
+
+    bool any = false;
+
+    for (uint i = 0u; i < 4u; ++i)
+    {
+        float rayZ = -rays[i].z;
+
+        if (rayZ < 1.0e-9)
+        {
+            continue;
+        }
+
+        for (uint d = 0u; d < 2u; ++d)
+        {
+            float depth = (d == 0u) ? nearDepth : farDepth;
+            float t     = depth / rayZ;
+
+            vec3 corner = vec3(rays[i].x * t, rays[i].y * t, -depth);
+
+            boundsMin = min(boundsMin, corner);
+            boundsMax = max(boundsMax, corner);
+
+            any = true;
+        }
+    }
+
+    if (!any)
+    {
+        // 一条有效射线都没有 —— 逆投影矩阵不对。写一个退化的空盒, 它与
+        // 任何球都不相交, 于是这个簇不会拿到光源。
+        boundsMin = vec3(0.0);
+        boundsMax = vec3(0.0);
+    }
+
+    clusterBounds.bounds[index * 2u]      = vec4(boundsMin, 0.0);
+    clusterBounds.bounds[index * 2u + 1u] = vec4(boundsMax, 0.0);
+}

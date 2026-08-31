@@ -89,6 +89,7 @@ class FPassManager;
 class FForwardPass;
 class FShadowPass;
 class FDepthPrePass;
+class FClusterLightPass;
 class FSkyPass;
 class FPostProcessPass;
 class FEnvironmentMap;
@@ -457,6 +458,12 @@ public:
         return m_DepthPrePass.Get();
     }
 
+    /// 分簇剔除通道 —— 回读校验用
+    LIMX_NODISCARD FClusterLightPass* GetClusterLightPass() const
+    {
+        return m_ClusterLightPass.Get();
+    }
+
     /// 上一帧的 Proj * View (无抖动) —— 校验速度缓冲时做 CPU 侧对照
     ///
     /// 返回的是**下一帧将会用到的**那一个, 即刚渲染完那一帧的矩阵。
@@ -624,6 +631,7 @@ private:
     UInt64                            m_GpuFrameNumber = 0;
     TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
+    TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FSkyPass>              m_SkyPass;
     TUniquePtr<FForwardPass>          m_ForwardPass;
     TUniquePtr<FPostProcessPass>      m_PostProcessPass;

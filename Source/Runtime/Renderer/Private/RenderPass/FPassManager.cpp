@@ -136,6 +136,7 @@ ERHIResult FPassManager::SetupAll(const FPassSetupInfo& info)
     setupDesc.SharedColorFormat      = kSharedColorFormat;
     setupDesc.SharedDepthFormat      = kSharedDepthFormat;
     setupDesc.ViewProjSetLayout      = info.ViewProjSetLayout;
+    setupDesc.MaxFramesInFlight      = info.MaxFramesInFlight;
 
     for (SizeType i = 0; i < m_Passes.GetSize(); ++i)
     {

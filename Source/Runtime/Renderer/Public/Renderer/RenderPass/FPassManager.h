@@ -88,6 +88,9 @@ struct FPassSetupInfo
 
     /// set 0 (view/proj) 的描述符集布局 —— 供自建管线布局的 Pass 复用
     FRHIDescSetLayoutHandle  ViewProjSetLayout;
+
+    /// 最大并行帧数 —— 持有每帧独立资源的 Pass 需要
+    UInt32                   MaxFramesInFlight   = 0;
 };
 
 // ============================================================================

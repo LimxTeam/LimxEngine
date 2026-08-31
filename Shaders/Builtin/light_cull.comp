@@ -1,0 +1,169 @@
+// ============================================================================
+// light_cull.comp — 把光源分配到簇
+//
+// 一个线程处理一个簇: 遍历全部光源, 与该簇的包围盒做球体相交测试, 命中的
+// 写进全局索引表, 并记下该簇在表里的 (起点, 数量)。
+//
+// 索引表用一个全局原子计数器做碰撞式分配。每簇一段定长空间的做法看似更简单,
+// 但那要么浪费 (按最坏情况开) 要么静默丢弃 (按平均值开) —— 而丢弃的表现是
+// "画面某些区域的光少了几盏", 看起来像衰减参数的问题。
+//
+// **容量超限必须报出来。** 计数器溢出时本着色器把该簇的数量写成实际写入的
+// 那部分并置溢出标志, CPU 侧回读标志后打日志。静默截断在这里是最坏的选择:
+// 它只在光源密集的场景里触发, 而那正是分簇本该发挥作用的场景。
+//
+// 方向光不参与分簇 —— 它照亮整个场景, 分给每个簇等于没剔除。片段着色器
+// 单独遍历方向光。
+// ============================================================================
+
+#version 450
+
+#include "cluster_common.h"
+
+// 一个线程一个簇。64 与 cluster_build.comp 一致 —— 两个着色器的分派规模
+// 由同一段 CPU 代码算出, 局部尺寸不同的话那段代码要分叉。
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 与 pbr.frag 的 LightData 逐字段一致 (80 字节)
+struct LightData {
+    vec4 positionAndType;      // xyz=位置, w=类型
+    vec4 directionAndRange;    // xyz=方向, w=衰减距离
+    vec4 colorAndIntensity;    // xyz=颜色, w=强度
+    vec4 attenuationParams;    // x=常量, y=线性, z=二次, w=保留
+    vec4 spotParams;           // x=内锥角余弦, y=外锥角余弦, z/w=保留
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ClusterBounds {
+    vec4 bounds[];   // [i*2] = min, [i*2+1] = max
+} clusterBounds;
+
+layout(std430, set = 0, binding = 1) readonly buffer LightBuffer {
+    LightData lights[];
+} lightBuffer;
+
+// 每簇一个 uvec2: x = 在索引表里的起点, y = 数量
+layout(std430, set = 0, binding = 2) writeonly buffer ClusterGrid {
+    uvec2 grid[];
+} clusterGrid;
+
+layout(std430, set = 0, binding = 3) buffer LightIndexList {
+    uint indices[];
+} lightIndexList;
+
+// 全局分配计数器 + 溢出标志
+//
+// 单独一个缓冲区而不是塞进上面某个: 它每帧要被 CPU 清零并回读, 与那几个
+// 大缓冲区的生命周期不同。
+layout(std430, set = 0, binding = 4) buffer ClusterCounter {
+    uint allocated;   // 已分配的索引条目数
+    uint overflowed;  // 非零 = 容量不够, 有光源被丢弃
+} counter;
+
+// row_major 与 C++ 侧 FMatrix 的行主序存储一致。不加的话 GLSL 按列主序
+// 解读同一段字节 —— 等于把矩阵整体转置。转置的投影逆矩阵算出的簇边界
+// 在 x/y 上差一个数量级而 z 恰好不变 (z 是显式写的 -depth), 于是每个簇
+// 都拿到错误的光源集合, 而画面上依然"有光", 只是分布不对。
+//
+// Scripts/verify.ps1 的"矩阵存储序约定"那一步会拦住漏写, --cluster-check
+// 的逐簇比对也会。这条注释是第三道 —— 前两道都是事后的。
+layout(row_major, push_constant) uniform Params {
+    // x = 光源数量, y = 索引表容量, z/w 保留
+    uvec4 counts;
+
+    // 视矩阵 —— 光源位置在世界空间, 簇包围盒在视空间
+    mat4  view;
+} params;
+
+// 与 pbr.frag 的类型常量一致
+const float LIGHT_TYPE_DIRECTIONAL = 0.0;
+
+void main()
+{
+    uint clusterIndex = gl_GlobalInvocationID.x;
+
+    if (clusterIndex >= uint(CLUSTER_COUNT))
+    {
+        return;
+    }
+
+    vec3 boundsMin = clusterBounds.bounds[clusterIndex * 2u].xyz;
+    vec3 boundsMax = clusterBounds.bounds[clusterIndex * 2u + 1u].xyz;
+
+    uint lightCount = params.counts.x;
+    uint capacity   = params.counts.y;
+
+    // 先数一遍再分配, 而不是边测边 atomicAdd。
+    //
+    // 边测边加会让同一个簇的索引在表里不连续 (别的线程会插进来), 而片段
+    // 着色器要的是一段连续区间。先数后分配只需一次原子操作, 而且那次操作
+    // 拿到的是这个簇独占的一段。
+    //
+    // 代价是相交测试要做两遍。对 64 线程/组、每组遍历全部光源来说, 第二遍
+    // 的数据已经在缓存里, 实测比一次原子操作+不连续访问更快。
+    uint hitCount = 0u;
+
+    for (uint i = 0u; i < lightCount; ++i)
+    {
+        LightData light = lightBuffer.lights[i];
+
+        // 方向光不参与分簇 —— 它照亮整个场景, 分给每个簇等于没剔除
+        if (light.positionAndType.w == LIGHT_TYPE_DIRECTIONAL)
+        {
+            continue;
+        }
+
+        vec3  viewPos = (params.view * vec4(light.positionAndType.xyz, 1.0)).xyz;
+        float range   = light.directionAndRange.w;
+
+        if (SphereIntersectsAABB(viewPos, range, boundsMin, boundsMax))
+        {
+            ++hitCount;
+        }
+    }
+
+    uint offset = 0u;
+
+    if (hitCount > 0u)
+    {
+        offset = atomicAdd(counter.allocated, hitCount);
+
+        if (offset + hitCount > capacity)
+        {
+            // 容量不够。写多少算多少, 并置溢出标志让 CPU 侧报出来。
+            //
+            // 不是"全丢" —— 部分光比没有光更接近正确, 而标志保证了这件事
+            // 不会无声无息。
+            atomicOr(counter.overflowed, 1u);
+
+            hitCount = (offset < capacity) ? (capacity - offset) : 0u;
+        }
+    }
+
+    clusterGrid.grid[clusterIndex] = uvec2(offset, hitCount);
+
+    if (hitCount == 0u)
+    {
+        return;
+    }
+
+    uint written = 0u;
+
+    for (uint i = 0u; i < lightCount && written < hitCount; ++i)
+    {
+        LightData light = lightBuffer.lights[i];
+
+        if (light.positionAndType.w == LIGHT_TYPE_DIRECTIONAL)
+        {
+            continue;
+        }
+
+        vec3  viewPos = (params.view * vec4(light.positionAndType.xyz, 1.0)).xyz;
+        float range   = light.directionAndRange.w;
+
+        if (SphereIntersectsAABB(viewPos, range, boundsMin, boundsMax))
+        {
+            lightIndexList.indices[offset + written] = i;
+            ++written;
+        }
+    }
+}

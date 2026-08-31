@@ -67,6 +67,7 @@
 #include "RenderCore/Lighting/FLight.h"
 #include "Renderer/RenderPass/FPassManager.h"
 #include "Renderer/RenderPass/FShadowPass.h"
+#include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FSkyPass.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
 #include "Renderer/RenderPass/FPostProcessPass.h"
@@ -230,7 +231,10 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PostProcessPass = MakeUnique<FPostProcessPass>();
     m_PassManager  = MakeUnique<FPassManager>();
 
+    m_ClusterLightPass = MakeUnique<FClusterLightPass>();
+
     m_PassManager->RegisterPass(m_ShadowPass.Get());
+    m_PassManager->RegisterPass(m_ClusterLightPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
@@ -260,6 +264,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     setupInfo.SwapchainImageCount = imageCount;
     setupInfo.PipelineLayout      = m_PipelineLayout;
     setupInfo.ViewProjSetLayout   = m_DescSetLayout;
+    setupInfo.MaxFramesInFlight   = m_Context->GetMaxFramesInFlight();
 
     result = m_PassManager->SetupAll(setupInfo);
     if (!IsRHISuccess(result))
@@ -543,6 +548,25 @@ void FRenderer::RenderFrame()
 
     // 每帧上传光照 UBO (含当前相机位置)
     FLightManager::Get().UploadLightData(frameIndex, m_Camera.GetPosition());
+
+    // 分簇剔除的输入 —— 必须在 UploadLightData 之后,
+    // 因为活跃光源数是那一步算出来的。
+    //
+    // 投影矩阵传**未抖动**的那一个: 抖动每帧改变亚像素偏移, 用它算出的
+    // 簇边界会逐帧漂移不到一个像素 —— 那本身无害, 但会让"分簇结果与暴力
+    // 法一致"这条验收判据变成逐帧不同, 无法比对。
+    if (m_ClusterLightPass)
+    {
+        m_ClusterLightPass->SetCameraParams(
+            m_Camera.GetViewMatrix(),
+            m_Camera.GetProjectionMatrix(),
+            m_Camera.GetNearPlane(),
+            m_Camera.GetFarPlane());
+
+        m_ClusterLightPass->SetLightSource(
+            FLightManager::Get().GetLightStorageBuffer(frameIndex),
+            FLightManager::Get().GetActiveLightCount());
+    }
 
     const Float64 recordBegin = FPlatformTime::Seconds();
 
