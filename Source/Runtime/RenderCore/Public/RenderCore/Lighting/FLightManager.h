@@ -184,6 +184,27 @@ public:
         return m_ActiveLightCount;
     }
 
+    /// 设置分簇光照的每帧参数
+    ///
+    /// 由 FRenderer 在 UploadLightData 之前调用。近远平面必须与
+    /// FClusterLightPass 用的**同一对** —— 两处不一致的表现是片段着色器
+    /// 算出的切片下标与计算着色器写表时用的不是同一套, 于是每个像素都去
+    /// 查错误的簇, 而画面依然"有光"。
+    void SetClusterParams(bool enabled, Float32 nearPlane, Float32 farPlane,
+                          Float32 screenWidth, Float32 screenHeight)
+    {
+        m_IsClusteredEnabled  = enabled;
+        m_ClusterNearPlane    = nearPlane;
+        m_ClusterFarPlane     = farPlane;
+        m_ClusterScreenWidth  = screenWidth;
+        m_ClusterScreenHeight = screenHeight;
+    }
+
+    LIMX_NODISCARD bool IsClusteredEnabled() const
+    {
+        return m_IsClusteredEnabled;
+    }
+
     /// 获取描述符集布局 (set 2) — 用于构建管线布局
     LIMX_NODISCARD FRHIDescSetLayoutHandle GetDescSetLayout() const
     {
@@ -209,6 +230,13 @@ private:
 
     /// 上一次 UploadLightData 写进去的活跃光源数
     UInt32                      m_ActiveLightCount = 0;
+
+    // ---- 分簇光照的每帧参数 ----
+    bool                        m_IsClusteredEnabled  = false;
+    Float32                     m_ClusterNearPlane    = 0.1f;
+    Float32                     m_ClusterFarPlane     = 100.0f;
+    Float32                     m_ClusterScreenWidth  = 1.0f;
+    Float32                     m_ClusterScreenHeight = 1.0f;
 
     /// 描述符集布局 (set 2, binding 0: UniformBuffer, Vertex+Fragment)
 

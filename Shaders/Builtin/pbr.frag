@@ -39,6 +39,7 @@ layout(location = 1) in vec3 fragWorldNormal;
 layout(location = 2) in vec3 fragColor;
 layout(location = 3) in vec2 fragTexCoord;
 layout(location = 4) in vec4 fragWorldTangent;   // xyz = 切线, w = 手性 (±1)
+layout(location = 5) in float fragViewDepth;     // 视空间深度 (正值)
 
 // ── 材质参数 (set 1, binding 0) — 必须匹配 FMaterialParams std140 布局 ──
 // ── 材质表 (set 1) ──
@@ -109,13 +110,15 @@ struct LightData {
 // row_major 与 FMatrix 的行主序存储一致 —— 不加的话 GLSL 按列主序解读,
 // 等于把阴影矩阵整体转置, 阴影坐标会落到完全无关的位置。
 layout(row_major, set = 2, binding = 0) uniform LightingUBO {
-    vec4      lightCountVec;   // x=光源数量
+    vec4      lightCountVec;   // x=光源数量, y=其中方向光的数量
     vec4      cameraPosition;  // xyz=相机世界位置
     vec4      ambientColor;    // xyz=环境光颜色, w=环境光强度
     mat4      cascadeViewProj[3];  // 各级联的视图投影矩阵
     vec4      cascadeSplits;         // xyz=各级外边界的径向距离
     vec4      shadowParams;          // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
     vec4      iblParams;             // x=启用 IBL, y=强度, z=预滤波最高 mip
+    vec4      clusterParams;         // x=切片 Scale, y=切片 Bias, z/w=视口尺寸
+    vec4      clusterConfig;         // x=分簇是否启用
 } lighting;
 
 // ── 光源数组 (set 2, binding 5) ──
@@ -134,6 +137,20 @@ layout(row_major, set = 2, binding = 0) uniform LightingUBO {
 layout(std430, set = 2, binding = 5) readonly buffer LightBuffer {
     LightData lights[];
 } lightBuffer;
+
+// ── 分簇的产出 (set 2, binding 6/7) ──
+//
+// 由 FClusterLightPass 的两个计算着色器每帧写入。grid[i] 给出簇 i 在索引表
+// 里的 (起点, 数量), indices 是全局的光源下标表。
+layout(std430, set = 2, binding = 6) readonly buffer ClusterGrid {
+    uvec2 grid[];
+} clusterGrid;
+
+layout(std430, set = 2, binding = 7) readonly buffer ClusterLightIndices {
+    uint indices[];
+} clusterIndices;
+
+#include "cluster_common.h"
 
 // ── 阴影贴图数组 (set 2, binding 1) ──
 //
@@ -534,6 +551,62 @@ float ComputeShadow(vec3 worldPos, vec3 normal, vec3 lightDir)
 // ============================================================
 // 主函数
 // ============================================================
+// ── 单盏光的贡献 ──
+//
+// 从原来的循环体里原样抽出来。抽出来的唯一理由是分簇与暴力两条路径必须
+// 走**同一份代码** —— 各写一遍的话, --light-cull-check 比出来的差异里就
+//混进了"两份代码本来就不完全一样"这个因素。
+//
+// lightIndex 只用于判断"是不是第 0 盏方向光"(当前只有它投射阴影)。
+vec3 ShadeOneLight(LightData light, int lightIndex,
+                   vec3 N, vec3 V, vec3 F0,
+                   vec3 albedo, float roughness, float metallic)
+{
+    // 光照方向 (从片段指向光源)
+    vec3 L = GetLightDirection(light, fragWorldPos);
+
+    // 半程向量
+    vec3 H = normalize(V + L);
+
+    // 衰减
+    float attenuation = CalcAttenuation(light, fragWorldPos);
+
+    // 入射辐照度 = 光源颜色 × 强度 × 衰减
+    vec3 radiance = light.colorAndIntensity.xyz *
+                    light.colorAndIntensity.w *
+                    attenuation;
+
+    // ---- Cook-Torrance BRDF ----
+    float D = DistributionGGX(N, H, roughness);
+    float G = GeometrySmith(N, V, L, roughness);
+    vec3  F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    vec3  numerator   = D * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) *
+                        max(dot(N, L), 0.0) + 0.0001;
+    vec3 specular = numerator / denominator;
+
+    // 能量守恒: kS = F (镜面反射比例)
+    vec3 kS = F;
+
+    // kD = 1 - kS (漫反射比例, 金属无漫反射)
+    vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
+
+    // Lambert 漫反射
+    vec3 diffuse = kD * albedo / PI;
+
+    float NdotL = max(dot(N, L), 0.0);
+
+    // 阴影 —— 当前只有主方向光(第 0 盏)投射阴影。
+    // 其余光源按无遮挡处理: 每盏光一张阴影贴图的代价与收益在这个阶段完全
+    // 不成比例, 而"只有主光有影子"在户外场景里几乎看不出来。
+    float shadow = (lightIndex == 0 && int(light.positionAndType.w) == 0)
+                       ? ComputeShadow(fragWorldPos, N, L)
+                       : 1.0;
+
+    return (diffuse + specular) * radiance * NdotL * shadow;
+}
+
 void main()
 {
     // 取本次绘制的材质。
@@ -592,60 +665,55 @@ void main()
     F0 = mix(F0, albedo, metallic);
 
     // ---- 累积所有光源的辐照度 ----
+    //
+    // 两条路径, 同一个着色函数 (ShadeOneLight):
+    //   分簇开 — 方向光走 [0, dirCount), 其余走本像素所在簇的索引区间
+    //   分簇关 — 全部光源一遍
+    //
+    // 用运行时分支而不是两个着色器变体, 是为了让 --light-cull-check 能在
+    // **同一份代码**上比对两条路径。两个变体的话, 比出来的差异里就分不清
+    // 哪些来自剔除、哪些来自编译器对两份代码的不同优化。
     vec3 Lo = vec3(0.0);
 
     int lightCount = int(lighting.lightCountVec.x);
+    int dirCount   = int(lighting.lightCountVec.y);
 
-    for (int i = 0; i < lightCount; ++i)
+    bool clustered = lighting.clusterConfig.x > 0.5;
+
+    if (clustered)
     {
-        LightData light = lightBuffer.lights[i];
+        // 方向光不参与分簇 —— 它照亮整个场景, 分给每个簇等于没剔除。
+        // FLightManager 保证它们占据 [0, dirCount)。
+        for (int i = 0; i < dirCount; ++i)
+        {
+            Lo += ShadeOneLight(lightBuffer.lights[i], i, N, V, F0,
+                                albedo, roughness, metallic);
+        }
 
-        // 光照方向 (从片段指向光源)
-        vec3 L = GetLightDirection(light, fragWorldPos);
+        uint clusterIndex = ClusterIndexForFragment(
+            gl_FragCoord.xy,
+            lighting.clusterParams.zw,
+            fragViewDepth,
+            lighting.clusterParams.x,
+            lighting.clusterParams.y);
 
-        // 半程向量
-        vec3 H = normalize(V + L);
+        uvec2 range = clusterGrid.grid[clusterIndex];
 
-        // 衰减
-        float attenuation = CalcAttenuation(light, fragWorldPos);
+        for (uint k = 0u; k < range.y; ++k)
+        {
+            int i = int(clusterIndices.indices[range.x + k]);
 
-        // 入射辐照度 = 光源颜色 × 强度 × 衰减
-        vec3 radiance = light.colorAndIntensity.xyz *
-                        light.colorAndIntensity.w *
-                        attenuation;
-
-        // ---- Cook-Torrance BRDF ----
-        float D = DistributionGGX(N, H, roughness);
-        float G = GeometrySmith(N, V, L, roughness);
-        vec3  F = FresnelSchlick(max(dot(H, V), 0.0), F0);
-
-        // 镜面反射项
-        vec3  numerator   = D * G * F;
-        float denominator = 4.0 * max(dot(N, V), 0.0) *
-                            max(dot(N, L), 0.0) + 0.0001;
-        vec3 specular = numerator / denominator;
-
-        // 能量守恒: kS = F (镜面反射比例)
-        vec3 kS = F;
-
-        // kD = 1 - kS (漫反射比例, 金属无漫反射)
-        vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
-
-        // Lambert 漫反射
-        vec3 diffuse = kD * albedo / PI;
-
-        // N·L 因子
-        float NdotL = max(dot(N, L), 0.0);
-
-        // 阴影 —— 当前只有主方向光(第 0 盏)投射阴影。
-        // 其余光源按无遮挡处理: 每盏光一张阴影贴图的代价与收益在这个
-        // 阶段完全不成比例, 而"只有主光有影子"在户外场景里几乎看不出来。
-        float shadow = (i == 0 && int(light.positionAndType.w) == 0)
-                           ? ComputeShadow(fragWorldPos, N, L)
-                           : 1.0;
-
-        // 累加该光源贡献
-        Lo += (diffuse + specular) * radiance * NdotL * shadow;
+            Lo += ShadeOneLight(lightBuffer.lights[i], i, N, V, F0,
+                                albedo, roughness, metallic);
+        }
+    }
+    else
+    {
+        for (int i = 0; i < lightCount; ++i)
+        {
+            Lo += ShadeOneLight(lightBuffer.lights[i], i, N, V, F0,
+                                albedo, roughness, metallic);
+        }
     }
 
     // ---- 环境光 ----

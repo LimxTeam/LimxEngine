@@ -154,6 +154,12 @@ struct FLaunchOptions
     /// 分簇剔除自检: 回读簇表与 CPU 参照逐簇比对, 以退出码报告
     bool ClusterCheck = false;
 
+    /// 片段着色器走分簇路径
+    bool Clustered = false;
+
+    /// 分簇着色自检: 分簇与暴力法逐像素比对, 以退出码报告
+    bool LightCullCheck = false;
+
     /// 白炉测试 —— 用各方向恒为 1 的合成环境替代 HDRI, 并关掉全部直接光
     ///
     /// 能量守恒唯一的客观判据: 反照率为 1 的表面在这个环境下必须原样反射
@@ -358,6 +364,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
 ///   --jitter         启用 TAA 亚像素抖动 (Halton 2,3, 周期 16 帧)
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
+///   --clustered      片段着色器走分簇路径 (默认走暴力法)
+///   --light-cull-check 分簇着色自检: 与暴力法逐像素比对, 以退出码报告
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -498,6 +506,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--furnace"))
         {
             options.Furnace = true;
+        }
+        else if (WideEquals(arg, L"--clustered"))
+        {
+            options.Clustered = true;
+        }
+        else if (WideEquals(arg, L"--light-cull-check"))
+        {
+            options.LightCullCheck = true;
         }
         else if (WideEquals(arg, L"--cluster-check"))
         {
@@ -1005,6 +1021,57 @@ public:
         }
 
         return written;
+    }
+
+    /// 等 GPU 空闲后把像素读成 RGB 字节数组 (不写文件)
+    ///
+    /// 与 WriteFile 共用同一套通道序处理。分簇与暴力法的逐像素比对要的是
+    /// 内存里的两张图 —— 落盘再读回来除了慢没有别的好处, 而且会让比对的
+    /// 对象变成"两个 PPM 文件", 多一层可能出错的编解码。
+    bool ReadPixels(FRenderContext* context, TArray<UInt8>& outPixels)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr || !m_IsRecorded || !m_Readback.IsValid())
+        {
+            LIMX_LOG(LogLaunch, Error, "[截屏] 拷贝未录制");
+            return false;
+        }
+
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (!IsRHISuccess(device->MapBuffer(m_Readback, &mapped)) ||
+            mapped == nullptr)
+        {
+            LIMX_LOG(LogLaunch, Error, "[截屏] 回读缓冲区映射失败");
+            return false;
+        }
+
+        const UInt8*   source     = static_cast<const UInt8*>(mapped);
+        const SizeType pixelCount =
+            static_cast<SizeType>(m_Extent.Width) * m_Extent.Height;
+
+        const bool isBgra = (m_Format == EPixelFormat::BGRA8_UNORM) ||
+                            (m_Format == EPixelFormat::BGRA8_SRGB);
+
+        outPixels.Clear();
+        outPixels.Reserve(pixelCount * 3);
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            const UInt8* texel = source + i * 4;
+
+            outPixels.Add(isBgra ? texel[2] : texel[0]);
+            outPixels.Add(texel[1]);
+            outPixels.Add(isBgra ? texel[0] : texel[2]);
+        }
+
+        device->UnmapBuffer(m_Readback);
+
+        m_IsRecorded = false;
+        return true;
     }
 
     void Release(IRHIDevice* device)
@@ -1548,6 +1615,158 @@ private:
     bool             m_IsPending   = false;
     bool             m_IsRecorded  = false;
 };
+
+// ============================================================================
+// RunLightCullChecks — 分簇着色与暴力法的逐像素比对
+//
+// 这是分簇光照最强的一条验收判据: **同一帧、同一个着色器、只翻转一个布尔
+// 值**, 两次的画面必须完全一致。分簇的定义就是"剔掉那些照不到本像素的光",
+// 所以正确的剔除对最终颜色的影响必须恰好为零。
+//
+// 前一条 (--cluster-check) 验的是簇表本身与 CPU 参照一致; 这一条验的是
+// 片段着色器**用对了**那张表 —— 切片映射、屏幕分块、索引区间的读取。两者
+// 覆盖的是完全不同的失效方式: 簇表全对而片段着色器查错簇, 前一条全绿。
+//
+// 判据不留容差: 两条路径累加的是同一批光源的同一批贡献, 只是遍历顺序不同。
+// 浮点加法不满足结合律, 所以顺序不同**会**带来最低位的差异 —— 因此判据是
+// "每个通道差不超过 1/255", 那正好是 8 位输出的一个量化档。
+// ============================================================================
+static bool RunLightCullChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FClusterLightPass* const pass = renderer.GetClusterLightPass();
+
+    if (pass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[LightCull] 分簇通道不存在");
+        return false;
+    }
+
+    FScreenshotCapture brute;
+    FScreenshotCapture clustered;
+
+    const bool originalMode = renderer.IsClusteredLighting();
+
+    // ---- 暴力法 ----
+    renderer.SetClusteredLighting(false);
+
+    if (!brute.Request(context))
+    {
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(
+        [&brute, context]() { brute.RecordCopy(context); });
+
+    renderer.RenderFrame();
+
+    TArray<UInt8> bruteImage;
+
+    if (!brute.ReadPixels(context, bruteImage))
+    {
+        brute.Release(context->GetDevice());
+        return false;
+    }
+
+    // ---- 分簇 ----
+    renderer.SetClusteredLighting(true);
+
+    if (!clustered.Request(context))
+    {
+        brute.Release(context->GetDevice());
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(
+        [&clustered, context]() { clustered.RecordCopy(context); });
+
+    renderer.RenderFrame();
+
+    TArray<UInt8> clusteredImage;
+
+    if (!clustered.ReadPixels(context, clusteredImage))
+    {
+        brute.Release(context->GetDevice());
+        clustered.Release(context->GetDevice());
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+    renderer.SetClusteredLighting(originalMode);
+
+    brute.Release(context->GetDevice());
+    clustered.Release(context->GetDevice());
+
+    // ---- 比对 ----
+    bool passed = true;
+
+    if (bruteImage.GetSize() != clusteredImage.GetSize() ||
+        bruteImage.GetSize() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LightCull] 两次回读的尺寸不同 ({} vs {})",
+                 bruteImage.GetSize(), clusteredImage.GetSize());
+        return false;
+    }
+
+    SizeType overTolerance = 0;
+    UInt32   maxDiff       = 0;
+    SizeType nonBlack      = 0;
+
+    for (SizeType i = 0; i < bruteImage.GetSize(); ++i)
+    {
+        const UInt32 a = bruteImage[i];
+        const UInt32 b = clusteredImage[i];
+
+        const UInt32 diff = (a > b) ? (a - b) : (b - a);
+
+        maxDiff = FMath::Max(maxDiff, diff);
+
+        if (diff > 1u)
+        {
+            ++overTolerance;
+        }
+
+        if (a > 8u)
+        {
+            ++nonBlack;
+        }
+    }
+
+    // 全黑画面下两张图当然一致 —— 那证明不了任何事。
+    if (nonBlack * 10 < bruteImage.GetSize())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LightCull] 画面几乎全黑 ({} / {} 个通道有值) —— "
+                 "比对无意义, 判定无效",
+                 nonBlack, bruteImage.GetSize());
+        passed = false;
+    }
+
+    if (overTolerance > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LightCull] {} / {} 个通道的差异超过 1/255 (最大 {}) —— "
+                 "分簇剔掉了本该照到的光, 或者查错了簇",
+                 overTolerance, bruteImage.GetSize(), maxDiff);
+        passed = false;
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[LightCull] 分簇与暴力法逐像素一致 "
+                 "({} 个通道, 最大差异 {}/255)",
+                 bruteImage.GetSize(), maxDiff);
+    }
+
+    if (pass->HasOverflowed())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LightCull] 索引表曾经溢出 — 比对结果不可信");
+        passed = false;
+    }
+
+    return passed;
+}
 
 // ============================================================================
 // RunClusterChecks — 分簇剔除的数值自检
@@ -3591,6 +3810,13 @@ int WINAPI wWinMain(
                  launchOptions.CameraYaw, launchOptions.CameraPitch);
     }
 
+    if (launchOptions.Clustered)
+    {
+        renderer.SetClusteredLighting(true);
+
+        LIMX_LOG(LogLaunch, Display, "[Launch] 分簇光照已启用");
+    }
+
     if (launchOptions.TemporalJitter)
     {
         renderer.SetTemporalJitterEnabled(true);
@@ -3660,6 +3886,7 @@ int WINAPI wWinMain(
     // 而退出码那里也判了同一个开关 —— 没开自检时它不参与任何判断。
     bool    gbufferCheckPassed = true;
     bool    clusterCheckPassed = true;
+    bool    lightCullCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -3712,6 +3939,12 @@ int WINAPI wWinMain(
             if (launchOptions.ClusterCheck)
             {
                 clusterCheckPassed = RunClusterChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.LightCullCheck)
+            {
+                lightCullCheckPassed =
+                    RunLightCullChecks(&renderContext, renderer);
             }
 
             // G-Buffer 自检: 会自己再渲三帧并改动相机朝向, 所以必须放在
@@ -3810,6 +4043,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.ClusterCheck)
     {
         selfCheckCode = FinalizeSelfCheck(clusterCheckPassed, 9, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.LightCullCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(lightCullCheckPassed, 10, errorSink,
                                           errorsBeforeShutdown);
     }
 

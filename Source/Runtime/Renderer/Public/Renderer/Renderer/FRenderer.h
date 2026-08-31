@@ -464,6 +464,18 @@ public:
         return m_ClusterLightPass.Get();
     }
 
+    /// 分簇光照开关
+    ///
+    /// 剔除通道**始终执行** (它的产出要能被自检回读比对), 这个开关只决定
+    /// 片段着色器走哪条路径。这样 --light-cull-check 可以在同一次运行里
+    /// 渲两帧再逐像素比对, 而两帧之间除了这一个布尔值什么都没变。
+    void SetClusteredLighting(bool enabled) { m_ClusteredLighting = enabled; }
+
+    LIMX_NODISCARD bool IsClusteredLighting() const
+    {
+        return m_ClusteredLighting;
+    }
+
     /// 上一帧的 Proj * View (无抖动) —— 校验速度缓冲时做 CPU 侧对照
     ///
     /// 返回的是**下一帧将会用到的**那一个, 即刚渲染完那一帧的矩阵。
@@ -632,6 +644,9 @@ private:
     TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
+
+    /// 片段着色器是否走分簇路径 (默认关 —— 先让暴力法作为基准可比)
+    bool                              m_ClusteredLighting = false;
     TUniquePtr<FSkyPass>              m_SkyPass;
     TUniquePtr<FForwardPass>          m_ForwardPass;
     TUniquePtr<FPostProcessPass>      m_PostProcessPass;

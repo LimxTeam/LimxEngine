@@ -170,7 +170,10 @@ struct FCascadedShadowInfo
 //                                        z=阴影贴图边长, w=是否启用
 //   偏移 272:    IblParams      (vec4) — x=是否启用, y=强度倍数,
 //                                        z=预滤波最高 mip 下标
-//   总计: 288 字节
+//   偏移 288:    ClusterParams  (vec4) — x=切片 Scale, y=切片 Bias,
+//                                        z=视口宽, w=视口高
+//   偏移 304:    ClusterConfig  (vec4) — x=分簇是否启用
+//   总计: 320 字节
 //
 // 光源数组已移出 (见上方说明), 因此从 1568 降到 288 —— 其后每个字段的
 // 偏移都变了。这份清单以 lsc 的 SPIR-V 反射为准, 且
@@ -201,9 +204,15 @@ struct FLightingUBO
     // 数据, 而它产出的簇索引表必须是 storage buffer (要原子写入) —— 两者
     // 用同一种缓冲区, 绑定与屏障都少一套。
 
-    // vec4: x=活跃光源数量 (uint→float), y/z/w=保留
-    Float32 LightCount     = 0.0f;
-    Float32 LightCountPad0 = 0.0f;
+    // vec4: x=活跃光源数量, y=其中方向光的数量, z/w=保留
+    //
+    // 方向光排在 storage buffer 的**最前面** [0, DirectionalCount)。这不是
+    // 整理癖: 方向光不参与分簇剔除 (它照亮整个场景, 分给每个簇等于没剔除),
+    // 所以分簇模式下片段着色器必须单独遍历它们。若它们散落在缓冲区各处,
+    // 那一遍就得扫过全部光源并逐个判类型 —— 每像素 O(N) 的分支, 而分簇的
+    // 全部意义就是消掉那个 O(N)。
+    Float32 LightCount        = 0.0f;
+    Float32 DirectionalCount  = 0.0f;
     Float32 LightCountPad1 = 0.0f;
     Float32 LightCountPad2 = 0.0f;
 
@@ -264,6 +273,26 @@ struct FLightingUBO
     Float32 IblPrefilteredMaxLod = 0.0f;
 
     Float32 IblPad0      = 0.0f;
+
+    // vec4: 分簇的切片映射 — x=Scale, y=Bias, z=视口宽, w=视口高
+    //
+    // Scale/Bias 由近远平面算出 (见 FClusterGrid.h 的 ComputeSliceMapping),
+    // 片段着色器用 log2(viewDepth) * Scale + Bias 求切片下标。放在 UBO 里
+    // 而不是着色器里现算, 因为它只与相机有关, 每帧算一次就够。
+    Float32 ClusterSliceScale = 0.0f;
+    Float32 ClusterSliceBias  = 0.0f;
+    Float32 ClusterScreenW    = 0.0f;
+    Float32 ClusterScreenH    = 0.0f;
+
+    // vec4: x=分簇是否启用(0/1), y/z/w 保留
+    //
+    // 运行时开关而不是着色器变体: --light-cull-check 要在**同一个着色器**
+    // 里跑两条路径再逐像素比对。两个变体的话, 比出来的差异里就分不清哪些
+    // 来自剔除、哪些来自编译器对两份代码的不同优化。
+    Float32 ClusteredEnabled  = 0.0f;
+    Float32 ClusterPad0       = 0.0f;
+    Float32 ClusterPad1       = 0.0f;
+    Float32 ClusterPad2       = 0.0f;
 };
 
 // 编译时验证 FLightingUBO 大小
@@ -271,8 +300,8 @@ struct FLightingUBO
 // + mat4×3 级联矩阵 192 + vec4 切分 16 + vec4 阴影参数 16 = 1552 字节
 // + vec4 IBL 参数 16 = 1568 字节
 // std140 要求数组元素与结构体尾部都对齐到 16 字节, 1568 已是 16 的倍数
-static_assert(sizeof(FLightingUBO) == 288,
-    "FLightingUBO 必须为 288 字节 (std140 对齐) — 与 pbr.frag 的 "
+static_assert(sizeof(FLightingUBO) == 320,
+    "FLightingUBO 必须为 320 字节 (std140 对齐) — 与 pbr.frag 的 "
     "LightingUBO 块一致, 由 Scripts/verify-shader-layout.ps1 逐次核对");
 
 // ============================================================================

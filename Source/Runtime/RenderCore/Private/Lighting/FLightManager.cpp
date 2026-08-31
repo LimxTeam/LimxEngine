@@ -36,6 +36,7 @@
 // ============================================================
 
 #include "RenderCore/Lighting/FLightManager.h"
+#include "RenderCore/Lighting/FClusterGrid.h"
 
 namespace Limx
 {
@@ -108,7 +109,9 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     //
     // 光源从 UBO 挪到 SSBO 之后, binding 0 里只剩全局参数。StageFlags 必须
     // 含 Compute: 分簇剔除的计算着色器读的是同一份数据。
-    FRHIDescriptorBinding bindings[6] = {};
+    //   set 2, binding 6 — 每簇的 (起点, 数量)
+    //   set 2, binding 7 — 全局光源索引表
+    FRHIDescriptorBinding bindings[8] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -143,11 +146,23 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[5].Binding    = 5;
     bindings[5].Type       = EDescriptorType::StorageBuffer;
     bindings[5].Count      = 1;
-    bindings[5].StageFlags = EShaderStage::Fragment | EShaderStage::Compute;
+    bindings[5].StageFlags = EShaderStage::Fragment;
+
+    // 分簇的产出。计算通道用的是它自己的 set 0, 不经过这里 —— 这两个
+    // binding 只给片段着色器读。
+    bindings[6].Binding    = 6;
+    bindings[6].Type       = EDescriptorType::StorageBuffer;
+    bindings[6].Count      = 1;
+    bindings[6].StageFlags = EShaderStage::Fragment;
+
+    bindings[7].Binding    = 7;
+    bindings[7].Type       = EDescriptorType::StorageBuffer;
+    bindings[7].Count      = 1;
+    bindings[7].StageFlags = EShaderStage::Fragment;
 
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 6;
+    layoutDesc.BindingCount = 8;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -368,6 +383,7 @@ void FLightManager::UploadLightData(
 
     // 打包所有启用的光源, 写进 storage buffer
     UInt32 activeLightCount = 0;
+    UInt32 directionalCount = 0;
 
     void* lightPtr = nullptr;
 
@@ -377,25 +393,52 @@ void FLightManager::UploadLightData(
     {
         FLightData* const lights = static_cast<FLightData*>(lightPtr);
 
-        for (SizeType i = 0; i < m_Lights.GetSize(); ++i)
+        // 两趟: 方向光先写, 其余随后。
+        //
+        // 方向光必须占据 [0, DirectionalCount) —— 它们不参与分簇剔除, 所以
+        // 分簇模式下片段着色器要单独遍历它们。散落在缓冲区各处的话, 那一遍
+        // 就得扫过全部光源并逐个判类型, 每像素 O(N) 的分支, 而分簇的全部
+        // 意义就是消掉那个 O(N)。
+        bool truncated = false;
+
+        for (UInt32 phase = 0; phase < 2u && !truncated; ++phase)
         {
-            if (!m_Lights[i].IsEnabled())
-            {
-                continue;
-            }
+            const bool wantDirectional = (phase == 0u);
 
-            if (activeLightCount >= kMaxLightCount)
+            for (SizeType i = 0; i < m_Lights.GetSize(); ++i)
             {
-                // 超过上限时明确报出来。静默截断的表现是"多放的光源不亮",
-                // 而那看起来像是强度或衰减参数没调好。
-                LIMX_LOG(LogLighting, Warning,
-                         "[LightManager] 活跃光源超过上限 {} — 其余被忽略",
-                         kMaxLightCount);
-                break;
-            }
+                if (!m_Lights[i].IsEnabled())
+                {
+                    continue;
+                }
 
-            lights[activeLightCount] = m_Lights[i].ToGpuData();
-            ++activeLightCount;
+                const bool isDirectional =
+                    (m_Lights[i].GetType() == ELightType::Directional);
+
+                if (isDirectional != wantDirectional)
+                {
+                    continue;
+                }
+
+                if (activeLightCount >= kMaxLightCount)
+                {
+                    // 超过上限时明确报出来。静默截断的表现是"多放的光源
+                    // 不亮", 而那看起来像是强度或衰减参数没调好。
+                    LIMX_LOG(LogLighting, Warning,
+                             "[LightManager] 活跃光源超过上限 {} — 其余被忽略",
+                             kMaxLightCount);
+                    truncated = true;
+                    break;
+                }
+
+                lights[activeLightCount] = m_Lights[i].ToGpuData();
+                ++activeLightCount;
+
+                if (wantDirectional)
+                {
+                    ++directionalCount;
+                }
+            }
         }
 
         m_Device->UnmapBuffer(m_LightStorageBuffers[frameIndex]);
@@ -409,10 +452,20 @@ void FLightManager::UploadLightData(
     m_ActiveLightCount = activeLightCount;
 
     // 写入全局光照参数
-    uboData.LightCount     = static_cast<Float32>(activeLightCount);
-    uboData.LightCountPad0 = 0.0f;
-    uboData.LightCountPad1 = 0.0f;
-    uboData.LightCountPad2 = 0.0f;
+    uboData.LightCount       = static_cast<Float32>(activeLightCount);
+    uboData.DirectionalCount = static_cast<Float32>(directionalCount);
+    uboData.LightCountPad1   = 0.0f;
+    uboData.LightCountPad2   = 0.0f;
+
+    // 分簇参数
+    const FClusterSliceMapping mapping =
+        ComputeSliceMapping(m_ClusterNearPlane, m_ClusterFarPlane);
+
+    uboData.ClusterSliceScale = mapping.Scale;
+    uboData.ClusterSliceBias  = mapping.Bias;
+    uboData.ClusterScreenW    = m_ClusterScreenWidth;
+    uboData.ClusterScreenH    = m_ClusterScreenHeight;
+    uboData.ClusteredEnabled  = m_IsClusteredEnabled ? 1.0f : 0.0f;
 
     uboData.CameraPositionX = cameraPosition.X;
     uboData.CameraPositionY = cameraPosition.Y;

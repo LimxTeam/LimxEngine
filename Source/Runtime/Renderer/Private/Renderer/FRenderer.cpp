@@ -546,6 +546,18 @@ void FRenderer::RenderFrame()
         }
     }
 
+    // 分簇参数必须在 UploadLightData **之前**设 —— 那一步会把它们打包进 UBO
+    {
+        const FRHIExtent2D clusterExtent = m_Context->GetSwapchainExtent();
+
+        FLightManager::Get().SetClusterParams(
+            m_ClusteredLighting,
+            m_Camera.GetNearPlane(),
+            m_Camera.GetFarPlane(),
+            static_cast<Float32>(clusterExtent.Width),
+            static_cast<Float32>(clusterExtent.Height));
+    }
+
     // 每帧上传光照 UBO (含当前相机位置)
     FLightManager::Get().UploadLightData(frameIndex, m_Camera.GetPosition());
 
@@ -1453,7 +1465,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         //
         // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
         // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[6];
+        FRHIDescriptorWrite writes[8];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1500,7 +1512,22 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             0,
             sizeof(FLightData) * kMaxLightCount);
 
-        device->UpdateDescriptorSets(writes, 6);
+        // binding 6/7 — 分簇的产出
+        //
+        // 这两个缓冲区由 FClusterLightPass 持有, 而它在 SetupAll 里已经建好
+        // (本函数在 SetupAll 之后调用)。尺寸与分辨率无关, 所以写一次就够,
+        // 交换链重建也不必重写 —— 那正是选固定簇网格的理由之一。
+        writes[6] = FRHIDescriptorWrite::StorageBuffer(
+            descSet, 6,
+            m_ClusterLightPass->GetClusterGridBuffer(i), 0,
+            static_cast<UInt64>(kClusterCount) * 8u);
+
+        writes[7] = FRHIDescriptorWrite::StorageBuffer(
+            descSet, 7,
+            m_ClusterLightPass->GetLightIndexBuffer(i), 0,
+            static_cast<UInt64>(kClusterLightIndexCapacity) * 4u);
+
+        device->UpdateDescriptorSets(writes, 8);
 
         m_LightDescriptorSets.Add(descSet);
     }

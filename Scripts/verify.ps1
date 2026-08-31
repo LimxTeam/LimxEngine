@@ -446,6 +446,20 @@ Invoke-Step 'G-Buffer 自检 (开 TAA 抖动)' -RequiresGpu {
     Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check --jitter'
 }
 
+# 分簇光照自检 —— 需要真实 GPU。
+#
+# 两条判据覆盖的是完全不同的失效方式:
+#   --cluster-check    回读簇表, 与 FClusterGrid.h 的 CPU 参照逐簇比对。
+#                      验的是簇表本身对不对。
+#   --light-cull-check 同一帧、同一个着色器、只翻转分簇开关, 两次画面必须
+#                      逐像素一致。验的是片段着色器**用对了**那张表 ——
+#                      切片映射、屏幕分块、索引区间的读取。
+#
+# 簇表全对而片段着色器查错簇时, 前一条全绿。反过来也一样。
+Invoke-Step '分簇光照自检 (簇表 + 逐像素等价)' -RequiresGpu {
+    Invoke-Engine '--light-grid 12 --frames 20 --warmup 5 --cluster-check --light-cull-check'
+}
+
 # 图像回归 —— 需要真实 GPU。
 #
 # 前面所有的 GPU 自检验的都是**数值性质** (速度为零、法线朝向相机、能量

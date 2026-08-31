@@ -47,6 +47,13 @@ layout(location = 2) out vec3 fragColor;
 layout(location = 3) out vec2 fragTexCoord;
 layout(location = 4) out vec4 fragWorldTangent;
 
+// 视空间深度的绝对值 —— 分簇要用它求切片下标
+//
+// 从 gl_FragCoord.z 反算也行, 但那需要片段着色器拿到投影矩阵或近远平面,
+// 而且反算本身是一次除法加两次乘加。这里一个插值器换掉那些 —— 插值是
+// 透视校正的, 所以结果与逐像素重算完全一致。
+layout(location = 5) out float fragViewDepth;
+
 void main()
 {
     // 世界空间位置
@@ -57,6 +64,9 @@ void main()
     // 必须与 gbuffer.vert 写法逐字相同 —— 前向 Pass 的深度测试是 Equal,
     // 两处算出的 z 差一个 ulp 就会让整个物体被剔除。
     gl_Position = ubo.viewProj * worldPos;
+
+    // 视空间 -Z 为前方, 取绝对值
+    fragViewDepth = -(ubo.view * worldPos).z;
 
     // 世界空间法线 (使用 model 矩阵的逆转置 3x3 子矩阵)
     // 对于等比缩放场景，mat3(model) 等价于法线矩阵
