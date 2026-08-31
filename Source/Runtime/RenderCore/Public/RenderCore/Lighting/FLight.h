@@ -72,7 +72,13 @@ enum class ELightType : UInt32
 // kMaxLightCount — 场景最大光源数量
 // ============================================================================
 
-static constexpr UInt32 kMaxLightCount = 16;
+/// 1024 而非 16: 光源数据搬进 storage buffer 之后, 上限只受显存约束
+/// (1024 × 80 字节 = 80 KiB, 每并行帧一份)。此前的 16 是被 UBO 那 65536
+/// 字节的保证上限逼出来的。
+///
+/// 这个数只决定"缓冲区分配多大"。每帧实际上传的是活跃光源数, 着色器的
+/// 循环上界也来自那个数, 不是这里。
+static constexpr UInt32 kMaxLightCount = 1024;
 
 // ============================================================================
 // FLightData — 单光源 GPU 数据 (std140 对齐, 80 字节)
@@ -154,18 +160,21 @@ struct FCascadedShadowInfo
 // FLightingUBO — 场景级光照 Uniform Buffer (std140, set 2, binding 0)
 //
 // 内存布局:
-//   偏移 0:      Lights[16]     — 16 × FLightData = 1280 字节
-//   偏移 1280:   LightCount     (vec4 的 .x) — 活跃光源数量
-//   偏移 1296:   CameraPosition (vec4 的 .xyz) — 相机世界空间位置
-//   偏移 1312:   AmbientColor   (vec4 的 .xyz) — 环境光颜色
-//                AmbientIntensity (同一个 vec4 的 .w, 即偏移 1324)
-//   偏移 1328:   CascadeViewProj[3] (mat4×3, 步长 64) — 级联视图投影矩阵
-//   偏移 1520:   CascadeSplits  (vec4) — xyz=各级外边界的径向距离
-//   偏移 1536:   ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
+//   偏移 0:      LightCount     (vec4 的 .x) — 活跃光源数量
+//   偏移 16:     CameraPosition (vec4 的 .xyz) — 相机世界空间位置
+//   偏移 32:     AmbientColor   (vec4 的 .xyz) — 环境光颜色
+//                AmbientIntensity (同一个 vec4 的 .w, 即偏移 44)
+//   偏移 48:     CascadeViewProj[3] (mat4×3, 步长 64) — 级联视图投影矩阵
+//   偏移 240:    CascadeSplits  (vec4) — xyz=各级外边界的径向距离
+//   偏移 256:    ShadowParams   (vec4) — x=深度偏移, y=法线偏移,
 //                                        z=阴影贴图边长, w=是否启用
-//   偏移 1552:   IblParams      (vec4) — x=是否启用, y=强度倍数,
+//   偏移 272:    IblParams      (vec4) — x=是否启用, y=强度倍数,
 //                                        z=预滤波最高 mip 下标
-//   总计: 1568 字节
+//   总计: 288 字节
+//
+// 光源数组已移出 (见上方说明), 因此从 1568 降到 288 —— 其后每个字段的
+// 偏移都变了。这份清单以 lsc 的 SPIR-V 反射为准, 且
+// Scripts/verify-shader-layout.ps1 会逐次核对它与 C++ 侧的一致性。
 //
 // 这份清单以 `lsc` 的 SPIR-V 反射为准 (pbr.frag 的 set 2 / binding 0),
 // 不是照着 C++ 结构体读出来的。它此前有两处错: AmbientIntensity 被单列成
@@ -184,8 +193,13 @@ struct FCascadedShadowInfo
 
 struct FLightingUBO
 {
-    // 光源数据数组 (固定 16 盏，实际使用 LightCount 盏)
-    FLightData Lights[kMaxLightCount];
+    // 光源数据不在这个结构里 —— 它在一个独立的 storage buffer 中
+    // (set 2, binding 5, 见 FLightManager::GetLightStorageBuffer)。
+    //
+    // 搬出去有两条理由。一是 UBO 装不下: 保证上限 65536 字节, 而
+    // 1024 × 80 = 81920 已经超了。二是分簇剔除的计算着色器要读同一份光源
+    // 数据, 而它产出的簇索引表必须是 storage buffer (要原子写入) —— 两者
+    // 用同一种缓冲区, 绑定与屏障都少一套。
 
     // vec4: x=活跃光源数量 (uint→float), y/z/w=保留
     Float32 LightCount     = 0.0f;
@@ -257,8 +271,9 @@ struct FLightingUBO
 // + mat4×3 级联矩阵 192 + vec4 切分 16 + vec4 阴影参数 16 = 1552 字节
 // + vec4 IBL 参数 16 = 1568 字节
 // std140 要求数组元素与结构体尾部都对齐到 16 字节, 1568 已是 16 的倍数
-static_assert(sizeof(FLightingUBO) == 1568,
-    "FLightingUBO 必须为 1568 字节 (std140 对齐)");
+static_assert(sizeof(FLightingUBO) == 288,
+    "FLightingUBO 必须为 288 字节 (std140 对齐) — 与 pbr.frag 的 "
+    "LightingUBO 块一致, 由 Scripts/verify-shader-layout.ps1 逐次核对");
 
 // ============================================================================
 // FLight — CPU 侧光源对象

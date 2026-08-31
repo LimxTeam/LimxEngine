@@ -109,7 +109,6 @@ struct LightData {
 // row_major 与 FMatrix 的行主序存储一致 —— 不加的话 GLSL 按列主序解读,
 // 等于把阴影矩阵整体转置, 阴影坐标会落到完全无关的位置。
 layout(row_major, set = 2, binding = 0) uniform LightingUBO {
-    LightData lights[16];
     vec4      lightCountVec;   // x=光源数量
     vec4      cameraPosition;  // xyz=相机世界位置
     vec4      ambientColor;    // xyz=环境光颜色, w=环境光强度
@@ -118,6 +117,23 @@ layout(row_major, set = 2, binding = 0) uniform LightingUBO {
     vec4      shadowParams;          // x=深度偏移 y=法线偏移 z=贴图边长 w=启用
     vec4      iblParams;             // x=启用 IBL, y=强度, z=预滤波最高 mip
 } lighting;
+
+// ── 光源数组 (set 2, binding 5) ──
+//
+// 从 UBO 挪进 storage buffer 的理由有两条: UBO 的保证上限是 65536 字节,
+// 1024 盏 × 80 = 81920 已经超了; 而且分簇剔除的计算着色器要读同一份数据,
+// 它产出的簇索引表必须是 storage buffer (要原子写入), 两者同一种缓冲区
+// 就少一套绑定与屏障。
+//
+// std430 而非 std140: 这个结构全是 vec4, 两种布局给出的偏移完全相同
+// (80 字节本就是 16 的倍数), 但 std430 对将来加标量成员更宽容 —— std140
+// 会把数组元素补齐到 16 的倍数, 那种补齐 C++ 侧不会自动跟上。
+//
+// readonly 不是装饰: 它让驱动知道不必为这个绑定准备写入路径, 而且写错时
+// 编译期就报错, 而不是运行时静默污染光源数据。
+layout(std430, set = 2, binding = 5) readonly buffer LightBuffer {
+    LightData lights[];
+} lightBuffer;
 
 // ── 阴影贴图数组 (set 2, binding 1) ──
 //
@@ -160,6 +176,10 @@ const uint  TEX_NORMAL             = 1u << 1;
 const uint  TEX_METALLIC_ROUGHNESS = 1u << 2;
 const uint  TEX_OCCLUSION          = 1u << 3;
 const uint  TEX_EMISSIVE           = 1u << 4;
+// 法线贴图只存了 RG 两个通道 (BC5), Z 要重建 —— 与 C++ 侧的
+// kMaterialTexFlagNormalTwoChannel 以及 material_common.h 里的
+// TEX_NORMAL_TWO_CHANNEL 对应
+const uint  TEX_NORMAL_TWO_CHANNEL = 1u << 5;
 const uint  BLEND_MASKED           = 1u;
 
 // ============================================================
@@ -349,10 +369,40 @@ vec3 ApplyNormalMap(vec3 baseNormal)
         return baseNormal;
     }
 
-    vec3 tangentNormal =
-        SampleBindless(material.NormalIndex, fragTexCoord).xyz * 2.0 - 1.0;
-    tangentNormal.xy *= max(material.NormalScale, 0.0);
-    tangentNormal.z = sqrt(max(0.0, 1.0 - dot(tangentNormal.xy, tangentNormal.xy)));
+    // ── 切线空间法线的解码 ──
+    //
+    // 两条路径, 由 TEX_NORMAL_TWO_CHANNEL 区分, **不能合并成一条**:
+    //
+    //   BC5 —— 文件里只有 RG。采样得到的 z 恒为 0, 换算后是 -1, 直接
+    //     拿来用会让整个表面的法线朝里。必须用 z = sqrt(1 - x² - y²)
+    //     重建 —— 单位球面的约束使这个式子在切线空间下有唯一解 (z 取正)。
+    //
+    //   RGB —— 文件里存了 Z, 此时必须**用存的那个值**。看上去重建也能
+    //     得到差不多的结果, 但两者在两种情况下会分道扬镳: 作者刻意压平
+    //     过法线 (存的是非单位向量, 用来削弱凹凸感), 或贴图经压缩与 mip
+    //     过滤之后长度不再为 1。重建会把这些统统抹平, 而抹平的表现只是
+    //     "法线贴图的强度对不上", 不会有任何报错。glTF 规范也明确要求
+    //     使用存储值。
+    //
+    // NormalScale 在两条路径上都只作用于 XY, 与 glTF 的
+    // normalize((<sampled> * 2 - 1) * vec3(scale, scale, 1)) 一致。
+    // 对 BC5 而言顺序尤其要紧: 缩放必须在重建 Z **之前**做, 否则
+    // 用来求 Z 的那个 XY 已经不是原始值了。
+    vec4 normalSample = SampleBindless(material.NormalIndex, fragTexCoord);
+
+    vec3 tangentNormal;
+    tangentNormal.xy =
+        (normalSample.xy * 2.0 - 1.0) * max(material.NormalScale, 0.0);
+
+    if ((material.TextureFlags & TEX_NORMAL_TWO_CHANNEL) != 0u)
+    {
+        tangentNormal.z =
+            sqrt(max(0.0, 1.0 - dot(tangentNormal.xy, tangentNormal.xy)));
+    }
+    else
+    {
+        tangentNormal.z = normalSample.z * 2.0 - 1.0;
+    }
 
     vec3  T;
     vec3  B;
@@ -548,7 +598,7 @@ void main()
 
     for (int i = 0; i < lightCount; ++i)
     {
-        LightData light = lighting.lights[i];
+        LightData light = lightBuffer.lights[i];
 
         // 光照方向 (从片段指向光源)
         vec3 L = GetLightDirection(light, fragWorldPos);

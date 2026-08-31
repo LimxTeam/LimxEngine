@@ -1429,7 +1429,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         //
         // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
         // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[5];
+        FRHIDescriptorWrite writes[6];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1466,7 +1466,17 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_FallbackCubeSampler,
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(writes, 5);
+        // binding 5 — 光源数组 storage buffer
+        //
+        // 光源从 UBO 挪出来之后, binding 0 里只剩全局参数 (288 字节)。
+        writes[5] = FRHIDescriptorWrite::StorageBuffer(
+            descSet,
+            5,
+            FLightManager::Get().GetLightStorageBuffer(i),
+            0,
+            sizeof(FLightData) * kMaxLightCount);
+
+        device->UpdateDescriptorSets(writes, 6);
 
         m_LightDescriptorSets.Add(descSet);
     }

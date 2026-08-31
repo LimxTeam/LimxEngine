@@ -171,6 +171,19 @@ public:
     /// 获取指定帧的光照 UBO 缓冲区句柄
     LIMX_NODISCARD FRHIBufferHandle GetLightUBO(UInt32 frameIndex) const;
 
+    /// 获取指定帧的光源 storage buffer 句柄 (set 2, binding 5)
+    ///
+    /// 每并行帧一份。共用一份的话, 帧 N+1 的上传会覆写帧 N 的片段着色器
+    /// 正在读的数据 —— 那是只在高帧率下偶发的画面撕裂, 验证层不报。
+    LIMX_NODISCARD FRHIBufferHandle GetLightStorageBuffer(
+        UInt32 frameIndex) const;
+
+    /// 上一次上传的活跃光源数 —— 分簇剔除要用它决定分派规模
+    LIMX_NODISCARD UInt32 GetActiveLightCount() const
+    {
+        return m_ActiveLightCount;
+    }
+
     /// 获取描述符集布局 (set 2) — 用于构建管线布局
     LIMX_NODISCARD FRHIDescSetLayoutHandle GetDescSetLayout() const
     {
@@ -190,6 +203,12 @@ private:
 
     /// 每帧一个 UBO 缓冲区 (避免写入冲突)
     TArray<FRHIBufferHandle>    m_LightUBOs;
+
+    /// 每并行帧一个光源 storage buffer (kMaxLightCount × 80 字节)
+    TArray<FRHIBufferHandle>    m_LightStorageBuffers;
+
+    /// 上一次 UploadLightData 写进去的活跃光源数
+    UInt32                      m_ActiveLightCount = 0;
 
     /// 描述符集布局 (set 2, binding 0: UniformBuffer, Vertex+Fragment)
 

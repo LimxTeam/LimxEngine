@@ -104,7 +104,11 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     // 绑定 (它需要光源矩阵), 把正在写入的阴影贴图放进去会形成"同一帧内
     // 既作为附件写入又作为纹理读取"的冲突。set 2 只有前向 Pass 绑定,
     // 天然避开这个问题。
-    FRHIDescriptorBinding bindings[5] = {};
+    //   set 2, binding 5 — 光源数组 storage buffer
+    //
+    // 光源从 UBO 挪到 SSBO 之后, binding 0 里只剩全局参数。StageFlags 必须
+    // 含 Compute: 分簇剔除的计算着色器读的是同一份数据。
+    FRHIDescriptorBinding bindings[6] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -136,9 +140,14 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[4].Count      = 1;
     bindings[4].StageFlags = EShaderStage::Fragment;
 
+    bindings[5].Binding    = 5;
+    bindings[5].Type       = EDescriptorType::StorageBuffer;
+    bindings[5].Count      = 1;
+    bindings[5].StageFlags = EShaderStage::Fragment | EShaderStage::Compute;
+
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 5;
+    layoutDesc.BindingCount = 6;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -172,6 +181,30 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
         m_LightUBOs.Add(buffer);
     }
 
+    // ---- 为每并行帧创建一个光源 storage buffer ----
+    m_LightStorageBuffers.Reserve(maxFramesInFlight);
+
+    for (UInt32 i = 0; i < maxFramesInFlight; ++i)
+    {
+        FRHIBufferDesc bufferDesc = {};
+        bufferDesc.Size        = sizeof(FLightData) * kMaxLightCount;
+        bufferDesc.Usage       = EBufferUsage::StorageBuffer;
+        bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+        bufferDesc.DebugName   = "LightStorageBuffer";
+
+        FRHIBufferHandle buffer;
+        result = m_Device->CreateBuffer(bufferDesc, buffer);
+        if (!IsRHISuccess(result))
+        {
+            LIMX_LOG(LogLighting, Error,
+                     "[LightManager] 光源 storage buffer [{}] 创建失败", i);
+            Shutdown();
+            return result;
+        }
+
+        m_LightStorageBuffers.Add(buffer);
+    }
+
     // 预分配光源数组容量
     m_Lights.Reserve(kMaxLightCount);
 
@@ -203,6 +236,13 @@ void FLightManager::Shutdown()
         m_Device->DestroyBuffer(m_LightUBOs[i]);
     }
     m_LightUBOs.Clear();
+
+    // 释放光源 storage buffer
+    for (SizeType i = 0; i < m_LightStorageBuffers.GetSize(); ++i)
+    {
+        m_Device->DestroyBuffer(m_LightStorageBuffers[i]);
+    }
+    m_LightStorageBuffers.Clear();
 
     // 释放描述符集布局
     m_Device->DestroyDescSetLayout(m_DescSetLayout);
@@ -326,23 +366,47 @@ void FLightManager::UploadLightData(
     FLightingUBO uboData;
     MemZero(&uboData, sizeof(FLightingUBO));
 
-    // 打包所有启用的光源
+    // 打包所有启用的光源, 写进 storage buffer
     UInt32 activeLightCount = 0;
-    for (SizeType i = 0; i < m_Lights.GetSize(); ++i)
+
+    void* lightPtr = nullptr;
+
+    if (IsRHISuccess(m_Device->MapBuffer(m_LightStorageBuffers[frameIndex],
+                                        &lightPtr)) &&
+        lightPtr != nullptr)
     {
-        if (!m_Lights[i].IsEnabled())
+        FLightData* const lights = static_cast<FLightData*>(lightPtr);
+
+        for (SizeType i = 0; i < m_Lights.GetSize(); ++i)
         {
-            continue;
+            if (!m_Lights[i].IsEnabled())
+            {
+                continue;
+            }
+
+            if (activeLightCount >= kMaxLightCount)
+            {
+                // 超过上限时明确报出来。静默截断的表现是"多放的光源不亮",
+                // 而那看起来像是强度或衰减参数没调好。
+                LIMX_LOG(LogLighting, Warning,
+                         "[LightManager] 活跃光源超过上限 {} — 其余被忽略",
+                         kMaxLightCount);
+                break;
+            }
+
+            lights[activeLightCount] = m_Lights[i].ToGpuData();
+            ++activeLightCount;
         }
 
-        if (activeLightCount >= kMaxLightCount)
-        {
-            break;
-        }
-
-        uboData.Lights[activeLightCount] = m_Lights[i].ToGpuData();
-        ++activeLightCount;
+        m_Device->UnmapBuffer(m_LightStorageBuffers[frameIndex]);
     }
+    else
+    {
+        LIMX_LOG(LogLighting, Error,
+                 "[LightManager] 光源 storage buffer 映射失败 — 本帧无光照");
+    }
+
+    m_ActiveLightCount = activeLightCount;
 
     // 写入全局光照参数
     uboData.LightCount     = static_cast<Float32>(activeLightCount);
@@ -400,6 +464,20 @@ void FLightManager::UploadLightData(
         MemCopy(mappedPtr, &uboData, sizeof(FLightingUBO));
         m_Device->UnmapBuffer(m_LightUBOs[frameIndex]);
     }
+}
+
+// ============================================================================
+// GetLightStorageBuffer — 指定帧的光源 storage buffer
+// ============================================================================
+
+FRHIBufferHandle FLightManager::GetLightStorageBuffer(UInt32 frameIndex) const
+{
+    if (frameIndex >= m_LightStorageBuffers.GetSize())
+    {
+        return FRHIBufferHandle();
+    }
+
+    return m_LightStorageBuffers[frameIndex];
 }
 
 // ============================================================================
