@@ -111,7 +111,11 @@ public:
         return m_AtlasSampler;
     }
 
-    /// 上一帧实际绘制的块数 —— 自检与统计用
+    /// 上一帧**实际绘制**的块数 —— 自检与统计用
+    ///
+    /// 是绘制循环里逐块累加出来的, 不是"分配了几块"。两者平时相等, 而它们
+    /// 不等的那一刻正是这个计数存在的理由: 报分配数的话, 一个只画第一块的
+    /// 实现照样报满数。
     LIMX_NODISCARD UInt32 GetRenderedTileCount() const
     {
         return m_RenderedTileCount;

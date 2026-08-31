@@ -520,7 +520,14 @@ void FShadowAtlasPass::Execute(IRHICommandBuffer*        commandBuffer,
     const TArray<FSpotShadowData>& casters =
         FLightManager::Get().GetSpotShadowCasters();
 
-    m_RenderedTileCount = static_cast<UInt32>(casters.GetSize());
+    // 计的是**实际画进去的块数**, 不是分配出去的块数。
+    //
+    // 第一版写的是 casters.GetSize() —— 那是"应该画几块", 而这个计数的用处
+    // 恰恰是回答"到底画了几块"。变异验证一眼看穿: 把绘制循环改成只画第一块,
+    // 计数照样报 7, 综合场景自检满分通过。
+    //
+    // 报意图而不是报事实的计数器, 与没有计数器等价。
+    m_RenderedTileCount = 0;
 
     // 没有投影灯时也要走一遍通道, 只清不画。
     //
@@ -560,6 +567,8 @@ void FShadowAtlasPass::Execute(IRHICommandBuffer*        commandBuffer,
         {
             RecordTile(commandBuffer, context, casters[i],
                        static_cast<UInt32>(i));
+
+            ++m_RenderedTileCount;
         }
     }
 

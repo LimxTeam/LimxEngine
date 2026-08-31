@@ -639,6 +639,43 @@ Invoke-Step '图像回归 (演示场景)' -RequiresGpu {
         -Ppm $shot -Baseline Content/Baselines/demo-scene.sig
 }
 
+# 综合场景自检 —— 需要真实 GPU。
+#
+# 前面每条判据各用一个**最小场景**: 墙角只有两块平面, 泛光只有一个方块,
+# 阴影只有一堵墙加一块板。那是刻意的 —— 多一样东西, 解析判据就不再成立。
+#
+# 但那也留下一个空白: 没有任何一个场景**同时**跑全部子系统。而子系统之间会
+# 互相影响 —— 分簇决定哪些光参与着色, 阴影图集的块下标存在光源数据里,
+# GPU 驱动的逐物体缓冲区被四个通道共用, TAA 的历史依赖速度矢量。任何一处
+# 对不上, 单独的最小场景都发现不了。
+#
+# 这一条问的因此是另一件事: 不是"这个数对不对", 而是**"这个子系统到底跑没
+# 跑"**。每一条都带"够不够判"的元判据 —— 场景里没有对应的东西时直接判失败,
+# 而不是悄悄通过。
+Invoke-Step '综合场景自检 (每个子系统都留下痕迹)' -RequiresGpu {
+    Invoke-Engine '--showcase --gpu-driven --gtao --gtao-half --taa --bloom --clustered --frames 20 --warmup 5 --showcase-check'
+}
+
+# 图像回归 (综合场景) —— 需要真实 GPU。
+#
+# 与演示场景那一条同一个机制, 但覆盖面完全不同: 演示场景只有一盏方向光与
+# 几个物体, 而这个场景里三种阴影、四类材质、全套后处理同时在跑。着色路径上
+# 任何一处"数值合法但结果变了"的回归, 这里比那里更容易撞上。
+Invoke-Step '图像回归 (综合场景)' -RequiresGpu {
+    $shot = Join-Path $env:TEMP 'limx-verify-showcase.ppm'
+
+    Invoke-Engine "--showcase --gpu-driven --gtao --gtao-half --taa --bloom --clustered --frames 20 --warmup 5 --screenshot $shot"
+
+    if ($global:LASTEXITCODE -ne 0)
+    {
+        return
+    }
+
+    powershell -NoProfile -ExecutionPolicy Bypass `
+        -File Scripts/image-signature.ps1 `
+        -Ppm $shot -Baseline Content/Baselines/showcase-scene.sig
+}
+
 # 交换链重建自检 —— 需要真实 GPU。
 #
 # OnResize 平时只有窗口缩放时才走, 而自动化里没有任何东西会改窗口尺寸。

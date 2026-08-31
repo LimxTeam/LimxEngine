@@ -179,6 +179,12 @@ struct FLaunchOptions
     /// 泛光自检: 断言点扩散函数的对称性与能量守恒, 以退出码报告
     bool BloomCheck = false;
 
+    /// 构建综合示例场景 (三种光源类型 + 四类材质 + 全部后处理)
+    bool ShowcaseScene = false;
+
+    /// 综合自检: 逐个子系统断言"它到底跑没跑", 以退出码报告
+    bool ShowcaseCheck = false;
+
     /// 构建聚光灯阴影场景 (阴影图集自检的相似三角形基准)
     bool ShadowScene = false;
 
@@ -437,6 +443,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --corner-scene   构建直角墙角场景 (GTAO 自检的解析基准)
 ///   --bloom-scene    构建单点自发光场景 (泛光自检的点扩散基准)
 ///   --bloom-check    泛光自检: 点扩散的对称性与能量守恒, 以退出码报告
+///   --showcase       构建综合示例场景 (三种光源类型 + 四类材质)
+///   --showcase-check 综合自检: 逐个子系统断言"它到底跑没跑", 以退出码报告
 ///   --shadow-scene   构建聚光灯阴影场景 (阴影图集自检的相似三角形基准)
 ///   --shadow-check   阴影自检: 断言阴影边界的解析位置, 以退出码报告
 ///   --gpu-driven     GPU 驱动的剔除与间接绘制 (相机通道)
@@ -628,6 +636,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--bloom-check"))
         {
             options.BloomCheck = true;
+        }
+        else if (WideEquals(arg, L"--showcase"))
+        {
+            options.ShowcaseScene = true;
+        }
+        else if (WideEquals(arg, L"--showcase-check"))
+        {
+            options.ShowcaseCheck = true;
         }
         else if (WideEquals(arg, L"--shadow-scene"))
         {
@@ -4828,6 +4844,226 @@ static bool RunGpuDrivenChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunShowcaseChecks — 每个子系统到底跑没跑
+//
+// 前面所有的判据问的都是"这个数对不对"。这一条问的是另一件事: **这个子系统
+// 是不是真的在起作用。**
+//
+// 两者不重叠。一个被悄悄关掉的子系统在它自己的最小场景里根本不会被跑到 ——
+// 那些判据要么不适用, 要么因为场景不对而无从判定。而在综合场景里, 每一个都
+// 该留下可观测的痕迹:
+//
+//   分簇剔除    → 索引表里必须有条目
+//   GPU 驱动    → 可见数必须少于总数, 分组数必须少于物体数
+//   阴影图集    → 必须画了 1 + 6 = 7 块 (聚光灯一块, 点光源六块)
+//   方向光级联  → 级联视图的可见数必须非零
+//   GTAO        → 必须有相当比例的像素被遮蔽
+//   泛光        → 泛光缓冲必须有能量
+//   TAA         → 解析必须真的在混合历史 (前后两帧不能完全相同)
+//   半透明      → 必须有半透明批次
+//
+// 每一条都带"够不够判"的元判据: 场景里没有对应的东西时直接判失败, 而不是
+// 悄悄通过。这是 Day 10~13 反复撞到的那件事 —— 判据正确不等于场景能让它区分。
+// ============================================================================
+static bool RunShowcaseChecks(FRenderContext* context, FRenderer& renderer)
+{
+    // 先渲几帧, 让所有每帧状态 (计数器回读、TAA 历史) 稳定下来。
+    //
+    // 计数器的回读隔着并行帧数, 只渲一帧读到的是上一轮的值 —— Day 10 在这
+    // 上面栽过一次, 读出 0 而画面完全正确。
+    for (UInt32 i = 0; i < context->GetMaxFramesInFlight() + 2u; ++i)
+    {
+        renderer.RenderFrame();
+    }
+
+    bool passed = true;
+
+    const auto Fail = [&passed](const AnsiChar* message)
+    {
+        LIMX_LOG(LogLaunch, Error, "[综合] {}", message);
+        passed = false;
+    };
+
+    // ---- 光源 ----
+    FLightManager& lights = FLightManager::Get();
+
+    UInt32 directionalCount = 0;
+    UInt32 spotShadowCount  = 0;
+    UInt32 pointShadowCount = 0;
+
+    for (UInt32 i = 0; i < lights.GetLightCount(); ++i)
+    {
+        const FLight& light = lights.GetLight(i);
+
+        if (light.GetType() == ELightType::Directional)
+        {
+            ++directionalCount;
+        }
+        else if (light.GetType() == ELightType::Spot && light.CastsShadow())
+        {
+            ++spotShadowCount;
+        }
+        else if (light.GetType() == ELightType::Point && light.CastsShadow())
+        {
+            ++pointShadowCount;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[综合] 光源 — 方向光 {} 盏, 投影聚光灯 {} 盏, 投影点光源 {} 盏",
+             directionalCount, spotShadowCount, pointShadowCount);
+
+    if (directionalCount == 0 || spotShadowCount == 0 || pointShadowCount == 0)
+    {
+        Fail("三种光源类型没有凑齐 — 这个场景验不了三条阴影路径");
+    }
+
+    // ---- 阴影图集 ----
+    //
+    // 聚光灯一块 + 点光源六块 = 7 块。数目写死而不是"大于零": 点光源少分了
+    // 五块的话总数是 2, 而"大于零"照样通过。
+    FShadowAtlasPass* const atlas = renderer.GetShadowAtlasPass();
+
+    const UInt32 tileCount =
+        (atlas != nullptr) ? atlas->GetRenderedTileCount() : 0u;
+
+    LIMX_LOG(LogLaunch, Display, "[综合] 阴影图集绘制 {} 块", tileCount);
+
+    if (tileCount != 1u + kCubeFaceCount)
+    {
+        Fail("阴影图集应当绘制 7 块 (聚光灯 1 + 点光源 6)");
+    }
+
+    // ---- 分簇剔除 ----
+    FClusterLightPass* const cluster = renderer.GetClusterLightPass();
+
+    const UInt32 allocated =
+        (cluster != nullptr) ? cluster->GetAllocatedIndexCount() : 0u;
+
+    LIMX_LOG(LogLaunch, Display, "[综合] 分簇索引表 {} 条", allocated);
+
+    if (renderer.IsClusteredLighting())
+    {
+        if (allocated == 0u)
+        {
+            Fail("分簇开着却一条索引都没分配 — 剔除没跑?");
+        }
+
+        if (cluster != nullptr && cluster->HasOverflowed())
+        {
+            Fail("分簇索引表溢出 — 有光源被丢弃");
+        }
+    }
+
+    // ---- GPU 驱动 ----
+    FGpuCullPass* const cull = renderer.GetGpuCullPass();
+
+    if (cull != nullptr && cull->IsEnabled())
+    {
+        const UInt32 objects = cull->GetObjectCount();
+        const UInt32 visible = cull->GetVisibleCount();
+        const UInt32 groups  = static_cast<UInt32>(cull->GetGroups().GetSize());
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[综合] GPU 驱动 — {} 个物体, 相机视图可见 {}, {} 组, "
+                 "{} 个视图",
+                 objects, visible, groups, cull->GetViewCount());
+
+        if (objects == 0u)
+        {
+            Fail("GPU 驱动一个物体都没上传");
+        }
+        else if (visible == 0u)
+        {
+            Fail("GPU 驱动的可见数为零 — 计数器回读断了?");
+        }
+        else if (visible >= objects)
+        {
+            Fail("GPU 驱动一个物体都没剔掉 — 换个有物体在视锥外的角度");
+        }
+
+        if (objects > 0u && groups >= objects)
+        {
+            Fail("GPU 驱动的分组没起作用 — 批次列表没按状态聚类?");
+        }
+
+        // 级联视图也要有可见物体 —— 那一段间接命令必须真的被写过
+        for (UInt32 view = FGpuCullPass::kFirstCascadeView;
+             view < cull->GetViewCount(); ++view)
+        {
+            if (cull->GetVisibleCount(view) == 0u)
+            {
+                Fail("某个级联视图一个可见物体都没有 — 那一段命令没写过?");
+                break;
+            }
+        }
+    }
+
+    // ---- 半透明 ----
+    const SizeType translucentCount =
+        renderer.GetTranslucentObjects().GetSize();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[综合] 半透明批次 {} 个", translucentCount);
+
+    if (translucentCount == 0)
+    {
+        Fail("场景里没有半透明批次 — 那条绘制路径没被走到");
+    }
+
+    // ---- GTAO ----
+    FGtaoPass* const gtao = renderer.GetGtaoPass();
+
+    if (gtao != nullptr && gtao->IsEnabled())
+    {
+        TArray<Float32> ao;
+        TArray<Float32> depth;
+
+        if (!ReadAoAndDepth(context, renderer, ao, depth))
+        {
+            Fail("AO 回读失败");
+        }
+        else
+        {
+            SizeType shaded = 0;
+
+            for (SizeType i = 0; i < ao.GetSize(); ++i)
+            {
+                if (ao[i] < 0.9f)
+                {
+                    ++shaded;
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[综合] GTAO — {} / {} 个像素有明显遮蔽",
+                     shaded, ao.GetSize());
+
+            // 一成。整个场景堆满了柱子与球, 遮蔽应当到处都是。
+            //
+            // 判据不写成"大于零": 一个只在几个像素上有值的 AO 与"AO 没跑"
+            // 在效果上没有区别, 而"大于零"对它照样通过。
+            if (shaded * 10 < ao.GetSize())
+            {
+                Fail("GTAO 几乎没有遮蔽 — 通道跑了吗?");
+            }
+        }
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[综合] 通过 — 每个子系统都留下了可观测的痕迹");
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Error, "[综合] 失败");
+    }
+
+    return passed;
+}
+
+// ============================================================================
 // RunClusterChecks — 分簇剔除的数值自检
 //
 // 判据是"GPU 算出的簇表与 CPU 参照实现**完全一致**"。这比"看起来对"强得多:
@@ -6400,6 +6636,293 @@ static void BuildShadowScene(LScene* scene, FRenderContext* context,
 }
 
 // ============================================================================
+// BuildShowcaseScene — 一个场景同时跑全部子系统
+//
+// 到 Day 13 为止, 每条判据各用一个**最小场景**: 墙角只有两块平面, 泛光只有
+// 一个方块, 阴影只有一堵墙加一块板。那是刻意的 —— 多一样东西, 解析判据就
+// 不再成立。
+//
+// 但那也留下一个空白: **没有任何一个场景同时跑全部子系统**。而子系统之间
+// 会互相影响 —— 分簇剔除决定哪些光参与着色, 阴影图集的块下标存在光源数据
+// 里, GPU 驱动的逐物体缓冲区被四个通道共用, TAA 的历史依赖速度矢量, 而速度
+// 矢量来自深度预通道。任何一处对不上, 单独的最小场景都发现不了。
+//
+// 这个场景不追求解析可判定, 它追求的是**覆盖**: 三种光源类型都投影, 不透明
+// 与半透明都有, 蒙版材质有, 而且物体足够多、足够分散, 让分簇与剔除都有东西
+// 可做。
+//
+// 判据因此也换了一种: 不问"这个数对不对", 问"这个子系统到底跑没跑"。
+// 见 RunShowcaseChecks。
+// ============================================================================
+static void BuildShowcaseScene(LScene* scene, FRenderContext* context,
+                               FRenderer* renderer)
+{
+    LIMX_CHECK(scene != nullptr);
+    LIMX_CHECK(context != nullptr);
+    LIMX_CHECK(renderer != nullptr);
+
+    FRenderResourceManager& resources = context->GetResourceManager();
+
+    FMeshData cubeMesh   = FGeometryGenerator::GenerateCube();
+    FMeshData sphereMesh = FGeometryGenerator::GenerateSphere(1.0f, 24, 16);
+
+    // 顶点色刷白。
+    //
+    // 程序化图元自带**调试用的顶点色**: 立方体六个面各一色 (红/青/绿/品红/
+    // 蓝/黄), 球体按经纬映射色相。而 pbr.frag 算的是
+    // albedo = fragColor * baseColor —— 于是材质的基色被那层调试色整个盖掉,
+    // 四种材质在画面上分不出来。
+    //
+    // 这不是缺陷 (那些颜色对"看清楚一个图元的朝向"很有用), 但它与这个场景的
+    // 目的冲突: 综合场景要展示的是材质与光照, 不是图元的面序。
+    //
+    // 刷白之后 albedo 就是材质的基色。第一版没刷, 截图里地面是绿的、柱子是
+    // 红蓝相间的 —— 而那时我以为是材质下标串了位, 查了一圈才发现是顶点色。
+    const auto WhitenVertexColors = [](FMeshData& mesh)
+    {
+        for (SizeType i = 0; i < mesh.Vertices.GetSize(); ++i)
+        {
+            mesh.Vertices[i].Color = FVector4(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    };
+
+    WhitenVertexColors(cubeMesh);
+    WhitenVertexColors(sphereMesh);
+
+    FMeshResourceHandle cubeHandle =
+        resources.CreateMesh(cubeMesh, FName("ShowcaseCube"));
+    FMeshResourceHandle sphereHandle =
+        resources.CreateMesh(sphereMesh, FName("ShowcaseSphere"));
+
+    if (!cubeHandle.IsValid() || !sphereHandle.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 综合场景的网格上传失败");
+        return;
+    }
+
+    // ---- 材质 ----
+    //
+    // 三类都要有: 不透明、蒙版、半透明。三者走的是不同的管线变体与不同的
+    // 绘制顺序, 而"某一类悄悄没画"在别的场景里看不出来。
+    FMaterial* opaque =
+        FMaterialManager::Get().CreateMaterial("ShowcaseOpaque");
+    FMaterial* metal =
+        FMaterialManager::Get().CreateMaterial("ShowcaseMetal");
+    FMaterial* glass =
+        FMaterialManager::Get().CreateMaterial("ShowcaseGlass");
+    FMaterial* emissive =
+        FMaterialManager::Get().CreateMaterial("ShowcaseEmissive");
+
+    if (opaque == nullptr || metal == nullptr || glass == nullptr ||
+        emissive == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 综合场景的材质创建失败");
+        return;
+    }
+
+    opaque->SetBaseColor(FVector4(0.75f, 0.72f, 0.68f, 1.0f));
+    opaque->SetMetallic(0.0f);
+    opaque->SetRoughness(0.85f);
+
+    metal->SetBaseColor(FVector4(0.9f, 0.75f, 0.35f, 1.0f));
+    metal->SetMetallic(1.0f);
+    metal->SetRoughness(0.25f);
+
+    // 半透明 —— 它必须由远及近绘制, 而那个顺序是 CPU 排的。
+    glass->SetBaseColor(FVector4(0.35f, 0.6f, 0.9f, 0.45f));
+    glass->SetMetallic(0.0f);
+    glass->SetRoughness(0.1f);
+    glass->SetBlendMode(EMaterialBlendMode::Translucent);
+
+    // 自发光 —— 泛光的信号源。不给自发光的话泛光链跑了也是全黑, 而"泛光
+    // 没跑"与"没有超过阈值的像素"在结果上无法区分。
+    emissive->SetBaseColor(FVector4(0.0f, 0.0f, 0.0f, 1.0f));
+    emissive->SetEmissiveColor(FVector3(12.0f, 9.0f, 4.0f));
+    emissive->SetMetallic(0.0f);
+    emissive->SetRoughness(1.0f);
+
+    // 蒙版 —— 它走的是"深度预通道与前向通道必须做逐纹素一致的裁剪"那条路径,
+    // 而前向的深度测试是 Equal: 两处裁剪结论差一个纹素, 那一片就整个消失。
+    //
+    // 这里没有带 alpha 的贴图, 所以把阈值设在基色 alpha 之下 —— 裁剪不会
+    // 真的丢掉任何纹素, 但**管线变体与那条代码路径确实被走到了**。真正验
+    // 裁剪一致性要一张带镂空的贴图, 那是资产的事。
+    FMaterial* masked =
+        FMaterialManager::Get().CreateMaterial("ShowcaseMasked");
+
+    if (masked == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Launch] 综合场景的蒙版材质创建失败");
+        return;
+    }
+
+    masked->SetBaseColor(FVector4(0.4f, 0.8f, 0.45f, 1.0f));
+    masked->SetMetallic(0.0f);
+    masked->SetRoughness(0.6f);
+    masked->SetBlendMode(EMaterialBlendMode::Masked);
+    masked->SetAlphaCutoff(0.5f);
+    masked->SetDoubleSided(true);
+
+    const auto Spawn = [&](const FName& name, FMeshResourceHandle mesh,
+                           FMaterial* material, const FVector3& position,
+                           const FVector3& scale)
+    {
+        FTransform transform;
+        transform.Translation = position;
+        transform.Scale3D     = scale;
+
+        LNode* node = scene->SpawnNode<LNode>(name, transform);
+
+        LMeshTrait* meshTrait = node->AddTrait<LMeshTrait>(FName("Mesh"));
+        meshTrait->SetMesh(&resources, mesh);
+        meshTrait->SetMaterial(material);
+        meshTrait->SetVisible(true);
+    };
+
+    // ---- 地面 ----
+    //
+    // 阴影要有地方落。没有地面时三种阴影都照画, 而画面上一个像素都不受
+    // 影响 —— Day 11 在压力场景上正是这么栽的。
+    Spawn(FName("ShowcaseGround"), cubeHandle, opaque,
+          FVector3(0.0f, -0.5f, 0.0f), FVector3(40.0f, 1.0f, 40.0f));
+
+    // ---- 背墙 ----
+    //
+    // 给聚光灯与点光源的阴影一个竖直的接收面。只有地面的话, 侧向的阴影
+    // 全落在视野之外。
+    Spawn(FName("ShowcaseBackWall"), cubeHandle, opaque,
+          FVector3(0.0f, 5.0f, -12.0f), FVector3(40.0f, 12.0f, 1.0f));
+
+    // ---- 主体 ----
+    //
+    // 一圈球与柱, 高低错落 —— 让三种光源的阴影互相交叠。分簇剔除也要有
+    // 东西可剔: 物体分散在 x/z 各 ±10 的范围里, 而相机只看得到一部分。
+    for (UInt32 i = 0; i < 12u; ++i)
+    {
+        const Float32 angle =
+            static_cast<Float32>(i) * (2.0f * FMath::kPi / 12.0f);
+
+        const Float32 radius = 6.0f;
+
+        const FVector3 position(radius * FMath::Cos(angle),
+                                0.6f + 0.4f * static_cast<Float32>(i % 3u),
+                                radius * FMath::Sin(angle));
+
+        Spawn(FName("ShowcaseSphere"), sphereHandle,
+              (i % 2u == 0u) ? opaque : metal, position,
+              FVector3(1.2f, 1.2f, 1.2f));
+
+        // 柱子 —— 竖直的遮挡物, 阴影拉得长, 三种光源都能照到
+        Spawn(FName("ShowcasePillar"), cubeHandle, opaque,
+              FVector3(position.X * 1.55f, 1.75f, position.Z * 1.55f),
+              FVector3(0.5f, 3.5f, 0.5f));
+    }
+
+    // ---- 半透明 ----
+    //
+    // 两块玻璃前后叠放 —— 排序错了的话混合结果不对, 而那是"正确性"而不是
+    // "优化"的问题。
+    Spawn(FName("ShowcaseGlassFar"), cubeHandle, glass,
+          FVector3(-1.5f, 1.5f, 1.0f), FVector3(2.5f, 3.0f, 0.1f));
+
+    Spawn(FName("ShowcaseGlassNear"), cubeHandle, glass,
+          FVector3(1.5f, 1.5f, 2.5f), FVector3(2.5f, 3.0f, 0.1f));
+
+    // ---- 相机背后的柱子 ----
+    //
+    // 它们**故意**放在视锥之外。两个用处:
+    //
+    //   剔除要有东西可剔。全部物体都可见的话, 一个什么都不做的剔除实现
+    //     也会给出完全正确的画面 —— 判据无从判定 (第一版就是这样, 29 个
+    //     物体可见 29 个)。
+    //   而它们仍然**投射阴影**: 相机背后的物体照样能把影子投进画面。这条
+    //     路径 (阴影用未经相机剔除的列表) 除此之外没有别的地方覆盖。
+    for (UInt32 i = 0; i < 4u; ++i)
+    {
+        const Float32 offset = -4.5f + 3.0f * static_cast<Float32>(i);
+
+        Spawn(FName("ShowcaseBehindCamera"), cubeHandle, opaque,
+              FVector3(offset, 2.0f, 22.0f), FVector3(0.6f, 4.0f, 0.6f));
+    }
+
+    // ---- 蒙版 ----
+    //
+    // 双面 —— 这样单面/双面两条管线变体在同一帧里都被用到, 而 GPU 驱动的
+    // 分组正是按"单双面"切的。
+    Spawn(FName("ShowcaseMaskedA"), cubeHandle, masked,
+          FVector3(-4.0f, 1.2f, 4.5f), FVector3(1.6f, 2.4f, 0.08f));
+
+    Spawn(FName("ShowcaseMaskedB"), cubeHandle, masked,
+          FVector3(4.0f, 1.2f, 4.5f), FVector3(1.6f, 2.4f, 0.08f));
+
+    // ---- 自发光 ----
+    Spawn(FName("ShowcaseEmissive"), sphereHandle, emissive,
+          FVector3(0.0f, 3.2f, -2.0f), FVector3(0.5f, 0.5f, 0.5f));
+
+    resources.ReleaseMeshReference(cubeHandle);
+    resources.ReleaseMeshReference(sphereHandle);
+
+    // ---- 光源 ----
+    //
+    // 三种类型各一盏, 都投影。这是这个场景存在的主要理由: 三条阴影路径
+    // (级联 / 图集一块 / 图集连续六块) 在同一帧里跑。
+    FLightManager& lights = FLightManager::Get();
+
+    lights.ClearAllLights();
+
+    {
+        FLight sun = FLight::CreateDirectional(
+            FVector3(-0.45f, -0.8f, -0.4f),
+            FLinearColor(1.0f, 0.96f, 0.88f, 1.0f), 2.6f);
+
+        sun.SetDebugName("ShowcaseSun");
+
+        lights.AddLight(static_cast<FLight&&>(sun));
+    }
+
+    {
+        FLight spot = FLight::CreateSpot(
+            FVector3(-7.0f, 7.5f, 5.0f),
+            FVector3(0.55f, -0.75f, -0.36f),
+            FLinearColor(0.55f, 0.8f, 1.0f, 1.0f), 25.0f,
+            22.0f, 30.0f, 30.0f);
+
+        spot.SetCastsShadow(true);
+        spot.SetDebugName("ShowcaseSpot");
+
+        lights.AddLight(static_cast<FLight&&>(spot));
+    }
+
+    {
+        FLight point = FLight::CreatePoint(
+            FVector3(4.5f, 2.6f, 3.0f),
+            FLinearColor(1.0f, 0.55f, 0.3f, 1.0f), 22.0f, 16.0f);
+
+        point.SetCastsShadow(true);
+        point.SetDebugName("ShowcasePoint");
+
+        lights.AddLight(static_cast<FLight&&>(point));
+    }
+
+    // ---- 相机 ----
+    //
+    // 摆在能同时看到地面、背墙、一圈柱子与两块玻璃的位置。
+    // yaw 0 朝 -Z —— 相机放在 +Z 一侧才看得到原点附近的东西。
+    //
+    // 第一版写成了 yaw = π (那是压力场景的写法, 它的相机在 -Z 一侧), 于是
+    // 相机背对整个场景: 29 个物体里只有 1 个可见, GTAO 一个像素都没遮蔽。
+    // 判据立刻报了出来 —— 那正是"每个子系统必须留下痕迹"这条判据的用处:
+    // 它抓的不只是子系统, 也包括场景本身摆得对不对。
+    renderer->GetCamera().SetPosition(FVector3(0.0f, 6.0f, 16.0f));
+    renderer->GetCamera().SetRotation(0.0f, -0.28f);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Launch] 综合场景已构建 — {} 个节点, 三种光源类型各一盏 (都投影), "
+             "不透明/蒙版/半透明/自发光四类材质",
+             scene->GetNodeCount());
+}
+
+// ============================================================================
 // BuildMaterialGrid — 粗糙度 × 金属度 的球体阵列
 //
 // 这是验证 IBL 的标准场景, 理由是它把两个自由度摊平成一张图:
@@ -7316,6 +7839,10 @@ int WINAPI wWinMain(
     {
         BuildBloomScene(scene, &renderContext, &renderer);
     }
+    else if (launchOptions.ShowcaseScene)
+    {
+        BuildShowcaseScene(scene, &renderContext, &renderer);
+    }
     else if (launchOptions.ShadowScene)
     {
         BuildShadowScene(scene, &renderContext, &renderer,
@@ -7504,6 +8031,7 @@ int WINAPI wWinMain(
     bool    shadowCheckPassed = true;
     bool    gpuDrivenCheckPassed = true;
     bool    aoHalfCheckPassed = true;
+    bool    showcaseCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -7572,6 +8100,12 @@ int WINAPI wWinMain(
             if (launchOptions.AoHalfCheck)
             {
                 aoHalfCheckPassed = RunAoHalfChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.ShowcaseCheck)
+            {
+                showcaseCheckPassed =
+                    RunShowcaseChecks(&renderContext, renderer);
             }
 
             if (launchOptions.BloomCheck)
@@ -7743,6 +8277,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.AoHalfCheck)
     {
         selfCheckCode = FinalizeSelfCheck(aoHalfCheckPassed, 16, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.ShowcaseCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(showcaseCheckPassed, 17, errorSink,
                                           errorsBeforeShutdown);
     }
 
