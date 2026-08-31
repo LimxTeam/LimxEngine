@@ -18,10 +18,7 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 3) in vec2 inTexCoord0;
 
 // location 编号与 pbr.vert 一致 —— 两条管线读的是同一份顶点数据布局
-layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
-    mat4 view;
-    mat4 proj;
-} ubo;
+#include "view_common.h"
 
 // 与 pbr.vert / depth_only.vert 逐字段一致 —— push constant 的布局在整条
 // 管线上共享, 而这几个通道用的是同一个 m_PipelineLayout。
@@ -33,10 +30,32 @@ layout(row_major, push_constant) uniform PushConstants {
 layout(location = 0) out vec2 fragTexCoord;
 layout(location = 1) out vec3 fragWorldNormal;
 
+// 裁剪空间位置传两份, 透视除法留到片段着色器里做。
+//
+// 不能在这里就除掉 w 再传 NDC: 插值器对 varying 做的是透视校正插值, 而
+// NDC 已经是除过的量, 对它再插值得到的不是"该像素的 NDC"。表现是三角形
+// 内部的速度矢量偏斜, 靠近顶点处正确、中心处最错 —— 很容易被当成 TAA
+// 的"重投影精度问题"。
+layout(location = 2) out vec4 fragCurrentClip;
+layout(location = 3) out vec4 fragPrevClip;
+
 void main()
 {
-    gl_Position  = ubo.proj * ubo.view * pc.model * vec4(inPosition, 1.0);
+    vec4 worldPos = pc.model * vec4(inPosition, 1.0);
+
+    gl_Position  = ubo.viewProj * worldPos;
     fragTexCoord = inTexCoord0;
+
+    fragCurrentClip = gl_Position;
+
+    // 上一帧位置用的是**同一个** pc.model —— 前提是物体在帧间不动。
+    //
+    // 这个前提目前成立 (引擎里没有任何地方逐帧改变换), 但它是前提而不是
+    // 定理。等有了骨骼动画或移动物体, 这里必须换成上一帧的 model 矩阵,
+    // 而那放不进 push constant: 现在已用 68 字节, 再加一个 mat4 就是 132,
+    // 超过 Vulkan 保证的 128 字节下限。届时的正确做法是把逐物体变换搬进
+    // storage buffer, 而不是把 model 矩阵压缩成不等价的形式。
+    fragPrevClip = ubo.prevViewProj * worldPos;
 
     // 法线矩阵与 pbr.vert 逐字一致。
     //

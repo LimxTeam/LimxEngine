@@ -48,6 +48,9 @@
 #include "RenderCore/Profiling/FGpuProfiler.h"
 #include "Renderer/RenderPass/FPassManager.h"
 #include "AssetPipeline/FImageDecoder.h"
+#include "Renderer/RenderPass/FDepthPrePass.h"
+#include "Core/Math/FFloat16.h"
+#include "RenderCore/Profiling/FOctahedral.h"
 
 namespace Limx
 {
@@ -139,6 +142,9 @@ struct FLaunchOptions
     /// 与 --furnace 的区别: 后者是让人看的 (渲染出来对着背景比), 前者是
     /// 让 CI 跑的 (读回数值直接断言)。
     bool FurnaceCheck = false;
+
+    /// G-Buffer 自检: 法线编码与速度矢量的数值校验, 以退出码报告
+    bool GBufferCheck = false;
 
     /// 白炉测试 —— 用各方向恒为 1 的合成环境替代 HDRI, 并关掉全部直接光
     ///
@@ -334,6 +340,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --material-grid N  构建 N×N 球体阵列 (横向粗糙度, 纵向金属度)
 ///   --furnace        白炉测试: 合成均匀环境 + 关闭直接光
 ///   --furnace-check  白炉自检: 断言 IBL 各级预计算, 以退出码报告
+///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -471,6 +478,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.Furnace = true;
         }
+        else if (WideEquals(arg, L"--gbuffer-check"))
+        {
+            options.GBufferCheck = true;
+        }
         else if (WideEquals(arg, L"--furnace-check"))
         {
             options.FurnaceCheck = true;
@@ -492,6 +503,233 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 // 无压缩、格式说明只有三行的容器 —— 引入压缩编码器只会在验收链条上多一个
 // 可能出错的环节。需要 PNG 时用任意工具转一次即可。
 // ============================================================================
+
+// ============================================================================
+// FGBufferCapture — 法线与速度附件的回读
+//
+// 与 FScreenshotCapture 分开而不是共用: 那个读的是交换链图像 (布局
+// PresentSrc、格式 BGRA8), 这个读的是两张 RG16_SFLOAT 附件 (布局
+// ShaderReadOnly)。共用的话两条路径的布局转换都得参数化, 而布局转换写错
+// 的表现是验证层报错或读到垃圾, 不值得为省几十行代码去冒险。
+//
+// **深度附件不在这里回读**: 前向 Pass 对深度的 StoreOp 是 DontCare, 场景
+// 渲染结束后深度内容是未定义的。覆盖掩码改用法线附件的哨兵值判定。
+// ============================================================================
+class FGBufferCapture
+{
+public:
+    /// 准备回读缓冲区 —— 必须在录制拷贝命令之前调用
+    bool Request(FRenderContext* context)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr)
+        {
+            return false;
+        }
+
+        // 先归还上一次的。本类会被连续 Request 两次 (运动帧与静止帧),
+        // 不释放就直接覆盖句柄 = 两个缓冲区泄漏, 而泄漏只在关闭时才报。
+        Release(device);
+
+        m_Extent = context->GetSwapchainExtent();
+
+        if (m_Extent.Width == 0 || m_Extent.Height == 0)
+        {
+            return false;
+        }
+
+        // RG16_SFLOAT = 每像素 4 字节
+        const SizeType byteSize =
+            static_cast<SizeType>(m_Extent.Width) * m_Extent.Height * 4;
+
+        const char* const names[2] =
+        {
+            "GBufferCheck.NormalReadback",
+            "GBufferCheck.VelocityReadback",
+        };
+
+        for (UInt32 i = 0; i < 2; ++i)
+        {
+            FRHIBufferDesc desc = {};
+            desc.Size        = byteSize;
+            desc.Usage       = EBufferUsage::TransferDst;
+            desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+            desc.DebugName   = names[i];
+
+            if (!IsRHISuccess(device->CreateBuffer(desc, m_Readback[i])))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[GBuffer] 回读缓冲区创建失败: {}", names[i]);
+                Release(device);
+                return false;
+            }
+        }
+
+        m_IsPending = true;
+        return true;
+    }
+
+    /// 帧内录制拷贝命令 —— 由场景渲染后回调驱动
+    void RecordCopy(FRenderContext* context, FDepthPrePass* pass)
+    {
+        if (!m_IsPending || pass == nullptr)
+        {
+            return;
+        }
+
+        IRHICommandBuffer* commandBuffer = context->GetCurrentCommandBuffer();
+
+        if (commandBuffer == nullptr)
+        {
+            return;
+        }
+
+        const FRHITextureHandle textures[2] =
+        {
+            pass->GetNormalTexture(),
+            pass->GetVelocityTexture(),
+        };
+
+        for (UInt32 i = 0; i < 2; ++i)
+        {
+            if (!textures[i].IsValid())
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[GBuffer] 第 {} 张附件句柄无效", i);
+                return;
+            }
+
+            // 深度预通道的 FinalLayout 是 ShaderReadOnly, 而且之后没有任何
+            // 通道再动这两张图 —— 所以这里的旧布局是确定的。
+            commandBuffer->TransitionImageLayout(
+                textures[i],
+                EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead,
+                EAccessFlags::TransferRead);
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { m_Extent.Width, m_Extent.Height, 1 };
+
+            commandBuffer->CopyTextureToBuffer(
+                textures[i], EImageLayout::TransferSrc, m_Readback[i], region);
+
+            // 必须转回去 —— 下一帧的渲染通道声明的 InitialLayout 是
+            // Undefined, 但那意味着"内容可丢弃", 不意味着"任何旧布局都行"。
+            // 留在 TransferSrc 上会让下一帧的布局转换从错误的旧布局开始。
+            commandBuffer->TransitionImageLayout(
+                textures[i],
+                EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead,
+                EAccessFlags::ShaderRead);
+        }
+
+        m_IsPending  = false;
+        m_IsRecorded = true;
+    }
+
+    /// 等 GPU 空闲后把两张图解成 FVector2 数组
+    bool Resolve(FRenderContext* context)
+    {
+        IRHIDevice* device = context->GetDevice();
+
+        if (device == nullptr || !m_IsRecorded)
+        {
+            LIMX_LOG(LogLaunch, Error, "[GBuffer] 拷贝命令未录制");
+            return false;
+        }
+
+        device->WaitIdle();
+
+        const SizeType pixelCount =
+            static_cast<SizeType>(m_Extent.Width) * m_Extent.Height;
+
+        TArray<FVector2>* const targets[2] = { &m_Normal, &m_Velocity };
+
+        for (UInt32 i = 0; i < 2; ++i)
+        {
+            void* mapped = nullptr;
+
+            if (!IsRHISuccess(device->MapBuffer(m_Readback[i], &mapped)) ||
+                mapped == nullptr)
+            {
+                LIMX_LOG(LogLaunch, Error, "[GBuffer] 回读缓冲区映射失败");
+                return false;
+            }
+
+            const Float16Bits* source =
+                static_cast<const Float16Bits*>(mapped);
+
+            targets[i]->Clear();
+            targets[i]->Reserve(pixelCount);
+
+            for (SizeType p = 0; p < pixelCount; ++p)
+            {
+                targets[i]->Add(
+                    FVector2(Float16ToFloat32(source[p * 2 + 0]),
+                             Float16ToFloat32(source[p * 2 + 1])));
+            }
+
+            device->UnmapBuffer(m_Readback[i]);
+        }
+
+        m_IsRecorded = false;
+        return true;
+    }
+
+    void Release(IRHIDevice* device)
+    {
+        if (device == nullptr)
+        {
+            return;
+        }
+
+        for (UInt32 i = 0; i < 2; ++i)
+        {
+            if (m_Readback[i].IsValid())
+            {
+                device->DestroyBuffer(m_Readback[i]);
+                m_Readback[i] = {};
+            }
+        }
+
+        m_IsPending  = false;
+        m_IsRecorded = false;
+    }
+
+    LIMX_NODISCARD const TArray<FVector2>& GetNormal() const
+    {
+        return m_Normal;
+    }
+
+    LIMX_NODISCARD const TArray<FVector2>& GetVelocity() const
+    {
+        return m_Velocity;
+    }
+
+    LIMX_NODISCARD FRHIExtent2D GetExtent() const { return m_Extent; }
+
+private:
+    FRHIBufferHandle m_Readback[2] = {};
+    FRHIExtent2D     m_Extent      = {};
+    TArray<FVector2> m_Normal;
+    TArray<FVector2> m_Velocity;
+    bool             m_IsPending   = false;
+    bool             m_IsRecorded  = false;
+};
 
 class FScreenshotCapture
 {
@@ -979,6 +1217,407 @@ static FImageData BuildFurnaceEnvironment()
 }
 
 // ============================================================================
+// ============================================================================
+// RunGBufferChecks — G-Buffer 的数值自检
+//
+// 三个阶段, 顺序不能换:
+//   A. 相机静止渲一帧 —— 建立"上一帧矩阵"
+//   B. 只转动偏航角 (不平移) 再渲一帧 —— 速度必须**非零且逐像素等于预测值**
+//   C. 相机保持不动再渲一帧 —— 速度必须**处处恰好为零**
+//
+// 为什么必须先 B 后 C: 只测 C 的话, 一个"速度恒为零"的实现 (比如上一帧
+// 矩阵根本没接进 UBO) 会完美通过。B 证明这条通路真的能产出非零值, C 才
+// 证明它在该为零时确实归零。反过来的顺序验证不了任何东西。
+//
+// 为什么 B 只转不平移: 纯旋转下, 同一条视线上的所有点投影到同一个像素,
+// 因而速度与深度无关 —— 可以只凭像素的 NDC 坐标算出精确预测值, 不需要
+// 回读深度。而深度在场景渲染后是 DontCare 的, 本来也读不到。
+//
+// 这一条同时钉住了另一个坑: 若顶点着色器提前做了透视除法再插值 (那是错
+// 的, NDC 不能线性插值), 三角形内部的误差会远超容差, 而顶点附近正常。
+// ============================================================================
+static bool RunGBufferChecks(FRenderContext* context,
+                             FRenderer&      renderer,
+                             LScene*         scene)
+{
+    FDepthPrePass* const pass = renderer.GetDepthPrePass();
+
+    if (pass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[GBuffer] 深度预通道不存在");
+        return false;
+    }
+
+    FCamera& camera = renderer.GetCamera();
+
+    // 只动偏航角, 位置保持不变 —— 深度无关性的前提就是相机不平移
+    const Float32 baseYaw   = camera.GetYaw();
+    const Float32 basePitch = camera.GetPitch();
+
+    // 2.9 度。够大, 使 NDC 位移 (约 0.09) 远高于半精度的分辨率 (那个量级
+    // 上约 6e-5); 又够小, 使上一次剔除得到的可见物体列表依然基本有效。
+    constexpr Float32 kYawDelta = 0.05f;
+
+    FGBufferCapture capture;
+
+    // 场景不动, 所以每一帧之前不做 SyncScene —— 它会把相机换成场景里那个
+    // 主相机 Trait 的外部矩阵, 把这里的 SetRotation 覆盖掉。
+    (void)scene;
+
+    // ---- 阶段 A: 建立上一帧矩阵 ----
+    camera.SetRotation(baseYaw, basePitch);
+    renderer.RenderFrame();
+
+    const FMatrix viewProjA =
+        camera.GetProjectionMatrix() * camera.GetViewMatrix();
+
+    // ---- 阶段 B: 转动 ----
+    camera.SetRotation(baseYaw + kYawDelta, basePitch);
+
+    if (!capture.Request(context))
+    {
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(
+        [&capture, context, pass]()
+        {
+            capture.RecordCopy(context, pass);
+        });
+
+    renderer.RenderFrame();
+
+    const FMatrix viewProjB =
+        camera.GetProjectionMatrix() * camera.GetViewMatrix();
+
+    if (!capture.Resolve(context))
+    {
+        capture.Release(context->GetDevice());
+        return false;
+    }
+
+    // 渲染器实际用的上一帧矩阵必须就是阶段 A 那个。这一条直接钉住"保存
+    // 时机错位"这类 bug —— 它比后面的逐像素比较更早、更明确地失败。
+    const FMatrix& rendererPrev = renderer.GetPrevViewProj();
+
+    Float32 prevMatrixDrift = 0.0f;
+
+    for (Int32 row = 0; row < 4; ++row)
+    {
+        for (Int32 col = 0; col < 4; ++col)
+        {
+            prevMatrixDrift = FMath::Max(
+                prevMatrixDrift,
+                FMath::Abs(rendererPrev.M[row][col] - viewProjB.M[row][col]));
+        }
+    }
+
+    bool passed = true;
+
+    if (prevMatrixDrift > 1.0e-5f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 渲染器保存的上一帧矩阵与本帧矩阵不符 "
+                 "(最大偏差 {}) —— 保存时机错位",
+                 prevMatrixDrift);
+        passed = false;
+    }
+
+    const TArray<FVector2>& normalB   = capture.GetNormal();
+    const TArray<FVector2>& velocityB = capture.GetVelocity();
+    const FRHIExtent2D      extent    = capture.GetExtent();
+
+    const FMatrix inverseB = viewProjB.Inverse();
+
+    SizeType covered      = 0;
+    SizeType mismatched   = 0;
+    Float32  maxError     = 0.0f;
+    Float32  maxPredicted = 0.0f;
+
+    const FVector3 cameraPosition = camera.GetPosition();
+
+    Float32  maxFacing    = -2.0f;
+    Float64  facingSum    = 0.0;
+    SizeType facingCount  = 0;
+    bool     directionBuckets[512] = {};
+
+    // 半精度在 0.1 量级的 ulp 约 6e-5。取 2e-3 是三十多个 ulp, 足以吸收
+    // 存储量化与矩阵求逆的累积误差, 而任何矩阵错位造成的偏差都在 0.1 以上
+    // —— 两者相差近两个数量级, 这个阈值不敏感。
+    constexpr Float32 kVelocityTolerance = 2.0e-3f;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const SizeType index =
+                static_cast<SizeType>(y) * extent.Width + x;
+
+            // 哨兵 = 这个像素没有几何
+            if (FMath::Abs(normalB[index].X) > 1.0f ||
+                FMath::Abs(normalB[index].Y) > 1.0f)
+            {
+                continue;
+            }
+
+            ++covered;
+
+            const Float32 ndcX =
+                (static_cast<Float32>(x) + 0.5f) /
+                    static_cast<Float32>(extent.Width) * 2.0f - 1.0f;
+            const Float32 ndcY =
+                (static_cast<Float32>(y) + 0.5f) /
+                    static_cast<Float32>(extent.Height) * 2.0f - 1.0f;
+
+            // 反投影到世界空间。取远平面上那个点 —— 纯旋转下同一视线上
+            // 任何点算出的速度都相同, 取哪个不影响结果。
+            const FVector4 farClip(ndcX, ndcY, 1.0f, 1.0f);
+            const FVector4 farWorld = inverseB.TransformVector4(farClip);
+
+            if (FMath::Abs(farWorld.W) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            const FVector4 worldPoint(farWorld.X / farWorld.W,
+                                      farWorld.Y / farWorld.W,
+                                      farWorld.Z / farWorld.W,
+                                      1.0f);
+
+            // ---- 法线: 可见表面必须朝向相机 ----
+            //
+            // 这一条是真有内容的判据。原先那条"解码后是单位向量"是同义
+            // 反复 —— DecodeOctahedralNormal 末尾就做了归一化, 无论输入
+            // 是什么它都返回单位向量, 所以那个检查恒真。
+            //
+            // 背面剔除开着, 所以每个可见片元的法线与视线方向的点积必须
+            // 为负 (剪影处趋近于 0)。编码里任何符号错误、折叠分支漏写、
+            // 或者通道写反, 都会让一大片像素的点积变正。
+            const FVector3 rayDir(worldPoint.X - cameraPosition.X,
+                                  worldPoint.Y - cameraPosition.Y,
+                                  worldPoint.Z - cameraPosition.Z);
+
+            const Float32 rayLength =
+                FMath::Sqrt(rayDir.X * rayDir.X + rayDir.Y * rayDir.Y +
+                            rayDir.Z * rayDir.Z);
+
+            if (rayLength > 1.0e-6f)
+            {
+                const FVector3 decoded =
+                    DecodeOctahedralNormal(normalB[index]);
+
+                const Float32 facing =
+                    (decoded.X * rayDir.X + decoded.Y * rayDir.Y +
+                     decoded.Z * rayDir.Z) / rayLength;
+
+                maxFacing  = FMath::Max(maxFacing, facing);
+                facingSum += static_cast<Float64>(facing);
+                ++facingCount;
+
+                // 把方向量化进 8x8x8 的格子, 统计占用了多少格。
+                //
+                // 这一条防的是"整张图是同一个常量"——比如附件根本没写入,
+                // 或者法线矩阵算成了零。那种情况下上面两个统计量可能碰巧
+                // 落在合格区间里, 但占用格数会是 1。
+                const Int32 bx = FMath::Clamp(
+                    static_cast<Int32>((decoded.X + 1.0f) * 4.0f), 0, 7);
+                const Int32 by = FMath::Clamp(
+                    static_cast<Int32>((decoded.Y + 1.0f) * 4.0f), 0, 7);
+                const Int32 bz = FMath::Clamp(
+                    static_cast<Int32>((decoded.Z + 1.0f) * 4.0f), 0, 7);
+
+                directionBuckets[(bz * 8 + by) * 8 + bx] = true;
+            }
+
+            const FVector4 prevClip = viewProjA.TransformVector4(worldPoint);
+
+            if (FMath::Abs(prevClip.W) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            const Float32 predictedX = ndcX - prevClip.X / prevClip.W;
+            const Float32 predictedY = ndcY - prevClip.Y / prevClip.W;
+
+            maxPredicted = FMath::Max(
+                maxPredicted,
+                FMath::Max(FMath::Abs(predictedX), FMath::Abs(predictedY)));
+
+            const Float32 errorX =
+                FMath::Abs(velocityB[index].X - predictedX);
+            const Float32 errorY =
+                FMath::Abs(velocityB[index].Y - predictedY);
+            const Float32 error = FMath::Max(errorX, errorY);
+
+            maxError = FMath::Max(maxError, error);
+
+            if (error > kVelocityTolerance)
+            {
+                if (mismatched < 4)
+                {
+                    LIMX_LOG(LogLaunch, Error,
+                             "[GBuffer] 像素 ({},{}) 速度不符: "
+                             "GPU=({},{}) 预测=({},{})",
+                             x, y, velocityB[index].X, velocityB[index].Y,
+                             predictedX, predictedY);
+                }
+                ++mismatched;
+            }
+        }
+    }
+
+    const SizeType totalPixels =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    // 覆盖率太低说明画面里几乎没有几何 —— 那样上面的循环等于没跑, 而
+    // "没跑" 与 "全对" 在结果上无法区分。这是本项目反复踩到的坑。
+    if (covered * 20 < totalPixels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 覆盖像素仅 {} / {} (不足 5%) —— "
+                 "校验样本不足, 判定无效",
+                 covered, totalPixels);
+        passed = false;
+    }
+
+    // 预测值本身必须是个有意义的非零量。若相机其实没转 (或矩阵没更新),
+    // 预测值会全是 0, 而 GPU 侧也是 0, 逐像素比较全部通过。
+    if (maxPredicted < 0.01f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 预测位移最大仅 {} —— 相机实际未转动, 判定无效",
+                 maxPredicted);
+        passed = false;
+    }
+
+    if (mismatched > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 运动帧: {} / {} 个覆盖像素的速度与预测不符 "
+                 "(最大偏差 {})",
+                 mismatched, covered, maxError);
+        passed = false;
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[GBuffer] 运动帧: {} 个覆盖像素全部吻合 "
+                 "(最大偏差 {}, 最大位移 {})",
+                 covered, maxError, maxPredicted);
+    }
+
+    // ---- 阶段 C: 相机保持不动 ----
+    if (!capture.Request(context))
+    {
+        capture.Release(context->GetDevice());
+        return false;
+    }
+
+    renderer.RenderFrame();
+
+    if (!capture.Resolve(context))
+    {
+        capture.Release(context->GetDevice());
+        return false;
+    }
+
+    const TArray<FVector2>& velocityC = capture.GetVelocity();
+
+    SizeType nonZero    = 0;
+    Float32  maxNonZero = 0.0f;
+
+    for (SizeType index = 0; index < totalPixels; ++index)
+    {
+        // 恰好为零, 不留容差。相机与物体都没动, 两帧的矩阵逐位相同,
+        // 着色器算出的差值就是精确的 0 —— 这里放容差等于放掉了整类
+        // "矩阵差了一帧" 的 bug (那类 bug 的残留量可以很小)。
+        if (velocityC[index].X != 0.0f || velocityC[index].Y != 0.0f)
+        {
+            ++nonZero;
+            maxNonZero = FMath::Max(
+                maxNonZero,
+                FMath::Max(FMath::Abs(velocityC[index].X),
+                           FMath::Abs(velocityC[index].Y)));
+        }
+    }
+
+    if (nonZero > 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 静止帧: {} / {} 个像素速度非零 (最大 {}) —— "
+                 "上一帧矩阵保存错位",
+                 nonZero, totalPixels, maxNonZero);
+        passed = false;
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[GBuffer] 静止帧: {} 个像素速度全部为零", totalPixels);
+    }
+
+    // ---- 法线判据的结论 (数据在运动帧那一轮里已经统计完) ----
+    SizeType occupiedBuckets = 0;
+
+    for (SizeType i = 0; i < 512; ++i)
+    {
+        if (directionBuckets[i])
+        {
+            ++occupiedBuckets;
+        }
+    }
+
+    const Float32 meanFacing =
+        (facingCount > 0)
+            ? static_cast<Float32>(facingSum / static_cast<Float64>(facingCount))
+            : 0.0f;
+
+    // 剪影处点积趋近 0, 插值法线在最边上可以略微越过 —— 0.15 是给这一圈
+    // 留的余量。任何符号错误造成的偏差都在 1.0 量级, 与它差近一个数量级。
+    if (maxFacing > 0.15f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 存在背离相机的法线 (最大点积 {}) —— "
+                 "八面体编码的符号或折叠分支有误",
+                 maxFacing);
+        passed = false;
+    }
+
+    if (meanFacing > -0.25f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 法线与视线的平均点积 {} 偏高 —— "
+                 "法线整体朝向不对",
+                 meanFacing);
+        passed = false;
+    }
+
+    // 演示场景有球、立方体与地面, 法线方向应当遍布多个卦限。
+    // 只占几个格子说明整张图接近常量。
+    if (occupiedBuckets < 20)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GBuffer] 法线方向只落在 {} 个格子里 —— "
+                 "法线缓冲接近常量",
+                 occupiedBuckets);
+        passed = false;
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[GBuffer] 法线: {} 个像素朝向相机 "
+                 "(最大点积 {}, 平均 {}, 占用 {} / 512 个方向格)",
+                 facingCount, maxFacing, meanFacing, occupiedBuckets);
+    }
+
+    capture.Release(context->GetDevice());
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    camera.SetRotation(baseYaw, basePitch);
+
+    return passed;
+}
+
 // RunFurnaceChecks — 白炉下 IBL 各级预计算结果的数值自检
 //
 // 三条性质都是解析可知的, 不依赖任何具体环境:
@@ -2170,6 +2809,10 @@ int WINAPI wWinMain(
     UInt64  loopFrame     = 0;
     bool    statsReset    = false;
 
+    // 自检结果。初值为 true 但只在 --gbuffer-check 打开时才会被真正赋值,
+    // 而退出码那里也判了同一个开关 —— 没开自检时它不参与任何判断。
+    bool    gbufferCheckPassed = true;
+
     while (window.ProcessMessages())
     {
         // 计算帧间隔
@@ -2217,6 +2860,14 @@ int WINAPI wWinMain(
                          static_cast<UInt64>(launchOptions.FrameLimit))
         {
             LogBenchmarkReport(launchOptions, renderer, &renderContext);
+
+            // G-Buffer 自检: 会自己再渲三帧并改动相机朝向, 所以必须放在
+            // 截屏之前 —— 否则截到的是自检最后那一帧的朝向。
+            if (launchOptions.GBufferCheck)
+            {
+                gbufferCheckPassed =
+                    RunGBufferChecks(&renderContext, renderer, scene);
+            }
 
             // 截屏: 再渲一帧, 这一帧的命令缓冲区里带上拷贝命令
             if (!launchOptions.ScreenshotPath.IsEmpty() &&
@@ -2290,6 +2941,16 @@ int WINAPI wWinMain(
     // 移除文件日志 Sink 并关闭
     FLog::RemoveSink(&fileLogSink);
     fileLogSink.Close();
+
+    // 自检的判定必须放在**全部关闭之后**返回。
+    //
+    // 这一点看着无所谓, 其实是本项目栽过的坑: 判定值若在关闭之前就算完并
+    // 直接 return, 那么关闭阶段才发现的问题 (显存泄漏、资源未回收) 永远
+    // 影响不到退出码, 而它们只在日志里留一行 Error —— CI 看的是退出码。
+    if (launchOptions.GBufferCheck && !gbufferCheckPassed)
+    {
+        return 7;
+    }
 
     return 0;
 }

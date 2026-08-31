@@ -16,10 +16,7 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 3) in vec2 inTexCoord0;
 
 // ── Uniform Buffer: 视图+投影矩阵 (set 0 binding 0) ──
-layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
-    mat4 view;
-    mat4 proj;
-} ubo;
+#include "view_common.h"
 
 // ── Push Constant: 逐物体 Model 矩阵 ──
 // 与 pbr.vert 逐字段一致 —— push constant 的布局在整条管线上共享,

@@ -657,6 +657,12 @@ void FShadowPass::UpdateLightUniform(IRHIDevice* device, UInt32 frameIndex)
         uboData.View = FMatrix::Identity();
         uboData.Proj = m_CascadeViewProj[cascade];
 
+        // 阴影通道不算速度, depth_only.vert 也不读这个字段。填成与本帧
+        // 相同的矩阵 (语义上"没有运动") 而不是留着不管 —— 万一以后阴影
+        // 通道也要输出速度, 默认值至少是有意义的那一个。
+        uboData.ViewProj     = m_CascadeViewProj[cascade];
+        uboData.PrevViewProj = m_CascadeViewProj[cascade];
+
         void* mapped = nullptr;
         if (IsRHISuccess(device->MapBuffer(m_LightUniformBuffers[index],
                                            &mapped)))

@@ -274,17 +274,24 @@ void FDepthPrePass::Execute(IRHICommandBuffer*        commandBuffer,
     clearDepth.Depth   = 1.0f;
     clearDepth.Stencil = 0;
 
-    // 法线清成 (0,0) —— 八面体解码后是 +Z, 一个合法方向。
+    // 法线清成哨兵值 (2,2) —— 八面体编码**产不出**的值。
     //
-    // 不清成别的值是有讲究的: 天空区域没有几何写入, 后续 GTAO 会读到这里
-    // 的清除值。清成 (0,0) 至少是个单位向量; 若清成随便什么数, 解码出来的
-    // 法线长度不为 1, GTAO 的余弦加权会算出无意义的结果, 而那看起来像是
-    // "天空附近的 AO 参数没调好"。
+    // 八面体编码的值域恰好填满 [-1,1]^2, 所以任何分量绝对值大于 1 的取值
+    // 都不可能来自真实几何。这让消费方能够区分"这里没有几何"和"这里有一
+    // 个朝向恰好如此的面" —— 二者的正确处理方式完全不同 (天空不该参与
+    // GTAO 的遮蔽计算, 而不是被当成一个朝 +Z 的面)。
+    //
+    // 清成 (0,0) 也能解出合法单位向量, 但那个值 **是** 合法编码 (对应
+    // +Z), 于是"没有几何"与"朝向 +Z"永久无法区分。区分不了的后果不是崩,
+    // 是天空边缘多出一圈说不清来源的 AO。
+    //
+    // 解码 (2,2) 得到 (2,2,-3) 归一化后仍是单位向量, 所以即使消费方忘了
+    // 判哨兵, 退化行为也是"一个方向", 而不是 NaN。
     //
     // 速度清成 0 —— 天空不动。
     FRHIClearColorValue clearColors[2] = {};
-    clearColors[0].R = 0.0f;
-    clearColors[0].G = 0.0f;
+    clearColors[0].R = kGBufferNormalSentinel;
+    clearColors[0].G = kGBufferNormalSentinel;
     clearColors[1].R = 0.0f;
     clearColors[1].G = 0.0f;
 
@@ -799,9 +806,15 @@ ERHIResult FDepthPrePass::CreateGBufferTargets(IRHIDevice*  device,
         texDesc.MipLevels   = 1;
         texDesc.ArrayLayers = 1;
         texDesc.Samples     = ESampleCount::Count1;
+        // TransferSrc 是常开的, 不挂在某个调试开关下面。
+        //
+        // 只在自检模式下加这个标志的话, 自检验证的就是一份与实际发布配置
+        // 不同的资源 —— 而两者的差异恰恰在同步与布局上, 那正是最容易出错
+        // 且最难复现的部分。桌面 GPU 上多这一个标志没有实测代价。
         texDesc.Usage       = static_cast<ETextureUsage>(
             static_cast<UInt32>(ETextureUsage::ColorAttachment) |
-            static_cast<UInt32>(ETextureUsage::Sampled));
+            static_cast<UInt32>(ETextureUsage::Sampled) |
+            static_cast<UInt32>(ETextureUsage::TransferSrc));
         texDesc.MemoryUsage = EMemoryUsage::GpuOnly;
         texDesc.DebugName   = spec.DebugName;
 

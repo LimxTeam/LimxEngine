@@ -12,10 +12,7 @@ layout(location = 3) in vec2 inTexCoord;
 // 解读 uniform 中的 mat4, 不加 row_major 就等于把矩阵整体转置 —— 顶点会被
 // 变换到裁剪体之外, 表现为"什么都不显示"而没有任何报错。
 // FMatrix.h 的注释即以"与着色器 row_major 一致"为前提。
-layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
-    mat4 view;
-    mat4 proj;
-} ubo;
+#include "view_common.h"
 
 // ── Push Constant: 逐物体 Model 矩阵 ──
 layout(row_major, push_constant) uniform PushConstants {

@@ -89,6 +89,35 @@ public:
         return m_VelocityView;
     }
 
+    /// 法线附件的清除值 —— 八面体编码产不出的哨兵
+    ///
+    /// 八面体编码的值域恰好填满 [-1,1]^2, 任何分量绝对值大于 1 的取值都
+    /// 不可能来自真实几何。消费方据此区分"没有几何"与"有一个朝向如此的
+    /// 面"。判据写成 `FMath::Abs(x) <= 1.0f` 即可 —— 2.0 在半精度里是精确
+    /// 值, 不存在读回来变成 1.999 的可能。
+    static constexpr Float32 kGBufferNormalSentinel = 2.0f;
+
+    /// 法线附件纹理 (回读校验用 —— 视图不能作为拷贝命令的源)
+    LIMX_NODISCARD FRHITextureHandle GetNormalTexture() const
+    {
+        return m_NormalTexture;
+    }
+
+    /// 速度附件纹理
+    LIMX_NODISCARD FRHITextureHandle GetVelocityTexture() const
+    {
+        return m_VelocityTexture;
+    }
+
+    /// 共享深度纹理 (本 Pass 不拥有它, 只是唯一的写入方)
+    ///
+    /// 前向 Pass 的深度写入是全程关闭的, 所以这张图里 depth < 1 的像素
+    /// 恰好就是深度预通道的覆盖范围 —— 校验速度缓冲时用它做覆盖掩码。
+    LIMX_NODISCARD FRHITextureHandle GetSharedDepthTexture() const
+    {
+        return m_SharedDepthTexture;
+    }
+
     /// 设置并行录制器 (可空 = 走内联路径)
     void SetRecorder(FParallelRecorder* recorder) { m_Recorder = recorder; }
 

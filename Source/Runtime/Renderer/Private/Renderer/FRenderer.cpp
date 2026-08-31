@@ -1320,7 +1320,7 @@ ERHIResult FRenderer::CreateDescriptorResources()
             0,                       // binding = 0
             m_UniformBuffers[i],
             0,                       // offset = 0
-            sizeof(FViewProjUBO)     // range = 128 bytes
+            sizeof(FViewProjUBO)     // range = 整个结构 (三个 mat4)
         );
 
         // binding 1: 棋盘格纹理 + 采样器
@@ -1539,6 +1539,16 @@ void FRenderer::UpdateUniformBuffer(UInt32 frameIndex)
     viewProj.View = m_Camera.GetViewMatrix();
     viewProj.Proj = m_Camera.GetProjectionMatrix();
 
+    // 上一帧的 Proj * View —— 速度矢量靠它算。
+    //
+    // 第一帧没有"上一帧", 此时填本帧的矩阵, 速度就恒等于零。这比填单位
+    // 矩阵好: 单位矩阵会让第一帧的速度等于整个 viewProj 变换的量, 那是个
+    // 巨大的假运动, TAA 接上以后表现为开场第一帧的整屏拖影。
+    viewProj.ViewProj = viewProj.Proj * viewProj.View;
+
+    viewProj.PrevViewProj =
+        m_HasPrevViewProj ? m_PrevViewProj : viewProj.ViewProj;
+
     // 映射并写入 Uniform Buffer
     void* mappedPtr = nullptr;
     ERHIResult result =
@@ -1548,6 +1558,14 @@ void FRenderer::UpdateUniformBuffer(UInt32 frameIndex)
         MemCopy(mappedPtr, &viewProj, sizeof(FViewProjUBO));
         device->UnmapBuffer(m_UniformBuffers[frameIndex]);
     }
+
+    // 存本帧矩阵供下一帧用。
+    //
+    // 必须在这里 (写完 UBO 之后) 存, 而不是在下一帧开头算 —— 下一帧开头时
+    // 相机已经被 Tick 更新过了, 那时读到的是新矩阵, 速度会恒等于零而且没
+    // 有任何报错。这类"少一帧延迟"的错位是速度缓冲最典型的失效方式。
+    m_PrevViewProj    = viewProj.ViewProj;
+    m_HasPrevViewProj = true;
 }
 
 } // namespace Limx

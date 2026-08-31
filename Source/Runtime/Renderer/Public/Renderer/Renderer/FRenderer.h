@@ -101,8 +101,26 @@ class FMaterial;
 
 struct FViewProjUBO
 {
-    FMatrix View;
-    FMatrix Proj;
+    // 三个字段都给默认值。FMatrix 的默认构造是 `= default` (不初始化),
+    // 而这个结构是整块 MemCopy 进映射内存的 —— 少填一个字段, 进 GPU 的
+    // 就是栈上的残留字节。那既不报错也不稳定复现。
+    FMatrix View = FMatrix::kIdentity;
+    FMatrix Proj = FMatrix::kIdentity;
+
+    /// Proj * View —— 顶点着色器实际用的那一个
+    ///
+    /// 与 View/Proj 冗余是刻意的: 前向 Pass 的深度测试是 Equal, 要求
+    /// gbuffer.vert 与 pbr.vert 算出逐位相同的 gl_Position。让两者都用
+    /// 这一个预乘矩阵, 比指望编译器对两处 `proj * view * world` 做出相同
+    /// 的重结合可靠得多。详见 Shaders/Builtin/view_common.h。
+    FMatrix ViewProj = FMatrix::kIdentity;
+
+    /// 上一帧的 Proj * View (已含抖动)
+    ///
+    /// 速度矢量靠它与本帧的差算出。必须是**上一帧同样抖动过的**矩阵 ——
+    /// 存未抖动的版本会让速度里混进抖动本身的偏移, 那是一个每帧固定模式
+    /// 的假运动, TAA 会当真。
+    FMatrix PrevViewProj = FMatrix::kIdentity;
 };
 
 /// 这是扇出最大的 GPU 结构 — 四个着色器 (pbr.vert / depth_only.vert /
@@ -111,9 +129,9 @@ struct FViewProjUBO
 ///
 /// 在中间加字段会让 Proj 错位, 在末尾加字段会让 C++ 侧六处缓冲区与
 /// 描述符 range 自动跟着变大, 而着色器不会 —— 两种都不报错。
-static_assert(sizeof(FViewProjUBO) == 128,
-              "FViewProjUBO 必须是 128 字节 (两个 mat4) — "
-              "与四个顶点着色器的 ViewProjUBO 块一致");
+static_assert(sizeof(FViewProjUBO) == 256,
+              "FViewProjUBO 必须是 256 字节 (四个 mat4) — "
+              "与 Shaders/Builtin/view_common.h 的 ViewProjUBO 块一致");
 
 // ============================================================================
 // FModelPushConstant — 逐物体 Model 矩阵 Push Constant 数据 (64 bytes)
@@ -431,6 +449,20 @@ public:
     /// 清空滚动窗口 — 用于跳过启动阶段的预热帧后重新计时
     void ResetFrameStats();
 
+    /// 深度预通道 (G-Buffer 的产出方) —— 回读校验用
+    LIMX_NODISCARD FDepthPrePass* GetDepthPrePass() const
+    {
+        return m_DepthPrePass.Get();
+    }
+
+    /// 上一帧的 Proj * View —— 校验速度缓冲时要拿它做 CPU 侧对照
+    ///
+    /// 返回的是**下一帧将会用到的**那一个, 即刚渲染完那一帧的矩阵。
+    LIMX_NODISCARD const FMatrix& GetPrevViewProj() const
+    {
+        return m_PrevViewProj;
+    }
+
     /// 设置场景渲染后回调 — 在所有场景 Pass 执行完毕、EndFrame 之前调用
     /// 用于 UI 渲染叠加等需要录制到同一命令缓冲区的操作
     void SetPostSceneRenderCallback(const TFunction<void()>& callback)
@@ -532,6 +564,15 @@ private:
     /// 关掉时前向 Pass 走内联路径, 两条路径共用同一份绘制代码, 因此
     /// 输出应当逐像素相同 —— 这正是 Day 2 的核心验收。
     bool                              m_ParallelRecording = true;
+
+    /// 上一帧的 Proj * View (已含抖动)
+    ///
+    /// 单个成员而非按帧索引的数组: 它要的是"上一次渲染的那一帧", 而不是
+    /// "上一次用同一个 frameIndex 的那一帧" —— 后者在双缓冲下差了两帧。
+    FMatrix                           m_PrevViewProj = FMatrix::kIdentity;
+
+    /// m_PrevViewProj 是否已经被填过 (决定第一帧怎么处理)
+    bool                              m_HasPrevViewProj = false;
 
     /// 单调递增的帧号 — 决定计时器用哪个环形槽位
     ///

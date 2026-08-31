@@ -28,6 +28,8 @@ layout(row_major, push_constant) uniform PushConstants {
 
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 1) in vec3 fragWorldNormal;
+layout(location = 2) in vec4 fragCurrentClip;
+layout(location = 3) in vec4 fragPrevClip;
 
 // 顺序必须与渲染通道的附件顺序一致: [0]=法线 [1]=速度
 layout(location = 0) out vec2 outNormal;
@@ -62,9 +64,10 @@ void main()
 
     outNormal = EncodeOctahedralNormal(n);
 
-    // 速度暂时恒为 0 —— 上一帧矩阵还没接进来。
+    // NDC 差值, 不转成 UV 偏移。
     //
-    // 写 0 而不是不写: 不写的输出内容是**未定义**的, 而 0 有明确语义
-    // ("没有运动"), 下一步接上真实速度时也不会有中间状态。
-    outVelocity = vec2(0.0);
+    // 两种约定都有人用, 差别是 Y 轴朝向和一个 0.5 的缩放。定成 NDC 是因为
+    // 它与 gl_Position 同一个空间, 消费方 (TAA 的重投影) 自己乘 0.5 并翻 Y
+    // 即可 —— 反过来在这里就转成 UV, 会让"这张图是什么空间"取决于读注释。
+    outVelocity = ComputeVelocity(fragCurrentClip, fragPrevClip);
 }

@@ -20,10 +20,7 @@
 // ============================================================
 
 // 与顶点着色器共享 set 0 —— 天空只需要 view 与 proj, 不额外占描述符集
-layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
-    mat4 view;
-    mat4 proj;
-} ubo;
+#include "view_common.h"
 
 layout(location = 0) out vec3 fragViewDirection;
 

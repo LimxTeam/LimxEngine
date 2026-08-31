@@ -28,10 +28,7 @@ layout(location = 5) in vec4 inColor;
 // 解读 uniform 中的 mat4, 不加 row_major 就等于把矩阵整体转置 —— 顶点会被
 // 变换到裁剪体之外, 表现为"什么都不显示"而没有任何报错。
 // FMatrix.h 的注释即以"与着色器 row_major 一致"为前提。
-layout(row_major, set = 0, binding = 0) uniform ViewProjUBO {
-    mat4 view;
-    mat4 proj;
-} ubo;
+#include "view_common.h"
 
 // ── Push Constant: 逐物体 Model 矩阵 ──
 // push constant 里多了材质下标。
@@ -57,7 +54,9 @@ void main()
     fragWorldPos  = worldPos.xyz;
 
     // 裁剪空间位置
-    gl_Position = ubo.proj * ubo.view * worldPos;
+    // 必须与 gbuffer.vert 写法逐字相同 —— 前向 Pass 的深度测试是 Equal,
+    // 两处算出的 z 差一个 ulp 就会让整个物体被剔除。
+    gl_Position = ubo.viewProj * worldPos;
 
     // 世界空间法线 (使用 model 矩阵的逆转置 3x3 子矩阵)
     // 对于等比缩放场景，mat3(model) 等价于法线矩阵
