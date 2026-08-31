@@ -446,6 +446,34 @@ Invoke-Step 'G-Buffer 自检 (开 TAA 抖动)' -RequiresGpu {
     Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check --jitter'
 }
 
+# 图像回归 —— 需要真实 GPU。
+#
+# 前面所有的 GPU 自检验的都是**数值性质** (速度为零、法线朝向相机、能量
+# 守恒), 没有一条能回答"画面看起来还对不对"。而着色路径最常见的回归恰恰
+# 是数值上完全合法、只是结果变了: UBO 字段错位、材质参数读错、某盏光丢了。
+#
+# 比的不是整张图, 是 32x18 平均池化的签名 (1728 字节, 可提交)。逐像素相等
+# 对 GPU 渲染过于严苛 —— 驱动版本、光栅化绑定规则、浮点收缩都会让个别像素
+# 差 1。而一个 40x40 的格子平均之后, 那些差异被抹平, 真实的着色改动却不会。
+#
+# **局限**: 基线是在特定 GPU 与驱动上生成的。换硬件需要重新生成基线, 那
+# 一步必须由人确认画面确实正确, 不能自动覆盖 —— 自动覆盖等于这个检查永远
+# 通过。生成命令写在 Content/Baselines/README.md 里。
+Invoke-Step '图像回归 (演示场景)' -RequiresGpu {
+    $shot = Join-Path $env:TEMP 'limx-verify-demo.ppm'
+
+    Invoke-Engine "--frames 20 --warmup 5 --screenshot $shot"
+
+    if ($global:LASTEXITCODE -ne 0)
+    {
+        return
+    }
+
+    powershell -NoProfile -ExecutionPolicy Bypass `
+        -File Scripts/image-signature.ps1 `
+        -Ppm $shot -Baseline Content/Baselines/demo-scene.sig
+}
+
 # 交换链重建自检 —— 需要真实 GPU。
 #
 # OnResize 平时只有窗口缩放时才走, 而自动化里没有任何东西会改窗口尺寸。
