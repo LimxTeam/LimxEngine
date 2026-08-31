@@ -90,6 +90,7 @@ class FForwardPass;
 class FShadowPass;
 class FDepthPrePass;
 class FClusterLightPass;
+class FTaaPass;
 class FSkyPass;
 class FPostProcessPass;
 class FEnvironmentMap;
@@ -487,6 +488,21 @@ public:
         return m_PrevViewProjNoJitter;
     }
 
+    /// TAA 解析通道 —— 自检要用
+    LIMX_NODISCARD FTaaPass* GetTaaPass() const { return m_TaaPass.Get(); }
+
+    /// 时域抗锯齿总开关
+    ///
+    /// **同时控制抖动与解析。** 两者必须同开同关: 抖动开而解析关 = 画面纯粹
+    /// 多一层每帧变化的亚像素噪声; 解析开而抖动关 = 每帧采样位置相同, 累积
+    /// 不出任何新信息, 只剩下运动时的拖影。
+    ///
+    /// 分成两个开关的话, 三种非法组合里有两种在画面上看起来"只是有点糊",
+    /// 没人会怀疑到开关上。
+    void SetTaaEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsTaaEnabled() const { return m_TemporalJitterEnabled; }
+
     /// TAA 亚像素抖动开关
     ///
     /// 抖动只作用在写进 UBO 的那一份投影矩阵拷贝上, 相机自身的矩阵不变。
@@ -647,6 +663,7 @@ private:
     TUniquePtr<FShadowPass>           m_ShadowPass;
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
+    TUniquePtr<FTaaPass>              m_TaaPass;
 
     /// 是否启用分簇光照
     ///

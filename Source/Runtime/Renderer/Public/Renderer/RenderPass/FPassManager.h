@@ -229,6 +229,14 @@ public:
         return m_IsInitialized;
     }
 
+    /// 共享 HDR 颜色目标的视图
+    ///
+    /// TAA 关闭时后处理直接采样它; 开启时改采 TAA 的解析目标。
+    LIMX_NODISCARD FRHITextureViewHandle GetSharedColorView() const
+    {
+        return m_SharedColorTextureView;
+    }
+
 private:
     // ====================================================================
     // 共享深度缓冲区

@@ -441,9 +441,21 @@ Invoke-Step 'G-Buffer 自检 (法线编码 + 速度矢量)' -RequiresGpu {
 # 只跑其中一个的话, 另一边的失效方式完全没有覆盖。
 #
 # 开抖动那次还多验一条正向对照: 相机不变的两帧覆盖掩码必须有差异。
-# 没有它, "--jitter 是个空开关"会让上面每一项都完美通过。
+# 没有它, "--taa 是个空开关"会让上面每一项都完美通过。
 Invoke-Step 'G-Buffer 自检 (开 TAA 抖动)' -RequiresGpu {
-    Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check --jitter'
+    Invoke-Engine '--frames 20 --warmup 5 --gbuffer-check --taa'
+}
+
+# TAA 自检 —— 需要真实 GPU。
+#
+# TAA 最危险的失效方式是**看起来正常但什么都没做**: 裁剪范围取小了历史每帧
+# 都被拉回当前值, 或者重投影全部落在屏幕外历史一律被拒。两种情况下画面都完全
+# 正常, 只是锯齿还在 —— 而那要对着屏幕看边缘才发现。
+#
+# 判据是数值的: 抖动 N 帧的均匀平均就是超采样真值, TAA 的输出必须比其中任何
+# 单帧都显著更接近它。一个"什么都没做"的 TAA 输出等于单帧, 这一条直接不成立。
+Invoke-Step 'TAA 自检 (与多帧平均比对)' -RequiresGpu {
+    Invoke-Engine '--frames 20 --warmup 5 --taa-check'
 }
 
 # 分簇光照自检 —— 需要真实 GPU。

@@ -68,6 +68,7 @@
 #include "Renderer/RenderPass/FPassManager.h"
 #include "Renderer/RenderPass/FShadowPass.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
+#include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FSkyPass.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
 #include "Renderer/RenderPass/FPostProcessPass.h"
@@ -232,9 +233,11 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager  = MakeUnique<FPassManager>();
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
+    m_TaaPass          = MakeUnique<FTaaPass>();
 
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
+    m_PassManager->RegisterPass(m_TaaPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
@@ -298,6 +301,13 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     {
         LIMX_LOG(LogRenderer, Error, "[Renderer] BRDF 占位查找表创建失败");
         return result;
+    }
+
+    // TAA 的速度输入来自深度预通道的附件 —— 必须在 SetupAll 之后接,
+    // 那时它才存在。
+    if (m_TaaPass && m_DepthPrePass)
+    {
+        m_TaaPass->SetVelocityView(m_DepthPrePass->GetVelocityView());
     }
 
     // set 2 光照描述符集必须在 SetupAll 之后创建 —— 它的 binding 1 指向
@@ -1582,6 +1592,40 @@ void FRenderer::DestroyBufferResources()
         device->DestroyBuffer(m_UniformBuffers[i]);
     }
     m_UniformBuffers.Clear();
+}
+
+// ============================================================================
+// SetTaaEnabled — 抖动与解析同开同关
+// ============================================================================
+
+void FRenderer::SetTaaEnabled(bool enabled)
+{
+    m_TemporalJitterEnabled = enabled;
+
+    if (!m_TaaPass || !m_PostProcessPass)
+    {
+        return;
+    }
+
+    m_TaaPass->SetEnabled(enabled);
+
+    // 后处理采样谁: 开 TAA 时采解析目标, 关时直接采前向通道的 HDR 输出。
+    //
+    // 只在开关翻转时改一次描述符, 不逐帧改 —— 改一个正在被上一帧使用的
+    // 描述符集是验证层错误。翻转时调用方保证已经 WaitIdle (见调用点)。
+    IRHIDevice* const device = m_Context->GetDevice();
+
+    if (device == nullptr)
+    {
+        return;
+    }
+
+    device->WaitIdle();
+
+    m_PostProcessPass->UpdateSourceDescriptor(
+        device,
+        enabled ? m_TaaPass->GetResolveView()
+                : m_PassManager->GetSharedColorView());
 }
 
 // ============================================================================

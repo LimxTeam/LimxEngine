@@ -148,8 +148,11 @@ struct FLaunchOptions
     /// G-Buffer 自检: 法线编码与速度矢量的数值校验, 以退出码报告
     bool GBufferCheck = false;
 
-    /// 启用 TAA 亚像素抖动 (默认关 —— TAA 本身尚未落地)
-    bool TemporalJitter = false;
+    /// 启用时域抗锯齿 (抖动 + 解析, 同开同关)
+    bool TemporalAA = false;
+
+    /// TAA 自检: 断言解析结果比任何单帧都更接近多帧平均, 以退出码报告
+    bool TaaCheck = false;
 
     /// 分簇剔除自检: 回读簇表与 CPU 参照逐簇比对, 以退出码报告
     bool ClusterCheck = false;
@@ -362,7 +365,8 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --furnace        白炉测试: 合成均匀环境 + 关闭直接光
 ///   --furnace-check  白炉自检: 断言 IBL 各级预计算, 以退出码报告
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
-///   --jitter         启用 TAA 亚像素抖动 (Halton 2,3, 周期 16 帧)
+///   --taa            启用时域抗锯齿 (Halton 2,3 抖动 + 解析通道)
+///   --taa-check      TAA 自检: 与多帧平均比对, 以退出码报告
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
 ///   --no-clustered   关闭分簇, 强制暴力遍历全部光源 (性能对照用)
 ///   --light-cull-check 分簇着色自检: 与暴力法逐像素比对, 以退出码报告
@@ -519,9 +523,13 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.ClusterCheck = true;
         }
-        else if (WideEquals(arg, L"--jitter"))
+        else if (WideEquals(arg, L"--taa-check"))
         {
-            options.TemporalJitter = true;
+            options.TaaCheck = true;
+        }
+        else if (WideEquals(arg, L"--taa"))
+        {
+            options.TemporalAA = true;
         }
         else if (WideEquals(arg, L"--gbuffer-check"))
         {
@@ -1617,6 +1625,234 @@ private:
 };
 
 // ============================================================================
+// RunTaaChecks — 证明 TAA 真的在做抗锯齿
+//
+// TAA 最危险的失效方式是**看起来正常但什么都没做**: 裁剪范围取小了, 历史
+// 每帧都被拉回当前值; 或者重投影全部落在屏幕外, 历史一律被拒。两种情况下
+// 画面都完全正常, 只是锯齿还在 —— 而"锯齿还在"要对着屏幕看边缘才发现。
+//
+// 判据是数值的, 分三条:
+//
+//   1. **有效性**: 抖动 N 帧的**均匀平均**就是超采样的真值。TAA 的输出必须
+//      比其中任何单帧都显著更接近那个真值。一个"什么都没做"的 TAA 输出等于
+//      单帧, 这一条直接不成立。
+//
+//   2. **收敛性**: 静止场景下连续两帧的 TAA 输出必须几乎相同。不收敛意味着
+//      历史权重或裁剪有问题, 表现是静止画面上的持续闪烁。
+//
+//   3. **有效性的对照**: 单帧与均值的距离必须**足够大**。若场景本身没有
+//      锯齿 (比如全屏纯色), 单帧就已经等于均值, 第一条便退化成"0 < 0",
+//      恒不成立或恒成立 —— 都不是判据。
+//
+// 帧数取 32 (抖动周期 16 的整数倍), 于是均值里每个抖动位置的权重相同, 那
+// 才是真正的均匀超采样。不是整数倍的话均值本身就带偏。
+// ============================================================================
+static bool RunTaaChecks(FRenderContext* context, FRenderer& renderer)
+{
+    if (renderer.GetTaaPass() == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[TAA] 解析通道不存在");
+        return false;
+    }
+
+    // 抖动周期是 16, 取它的整数倍
+    constexpr UInt32 kFrames = 32;
+
+    // ---- 阶段 1: 抖动开、TAA 关 —— 收集 N 帧求均匀平均 ----
+    //
+    // 这是自检内部才允许的组合。正常运行时两者同开同关 (见
+    // FRenderer::SetTaaEnabled 的说明), 但构造超采样真值需要拿到每一帧的
+    // 抖动结果, 那只能在解析关闭时取。
+    renderer.SetTaaEnabled(false);
+    renderer.SetTemporalJitterEnabled(true);
+
+    TArray<Float64> accum;
+    TArray<UInt8>   lastFrame;
+
+    for (UInt32 i = 0; i < kFrames; ++i)
+    {
+        FScreenshotCapture shot;
+
+        if (!shot.Request(context))
+        {
+            return false;
+        }
+
+        renderer.SetPostSceneRenderCallback(
+            [&shot, context]() { shot.RecordCopy(context); });
+
+        renderer.RenderFrame();
+
+        // 立刻摘掉回调。shot 是栈上的, 循环下一轮它就没了 —— 而回调里持的
+        // 是引用。留着的话, 后面任何一次 RenderFrame 都会去访问一块已经出
+        // 作用域的内存, 表现是"dstBuffer is VK_NULL_HANDLE"后接一个访问
+        // 违例, 而崩溃点离真正的原因隔着几十帧。
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        TArray<UInt8> pixels;
+
+        if (!shot.ReadPixels(context, pixels))
+        {
+            shot.Release(context->GetDevice());
+            return false;
+        }
+
+        shot.Release(context->GetDevice());
+
+        if (accum.GetSize() == 0)
+        {
+            accum.Reserve(pixels.GetSize());
+
+            for (SizeType p = 0; p < pixels.GetSize(); ++p)
+            {
+                accum.Add(0.0);
+            }
+        }
+
+        if (accum.GetSize() != pixels.GetSize())
+        {
+            LIMX_LOG(LogLaunch, Error, "[TAA] 帧尺寸在采集途中变了");
+            return false;
+        }
+
+        for (SizeType p = 0; p < pixels.GetSize(); ++p)
+        {
+            accum[p] += static_cast<Float64>(pixels[p]);
+        }
+
+        lastFrame = pixels;
+    }
+
+    TArray<Float64> average;
+    average.Reserve(accum.GetSize());
+
+    for (SizeType p = 0; p < accum.GetSize(); ++p)
+    {
+        average.Add(accum[p] / static_cast<Float64>(kFrames));
+    }
+
+    // ---- 阶段 2: TAA 开, 渲到收敛 ----
+    renderer.SetTaaEnabled(true);
+
+    for (UInt32 i = 0; i < kFrames; ++i)
+    {
+        renderer.RenderFrame();
+    }
+
+    TArray<UInt8> taaFrame;
+    TArray<UInt8> taaFrameNext;
+
+    for (UInt32 pass = 0; pass < 2; ++pass)
+    {
+        FScreenshotCapture shot;
+
+        if (!shot.Request(context))
+        {
+            return false;
+        }
+
+        renderer.SetPostSceneRenderCallback(
+            [&shot, context]() { shot.RecordCopy(context); });
+
+        renderer.RenderFrame();
+
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        TArray<UInt8>& target = (pass == 0) ? taaFrame : taaFrameNext;
+
+        if (!shot.ReadPixels(context, target))
+        {
+            shot.Release(context->GetDevice());
+            return false;
+        }
+
+        shot.Release(context->GetDevice());
+    }
+
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    // ---- 判据 ----
+    bool passed = true;
+
+    if (taaFrame.GetSize() != average.GetSize() ||
+        lastFrame.GetSize() != average.GetSize() ||
+        taaFrameNext.GetSize() != average.GetSize())
+    {
+        LIMX_LOG(LogLaunch, Error, "[TAA] 采集到的尺寸不一致");
+        return false;
+    }
+
+    Float64 sumTaa    = 0.0;
+    Float64 sumSingle = 0.0;
+    Float64 sumStable = 0.0;
+
+    for (SizeType p = 0; p < average.GetSize(); ++p)
+    {
+        const Float64 dTaa =
+            static_cast<Float64>(taaFrame[p]) - average[p];
+        const Float64 dSingle =
+            static_cast<Float64>(lastFrame[p]) - average[p];
+        const Float64 dStable =
+            static_cast<Float64>(taaFrameNext[p]) -
+            static_cast<Float64>(taaFrame[p]);
+
+        sumTaa    += dTaa * dTaa;
+        sumSingle += dSingle * dSingle;
+        sumStable += dStable * dStable;
+    }
+
+    const Float64 count = static_cast<Float64>(average.GetSize());
+
+    const Float64 rmsTaa    = FMath::Sqrt(sumTaa / count);
+    const Float64 rmsSingle = FMath::Sqrt(sumSingle / count);
+    const Float64 rmsStable = FMath::Sqrt(sumStable / count);
+
+    // 3. 对照: 单帧与均值必须确实有差距, 否则第一条判据无意义
+    if (rmsSingle < 0.5)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[TAA] 单帧与多帧平均的 RMS 只有 {} —— 场景里几乎没有抖动"
+                 "带来的差异, 这组判据无从判定。抖动是不是没生效?",
+                 rmsSingle);
+        passed = false;
+    }
+
+    // 1. 有效性: TAA 必须显著更接近真值
+    //
+    // 阈值取 0.5 倍。TAA 的输出是指数滑动平均而非均匀平均, 所以不可能等于
+    // 真值; 但"比单帧近一倍以上"是一个不做任何抗锯齿的实现绝对达不到的。
+    if (rmsTaa >= rmsSingle * 0.5)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[TAA] 解析结果并不比单帧更接近多帧平均 "
+                 "(TAA RMS {} vs 单帧 RMS {}) —— 历史可能每帧都被裁掉了",
+                 rmsTaa, rmsSingle);
+        passed = false;
+    }
+
+    // 2. 收敛性: 静止场景下连续两帧必须几乎相同
+    if (rmsStable > 1.0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[TAA] 静止场景下连续两帧的 RMS 差异 {} 过大 —— 未收敛",
+                 rmsStable);
+        passed = false;
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Log,
+                 "[TAA] 解析有效: 与 {} 帧平均的 RMS {} vs 单帧 {} "
+                 "(近 {} 倍); 连续帧 RMS {}",
+                 kFrames, rmsTaa, rmsSingle,
+                 (rmsTaa > 1.0e-9) ? (rmsSingle / rmsTaa) : 0.0,
+                 rmsStable);
+    }
+
+    return passed;
+}
+
+// ============================================================================
 // RunLightCullChecks — 分簇着色与暴力法的逐像素比对
 //
 // 这是分簇光照最强的一条验收判据: **同一帧、同一个着色器、只翻转一个布尔
@@ -2469,7 +2705,7 @@ static bool RunGBufferChecks(FRenderContext* context,
     //   抖动关 → 两帧的光栅化覆盖必须**逐像素完全一致**
     //   抖动开 → 亚像素偏移会让轮廓上的像素翻转覆盖状态
     //
-    // 没有这一条时, "--jitter 是个空开关"这种情况会让上面每一项都完美
+    // 没有这一条时, "--taa 是个空开关"这种情况会让上面每一项都完美
     // 通过 —— 速度为零、法线正确、一切正常, 只是抖动根本没生效。而抖动
     // 没生效的后果要等 TAA 接上之后才看得出来 (锯齿消不掉), 那时已经很难
     // 定位到这里。
@@ -3818,12 +4054,12 @@ int WINAPI wWinMain(
                  "[Launch] 分簇光照已关闭 — 暴力遍历全部光源");
     }
 
-    if (launchOptions.TemporalJitter)
+    if (launchOptions.TemporalAA)
     {
-        renderer.SetTemporalJitterEnabled(true);
+        renderer.SetTaaEnabled(true);
 
         LIMX_LOG(LogLaunch, Display,
-                 "[Launch] TAA 亚像素抖动已启用 (Halton 2,3, 周期 16 帧)");
+                 "[Launch] 时域抗锯齿已启用 (Halton 2,3 抖动 + 方差裁剪解析)");
     }
 
     // 4f. 环境贴图 — 必须在渲染器初始化之后 (天空 Pass 的描述符集才存在)
@@ -3888,6 +4124,7 @@ int WINAPI wWinMain(
     bool    gbufferCheckPassed = true;
     bool    clusterCheckPassed = true;
     bool    lightCullCheckPassed = true;
+    bool    taaCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -3946,6 +4183,11 @@ int WINAPI wWinMain(
             {
                 lightCullCheckPassed =
                     RunLightCullChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.TaaCheck)
+            {
+                taaCheckPassed = RunTaaChecks(&renderContext, renderer);
             }
 
             // G-Buffer 自检: 会自己再渲三帧并改动相机朝向, 所以必须放在
@@ -4050,6 +4292,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.LightCullCheck)
     {
         selfCheckCode = FinalizeSelfCheck(lightCullCheckPassed, 10, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.TaaCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(taaCheckPassed, 11, errorSink,
                                           errorsBeforeShutdown);
     }
 

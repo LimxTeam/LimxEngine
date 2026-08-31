@@ -58,6 +58,17 @@ public:
 
     ERHIResult Setup(const FPassSetupDesc& desc) override;
 
+    /// 把要采样的视图写入描述符集
+    ///
+    /// 两个调用方: 交换链重建后 (视图换了新的), 以及 TAA 开关翻转时 ——
+    /// 开 TAA 后本通道采样的是 TAA 的解析目标而不是前向通道的 HDR 输出。
+    ///
+    /// **不能逐帧调用。** 改一个正在被上一帧使用的描述符集是验证层错误;
+    /// 调用方必须先 WaitIdle。TAA 的解析目标之所以是固定的一张 (而不是
+    /// 乒乓历史里的当前那张), 就是为了让这里一次写定。
+    void UpdateSourceDescriptor(IRHIDevice* device,
+                                FRHITextureViewHandle hdrView);
+
     void Execute(IRHICommandBuffer*        commandBuffer,
                  const FRenderPassContext& context) override;
 
@@ -91,10 +102,6 @@ private:
     ERHIResult CreateDescriptorResources(IRHIDevice* device);
     ERHIResult CreateShaders(IRHIDevice* device);
     ERHIResult CreatePipeline(IRHIDevice* device);
-
-    /// 把 HDR 视图写入描述符集 —— 尺寸变化后视图换了新的, 需要重写
-    void UpdateSourceDescriptor(IRHIDevice* device,
-                                FRHITextureViewHandle hdrView);
 
     // ====================================================================
     // 成员
