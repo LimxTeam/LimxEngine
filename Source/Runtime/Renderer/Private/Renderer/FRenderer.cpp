@@ -70,6 +70,7 @@
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
+#include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
 #include "Renderer/RenderPass/FBloomPass.h"
@@ -243,6 +244,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_ForwardPass  = MakeUnique<FForwardPass>();
     m_PostProcessPass = MakeUnique<FPostProcessPass>();
     m_PassManager  = MakeUnique<FPassManager>();
+    m_RayTracedShadowPass = MakeUnique<FRayTracedShadowPass>();
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_GpuCullPass      = MakeUnique<FGpuCullPass>();
@@ -258,6 +260,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager->RegisterPass(m_TaaPass.Get());
     m_PassManager->RegisterPass(m_BloomPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
+    m_PassManager->RegisterPass(m_RayTracedShadowPass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
 
@@ -320,6 +323,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
 
     if (m_GtaoPass && m_DepthPrePass && m_PassManager)
     {
+        if (m_RayTracedShadowPass)
+        {
+            m_RayTracedShadowPass->SetInputs(
+                m_DepthPrePass->GetSharedDepthTexture(),
+                m_PassManager->GetSharedDepthView(),
+                m_DepthPrePass->GetNormalView());
+        }
+
         m_GtaoPass->SetInputs(m_DepthPrePass->GetSharedDepthTexture(),
                               m_PassManager->GetSharedDepthView(),
                               m_DepthPrePass->GetNormalView());
@@ -374,6 +385,7 @@ void FRenderer::Shutdown()
     m_SkyPass.Reset();
     m_DepthPrePass.Reset();
     m_RayTracingScene.Shutdown();
+    m_RayTracedShadowPass.Reset();
     m_GpuCullPass.Reset();
     m_ShadowAtlasPass.Reset();
     m_ShadowPass.Reset();
@@ -408,6 +420,37 @@ void FRenderer::Shutdown()
 // ============================================================================
 // RenderFrame — 单帧渲染
 // ============================================================================
+
+bool FRenderer::IsRayTracedShadowsEnabled() const
+{
+    return m_RayTracedShadowPass && m_RayTracedShadowPass->IsEnabled();
+}
+
+bool FRenderer::SetRayTracedShadowsEnabled(bool enabled)
+{
+    if (!m_RayTracedShadowPass)
+    {
+        return false;
+    }
+
+    if (!enabled)
+    {
+        m_RayTracedShadowPass->SetEnabled(false);
+        return true;
+    }
+
+    // 光追阴影要读加速结构 —— 顺带把它打开。
+    //
+    // 不顺带打开的话, 调用方要记住"先开加速结构再开阴影", 而忘了的表现
+    // 是掩码保持上一帧内容: 静止场景里那与正确结果完全一样。
+    if (!SetRayTracingEnabled(true))
+    {
+        return false;
+    }
+
+    m_RayTracedShadowPass->SetEnabled(true);
+    return true;
+}
 
 bool FRenderer::SetRayTracingEnabled(bool enabled)
 {
@@ -547,6 +590,43 @@ void FRenderer::RenderFrame()
             m_Context->GetCurrentCommandBuffer();
 
         m_RayTracingScene.RecordBuild(rtCommandBuffer);
+    }
+
+    // 光追阴影通道每帧要知道: 树在哪、相机在哪、照哪盏灯
+    if (m_RayTracedShadowPass && m_RayTracedShadowPass->IsEnabled())
+    {
+        m_RayTracedShadowPass->SetTlas(m_RayTracingScene.GetTlas());
+
+        m_RayTracedShadowPass->SetCameraParams(
+            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix(),
+            m_Camera.GetNearPlane(), m_Camera.GetFarPlane());
+
+        // 第一盏投影的光源。
+        //
+        // 一次只处理一盏 —— 掩码是单通道的。选"第一盏投影的"而不是
+        // "第一盏", 是因为不投影的光源根本不需要算阴影, 而把算力花在
+        // 它身上不会有任何画面变化, 于是"选错了灯"这件事看不出来。
+        const FLightManager& lights = FLightManager::Get();
+
+        bool found = false;
+
+        for (UInt32 i = 0; i < lights.GetActiveLightCount(); ++i)
+        {
+            const FLight& light = lights.GetLight(i);
+
+            if (light.CastsShadow())
+            {
+                m_RayTracedShadowPass->SetLight(light.ToGpuData());
+                found = true;
+                break;
+            }
+        }
+
+        if (!found)
+        {
+            LIMX_LOG(LogRenderer, Error,
+                     "[光追阴影] 场景里没有投影的光源 — 掩码会保持上一帧");
+        }
     }
 
     // 材质表每帧整体上传 —— 见 FBindlessTable::Upload 的说明

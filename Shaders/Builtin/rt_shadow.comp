@@ -1,0 +1,167 @@
+// ============================================================
+// 文件名称：rt_shadow.comp
+// 创建时间：2026-08-31
+// 创建者  ：LimxTeam
+// 设计哲学：阴影贴图回答的是"这个点在光源的深度图里排第几"，光追回答的是
+//          "从这个点到光源的线段上有没有东西"。后者是问题本身的定义，
+//          前者是它的一个离散近似 —— 所以偏置、漏光、锯齿这些词只属于
+//          前者。这支着色器要保住这个性质，因此**不引入任何与几何无关的
+//          偏置**：起点的容差只用来盖住深度缓冲区自身的量化误差，而那个
+//          量是可以算出来的，不是调出来的。
+// 功能描述：逐像素从深度缓冲区还原世界坐标，向指定光源发一条阴影射线，
+//          输出可见度（0 = 被遮挡，1 = 见得到光）。
+// 技术特性：射线用 TerminateOnFirstHit + SkipClosestHit —— 阴影只关心
+//          "有没有"，不关心"最近的是哪个"，这让遍历一命中就停；
+//          起点沿几何法线偏移，偏移量由深度量化误差推出而非经验取值。
+// ============================================================
+
+#version 460
+
+#extension GL_EXT_ray_query : require
+
+#include "gbuffer_common.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+
+// 光栅化写出的深度
+layout(set = 0, binding = 1) uniform sampler2D sceneDepth;
+
+// 深度预通道写出的八面体法线
+layout(set = 0, binding = 2) uniform sampler2D sceneNormal;
+
+// 可见度输出 —— 0 = 被遮挡, 1 = 见得到光
+layout(set = 0, binding = 3, r8) uniform writeonly image2D shadowMask;
+
+layout(row_major, push_constant) uniform Params
+{
+    // 逆视图投影 —— 把 NDC 反投影回世界空间
+    mat4 InvViewProj;
+
+    // xyz = 光源世界位置 (方向光忽略), w = 光源类型 (0=方向 1=点 2=聚光)
+    vec4 LightPosition;
+
+    // xyz = 光源方向 (归一化, 由光源指向被照面), w = 最大衰减距离
+    vec4 LightDirection;
+
+    // x = 宽, y = 高, z = 射线掩码, w = 保留
+    uvec4 Params0;
+
+    // x = 近裁剪面, y = 远裁剪面, z = 法线偏移量, w = 射线 tMin
+    vec4 Params1;
+} pc;
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.Params0.x || pixel.y >= pc.Params0.y)
+    {
+        return;
+    }
+
+    const float ndcDepth = texelFetch(sceneDepth, ivec2(pixel), 0).r;
+
+    // 远平面 = 这一像素什么都没画上。
+    //
+    // 写 1.0 (见得到光) 而不是 0.0: 天空不该是黑的。而且这个值会被着色
+    // 阶段乘进直接光照, 写 0 的话天空周围会出现一圈说不清来源的暗边。
+    if (ndcDepth >= 0.999999)
+    {
+        imageStore(shadowMask, ivec2(pixel), vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // ---- 还原世界坐标 ----
+    const vec2 uv  = (vec2(pixel) + 0.5) / vec2(pc.Params0.xy);
+    const vec2 ndc = uv * 2.0 - 1.0;
+
+    const vec4 worldH = pc.InvViewProj * vec4(ndc, ndcDepth, 1.0);
+    const vec3 worldPos = worldH.xyz / worldH.w;
+
+    // ---- 几何法线 ----
+    //
+    // 深度预通道把"这里没有几何"清成 (2,2) —— 八面体编码产不出的值。
+    // 这里不需要区分 (远平面上面已经挡掉了), 但解码出来仍是单位向量,
+    // 所以即使读到哨兵也不会得到 NaN。
+    const vec2 encodedNormal = texelFetch(sceneNormal, ivec2(pixel), 0).rg;
+    const vec3 normal = DecodeOctahedralNormal(encodedNormal);
+
+    // ---- 射线 ----
+    const uint lightType = uint(pc.LightPosition.w + 0.5);
+
+    vec3 rayDirection;
+    float rayTMax;
+
+    if (lightType == 0u)
+    {
+        // 方向光: 朝光源来的反方向射出去。
+        //
+        // tMax 取衰减距离 —— 方向光没有位置, 但也不能设成无穷: 场景之外
+        // 什么都没有, 而无穷大的 tMax 会让遍历白跑很多层包围盒。
+        rayDirection = -pc.LightDirection.xyz;
+        rayTMax      = pc.LightDirection.w;
+    }
+    else
+    {
+        // 点光源与聚光灯: 朝光源位置射, tMax 就是到光源的距离。
+        //
+        // tMax 必须**略小于**那个距离: 正好等于的话, 光源自己所在位置上
+        // 若有几何体 (灯藏在灯罩里是常见摆法), 射线会命中它, 于是整盏灯
+        // 的所有影子都是全黑。
+        const vec3 toLight = pc.LightPosition.xyz - worldPos;
+        const float distance = length(toLight);
+
+        if (distance < 1.0e-6)
+        {
+            imageStore(shadowMask, ivec2(pixel), vec4(1.0, 0.0, 0.0, 0.0));
+            return;
+        }
+
+        rayDirection = toLight / distance;
+        rayTMax      = distance * 0.999;
+    }
+
+    // ---- 起点的容差 ----
+    //
+    // 沿法线推一点, 再加一个 tMin。两者防的是同一件事 —— 射线在出发点
+    // 打到自己脚下那个三角形 —— 但作用的方向不同:
+    //
+    //   法线偏移  对付"表面几乎与光线平行"的情形 (掠射角)。此时沿射线
+    //             推进多远都还贴着表面, 只有离开表面才有用。
+    //   tMin      对付"表面正对光源"的情形。此时法线方向就是射线方向,
+    //             两者等价, 但 tMin 更便宜。
+    //
+    // 这两个量都不是调出来的: 世界坐标是从深度缓冲区反投影来的, 它自带
+    // 一个量化误差 (实测在 near=0.1 的场景上、10 米处约 5.5e-5 世界单位),
+    // 容差只要盖住它就够。默认取 1e-3, 是那个误差的近二十倍。
+    //
+    // 取得过大的代价是影子的接触处脱开 (物体像浮在地面上), 而那正是阴影
+    // 贴图那套偏置的老毛病 —— 光追本来不该有。
+    const vec3 rayOrigin = worldPos + normal * pc.Params1.z;
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        topLevel,
+        // 阴影只关心"有没有挡住", 不关心"最近的是哪个" ——
+        // 一命中就终止, 遍历能省掉一大半。
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        pc.Params0.z,
+        rayOrigin,
+        pc.Params1.w,
+        rayDirection,
+        rayTMax);
+
+    while (rayQueryProceedEXT(query))
+    {
+    }
+
+    const bool occluded =
+        (rayQueryGetIntersectionTypeEXT(query, true) ==
+         gl_RayQueryCommittedIntersectionTriangleEXT);
+
+    imageStore(shadowMask, ivec2(pixel),
+               vec4(occluded ? 0.0 : 1.0, 0.0, 0.0, 0.0));
+}

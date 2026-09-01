@@ -705,6 +705,25 @@ Invoke-Step 'AO 双边上采样 (深度不连续处的渗色)' -RequiresGpu {
     Invoke-Engine '--showcase --gpu-driven --taa --bloom --clustered --gtao --frames 20 --warmup 5 --ao-edge-check'
 }
 
+# 光追阴影 —— 需要真实 GPU。
+#
+# 与 --shadow-check 问的是同一件事、用同一条扫描线、同一组解析常量, 差别只在
+# 输入: 一张是着色后的画面, 一张是光追的可见度掩码。于是量出来的差就只能是
+# 阴影本身的差, 不是测量方法的差。
+#
+# 实测 (阴影场景, 1280x720, 一个像素 0.00487 世界单位):
+#     光追      误差 0.00153 / 0.00191    容差 0.00974 (两个像素)
+#     阴影贴图  误差 0.01419 / 0.01294    容差 0.07273
+#
+# 同一个解析值, 光追准八倍 —— 因为阴影贴图的容差里塞着深度偏置与图集分辨率,
+# 而光追这两样都没有。容差一旦放宽到阴影贴图那个量级, 这条判据就不再是在
+# 验光追了。
+#
+# 变异 8/10, 两条逃逸的成因写在代码里 (其中一条是理论上就该逃的)。
+Invoke-Step '光追阴影 (边界落在相似三角形的解析位置上)' -RequiresGpu {
+    Invoke-Engine '--shadow-scene --shadow-lights 2 --clustered --frames 8 --warmup 3 --rt-shadow-check'
+}
+
 Invoke-Step '光追深度 (综合场景, 与光栅化逐像素比对)' -RequiresGpu {
     Invoke-Engine '--showcase --clustered --frames 8 --warmup 3 --rt-depth-check'
 }

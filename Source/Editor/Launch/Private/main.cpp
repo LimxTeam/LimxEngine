@@ -58,6 +58,7 @@
 #include "Renderer/RenderPass/FBloomPass.h"
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
+#include "Renderer/RenderPass/FRayTracedShadowPass.h"
 
 namespace Limx
 {
@@ -221,6 +222,12 @@ struct FLaunchOptions
 
     /// AO 边缘自检: 双边上采样在深度不连续处有没有起作用, 以退出码报告
     bool AoEdgeCheck = false;
+
+    /// 启用光追阴影 (替代阴影贴图)
+    bool RayTracedShadows = false;
+
+    /// 光追阴影自检: 边界与相似三角形的解析位置比对, 以退出码报告
+    bool RtShadowCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -698,6 +705,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--ao-edge-check"))
         {
             options.AoEdgeCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-shadows"))
+        {
+            options.RayTracedShadows = true;
+        }
+        else if (WideEquals(arg, L"--rt-shadow-check"))
+        {
+            options.RtShadowCheck = true;
         }
         else if (WideEquals(arg, L"--rt-depth-check"))
         {
@@ -4086,6 +4101,303 @@ static bool RunAoHalfChecks(FRenderContext* context, FRenderer& renderer)
 //      绝大多数是**未初始化显存与有效数据的边界**, 不是真的轮廓。
 //
 // 三件都修完之后, 综合场景上真正的深度不连续像素是 7236 个。
+// ============================================================================
+// RunRayTracedShadowChecks — 光追阴影的边界落在解析位置上
+//
+// 阴影贴图那一条判据 (--shadow-check) 问的是"影子边界落在相似三角形算出的
+// 位置附近吗", 容差里塞着深度偏置、图集分辨率、PCF 半径三样东西。光追这一条
+// 问的是同一件事, 但那三样东西**一样都没有** —— 所以它的容差应当小得多,
+// 而"小得多"本身就是一条可判定的性质。
+//
+// 用的是同一个 FindShadowSpan、同一条扫描线、同一组解析常量。两条判据的差别
+// 只在输入 (一张是着色后的画面, 一张是可见度掩码), 于是量出来的差别就只能是
+// 阴影本身的差别, 不是测量方法的差别。
+// ============================================================================
+
+/// 把 R8 可见度掩码读回来, 展开成 RGB —— 好让 SampleWorldPoint 原样可用
+///
+/// 展开而不是另写一份采样函数: 判据要与阴影贴图那一条**逐字**共用测量代码,
+/// 否则两边量出来的差里会混进"测量方式不同"这一项, 而那一项说不清楚。
+static bool ReadShadowMaskAsRgb(FRenderContext* context, FRenderer& renderer,
+                                TArray<UInt8>& outRgb)
+{
+    FRayTracedShadowPass* const pass = renderer.GetRayTracedShadowPass();
+
+    if (pass == nullptr || !pass->IsEnabled())
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追阴影] 通道未启用");
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle readback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Size        = pixelCount;   // R8
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "RtShadow.Readback";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+        {
+            return false;
+        }
+    }
+
+    const FRHITextureHandle maskTexture = pass->GetShadowMaskTexture();
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, maskTexture, readback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            // 掩码此刻停在 ShaderReadOnly (光追阴影通道的收尾转换)
+            cmd->TransitionImageLayout(
+                maskTexture,
+                EImageLayout::ShaderReadOnly, EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(maskTexture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                maskTexture,
+                EImageLayout::TransferSrc, EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(readback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* src = static_cast<const UInt8*>(mapped);
+
+            outRgb.Clear();
+            outRgb.Reserve(pixelCount * 3u);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outRgb.Add(src[i]);
+                outRgb.Add(src[i]);
+                outRgb.Add(src[i]);
+            }
+
+            device->UnmapBuffer(readback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(readback);
+
+    return ok;
+}
+
+// ── 已知的覆盖边界 (量过, 不是"没想到") ────────────────────────────────
+//
+// 变异验证 8/10, 两条逃逸的成因都查清了:
+//
+// 1. **tMax 用光源衰减距离而不是到光源的距离** —— 逃逸。
+//    危险在于"光源背后的几何体也来投影", 而阴影场景里 z>6 处什么都没有
+//    (灯在 z=6, 相机在 z=10 但相机不是几何体)。要验它需要一个灯背后有
+//    东西的场景。
+//
+// 2. **tMin 从 1e-3 放大到 0.1** —— 逃逸, 而且这是**理论上就该逃**的。
+//    上个周期推过: 沿光线方向的偏置不会移动影子边界 —— 起点沿射线推进
+//    多少, 在相似三角形里完全抵消。这里独立验到了同一件事。
+//    对照组: **法线偏移**从 1e-3 放大到 0.1 被抓住了 —— 法线偏置会移动
+//    边界。两条放在一起, 判据恰好分开了"影响边界的偏置"与"不影响的偏置",
+//    而那正是阴影偏置这件事的核心。
+//    tMin 过大真正的危害是接触阴影漏光 (遮挡物贴着接收面时), 要验它需要
+//    一个遮挡物离墙不到 0.1 的场景。
+static bool RunRayTracedShadowChecks(FRenderContext* context,
+                                     FRenderer& renderer)
+{
+    if (!renderer.SetRayTracedShadowsEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追阴影] 无法启用 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    TArray<UInt8> mask;
+
+    if (!ReadShadowMaskAsRgb(context, renderer, mask))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追阴影] 掩码回读失败");
+        return false;
+    }
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const FMatrix viewProj = renderer.GetCamera().GetProjectionMatrix() *
+                             renderer.GetCamera().GetViewMatrix();
+
+    // ---- 解析值 —— 与 --shadow-check 逐字一致 ----
+    //
+    // 刻意共用同一组式子与同一条扫描线: 两条判据的差别只应该在**输入**
+    // (一张是着色后的画面, 一张是可见度掩码), 于是量出来的差就只能是阴影
+    // 本身的差, 不是测量方法的差。
+    const Float32 scaleFront = ShadowScene::ShadowScaleFront();
+    const Float32 scaleBack  = ShadowScene::ShadowScaleBack();
+
+    const Float32 expectedXMax =  ShadowScene::kOccluderHalfX * scaleFront;
+    const Float32 expectedXMin = -expectedXMax;
+
+    const Float32 occluderYMin =
+        ShadowScene::kOccluderCenterY - ShadowScene::kOccluderHalfY;
+
+    const Float32 expectedYMin = occluderYMin * scaleFront;
+
+    const Float32 imageFront = ShadowScene::ImageScale(
+        ShadowScene::kOccluderZ + ShadowScene::kOccluderHalfThick);
+
+    const Float32 imageYMin = occluderYMin * imageFront;
+
+    const Float32 scanY = (expectedYMin + imageYMin) * 0.5f;
+
+    const Float32 usableRadius = ShadowScene::InnerConeRadiusAtWall() * 0.9f;
+
+    // ---- 扫描 ----
+    //
+    // 掩码是二值的 (0 或 255), 所以阈值取中点最稳 —— 不存在渐变区。
+    const FShadowSpan span = FindShadowSpan(
+        mask, extent.Width, extent.Height, viewProj,
+        0, scanY, -usableRadius, usableRadius, 0.004f, 0.5f);
+
+    if (!span.Found)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追阴影] 扫描线 y={} 上没找到完整的暗区 —— 亮 {} 暗 {}",
+                 scanY, span.LitLevel, span.ShadowLevel);
+        return false;
+    }
+
+    const Float32 errorMin = FMath::Abs(span.Enter - expectedXMin);
+    const Float32 errorMax = FMath::Abs(span.Exit  - expectedXMax);
+
+    // 一个像素在墙上覆盖多少世界宽度 —— 容差的下限就是它
+    const Float32 pixelWorldWidth =
+        usableRadius * 2.0f / static_cast<Float32>(extent.Width);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追阴影] 扫描线 y={} — 影子 [{}, {}] 解析 [{}, {}] | "
+             "误差 {} / {} | 一个像素 {} 世界单位 | 亮 {} 暗 {}",
+             scanY, span.Enter, span.Exit, expectedXMin, expectedXMax,
+             errorMin, errorMax, pixelWorldWidth,
+             span.LitLevel, span.ShadowLevel);
+
+    bool passed = true;
+
+    // ---- 判据 1: 边界落在解析位置上 ----
+    //
+    // 容差 = **两个像素**。就这么一项。
+    //
+    // 板子的厚度不进容差: 影子的外缘由靠灯那一面的轮廓决定, 而解析值
+    // 用的正是那一面 (scaleFront)。厚度只影响内缘, 与这里量的两条外缘
+    // 无关 —— 把它算进容差是白白放宽 24 倍。
+    //
+    // 偏置也不进容差: 光追这里没有深度偏置, 而法线偏移 1e-3 沿墙面法线
+    // (指向相机, 与光线近乎同向) 推, 对边界位置的影响是二阶的。
+    //
+    // 于是剩下的唯一不确定度就是"掩码是逐像素的": 边界最细只能定位到一个
+    // 像素, 取两个给扫描的线性插值留一点。
+    //
+    // 实测 (阴影场景, 1280x720, 一个像素 0.00487 世界单位):
+    //     光追      误差 0.00153 / 0.00191    容差 0.00974
+    //     阴影贴图  误差 0.01419 / 0.01294    容差 0.07273
+    //
+    // 同一条扫描线、同一个解析值, 光追准八倍 —— 而阴影贴图那条判据的容差
+    // 里塞着深度偏置与图集分辨率, 光追这里两样都不存在。这条判据存在的
+    // 意义就是把那个差别钉死: 容差一旦放宽到阴影贴图那个量级, 它就不再
+    // 是在验光追了。
+    const Float32 tolerance = pixelWorldWidth * 2.0f;
+
+    if (errorMin > tolerance || errorMax > tolerance)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追阴影] 边界偏离解析位置 —— 左 {} 右 {}, 容差 {} "
+                 "(两个像素)",
+                 errorMin, errorMax, tolerance);
+        passed = false;
+    }
+
+    // ---- 判据 2: 掩码必须是二值的 ----
+    //
+    // 可见度只有 0 与 1 两种取值。出现中间值说明读到的不是这张掩码,
+    // 或者它根本没被写过 —— 而"没被写过"与"这里没有影子"在别的判据上
+    // 分不开。
+    if (span.LitLevel < 250.0f || span.ShadowLevel > 5.0f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追阴影] 掩码不是二值的 —— 亮 {} 暗 {} (期望 255 与 0)",
+                 span.LitLevel, span.ShadowLevel);
+        passed = false;
+    }
+
+    // ---- 判据 3: 影子宽度 ----
+    //
+    // 只判两个边界的话, 整条影子平移一段仍可能两边都在容差内 (左偏左、
+    // 右也偏左)。宽度是独立的一维。
+    const Float32 measuredWidth = span.Exit - span.Enter;
+    const Float32 expectedWidth = expectedXMax - expectedXMin;
+
+    if (FMath::Abs(measuredWidth - expectedWidth) > tolerance * 2.0f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追阴影] 影子宽度 {} 与解析值 {} 不符 (容差 {})",
+                 measuredWidth, expectedWidth, tolerance * 2.0f);
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追阴影] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
 static bool RunAoEdgeChecks(FRenderContext* context, FRenderer& renderer)
 {
     FGtaoPass* const gtao = renderer.GetGtaoPass();
@@ -8296,6 +8608,7 @@ int WINAPI wWinMain(
     bool    rayTracingCheckPassed = true;
     bool    aoEdgeCheckPassed = true;
     bool    rtDepthCheckPassed = true;
+    bool    rtShadowCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -8381,6 +8694,12 @@ int WINAPI wWinMain(
             {
                 rtDepthCheckPassed =
                     RunRayTracingDepthCheck(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtShadowCheck)
+            {
+                rtShadowCheckPassed =
+                    RunRayTracedShadowChecks(&renderContext, renderer);
             }
 
             if (launchOptions.ShowcaseCheck)
@@ -8582,6 +8901,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.RtDepthCheck)
     {
         selfCheckCode = FinalizeSelfCheck(rtDepthCheckPassed, 20, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtShadowCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtShadowCheckPassed, 21, errorSink,
                                           errorsBeforeShutdown);
     }
 

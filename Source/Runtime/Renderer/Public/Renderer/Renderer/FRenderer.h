@@ -93,6 +93,7 @@ class FShadowAtlasPass;
 class FDepthPrePass;
 class FClusterLightPass;
 class FGpuCullPass;
+class FRayTracedShadowPass;
 class FTaaPass;
 class FGtaoPass;
 class FBloomPass;
@@ -499,6 +500,21 @@ public:
         return m_RayTracingScene;
     }
 
+    LIMX_NODISCARD FRayTracedShadowPass* GetRayTracedShadowPass()
+    {
+        return m_RayTracedShadowPass.Get();
+    }
+
+
+
+    /// 打开/关闭光追阴影
+    ///
+    /// 需要加速结构 —— 内部会顺带把它启用。设备不支持时返回 false,
+    /// 调用方必须处理: 静默降级会让依赖它的判据在一张空掩码上通过。
+    LIMX_NODISCARD bool SetRayTracedShadowsEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsRayTracedShadowsEnabled() const;
+
     /// 打开/关闭光追加速结构的每帧维护
     ///
     /// 设备不支持时返回 false —— 调用方必须处理, 不能当成打开了。
@@ -759,6 +775,9 @@ private:
 
     /// 场景的光追加速结构 —— 设备不支持光追时保持无效
     FRayTracingScene                  m_RayTracingScene;
+
+    /// 光追阴影通道
+    TUniquePtr<FRayTracedShadowPass>  m_RayTracedShadowPass;
 
     /// 是否启用光追加速结构
     ///
