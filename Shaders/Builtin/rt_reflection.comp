@@ -1,0 +1,332 @@
+// ============================================================
+// 文件名称：rt_reflection.comp
+// 创建时间：2026-09-01
+// 创建者  ：LimxTeam
+// 设计哲学：屏幕空间反射只能反射屏幕上有的东西 —— 相机背后的、被挡住的、
+//          视野外的，一概反射不出来，而那个缺口是**看不出来的**：画面上
+//          只是"那里没反射"，与"那里本来就不该有反射"长得一样。光追反射
+//          没有这个缺口，代价是命中之后要自己把顶点、法线、材质取回来 ——
+//          光栅化那条路上由固定功能硬件做的插值，这里得手写。
+//          手写的每一步都可能错位，所以这支着色器带一个调试输出模式：
+//          把命中距离、材质下标、插值法线原样写出来，让判据逐像素对。
+// 功能描述：逐像素沿反射方向发一条射线，命中后按重心坐标插值顶点属性、
+//          查材质、算一次朗伯着色（带一条阴影射线），输出反射辐射度。
+// 技术特性：几何用缓冲区设备地址取（GL_EXT_buffer_reference），不占描述符
+//          槽；实例的物体到世界矩阵由 rayQueryGetIntersectionObjectToWorld
+//          取回，法线按它变换；调试模式输出可逐像素比对的原始量。
+// ============================================================
+
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "gbuffer_common.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ── 几何体的取回 ──
+//
+// 用设备地址而不是描述符数组: 一个场景几百个网格, 每个占一个描述符槽的话
+// bindless 表会被几何体挤满; 设备地址只是两个 32 位数, 放在一张普通的
+// storage buffer 里, 想要多少有多少。
+layout(buffer_reference, scalar, buffer_reference_align = 4)
+readonly buffer VertexRef { float data[]; };
+
+layout(buffer_reference, scalar, buffer_reference_align = 4)
+readonly buffer IndexRef { uint data[]; };
+
+struct GeomEntry
+{
+    uvec2 VertexAddress;
+    uvec2 IndexAddress;
+    uint  VertexStride;   // 字节
+    uint  IndexType;      // 0 = 16 位, 1 = 32 位
+    uint  MaterialIndex;
+    uint  Pad0;
+};
+
+struct MaterialEntry
+{
+    vec4  BaseColor;
+    float Metallic;
+    float Roughness;
+    float AO;
+    float NormalScale;
+    vec4  EmissiveColor;
+    float AlphaCutoff;
+    uint  TextureFlags;
+    uint  BlendMode;
+    uint  AlbedoIndex;
+    uint  NormalIndex;
+    uint  MetallicRoughnessIndex;
+    uint  OcclusionIndex;
+    uint  EmissiveIndex;
+};
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+layout(set = 0, binding = 1) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 2) uniform sampler2D sceneNormal;
+layout(set = 0, binding = 3, rgba32f) uniform writeonly image2D reflection;
+
+layout(std430, set = 0, binding = 4) readonly buffer GeomTable
+{
+    GeomEntry entries[];
+} geom;
+
+layout(std430, set = 0, binding = 5) readonly buffer MaterialTable
+{
+    MaterialEntry entries[];
+} materialTable;
+
+layout(row_major, push_constant) uniform Params
+{
+    mat4 InvViewProj;
+
+    // xyz = 相机世界位置
+    vec4 CameraPos;
+
+    // xyz = 主光源方向 (由光源指向被照面), w = 光源类型
+    vec4 LightDirection;
+
+    // xyz = 主光源位置, w = 光源强度
+    vec4 LightPosition;
+
+    // x = 宽, y = 高, z = 射线掩码, w = 调试模式 (0=着色, 1=原始量)
+    uvec4 Params0;
+
+    // x = 最大反射距离, y = 法线偏移, z = 射线 tMin, w = 环境光
+    vec4 Params1;
+} pc;
+
+/// 取第 index 个顶点的位置
+vec3 FetchPosition(VertexRef vertices, uint stride, uint index)
+{
+    // 跨度是字节, 而 data[] 是 float 数组 —— 除以四。
+    //
+    // 忘了除的表现不是崩: 它会从四倍远的地方取出一组看似合法的坐标,
+    // 于是反射里的形状完全不对, 而形状"不对"本身很难说清是哪里不对。
+    const uint base = index * (stride / 4u);
+
+    return vec3(vertices.data[base + 0u],
+                vertices.data[base + 1u],
+                vertices.data[base + 2u]);
+}
+
+/// 取第 index 个顶点的法线 (FMeshVertex 里紧跟在位置之后)
+vec3 FetchNormal(VertexRef vertices, uint stride, uint index)
+{
+    const uint base = index * (stride / 4u);
+
+    return vec3(vertices.data[base + 3u],
+                vertices.data[base + 4u],
+                vertices.data[base + 5u]);
+}
+
+/// 取第 i 个索引 —— 16 位与 32 位两种位宽
+uint FetchIndex(IndexRef indices, uint indexType, uint i)
+{
+    if (indexType == 1u)
+    {
+        return indices.data[i];
+    }
+
+    // 16 位: 两个索引挤在一个 uint 里
+    const uint packed = indices.data[i >> 1u];
+
+    return ((i & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+}
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.Params0.x || pixel.y >= pc.Params0.y)
+    {
+        return;
+    }
+
+    const float ndcDepth = texelFetch(sceneDepth, ivec2(pixel), 0).r;
+
+    // 天空: 没有表面可反射
+    if (ndcDepth >= 0.999999)
+    {
+        imageStore(reflection, ivec2(pixel), vec4(0.0, 0.0, 0.0, -1.0));
+        return;
+    }
+
+    const vec2 uv  = (vec2(pixel) + 0.5) / vec2(pc.Params0.xy);
+    const vec2 ndc = uv * 2.0 - 1.0;
+
+    const vec4 worldH = pc.InvViewProj * vec4(ndc, ndcDepth, 1.0);
+    const vec3 worldPos = worldH.xyz / worldH.w;
+
+    const vec2 encodedNormal = texelFetch(sceneNormal, ivec2(pixel), 0).rg;
+    const vec3 normal = DecodeOctahedralNormal(encodedNormal);
+
+    const vec3 view = normalize(worldPos - pc.CameraPos.xyz);
+    const vec3 direction = reflect(view, normal);
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        topLevel,
+        gl_RayFlagsOpaqueEXT,
+        pc.Params0.z,
+        worldPos + normal * pc.Params1.y,
+        pc.Params1.z,
+        direction,
+        pc.Params1.x);
+
+    while (rayQueryProceedEXT(query))
+    {
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionTriangleEXT)
+    {
+        // 没命中 —— 反射到天空。这里给环境光的常量, 真正的天空采样要等
+        // 环境贴图接进来。距离写 -1 让判据能与"命中在很远处"分开。
+        imageStore(reflection, ivec2(pixel),
+                   vec4(pc.Params1.w, pc.Params1.w, pc.Params1.w, -1.0));
+        return;
+    }
+
+    const float hitT = rayQueryGetIntersectionTEXT(query, true);
+
+    const uint instanceIndex =
+        uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
+
+    const uint primitiveIndex =
+        uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+
+    const vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(query, true);
+
+    // 重心坐标只给两个分量, 第一个要自己补 —— 三者之和为一。
+    const vec3 bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+
+    const GeomEntry entry = geom.entries[instanceIndex];
+
+    // 地址为零 = 这个实例没有登记进几何表。
+    //
+    // 不判的话下面会去零地址取值 —— 那是崩溃。崩溃比读到随机内存好:
+    // 后者给出的是"反射里的材质偶尔串位", 而那要查几天。
+    if (entry.VertexAddress == uvec2(0u) && entry.IndexAddress == uvec2(0u))
+    {
+        imageStore(reflection, ivec2(pixel), vec4(1.0, 0.0, 1.0, hitT));
+        return;
+    }
+
+    VertexRef vertices = VertexRef(entry.VertexAddress);
+    IndexRef  indices  = IndexRef(entry.IndexAddress);
+
+    const uint i0 = FetchIndex(indices, entry.IndexType, primitiveIndex * 3u + 0u);
+    const uint i1 = FetchIndex(indices, entry.IndexType, primitiveIndex * 3u + 1u);
+    const uint i2 = FetchIndex(indices, entry.IndexType, primitiveIndex * 3u + 2u);
+
+    const vec3 p0 = FetchPosition(vertices, entry.VertexStride, i0);
+    const vec3 p1 = FetchPosition(vertices, entry.VertexStride, i1);
+    const vec3 p2 = FetchPosition(vertices, entry.VertexStride, i2);
+
+    const vec3 n0 = FetchNormal(vertices, entry.VertexStride, i0);
+    const vec3 n1 = FetchNormal(vertices, entry.VertexStride, i1);
+    const vec3 n2 = FetchNormal(vertices, entry.VertexStride, i2);
+
+    const vec3 objectNormal =
+        normalize(n0 * bary.x + n1 * bary.y + n2 * bary.z);
+
+    // 物体空间法线要变到世界空间。
+    //
+    // 用物体到世界矩阵的**左上 3x3** 直接乘是近似: 严格来说法线要用逆转置。
+    // 这个引擎的实例变换只有平移、旋转与**均匀**缩放, 而均匀缩放下逆转置
+    // 与原矩阵只差一个正标量, 归一化之后完全相同。非均匀缩放进来时这里要改,
+    // 所以写在这里而不是默认它永远成立。
+    const mat4x3 objectToWorld =
+        rayQueryGetIntersectionObjectToWorldEXT(query, true);
+
+    const vec3 hitNormal = normalize(mat3(objectToWorld) * objectNormal);
+
+    const vec3 hitPos = worldPos + normal * pc.Params1.y + direction * hitT;
+
+    // 自洽量: 由 t 算出的命中点, 与由**取回的三个顶点**按重心坐标插出来的
+    // 命中点, 必须是同一个点。
+    //
+    // 这是整条几何取回路径上唯一一个**与场景无关**的判据。法线那一条依赖
+    // 场景里的法线有变化 —— 而墙角场景的两块平面上九个顶点法线完全相同,
+    // 于是取错顶点、取错索引、重心权重算错, 插出来的法线都一样, 三条变异
+    // 全部逃逸。位置不一样: 三个顶点的位置必然不同, 取错任何一处, 这两个
+    // 点就分开了。
+    //
+    // 残差的量级就是"错了多少" —— 而正确时它只剩浮点误差。
+    const vec3 objectHit = p0 * bary.x + p1 * bary.y + p2 * bary.z;
+
+    const vec3 worldHitFromVertices =
+        (objectToWorld * vec4(objectHit, 1.0)).xyz;
+
+    const float positionResidual = length(hitPos - worldHitFromVertices);
+
+    // ---- 调试模式: 输出可逐像素比对的原始量 ----
+    //
+    // 判据要验的是"顶点取回来了没有、材质对不对、法线插值对不对", 而这三样
+    // 在着色之后就混成了一个颜色 —— 颜色对不上说不清是哪一步。
+    if (pc.Params0.w != 0u)
+    {
+        imageStore(reflection, ivec2(pixel),
+                   vec4(hitT, float(entry.MaterialIndex),
+                        positionResidual, hitNormal.y + 2.0));
+        return;
+    }
+
+    // ---- 着色 ----
+    const MaterialEntry material = materialTable.entries[entry.MaterialIndex];
+
+    vec3 lightDirection;
+
+    if (uint(pc.LightPosition.w + 0.5) == 0u)
+    {
+        lightDirection = -pc.LightDirection.xyz;
+    }
+    else
+    {
+        lightDirection = normalize(pc.LightPosition.xyz - hitPos);
+    }
+
+    const float ndotl = max(dot(hitNormal, lightDirection), 0.0);
+
+    // 阴影射线 —— 反射里的东西也会被挡住。
+    //
+    // 不发这条射线的话, 反射里的一切都是全亮的, 而那正是屏幕空间反射
+    // 最容易被认出来的破绽之一。
+    float shadow = 1.0;
+
+    if (ndotl > 0.0)
+    {
+        rayQueryEXT shadowQuery;
+        rayQueryInitializeEXT(
+            shadowQuery,
+            topLevel,
+            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+            pc.Params0.z,
+            hitPos + hitNormal * pc.Params1.y,
+            pc.Params1.z,
+            lightDirection,
+            pc.Params1.x);
+
+        while (rayQueryProceedEXT(shadowQuery))
+        {
+        }
+
+        if (rayQueryGetIntersectionTypeEXT(shadowQuery, true) ==
+            gl_RayQueryCommittedIntersectionTriangleEXT)
+        {
+            shadow = 0.0;
+        }
+    }
+
+    const vec3 radiance =
+        material.BaseColor.rgb * (pc.Params1.w + ndotl * shadow);
+
+    imageStore(reflection, ivec2(pixel), vec4(radiance, hitT));
+}

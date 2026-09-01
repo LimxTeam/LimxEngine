@@ -127,6 +127,22 @@ public:
 
     LIMX_NODISCARD bool IsInitialized() const { return m_Device != nullptr; }
 
+    /// 材质数据缓冲区 —— 光追命中之后要按材质下标去查基色
+    ///
+    /// 暴露出来而不是让光追通道去绑 set 1: 那个集是为光栅化管线布局建的,
+    /// 而计算管线的集布局对象不同 —— Vulkan 按布局**对象**判兼容性,
+    /// 结构相同并不算兼容。
+    LIMX_NODISCARD FRHIBufferHandle GetMaterialBuffer(UInt32 frame) const
+    {
+        return (frame < kMaxFrames) ? m_MaterialBuffers[frame]
+                                    : FRHIBufferHandle();
+    }
+
+    LIMX_NODISCARD UInt64 GetMaterialBufferBytes() const
+    {
+        return static_cast<UInt64>(sizeof(FBindlessMaterial)) * kMaxMaterials;
+    }
+
     LIMX_NODISCARD FRHIDescSetLayoutHandle GetLayout() const
     {
         return m_Layout;

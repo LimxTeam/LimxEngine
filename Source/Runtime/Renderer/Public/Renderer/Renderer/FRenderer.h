@@ -95,6 +95,7 @@ class FClusterLightPass;
 class FGpuCullPass;
 class FRayTracedShadowPass;
 class FRayTracedAoPass;
+class FRayTracedReflectionPass;
 class FTaaPass;
 class FGtaoPass;
 class FBloomPass;
@@ -511,6 +512,16 @@ public:
         return m_RayTracedAoPass.Get();
     }
 
+    LIMX_NODISCARD FRayTracedReflectionPass* GetRayTracedReflectionPass()
+    {
+        return m_RayTracedReflectionPass.Get();
+    }
+
+    /// 打开/关闭光追反射
+    LIMX_NODISCARD bool SetRayTracedReflectionEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsRayTracedReflectionEnabled() const;
+
     /// 打开/关闭光追环境光遮蔽
     ///
     /// 需要加速结构 —— 内部会顺带把它启用。设备不支持时返回 false。
@@ -794,6 +805,9 @@ private:
 
     /// 光追环境光遮蔽通道
     TUniquePtr<FRayTracedAoPass>      m_RayTracedAoPass;
+
+    /// 光追反射通道
+    TUniquePtr<FRayTracedReflectionPass> m_RayTracedReflectionPass;
 
     /// 是否启用光追加速结构
     ///

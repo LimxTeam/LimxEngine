@@ -72,6 +72,7 @@
 #include "Renderer/RenderPass/FGpuCullPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
+#include "Renderer/RenderPass/FRayTracedReflectionPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
 #include "Renderer/RenderPass/FBloomPass.h"
@@ -247,6 +248,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager  = MakeUnique<FPassManager>();
     m_RayTracedShadowPass = MakeUnique<FRayTracedShadowPass>();
     m_RayTracedAoPass     = MakeUnique<FRayTracedAoPass>();
+    m_RayTracedReflectionPass = MakeUnique<FRayTracedReflectionPass>();
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_GpuCullPass      = MakeUnique<FGpuCullPass>();
@@ -264,6 +266,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_RayTracedShadowPass.Get());
     m_PassManager->RegisterPass(m_RayTracedAoPass.Get());
+    m_PassManager->RegisterPass(m_RayTracedReflectionPass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
 
@@ -342,6 +345,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
                 m_DepthPrePass->GetNormalView());
         }
 
+        if (m_RayTracedReflectionPass)
+        {
+            m_RayTracedReflectionPass->SetInputs(
+                m_DepthPrePass->GetSharedDepthTexture(),
+                m_PassManager->GetSharedDepthView(),
+                m_DepthPrePass->GetNormalView());
+        }
+
         m_GtaoPass->SetInputs(m_DepthPrePass->GetSharedDepthTexture(),
                               m_PassManager->GetSharedDepthView(),
                               m_DepthPrePass->GetNormalView());
@@ -398,6 +409,7 @@ void FRenderer::Shutdown()
     m_RayTracingScene.Shutdown();
     m_RayTracedShadowPass.Reset();
     m_RayTracedAoPass.Reset();
+    m_RayTracedReflectionPass.Reset();
     m_GpuCullPass.Reset();
     m_ShadowAtlasPass.Reset();
     m_ShadowPass.Reset();
@@ -432,6 +444,34 @@ void FRenderer::Shutdown()
 // ============================================================================
 // RenderFrame — 单帧渲染
 // ============================================================================
+
+bool FRenderer::IsRayTracedReflectionEnabled() const
+{
+    return m_RayTracedReflectionPass &&
+           m_RayTracedReflectionPass->IsEnabled();
+}
+
+bool FRenderer::SetRayTracedReflectionEnabled(bool enabled)
+{
+    if (!m_RayTracedReflectionPass)
+    {
+        return false;
+    }
+
+    if (!enabled)
+    {
+        m_RayTracedReflectionPass->SetEnabled(false);
+        return true;
+    }
+
+    if (!SetRayTracingEnabled(true))
+    {
+        return false;
+    }
+
+    m_RayTracedReflectionPass->SetEnabled(true);
+    return true;
+}
 
 bool FRenderer::IsRayTracedAoEnabled() const
 {
@@ -684,6 +724,35 @@ void FRenderer::RenderFrame()
         m_RayTracedAoPass->SetTlas(m_RayTracingScene.GetTlas());
         m_RayTracedAoPass->SetCameraParams(
             m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix());
+    }
+
+    if (m_RayTracedReflectionPass && m_RayTracedReflectionPass->IsEnabled())
+    {
+        m_RayTracedReflectionPass->SetTlas(m_RayTracingScene.GetTlas());
+
+        m_RayTracedReflectionPass->SetCameraParams(
+            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix(),
+            m_Camera.GetPosition());
+
+        m_RayTracedReflectionPass->SetSceneBuffers(
+            m_RayTracingScene.GetGeometryTable(),
+            m_RayTracingScene.GetGeometryTableBytes(),
+            m_BindlessTable.GetMaterialBuffer(frameIndex),
+            m_BindlessTable.GetMaterialBufferBytes());
+
+        // 主光源 —— 与光追阴影选同一盏 (第一盏投影的)
+        const FLightManager& reflectionLights = FLightManager::Get();
+
+        for (UInt32 i = 0; i < reflectionLights.GetActiveLightCount(); ++i)
+        {
+            const FLight& light = reflectionLights.GetLight(i);
+
+            if (light.CastsShadow())
+            {
+                m_RayTracedReflectionPass->SetLight(light.ToGpuData());
+                break;
+            }
+        }
     }
 
     // 材质表每帧整体上传 —— 见 FBindlessTable::Upload 的说明

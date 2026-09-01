@@ -71,6 +71,41 @@ ERHIResult FRayTracingScene::Initialize(IRHIDevice* device)
         return result;
     }
 
+    // 几何表 —— 主机可写, 因为它随 BLAS 一起重建
+    {
+        FRHIBufferDesc tableDesc;
+        tableDesc.Size        = GetGeometryTableBytes();
+        tableDesc.Usage       = EBufferUsage::StorageBuffer;
+        tableDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+        tableDesc.DebugName   = "RayTracingGeometryTable";
+
+        const ERHIResult tableResult =
+            device->CreateBuffer(tableDesc, m_GeometryTable);
+
+        if (!IsRHISuccess(tableResult))
+        {
+            LIMX_LOG(LogRenderer, Error, "[光追场景] 几何表创建失败");
+            device->DestroyAccelStruct(m_Tlas);
+            m_Device = nullptr;
+            return tableResult;
+        }
+
+        // 整块清零。
+        //
+        // 被跳过的对象在表里留一个全零的条目, 而全零的设备地址在着色器里
+        // 取值会立刻崩 —— 那比读到一块随机内存好: 后者给出的是"材质随机
+        // 串位"这种要查几天的现象。
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(m_GeometryTable, &mapped)) &&
+            mapped != nullptr)
+        {
+            Memory::MemZero(mapped,
+                            static_cast<SizeType>(GetGeometryTableBytes()));
+            device->UnmapBuffer(m_GeometryTable);
+        }
+    }
+
     LIMX_LOG(LogRenderer, Display,
              "[光追场景] TLAS 就绪 — 实例数上限 {}", kMaxInstances);
 
@@ -98,9 +133,14 @@ void FRayTracingScene::Shutdown()
 {
     DestroyBlas();
 
-    if (m_Device != nullptr && m_Tlas.IsValid())
+    if (m_Device != nullptr)
     {
-        m_Device->DestroyAccelStruct(m_Tlas);
+        m_Device->DestroyBuffer(m_GeometryTable);
+
+        if (m_Tlas.IsValid())
+        {
+            m_Device->DestroyAccelStruct(m_Tlas);
+        }
     }
 
     m_Device = nullptr;
@@ -192,9 +232,35 @@ ERHIResult FRayTracingScene::RebuildGeometry(
     m_Blas.Reserve(objectCount);
     m_SourceIndices.Reserve(objectCount);
 
+    // 整个重建期间把几何表映射着 —— 逐条 Map/Unmap 是几百次系统调用,
+    // 而这块内存是持久映射的, Map 只是取一个已有的指针。
+    FRayTracingGeometryEntry* tableEntries = nullptr;
+
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(m_Device->MapBuffer(m_GeometryTable, &mapped)) &&
+            mapped != nullptr)
+        {
+            tableEntries = static_cast<FRayTracingGeometryEntry*>(mapped);
+
+            // 每次重建都整块清零: 上一个场景的条目留在表里的话, 这一次
+            // 被跳过的位置会读到**上一个场景的几何体**, 而那是"反射里
+            // 出现了已经不存在的东西"。
+            Memory::MemZero(tableEntries,
+                            static_cast<SizeType>(GetGeometryTableBytes()));
+        }
+        else
+        {
+            LIMX_LOG(LogRenderer, Error, "[光追场景] 几何表映射失败");
+        }
+    }
+
     for (SizeType i = 0; i < objectCount; ++i)
     {
         const FRenderObject& object = objects[i];
+
+        const UInt32 sourceIndex = static_cast<UInt32>(i);
 
         // 超出实例上限就停 —— 而且要说出来。
         //
@@ -275,6 +341,33 @@ ERHIResult FRayTracingScene::RebuildGeometry(
 
         m_Blas.Add(blas);
         m_SourceIndices.Add(static_cast<UInt32>(i));
+
+        // 几何表的条目 —— 与 BLAS 的几何描述用**同一组数**。
+        //
+        // 分别算两遍的话, 两处只要有一处漂移, 光追命中的三角形与着色器
+        // 取到的顶点就不是同一个 —— 那表现为"反射里的法线乱跳"。
+        if (sourceIndex < kMaxInstances && tableEntries != nullptr)
+        {
+            FRayTracingGeometryEntry& entry = tableEntries[sourceIndex];
+
+            entry.VertexAddress =
+                m_Device->GetBufferDeviceAddress(object.VertexBuffer) +
+                geometry.VertexOffset;
+
+            entry.IndexAddress =
+                m_Device->GetBufferDeviceAddress(object.IndexBuffer) +
+                geometry.IndexOffset;
+
+            entry.VertexStride = object.VertexStride;
+            entry.IndexType =
+                (object.IndexType == EIndexType::UInt16) ? 0u : 1u;
+            entry.MaterialIndex = object.BindlessMaterialIndex;
+        }
+    }
+
+    if (tableEntries != nullptr)
+    {
+        m_Device->UnmapBuffer(m_GeometryTable);
     }
 
     LIMX_LOG(LogRenderer, Display,

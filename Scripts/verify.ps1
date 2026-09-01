@@ -147,6 +147,16 @@ function Invoke-Step {
 function Invoke-Engine {
     param([string]$Arguments)
 
+    # 所有自检一律隐藏窗口。
+    #
+    # 一轮验证要启动引擎二十多次, 每次弹一个 1280x720 的窗口 —— 整个屏幕
+    # 闪个不停。--hidden 只是不 ShowWindow: 交换链、渲染、回读一切照旧,
+    # 判据量到的数字与可见时逐位相同 (实测)。
+    #
+    # 不走"离屏渲染"那条路是刻意的: 那需要一条不带交换链的独立路径, 而那条
+    # 路径与真实渲染的差别恰恰是判据最不该引入的东西。
+    $Arguments = "$Arguments --hidden"
+
     $stdout = Join-Path $env:TEMP 'limx_verify_stdout.txt'
     $stderr = Join-Path $env:TEMP 'limx_verify_stderr.txt'
 
@@ -703,6 +713,35 @@ Invoke-Step '综合场景自检 (每个子系统都留下痕迹)' -RequiresGpu {
 # 已知盲点写在代码里: 这条判据分得开"上采样太糊", 分不开"太锐"。
 Invoke-Step 'AO 双边上采样 (深度不连续处的渗色)' -RequiresGpu {
     Invoke-Engine '--showcase --gpu-driven --taa --bloom --clustered --gtao --frames 20 --warmup 5 --ao-edge-check'
+}
+
+# 光追反射 —— 需要真实 GPU。两个场景是互补的。
+#
+# 光追反射与屏幕空间反射的差别不在画质, 在**缺口看不看得见**: SSR 反射不出
+# 相机背后的、被挡住的、视野外的东西, 而画面上只是"那里没反射", 与"那里本来
+# 就不该有反射"长得一样。
+#
+# 代价是命中之后要自己把顶点、法线、材质取回来 —— 光栅化那条路上由固定功能
+# 硬件做的插值, 这里得手写。手写的每一步都可能错位, 所以判据不看颜色, 看四个
+# 能逐像素对的原始量。
+#
+# 墙角场景 (地面反射墙, 有解析值):
+#     命中距离  与 -P.z/R.z 比      实测 225280 像素全对, 最大误差 0.000154
+#     材质下标  与墙的 bindless 下标比  一个都不错 (地面 0 / 墙 1)
+#     命中法线  与墙的法线 (0,0,1) 比   最大误差**恰好 0**
+#     位置自洽  由 t 算的命中点 == 由取回顶点插的命中点, 最大残差 0.000003
+#
+# OBJ 场景 (六个子网格共用一对缓冲区, 索引字节偏移 0/768/840/912/984/1080):
+#     只跑位置自洽 —— 它与场景无关。43931 个命中像素, 最大残差 0.000001。
+#     这是唯一能验到"索引地址漏加字节偏移"的场景。
+#
+# 变异 9/10, 唯一逃逸需要"有对象被跳过"的场景, 写在代码里。
+Invoke-Step '光追反射 (墙角场景, 四个量对解析值)' -RequiresGpu {
+    Invoke-Engine '--corner-scene --clustered --frames 8 --warmup 3 --rt-reflection-check'
+}
+
+Invoke-Step '光追反射 (OBJ 子网格, 位置自洽)' -RequiresGpu {
+    Invoke-Engine '--scene Content/TestScene/testscene.obj --clustered --frames 8 --warmup 3 --rt-reflection-self'
 }
 
 # 光追环境光遮蔽 —— 需要真实 GPU。

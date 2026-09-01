@@ -76,6 +76,44 @@ inline constexpr UInt32 kRayMaskDepthWriting =
 inline constexpr UInt32 kRayMaskAll =
     kRayMaskOpaque | kRayMaskMasked | kRayMaskTranslucent;
 
+// ============================================================================
+// FRayTracingGeometryEntry — 一个实例的几何与材质索引信息
+//
+// 光追命中之后, 着色器手上只有 (实例自定义下标, 图元下标, 重心坐标)。要得到
+// 法线、UV、材质, 必须自己回到顶点缓冲区里取 —— 光栅化那条路上由固定功能
+// 硬件做的插值, 这里得手写。
+//
+// 缓冲区用**设备地址**而不是描述符数组: 一个场景几百个网格, 每个都占一个
+// 描述符槽的话, bindless 表会被几何体挤满; 而设备地址只是两个 32 位数,
+// 放在一张普通的 storage buffer 里, 想要多少有多少。
+//
+// 与着色器的 GeomEntry 逐字段一致 (32 字节)。
+// ============================================================================
+
+struct FRayTracingGeometryEntry
+{
+    /// 顶点数据的设备地址 (已含几何体在缓冲区里的偏移)
+    UInt64 VertexAddress = 0;
+
+    /// 索引数据的设备地址 (已含字节偏移)
+    UInt64 IndexAddress = 0;
+
+    /// 相邻两个顶点之间的字节跨度
+    UInt32 VertexStride = 0;
+
+    /// 0 = 16 位索引, 1 = 32 位索引
+    UInt32 IndexType = 1;
+
+    /// bindless 材质表里的下标
+    UInt32 MaterialIndex = 0;
+
+    UInt32 Pad0 = 0;
+};
+
+static_assert(sizeof(FRayTracingGeometryEntry) == 32,
+              "FRayTracingGeometryEntry 必须是 32 字节 — 与着色器的 "
+              "GeomEntry 逐字段一致");
+
 class LIMX_RENDERER_API FRayTracingScene
 {
 public:
@@ -113,6 +151,19 @@ public:
     void RecordBuild(IRHICommandBuffer* commandBuffer);
 
     LIMX_NODISCARD FRHIAccelStructHandle GetTlas() const { return m_Tlas; }
+
+    /// 几何表缓冲区 —— 着色器按实例自定义下标索引
+    LIMX_NODISCARD FRHIBufferHandle GetGeometryTable() const
+    {
+        return m_GeometryTable;
+    }
+
+    /// 几何表的字节数
+    LIMX_NODISCARD UInt64 GetGeometryTableBytes() const
+    {
+        return static_cast<UInt64>(sizeof(FRayTracingGeometryEntry)) *
+               kMaxInstances;
+    }
 
     LIMX_NODISCARD bool IsValid() const { return m_Tlas.IsValid(); }
 
@@ -161,6 +212,13 @@ private:
 
     /// 不透明 / 蒙版 / 半透明 各多少个实例
     UInt32 m_ClassCounts[3] = {};
+
+    /// 几何表 —— 按**源对象下标**索引, 与实例的自定义下标一致
+    ///
+    /// 按源下标而不是实例序号: 跳过任何一个对象之后两者就不再相等, 而
+    /// 着色器拿到的是自定义下标。用实例序号索引的话, 只要有一个对象被
+    /// 跳过, 后面所有物体的材质就整体错位一格。
+    FRHIBufferHandle m_GeometryTable;
 
     /// 上一次建 BLAS 时几何体的签名
     ///

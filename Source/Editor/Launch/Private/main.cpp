@@ -60,6 +60,7 @@
 #include "Renderer/RenderPass/FGpuCullPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
+#include "Renderer/RenderPass/FRayTracedReflectionPass.h"
 
 namespace Limx
 {
@@ -235,6 +236,29 @@ struct FLaunchOptions
 
     /// 光追 AO 自检: 与直角凹角的闭式解逐像素比对, 以退出码报告
     bool RtAoCheck = false;
+
+    /// 隐藏窗口 —— 自检与变异验证一轮要跑几十次, 每次弹一个窗口很难受
+    ///
+    /// 只是不 ShowWindow, 交换链、渲染、回读一切照旧。判据量到的**数值**
+    /// 与可见时逐位相同 (实测: 光追 AO 的 39236 个像素、均值 0.801607,
+    /// 两种模式下完全一致)。
+    ///
+    /// 不是"离屏渲染": 那需要另一条不带交换链的路径, 而那条路径与真实渲染
+    /// 的差别恰恰是判据最不该引入的东西。
+    ///
+    /// **但性能数字不可比。** 窗口不可见时合成器不再取用交换链图像, 呈现
+    /// 那一段的开销跟着变 —— 实测同一场景 GPU 整帧 0.70 ms (隐藏) 对
+    /// 1.02 ms (可见), 最差帧 8.2 对 4.0。跑基准要用可见窗口。
+    bool HiddenWindow = false;
+
+    /// 启用光追反射
+    bool RayTracedReflection = false;
+
+    /// 光追反射自检: 命中距离/材质下标/命中法线三个量对解析值, 以退出码报告
+    bool RtReflectionCheck = false;
+
+    /// 光追反射的与场景无关自洽检查 (可跑在有子网格的场景上)
+    bool RtReflectionSelfCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -728,6 +752,22 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--rt-ao-check"))
         {
             options.RtAoCheck = true;
+        }
+        else if (WideEquals(arg, L"--hidden"))
+        {
+            options.HiddenWindow = true;
+        }
+        else if (WideEquals(arg, L"--rt-reflection"))
+        {
+            options.RayTracedReflection = true;
+        }
+        else if (WideEquals(arg, L"--rt-reflection-check"))
+        {
+            options.RtReflectionCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-reflection-self"))
+        {
+            options.RtReflectionSelfCheck = true;
         }
         else if (WideEquals(arg, L"--rt-depth-check"))
         {
@@ -4759,6 +4799,880 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunRayTracedReflectionChecks — 地面反射墙, 三个量都对解析值
+//
+// 墙角场景里地面是 y=0 平面、墙是 z=0 平面。地面上一点 P 的反射方向是
+// R = reflect(normalize(P - C), (0,1,0)), 它命中墙的距离是
+//
+//     t = -P.z / R.z          (R.z < 0 时)
+//
+// 这是初中几何, 没有近似。而光追反射要走完的那一串 —— 反投影出 P、取法线、
+// 算反射方向、遍历 BVH、拿到重心坐标、按设备地址回到顶点缓冲区、插值法线、
+// 用物体到世界矩阵变换 —— 每一步都可能错位, 而错位之后画面上只是"反射里的
+// 东西看着不太对"。
+//
+// 所以判据不看颜色, 看三个能逐像素对的原始量:
+//
+//     命中距离    与 -P.z/R.z 比           验反射方向与遍历
+//     材质下标    与该物体的 bindless 下标比  验几何表的索引
+//     命中法线 y  与墙的法线 (0,0,1).y = 0 比 验顶点取回与重心插值
+//
+// 三个量互相独立: 反射方向算错但几何表对, 距离红而材质绿; 几何表错位但
+// 方向对, 材质红而距离绿。一个量对不上说得清是哪一步。
+// ============================================================================
+
+namespace
+{
+
+/// 光追反射的比对结果
+struct FRtReflectionComparison
+{
+    SizeType FloorPixels    = 0;
+    SizeType ComparedPixels = 0;
+
+    /// 命中距离对不上的像素数
+    SizeType DistanceMismatch = 0;
+
+    /// 材质下标对不上的
+    SizeType MaterialMismatch = 0;
+
+    /// 命中法线对不上的
+    SizeType NormalMismatch = 0;
+
+    /// 位置自洽残差超标的
+    ///
+    /// 由 t 算出的命中点与由取回顶点插出来的命中点必须是同一个点。
+    /// 这是几何取回路径上唯一与场景无关的判据。
+    SizeType ResidualMismatch = 0;
+
+    /// 该命中却没命中的
+    SizeType MissedHits = 0;
+
+    Float32 MaxDistanceError = 0.0f;
+    Float32 MaxNormalError   = 0.0f;
+    Float32 MaxResidual      = 0.0f;
+
+    /// 见到的材质下标 (取第一个) —— 判据要与渲染对象列表里的对上
+    Int32 ObservedMaterial = -1;
+
+    bool Valid = false;
+};
+
+static FRtReflectionComparison CaptureRtReflection(
+    FRenderContext* context, FRenderer& renderer, UInt32 expectedMaterial)
+{
+    FRtReflectionComparison result;
+
+    FRayTracedReflectionPass* const pass =
+        renderer.GetRayTracedReflectionPass();
+
+    FDepthPrePass* const depth = renderer.GetDepthPrePass();
+
+    if (pass == nullptr || depth == nullptr)
+    {
+        return result;
+    }
+
+    // 调试输出: rgb = (命中距离, 材质下标, 世界法线 y)
+    pass->SetDebugOutput(true);
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle reflectionReadback;
+    FRHIBufferHandle normalReadback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+
+        desc.Size      = pixelCount * 16u;   // RGBA32F
+        desc.DebugName = "RtReflCheck.Reflection";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, reflectionReadback)))
+        {
+            return result;
+        }
+
+        desc.Size      = pixelCount * 4u;    // RG16_SFLOAT
+        desc.DebugName = "RtReflCheck.Normal";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, normalReadback)))
+        {
+            device->DestroyBuffer(reflectionReadback);
+            return result;
+        }
+    }
+
+    const FRHITextureHandle reflectionTexture = pass->GetReflectionTexture();
+    const FRHITextureHandle normalTexture     = depth->GetNormalTexture();
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, reflectionTexture, normalTexture,
+         reflectionReadback, normalReadback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                reflectionTexture,
+                EImageLayout::ShaderReadOnly, EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(reflectionTexture,
+                                     EImageLayout::TransferSrc,
+                                     reflectionReadback, region);
+
+            cmd->TransitionImageLayout(
+                reflectionTexture,
+                EImageLayout::TransferSrc, EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            cmd->TransitionImageLayout(
+                normalTexture,
+                EImageLayout::ShaderReadOnly, EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(normalTexture, EImageLayout::TransferSrc,
+                                     normalReadback, region);
+
+            cmd->TransitionImageLayout(
+                normalTexture,
+                EImageLayout::TransferSrc, EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    pass->SetDebugOutput(false);
+
+    if (!recorded)
+    {
+        device->DestroyBuffer(normalReadback);
+        device->DestroyBuffer(reflectionReadback);
+        return result;
+    }
+
+    device->WaitIdle();
+
+    TArray<FVector4> reflection;
+    TArray<FVector2> normals;
+
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(reflectionReadback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* src = static_cast<const Float32*>(mapped);
+
+            reflection.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                reflection.Add(FVector4(src[i * 4 + 0], src[i * 4 + 1],
+                                        src[i * 4 + 2], src[i * 4 + 3]));
+            }
+
+            device->UnmapBuffer(reflectionReadback);
+        }
+
+        mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(normalReadback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* src = static_cast<const Float16Bits*>(mapped);
+
+            normals.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                normals.Add(FVector2(Float16ToFloat32(src[i * 2 + 0]),
+                                     Float16ToFloat32(src[i * 2 + 1])));
+            }
+
+            device->UnmapBuffer(normalReadback);
+        }
+    }
+
+    device->DestroyBuffer(normalReadback);
+    device->DestroyBuffer(reflectionReadback);
+
+    if (reflection.GetSize() != pixelCount || normals.GetSize() != pixelCount)
+    {
+        return result;
+    }
+
+    // ---- 逐像素比对 ----
+    const FCamera& camera = renderer.GetCamera();
+
+    const FMatrix inverse =
+        (camera.GetProjectionMatrix() * camera.GetViewMatrix()).Inverse();
+
+    const FVector3 cameraPos = camera.GetPosition();
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const SizeType index =
+                static_cast<SizeType>(y) * extent.Width + x;
+
+            if (FMath::Abs(normals[index].X) > 1.0f ||
+                FMath::Abs(normals[index].Y) > 1.0f)
+            {
+                continue;
+            }
+
+            const FVector3 n = DecodeOctahedralNormal(normals[index]);
+
+            // 只取朝上的地面像素
+            if (n.Y < 0.999f)
+            {
+                continue;
+            }
+
+            ++result.FloorPixels;
+
+            const Float32 ndcX =
+                (static_cast<Float32>(x) + 0.5f) /
+                    static_cast<Float32>(extent.Width) * 2.0f - 1.0f;
+            const Float32 ndcY =
+                (static_cast<Float32>(y) + 0.5f) /
+                    static_cast<Float32>(extent.Height) * 2.0f - 1.0f;
+
+            const FVector4 farWorld =
+                inverse.TransformVector4(FVector4(ndcX, ndcY, 1.0f, 1.0f));
+
+            if (FMath::Abs(farWorld.W) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            FVector3 dir(farWorld.X / farWorld.W - cameraPos.X,
+                         farWorld.Y / farWorld.W - cameraPos.Y,
+                         farWorld.Z / farWorld.W - cameraPos.Z);
+
+            if (FMath::Abs(dir.Y) < 1.0e-6f)
+            {
+                continue;
+            }
+
+            const Float32 t = -cameraPos.Y / dir.Y;
+
+            if (t <= 0.0f)
+            {
+                continue;
+            }
+
+            const FVector3 surface(cameraPos.X + dir.X * t,
+                                   0.0f,
+                                   cameraPos.Z + dir.Z * t);
+
+            // 视线方向 (归一化) 与反射方向
+            const FVector3 view = FVector3(dir.X, dir.Y, dir.Z).GetSafeNormal();
+
+            // reflect(V, N) 对 N = (0,1,0) 就是把 y 取反
+            const FVector3 reflectDir(view.X, -view.Y, view.Z);
+
+            // 反射线要朝墙走 (z 减小) 才可能命中
+            if (reflectDir.Z > -1.0e-3f)
+            {
+                continue;
+            }
+
+            const Float32 expectedT = -surface.Z / reflectDir.Z;
+
+            if (expectedT <= 0.0f)
+            {
+                continue;
+            }
+
+            // 命中点必须落在墙的范围内 (20x20 的板, 中心 y=10)
+            const Float32 hitY = surface.Y + reflectDir.Y * expectedT;
+            const Float32 hitX = surface.X + reflectDir.X * expectedT;
+
+            constexpr Float32 kHalfExtent = 10.0f;
+            constexpr Float32 kEdgeMargin = 2.0f;
+
+            if (hitY < kEdgeMargin ||
+                hitY > 2.0f * kHalfExtent - kEdgeMargin ||
+                FMath::Abs(hitX) > kHalfExtent - kEdgeMargin)
+            {
+                continue;
+            }
+
+            // 地面自身的范围也要够远离边缘
+            if (FMath::Abs(surface.X) > kHalfExtent - kEdgeMargin ||
+                surface.Z < 0.5f ||
+                surface.Z > kHalfExtent - kEdgeMargin)
+            {
+                continue;
+            }
+
+            ++result.ComparedPixels;
+
+            const FVector4& value = reflection[index];
+
+            const Float32 measuredT   = value.X;
+            const Float32 measuredMat = value.Y;
+            const Float32 measuredRes = value.Z;
+
+            // 法线 y 被平移了 2 —— 好与"未命中"的 -1 分开
+            const Float32 measuredNY  = value.W - 2.0f;
+
+            if (value.W < 0.0f)
+            {
+                // 该命中却没命中
+                ++result.MissedHits;
+                continue;
+            }
+
+            if (result.ObservedMaterial < 0)
+            {
+                result.ObservedMaterial =
+                    static_cast<Int32>(measuredMat + 0.5f);
+            }
+
+            const Float32 distanceError =
+                FMath::Abs(measuredT - expectedT);
+
+            result.MaxDistanceError =
+                FMath::Max(result.MaxDistanceError, distanceError);
+
+            // 容差: 反射方向由深度反投影得到, 而深度是量化的。命中点越远,
+            // 方向上的一点点误差被放得越大 —— 所以容差按距离成比例。
+            if (distanceError > expectedT * 2.0e-3f + 1.0e-3f)
+            {
+                ++result.DistanceMismatch;
+            }
+
+            if (static_cast<UInt32>(measuredMat + 0.5f) != expectedMaterial)
+            {
+                ++result.MaterialMismatch;
+            }
+
+            // 墙的法线是 (0,0,1), y 分量为 0
+            const Float32 normalError = FMath::Abs(measuredNY);
+
+            result.MaxNormalError =
+                FMath::Max(result.MaxNormalError, normalError);
+
+            if (normalError > 1.0e-3f)
+            {
+                ++result.NormalMismatch;
+            }
+
+            result.MaxResidual = FMath::Max(result.MaxResidual, measuredRes);
+
+            // 残差的容差按场景尺度定: 墙角场景是 20x20 的板, 单精度在那个
+            // 量级上的相对误差是 1e-7, 乘上几十的坐标值就是 1e-5 量级。
+            // 取 1e-3 留了两个数量级, 而取错顶点造成的残差是**几个世界
+            // 单位** —— 差三个数量级。
+            if (measuredRes > 1.0e-3f)
+            {
+                ++result.ResidualMismatch;
+            }
+        }
+    }
+
+    result.Valid = (result.ComparedPixels > 0);
+
+    return result;
+}
+
+} // namespace
+
+namespace
+{
+
+/// 与场景无关的反射自洽检查
+///
+/// 墙角场景能给出解析值, 但它太均匀: 两块平面上九个顶点的法线完全相同,
+/// 而两个物体都没有子网格、一个都没被跳过。于是"取错顶点""取错索引"
+/// "几何表按实例序号写"这几类错误在那里全部无声。
+///
+/// 这一段不要解析值, 只要**自洽**:
+///
+///   由 t 算出的命中点  ==  由取回的三个顶点按重心坐标插出来的命中点
+///
+/// 这个等式在任何场景上都成立, 而顶点、索引、跨度、几何表地址里任何一处
+/// 取错, 两边就分开。于是它可以跑在 OBJ 测试场景上 —— 那里六个子网格共用
+/// 一对缓冲区, 索引字节偏移是 0/768/840/912/984/1080, 正是墙角场景没有的
+/// 那一维。
+struct FRtReflectionSelfCheck
+{
+    SizeType HitPixels        = 0;
+    SizeType ResidualMismatch = 0;
+    SizeType MaterialOutOfRange = 0;
+
+    Float32 MaxResidual = 0.0f;
+
+    /// 见过的不同材质下标个数 —— 元判据要用
+    SizeType DistinctMaterials = 0;
+};
+
+static bool RunReflectionSelfConsistency(FRenderContext* context,
+                                         FRenderer&      renderer,
+                                         const AnsiChar* sceneName)
+{
+    FRayTracedReflectionPass* const pass =
+        renderer.GetRayTracedReflectionPass();
+
+    if (pass == nullptr)
+    {
+        return false;
+    }
+
+    pass->SetDebugOutput(true);
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle readback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Size        = pixelCount * 16u;
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "RtReflSelf.Readback";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+        {
+            return false;
+        }
+    }
+
+    const FRHITextureHandle texture = pass->GetReflectionTexture();
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, readback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    pass->SetDebugOutput(false);
+
+    FRtReflectionSelfCheck stats;
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(readback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* src = static_cast<const Float32*>(mapped);
+
+            // 材质下标见过哪些 —— 数量级很小, 用一个位图就够
+            constexpr UInt32 kMaterialBits = 256;
+            bool seen[kMaterialBits] = {};
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                const Float32 residual = src[i * 4 + 2];
+                const Float32 flag     = src[i * 4 + 3];
+
+                // 未命中 (-1) 与"几何表条目为空"(那一路写的是洋红色) 跳过
+                if (flag < 0.0f)
+                {
+                    continue;
+                }
+
+                ++stats.HitPixels;
+
+                stats.MaxResidual = FMath::Max(stats.MaxResidual, residual);
+
+                if (residual > 1.0e-2f)
+                {
+                    ++stats.ResidualMismatch;
+                }
+
+                const Int32 material =
+                    static_cast<Int32>(src[i * 4 + 1] + 0.5f);
+
+                if (material < 0 ||
+                    material >= static_cast<Int32>(kMaterialBits))
+                {
+                    ++stats.MaterialOutOfRange;
+                }
+                else if (!seen[material])
+                {
+                    seen[material] = true;
+                    ++stats.DistinctMaterials;
+                }
+            }
+
+            device->UnmapBuffer(readback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(readback);
+
+    if (!ok)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追反射] {} 场景的回读失败", sceneName);
+        return false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追反射] {} 场景自洽 — 命中 {} 像素, 残差超标 {}, "
+             "最大残差 {}, 材质越界 {}, 见到 {} 种材质",
+             sceneName, stats.HitPixels, stats.ResidualMismatch,
+             stats.MaxResidual, stats.MaterialOutOfRange,
+             stats.DistinctMaterials);
+
+    bool passed = true;
+
+    // ---- 元判据: 得有足够多的命中 ----
+    //
+    // 一条反射射线都没命中的话下面每一条都自动成立。
+    constexpr SizeType kMinHits = 5000;
+
+    if (stats.HitPixels < kMinHits)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} 场景只有 {} 个命中像素 (需要至少 {})",
+                 sceneName, stats.HitPixels, kMinHits);
+        passed = false;
+    }
+
+    // ---- 自洽 ----
+    if (stats.ResidualMismatch != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} 场景有 {} 个像素的位置自洽残差超标 "
+                 "(最大 {}) —— 顶点、索引或几何表的地址取错了",
+                 sceneName, stats.ResidualMismatch, stats.MaxResidual);
+        passed = false;
+    }
+
+    if (stats.MaterialOutOfRange != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} 场景有 {} 个像素的材质下标越界",
+                 sceneName, stats.MaterialOutOfRange);
+        passed = false;
+    }
+
+    return passed;
+}
+
+} // namespace
+
+// ── 已知的覆盖边界 (量过) ──────────────────────────────────────────────
+//
+// 变异验证 9/10 (两个场景合起来)。唯一逃逸:
+//
+//   **几何表的条目按实例序号写而不是源对象下标** —— 两个场景里都没有任何
+//   对象被跳过 (FRayTracingScene::GetSkippedCount() 恒为 0), 于是源下标与
+//   实例序号恒等。要验它需要一个"有对象因几何体无效而被跳过"的场景, 而
+//   现有的六个场景里一个都没有。
+//
+//   这一条错了的后果是: 只要有一个对象被跳过, 它之后所有物体在反射里查到
+//   的都是**前一个物体的材质与几何** —— 而画面上只是"反射里的材质有点怪"。
+//
+// 两个场景的分工 (缺一不可):
+//   墙角场景  给得出解析值 (命中距离 = -P.z/R.z, 法线 = (0,0,1)), 但两块
+//             平面上九个顶点法线完全相同、没有子网格 —— "取错顶点""取错
+//             索引""重心权重算错"三条在它上面全部无声。
+//   OBJ 场景  六个子网格共用一对缓冲区, 索引字节偏移 0/768/840/912/984/1080
+//             —— 唯一能验到"索引地址漏加偏移"的场景。它没有解析值, 只跑
+//             与场景无关的自洽检查。
+static bool RunRayTracedReflectionChecks(FRenderContext* context,
+                                         FRenderer&      renderer)
+{
+    if (!renderer.SetRayTracedReflectionEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] 无法启用 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    // 墙的材质下标 —— 从渲染对象列表里取, 不写死。
+    //
+    // 写死的话, 场景改了材质注册顺序之后这条判据会指向另一个材质, 而它
+    // 报的会是"材质下标对不上", 指向完全错误的方向。
+    const TArray<FRenderObject>& objects = renderer.GetShadowCasterObjects();
+
+    if (objects.GetSize() < 2)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] 场景里只有 {} 个物体 —— 墙角场景应当有两块板",
+                 objects.GetSize());
+        return false;
+    }
+
+    // 墙角场景: [0] 是地面, [1] 是墙 (见 BuildCornerScene)
+    const UInt32 floorMaterial = objects[0].BindlessMaterialIndex;
+    const UInt32 wallMaterial  = objects[1].BindlessMaterialIndex;
+
+    // 元判据: 两块板的材质下标必须不同。
+    //
+    // 相同的话"命中处的材质下标"这一条就是空的 —— 无论几何表怎么错位,
+    // 查到的都是同一个数, 而那是个满分通过。
+    if (floorMaterial == wallMaterial)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] 地面与墙的材质下标都是 {} —— "
+                 "材质那一条判据无从判定",
+                 wallMaterial);
+        return false;
+    }
+
+    const FRtReflectionComparison cmp =
+        CaptureRtReflection(context, renderer, wallMaterial);
+
+    if (!cmp.Valid)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追反射] 采集失败");
+        return false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追反射] 比对 {} 像素 (地面 {}) — 距离不符 {} 材质不符 {} "
+             "法线不符 {} 残差超标 {} 漏命中 {} | 最大: 距离 {} 法线 {} "
+             "残差 {} | 材质下标 实测 {} 预期 {}",
+             cmp.ComparedPixels, cmp.FloorPixels,
+             cmp.DistanceMismatch, cmp.MaterialMismatch,
+             cmp.NormalMismatch, cmp.ResidualMismatch, cmp.MissedHits,
+             cmp.MaxDistanceError, cmp.MaxNormalError, cmp.MaxResidual,
+             cmp.ObservedMaterial, wallMaterial);
+
+    bool passed = true;
+
+    // ---- 元判据: 比对的像素要够多 ----
+    constexpr SizeType kMinPixels = 20000;
+
+    if (cmp.ComparedPixels < kMinPixels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] 只比对了 {} 个像素 (需要至少 {}) —— "
+                 "相机是不是没看到地面反射墙的那一片?",
+                 cmp.ComparedPixels, kMinPixels);
+        passed = false;
+    }
+
+    // ---- 判据 1: 该命中的都要命中 ----
+    //
+    // 解析上确定会打到墙的射线一条都不该落空。落空说明遍历、掩码或
+    // 反射方向里有一处错了。
+    const Float32 missFraction =
+        (cmp.ComparedPixels > 0)
+            ? static_cast<Float32>(cmp.MissedHits) /
+              static_cast<Float32>(cmp.ComparedPixels)
+            : 1.0f;
+
+    if (missFraction > 1.0e-3f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} / {} 条该命中的射线落空了 ({}%)",
+                 cmp.MissedHits, cmp.ComparedPixels, missFraction * 100.0f);
+        passed = false;
+    }
+
+    // ---- 判据 2: 命中距离 ----
+    const Float32 distanceFraction =
+        (cmp.ComparedPixels > 0)
+            ? static_cast<Float32>(cmp.DistanceMismatch) /
+              static_cast<Float32>(cmp.ComparedPixels)
+            : 1.0f;
+
+    if (distanceFraction > 1.0e-3f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} / {} 个像素的命中距离与 -P.z/R.z 对不上 "
+                 "({}%), 最大误差 {}",
+                 cmp.DistanceMismatch, cmp.ComparedPixels,
+                 distanceFraction * 100.0f, cmp.MaxDistanceError);
+        passed = false;
+    }
+
+    // ---- 判据 3: 材质下标 ----
+    //
+    // 一个像素都不能错 —— 材质下标是整数, 没有"接近"这回事。
+    if (cmp.MaterialMismatch != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} 个像素的材质下标不是墙的 {} —— "
+                 "几何表的索引错位了",
+                 cmp.MaterialMismatch, wallMaterial);
+        passed = false;
+    }
+
+    // ---- 判据 4: 命中法线 ----
+    //
+    // 墙的法线是 (0,0,1), y 分量恒为 0。这一条验的是"顶点取回来了、
+    // 重心插值对了、物体到世界的变换用对了" —— 三者任一错位, 法线都不会
+    // 恰好落在 y=0 上。
+    const Float32 normalFraction =
+        (cmp.ComparedPixels > 0)
+            ? static_cast<Float32>(cmp.NormalMismatch) /
+              static_cast<Float32>(cmp.ComparedPixels)
+            : 1.0f;
+
+    if (normalFraction > 1.0e-3f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} / {} 个像素的命中法线 y 不为零 ({}%), "
+                 "最大 {} —— 顶点取回或重心插值错位",
+                 cmp.NormalMismatch, cmp.ComparedPixels,
+                 normalFraction * 100.0f, cmp.MaxNormalError);
+        passed = false;
+    }
+
+    // ---- 判据 5: 位置自洽 ----
+    //
+    // 由 t 算出的命中点与由取回顶点插出来的命中点必须是同一个点。
+    //
+    // 这一条是几何取回路径上**唯一与场景无关**的判据: 法线那一条依赖场景
+    // 里的法线有变化, 而墙角场景的两块平面上九个顶点法线完全相同 —— 取错
+    // 顶点、取错索引、重心权重算错, 插出来的法线都一样。位置不一样。
+    const Float32 residualFraction =
+        (cmp.ComparedPixels > 0)
+            ? static_cast<Float32>(cmp.ResidualMismatch) /
+              static_cast<Float32>(cmp.ComparedPixels)
+            : 1.0f;
+
+    if (residualFraction > 1.0e-3f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] {} / {} 个像素的位置自洽残差超标 ({}%), "
+                 "最大 {} —— 顶点、索引或几何表的地址取错了",
+                 cmp.ResidualMismatch, cmp.ComparedPixels,
+                 residualFraction * 100.0f, cmp.MaxResidual);
+        passed = false;
+    }
+
+    // ---- 判据 6: 同一场景上再跑一遍与场景无关的自洽检查 ----
+    //
+    // 上面五条都依赖墙角场景的解析值。这一条不依赖 —— 它验的是"由 t 算出的
+    // 命中点与由取回顶点插出来的命中点是同一个", 而那个等式在任何场景上都
+    // 成立。把它单独拿出来是为了能**跑在别的场景上** (见 --rt-reflection-self)。
+    if (!RunReflectionSelfConsistency(context, renderer, "墙角"))
+    {
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[光追反射] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunRayTracedReflectionSelfCheck — 只跑与场景无关的那一段
+//
+// 墙角场景给得出解析值, 但它太均匀: 两块平面上九个顶点法线完全相同, 两个
+// 物体都没有子网格、一个都没被跳过。而 OBJ 测试场景恰好相反 —— 六个子网格
+// 共用一对缓冲区, 索引字节偏移 0/768/840/912/984/1080。
+//
+// 两个场景是互补的, 而这个入口让自洽那一段能跑在后者上。
+// ============================================================================
+static bool RunRayTracedReflectionSelfCheck(FRenderContext* context,
+                                            FRenderer&      renderer)
+{
+    if (!renderer.SetRayTracedReflectionEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追反射] 无法启用 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    const bool passed =
+        RunReflectionSelfConsistency(context, renderer, "OBJ 子网格");
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追反射] 自洽检查 {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunRayTracedShadowChecks — 光追阴影的边界落在解析位置上
 //
 // 阴影贴图那一条判据 (--shadow-check) 问的是"影子边界落在相似三角形算出的
@@ -7557,6 +8471,24 @@ static void BuildCornerScene(LScene* scene, FRenderContext* context,
                                FMath::kHalfPi) },
     };
 
+    // 两块板各用一个材质。
+    //
+    // 共用一个的话, 光追反射的判据里"命中处的材质下标"这一条就是空的:
+    // 无论几何表怎么错位, 查到的都是同一个下标。两个不同的下标之后, 错位
+    // 会立刻表现为"反射里看到的是地面的材质"。
+    //
+    // 颜色也刻意不同 —— 地面偏冷、墙偏暖。GTAO 的判据只看遮蔽率, 与颜色
+    // 无关; 而反射的判据要的正是"看到的是哪一块"。
+    FMaterial* wallMaterial =
+        FMaterialManager::Get().CreateMaterial("CornerWall");
+
+    if (wallMaterial != nullptr)
+    {
+        wallMaterial->SetBaseColor(FVector4(0.85f, 0.55f, 0.35f, 1.0f));
+        wallMaterial->SetMetallic(0.0f);
+        wallMaterial->SetRoughness(1.0f);
+    }
+
     for (UInt32 i = 0; i < 2; ++i)
     {
         FTransform nodeTransform;
@@ -7568,7 +8500,12 @@ static void BuildCornerScene(LScene* scene, FRenderContext* context,
 
         LMeshTrait* meshTrait = node->AddTrait<LMeshTrait>(FName("Mesh"));
         meshTrait->SetMesh(&resources, meshHandle);
-        meshTrait->SetMaterial(defaultMaterial);
+
+        // [0] 地面用默认材质, [1] 墙用自己的
+        meshTrait->SetMaterial(
+            (i == 1 && wallMaterial != nullptr) ? wallMaterial
+                                                : defaultMaterial);
+
         meshTrait->SetVisible(true);
     }
 
@@ -9019,7 +9956,7 @@ int WINAPI wWinMain(
     windowDesc.Height      = 720;
     windowDesc.Title       = L"Limx Engine — Vulkan Renderer";
     windowDesc.IsResizable = true;
-    windowDesc.IsVisible   = true;
+    windowDesc.IsVisible   = !launchOptions.HiddenWindow;
 
     if (!window.Create(windowDesc))
     {
@@ -9205,6 +10142,19 @@ int WINAPI wWinMain(
                  "[Launch] 分簇光照已关闭 — 暴力遍历全部光源");
     }
 
+    if (launchOptions.RayTracedReflection)
+    {
+        if (renderer.SetRayTracedReflectionEnabled(true))
+        {
+            LIMX_LOG(LogLaunch, Display, "[Launch] 光追反射已启用");
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[启动] --rt-reflection 无法启用 —— 设备不支持光线追踪");
+        }
+    }
+
     if (launchOptions.RayTracedAo)
     {
         if (renderer.SetRayTracedAoEnabled(true))
@@ -9375,6 +10325,8 @@ int WINAPI wWinMain(
     bool    rtDepthCheckPassed = true;
     bool    rtShadowCheckPassed = true;
     bool    rtAoCheckPassed = true;
+    bool    rtReflectionCheckPassed = true;
+    bool    rtReflectionSelfPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -9472,6 +10424,18 @@ int WINAPI wWinMain(
             {
                 rtAoCheckPassed =
                     RunRayTracedAoChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtReflectionCheck)
+            {
+                rtReflectionCheckPassed =
+                    RunRayTracedReflectionChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtReflectionSelfCheck)
+            {
+                rtReflectionSelfPassed =
+                    RunRayTracedReflectionSelfCheck(&renderContext, renderer);
             }
 
             if (launchOptions.ShowcaseCheck)
@@ -9686,6 +10650,18 @@ int WINAPI wWinMain(
     {
         selfCheckCode = FinalizeSelfCheck(rtAoCheckPassed, 22, errorSink,
                                           errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtReflectionCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtReflectionCheckPassed, 23,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtReflectionSelfCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtReflectionSelfPassed, 24,
+                                          errorSink, errorsBeforeShutdown);
     }
 
     // 移除日志 Sink 并关闭
