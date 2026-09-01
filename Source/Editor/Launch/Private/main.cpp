@@ -219,6 +219,9 @@ struct FLaunchOptions
     /// 光追自检: 加速结构的 GPU 遍历与 CPU 解析解逐条比对, 以退出码报告
     bool RayTracingCheck = false;
 
+    /// AO 边缘自检: 双边上采样在深度不连续处有没有起作用, 以退出码报告
+    bool AoEdgeCheck = false;
+
     /// GTAO 的采样半径 (世界单位)
     Float32 AoRadius = 0.8f;
 
@@ -688,6 +691,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--rt-check"))
         {
             options.RayTracingCheck = true;
+        }
+        else if (WideEquals(arg, L"--ao-edge-check"))
+        {
+            options.AoEdgeCheck = true;
         }
         else if (WideEquals(arg, L"--ao-check"))
         {
@@ -3742,6 +3749,145 @@ static bool ReadAoAndDepth(FRenderContext* context, FRenderer& renderer,
     return ok;
 }
 
+// ============================================================================
+// 深度不连续处的统计
+//
+// 双边上采样的全部作用都在深度不连续处 —— 平坦区域上双边、双线性、最近邻
+// 给的是同一个数。所以要验它, 统计范围必须先缩到不连续处, 否则信号会被
+// 几十万个平坦像素摊平到小数点后五位。
+// ============================================================================
+
+struct FAoEdgeStats
+{
+    /// 深度不连续的像素数
+    SizeType EdgeCount = 0;
+
+    /// 其中半分辨率与全分辨率相差超过 kBleedThreshold 的
+    ///
+    /// 渗色的特征不在均值上而在**尾巴**上: 上采样在不连续处把前景与背景的
+    /// AO 混在一起, 产生的是少数像素上的大偏差。均值把它摊平, 计数不会。
+    SizeType BleedCount = 0;
+
+    /// 不连续处的平均差
+    Float32 EdgeMean = 0.0f;
+
+    /// **平坦区**的像素数 (不在深度不连续处的)
+    SizeType SmoothCount = 0;
+
+    /// 平坦区的平均差 —— **只报不判**
+    ///
+    /// 这一项本来是想抓"太锐"那一头的: 渗色计数抓的是上采样太糊 (把前景
+    /// 背景混在一起), 而权重退化成只剩最近邻是相反的错法, 表现为平坦的
+    /// AO 梯度上出现台阶。
+    ///
+    /// 实测的结论是**它抓不住**, 而且方向还反了:
+    ///
+    ///     双边 (正确)          平坦区 0.028465   渗色 2694
+    ///     退化成最近邻          平坦区 0.028344   渗色 2609
+    ///     去掉双线性因子        平坦区 0.028056   渗色 2653
+    ///     纯双线性             平坦区 0.029750   渗色 3793
+    ///     加权反向             平坦区 0.032732   渗色 4801
+    ///
+    /// 前三行彼此的差别在千分之四以内, 而"错"的那两行反而比正确的低。
+    ///
+    /// 原因是这个比对的**目标本身是锐的**: 半分辨率 AO 与全分辨率 AO 的
+    /// 差别主要来自采样数减半, 不来自上采样滤波。最近邻上采样同样是锐的,
+    /// 所以它与全分辨率的一致程度并不比双边差 —— 双边真正强过它的地方
+    /// (表面内部平滑过渡) 恰好是两者都与全分辨率差不多的地方。
+    ///
+    /// 何况着色器的退路本来就是"四个邻居都不同表面时取最近邻", 所以在
+    /// 不连续处双边与最近邻**按设计就该接近**。
+    ///
+    /// 也就是说: 手上的判据分得开"太糊", 分不开"太锐"。留着报数, 不判。
+    Float32 SmoothMean = 0.0f;
+};
+
+/// 算作"渗色"的偏差门槛
+///
+/// AO 的取值域是 [0,1], 0.2 是肉眼一眼看得出的一档明暗。取得更小会把
+/// 半分辨率固有的采样差也算进来 (那与上采样方式无关), 更大则只剩下
+/// 前景背景完全颠倒的极端像素, 样本太少。
+constexpr Float32 kAoBleedThreshold = 0.2f;
+
+/// 判定"深度不连续"的相对深度差门槛
+///
+/// 0.002 的 NDC 相对差已经是很陡的一步了 —— 透视深度在远处极度压缩,
+/// 用世界尺度的阈值会一个都选不出来。
+constexpr Float32 kAoEdgeRelativeThreshold = 0.002f;
+
+FAoEdgeStats ComputeAoEdgeStats(const TArray<Float32>& full,
+                                const TArray<Float32>& half,
+                                const TArray<Float32>& depth,
+                                const FRHIExtent2D& extent)
+{
+    FAoEdgeStats stats;
+
+    Float64 edgeSum   = 0.0;
+    Float64 smoothSum = 0.0;
+
+    for (UInt32 y = 1; y + 1 < extent.Height; ++y)
+    {
+        for (UInt32 x = 1; x + 1 < extent.Width; ++x)
+        {
+            const SizeType index =
+                static_cast<SizeType>(y) * extent.Width + x;
+
+            const Float32 center = depth[index];
+
+            // 四邻的最大相对深度差 —— 与 gtao_upsample.frag 里的判据同源
+            Float32 maxRelative = 0.0f;
+
+            const SizeType neighbors[4] = {
+                index - 1, index + 1,
+                index - extent.Width, index + extent.Width
+            };
+
+            for (SizeType n = 0; n < 4; ++n)
+            {
+                const Float32 other = depth[neighbors[n]];
+
+                const Float32 relative =
+                    FMath::Abs(center - other) /
+                    FMath::Max(FMath::Max(center, other), 1.0e-4f);
+
+                maxRelative = FMath::Max(maxRelative, relative);
+            }
+
+            const Float32 diff = FMath::Abs(full[index] - half[index]);
+
+            if (maxRelative > kAoEdgeRelativeThreshold)
+            {
+                edgeSum += static_cast<Float64>(diff);
+                ++stats.EdgeCount;
+
+                if (diff > kAoBleedThreshold)
+                {
+                    ++stats.BleedCount;
+                }
+            }
+            else
+            {
+                smoothSum += static_cast<Float64>(diff);
+                ++stats.SmoothCount;
+            }
+        }
+    }
+
+    if (stats.EdgeCount > 0)
+    {
+        stats.EdgeMean = static_cast<Float32>(
+            edgeSum / static_cast<Float64>(stats.EdgeCount));
+    }
+
+    if (stats.SmoothCount > 0)
+    {
+        stats.SmoothMean = static_cast<Float32>(
+            smoothSum / static_cast<Float64>(stats.SmoothCount));
+    }
+
+    return stats;
+}
+
 } // namespace
 
 static bool RunAoHalfChecks(FRenderContext* context, FRenderer& renderer)
@@ -3868,82 +4014,24 @@ static bool RunAoHalfChecks(FRenderContext* context, FRenderer& renderer)
         passed = false;
     }
 
-    // ---- 4. 深度不连续处的差 —— **只报不判** ----
+    // ---- 4. 深度不连续处的差 —— 这里只报, 判在 --ao-edge-check ----
     //
-    // 双边加权的全部作用都在深度不连续处。这一段本来是想为它建一条判据的,
-    // 而实测的结论是**建不起来**:
+    // 双边加权的全部作用都在深度不连续处, 而墙角场景 (这条判据唯一跑的
+    // 场景) **一个不连续像素都没有** —— 两块平面填满视野。所以在这里判
+    // 它是自欺: 阈值只能宽到连双线性都放过去。
     //
-    //   墙角场景 (--corner-scene): 两块平面填满视野, 深度不连续的像素
-    //     **一个都没有**。
-    //   阴影场景 (--shadow-scene): 1096 个不连续像素 (占万分之十二), 而
-    //     把双边退化成双线性之后, 那些像素上的平均差从 0.005806 变成
-    //     0.006379 —— 相对差 10%, 绝对差 0.0006。整幅平均则是
-    //     0.037312 对 0.037313, 小数点后五位才分得开。
-    //
-    // 也就是说: 手上的场景里, 深度加权这一项**量不出来**。它仍然留着 ——
-    // 它便宜, 而且防的是物体边缘一圈光晕, 那种光晕看起来像"AO 半径调大了",
-    // 调半径根本治不了。但把它写成判据就是自欺: 阈值只能宽到连双线性都放
-    // 过去, 那条判据就成了摆设。
-    //
-    // 所以这里只报数, 不参与判定。要真的验它, 需要一个**前景与背景 AO 差
-    // 别很大**的场景 —— 那是另一件事。
+    // 真正判它的是 --ao-edge-check, 跑在综合场景上 (15.7 万个不连续像素)。
     {
         const FRHIExtent2D extent = context->GetSwapchainExtent();
 
-        Float64  edgeSum   = 0.0;
-        SizeType edgeCount = 0;
-
-        for (UInt32 y = 1; y + 1 < extent.Height; ++y)
-        {
-            for (UInt32 x = 1; x + 1 < extent.Width; ++x)
-            {
-                const SizeType index =
-                    static_cast<SizeType>(y) * extent.Width + x;
-
-                const Float32 center = depth[index];
-
-                // 四邻的最大相对深度差 —— 与 gtao_upsample.frag 里的判据同源
-                Float32 maxRelative = 0.0f;
-
-                const SizeType neighbors[4] = {
-                    index - 1, index + 1,
-                    index - extent.Width, index + extent.Width
-                };
-
-                for (SizeType n = 0; n < 4; ++n)
-                {
-                    const Float32 other = depth[neighbors[n]];
-
-                    const Float32 relative =
-                        FMath::Abs(center - other) /
-                        FMath::Max(FMath::Max(center, other), 1.0e-4f);
-
-                    maxRelative = FMath::Max(maxRelative, relative);
-                }
-
-                // 0.002 的 NDC 相对差已经是很陡的一步了 —— 透视深度在
-                // 远处极度压缩, 用世界尺度的阈值会一个都选不出来。
-                if (maxRelative > 0.002f)
-                {
-                    edgeSum += static_cast<Float64>(
-                        FMath::Abs(full[index] - half[index]));
-                    ++edgeCount;
-                }
-            }
-        }
-
-        const Float32 edgeMean =
-            (edgeCount > 0)
-                ? static_cast<Float32>(edgeSum /
-                                       static_cast<Float64>(edgeCount))
-                : 0.0f;
+        const FAoEdgeStats stats =
+            ComputeAoEdgeStats(full, half, depth, extent);
 
         LIMX_LOG(LogLaunch, Display,
-                 "[AO半分] 深度不连续处 {} 个像素, 平均差 {}",
-                 edgeCount, edgeMean);
-
-        // 不参与判定 —— 理由见上面那段。
-        (void)edgeMean;
+                 "[AO半分] 深度不连续处 {} 个像素, 平均差 {}, "
+                 "偏差超 {} 的 {} 个",
+                 stats.EdgeCount, stats.EdgeMean,
+                 kAoBleedThreshold, stats.BleedCount);
     }
 
     if (passed)
@@ -3954,6 +4042,153 @@ static bool RunAoHalfChecks(FRenderContext* context, FRenderer& renderer)
     else
     {
         LIMX_LOG(LogLaunch, Error, "[AO半分] 失败");
+    }
+
+    return passed;
+}
+
+// ============================================================================
+// RunAoEdgeChecks — 双边上采样在深度不连续处到底有没有起作用
+//
+// 这条判据是补上一个记了一个周期的空白。上个周期的结论是"双边加权在手上的
+// 场景里量不出来", 而那个结论其实是**两件事叠在一起**:
+//
+//   1. 墙角场景根本没有深度不连续 —— 场景不够。
+//   2. LinearizeDepth 的分母符号写错了, 线性深度成了 -0.1..-0.05 的负数,
+//      于是 max(max(a,b), 1e-4) 永远取到 1e-4, 相对差被放大四个量级,
+//      exp(-relative/0.05) 直接下溢成零 —— **当时根本没有双边加权**,
+//      它一直在做最近邻。
+//
+// 第二件事修掉之后, 第一件事仍然成立: 判据必须换个场景。综合场景有 15.7 万
+// 个深度不连续的像素, 而那里双边与双线性的差别是能量出来的。
+//
+// 统计量选的是**渗色像素计数**而不是均值: 15.7 万个像素上的均值差只有
+// 8.4% (0.0313 对 0.0340), 而偏差超过 0.2 的像素数差 41% (2694 对 3793)。
+// 渗色本来就是少数像素上的大偏差, 均值会把它摊平。
+// ============================================================================
+
+static bool RunAoEdgeChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FGtaoPass* const gtao = renderer.GetGtaoPass();
+
+    if (gtao == nullptr || !gtao->IsEnabled())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO边缘] GTAO 未启用 — 自检无从判定 (加 --gtao)");
+        return false;
+    }
+
+    const bool originalHalf = gtao->IsHalfResolution();
+
+    TArray<Float32> full;
+    TArray<Float32> half;
+    TArray<Float32> depth;
+    TArray<Float32> depthIgnored;
+
+    gtao->SetHalfResolution(false);
+
+    if (!ReadAoAndDepth(context, renderer, full, depth))
+    {
+        gtao->SetHalfResolution(originalHalf);
+        LIMX_LOG(LogLaunch, Error, "[AO边缘] 全分辨率回读失败");
+        return false;
+    }
+
+    gtao->SetHalfResolution(true);
+
+    if (!ReadAoAndDepth(context, renderer, half, depthIgnored))
+    {
+        gtao->SetHalfResolution(originalHalf);
+        LIMX_LOG(LogLaunch, Error, "[AO边缘] 半分辨率回读失败");
+        return false;
+    }
+
+    gtao->SetHalfResolution(originalHalf);
+
+    if (full.GetSize() != half.GetSize() || full.GetSize() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO边缘] 两次回读的尺寸不同 ({} vs {})",
+                 full.GetSize(), half.GetSize());
+        return false;
+    }
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const FAoEdgeStats stats = ComputeAoEdgeStats(full, half, depth, extent);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[AO边缘] 不连续处 {} 个 (平均差 {}, 渗色 {} 个) | "
+             "平坦区 {} 个 (平均差 {})",
+             stats.EdgeCount, stats.EdgeMean, stats.BleedCount,
+             stats.SmoothCount, stats.SmoothMean);
+
+    bool passed = true;
+
+    // ---- 0. 场景里必须真的有深度不连续 ----
+    //
+    // 没有不连续的话双边、双线性、最近邻给的是同一张图 —— 那时这条判据
+    // 满分通过, 而它什么都没验。墙角场景实测 0 个, 综合场景 157095 个。
+    constexpr SizeType kMinEdgePixels = 50000;
+
+    if (stats.EdgeCount < kMinEdgePixels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO边缘] 只有 {} 个深度不连续像素 (需要至少 {}) —— "
+                 "这个场景判不了双边加权",
+                 stats.EdgeCount, kMinEdgePixels);
+        passed = false;
+    }
+
+    // ---- 1. 渗色像素数不能为零 ----
+    //
+    // 正确实现也会有一些: 半分辨率本来就抓不住比半个像素还细的遮挡物,
+    // 那与上采样方式无关。一个都没有反而说明场景里前景背景的 AO 差别
+    // 不够大 —— 那时判据同样无从分辨。实测正确实现 2694 个。
+    if (stats.BleedCount == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO边缘] 渗色像素一个都没有 —— 场景的前景背景 AO 差别"
+                 "不够大, 判据分辨不出上采样方式");
+        passed = false;
+    }
+
+    // ---- 2. 渗色像素数要有上界 ----
+    //
+    // 综合场景上的五个实测点 (帧数与预热固定, 三次重复完全一致):
+    //
+    //   双边 (正确)          2694
+    //   退化成最近邻          2609   <- 判不出来, 见 SmoothMean 的说明
+    //   去掉双线性因子        2653   <- 同上
+    //   纯双线性             3793   <- 抓得住
+    //   加权反向             4801   <- 抓得住
+    //
+    // 阈值 3200 卡在 2694 与 3793 之间: 距正确实现 19% 余量, 距双线性
+    // 16% 余量。两侧都不算宽, 所以这个数**与场景绑死** —— verify.ps1 里
+    // 只在综合场景上跑这一条, 换场景必须重新量。
+    //
+    // 这条判据能抓的是"上采样太糊"这一类。"太锐"那一类抓不住, 理由写在
+    // FAoEdgeStats::SmoothMean 上 —— 那是这条判据已知的、量过的盲点,
+    // 不是没想到。
+    constexpr SizeType kMaxBleedPixels = 3200;
+
+    if (stats.BleedCount > kMaxBleedPixels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[AO边缘] 渗色像素 {} 个超过上限 {} —— "
+                 "上采样在深度不连续处把前景与背景混在一起了",
+                 stats.BleedCount, kMaxBleedPixels);
+        passed = false;
+    }
+
+    if (passed)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[AO边缘] 通过 — 双边加权在深度不连续处确实起了作用");
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Error, "[AO边缘] 失败");
     }
 
     return passed;
@@ -8041,6 +8276,7 @@ int WINAPI wWinMain(
     bool    aoHalfCheckPassed = true;
     bool    showcaseCheckPassed = true;
     bool    rayTracingCheckPassed = true;
+    bool    aoEdgeCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -8115,6 +8351,11 @@ int WINAPI wWinMain(
             {
                 rayTracingCheckPassed = RunRayTracingChecks(
                     renderContext.GetDevice(), &renderContext);
+            }
+
+            if (launchOptions.AoEdgeCheck)
+            {
+                aoEdgeCheckPassed = RunAoEdgeChecks(&renderContext, renderer);
             }
 
             if (launchOptions.ShowcaseCheck)
@@ -8304,6 +8545,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.RayTracingCheck)
     {
         selfCheckCode = FinalizeSelfCheck(rayTracingCheckPassed, 18, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.AoEdgeCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(aoEdgeCheckPassed, 19, errorSink,
                                           errorsBeforeShutdown);
     }
 

@@ -42,8 +42,28 @@ layout(push_constant) uniform Params {
 
 /// NDC 深度 → 视空间线性深度 (正值)
 ///
-/// Vulkan 的 NDC z 是 [0,1], 而透视投影下 z_ndc = A + B/z_view。反解得到
-/// z_view = B / (z_ndc - A), 其中 A = far/(near-far), B = far*near/(near-far)。
+/// 把 [0,1] 的 NDC 深度还原成沿相机前向的世界距离 (正数)
+///
+/// 推导 (右手系视空间, -Z 为前方, Vulkan NDC z ∈ [0,1]):
+///
+///   投影矩阵的第三、四行给出
+///     z_clip = A*z_view + B      A = far/(near-far)
+///     w_clip = -z_view           B = far*near/(near-far)
+///   于是
+///     z_ndc = z_clip / w_clip = -A - B/z_view
+///   反解 z_view 并取距离 = -z_view:
+///     距离 = B / (z_ndc + A)
+///
+/// 注意分母是 **+A** 不是 -A。A 与 B 在这套约定下都是负数, 二者相除得正。
+///
+/// 曾经写成 B/(z_ndc - A), 后果不是"稍微不准": 它把 0.1..100 的距离映到
+/// -0.1..-0.05 —— 负数, 而且随距离**减小**。下面那句
+/// max(max(a, b), 1.0e-4) 于是永远取到 1.0e-4, 相对差被放大四个量级,
+/// exp(-relative/0.05) 直接下溢成 0。结果是除了深度逐位相同的邻居之外
+/// 权重全为零, 双边上采样静默退化成最近邻。
+///
+/// 而它退化得很"干净": 不崩、不出 NaN、画面上只有边缘一点点台阶。上个
+/// 周期"去掉双边加权"那条变异之所以逃逸, 就是因为当时根本没有双边加权。
 ///
 /// 直接用 near/far 而不是传逆投影矩阵进来: 上采样只需要"两个样本在不在同一
 /// 个表面上", 而那只跟线性深度的比值有关, 与横向位置无关。
@@ -55,12 +75,14 @@ float LinearizeDepth(float ndcDepth)
     float a = farPlane / (nearPlane - farPlane);
     float b = farPlane * nearPlane / (nearPlane - farPlane);
 
-    // z_ndc 等于 a 时分母为零 —— 那对应无穷远。钳一个极小量, 让它给出一个
-    // 极大的深度而不是 inf: inf 会让下面的相对差变成 NaN, 而 NaN 参与比较
-    // 时永远为假, 于是四个权重全零, 结果退化成除以零。
-    float denom = ndcDepth - a;
+    // z_ndc 等于 -a 时分母为零 —— 那对应无穷远。钳一个极小的**负**量, 让它
+    // 给出一个极大的正距离而不是 inf: 钳成正的会翻转符号, 得到一个极大的
+    // 负距离, 而那正是上面那段说的失败模式。
+    // inf 本身也不行 —— 它会让下面的相对差变成 NaN, 而 NaN 参与比较时永远
+    // 为假, 于是四个权重全零, 结果退化成除以零。
+    float denom = ndcDepth + a;
 
-    return b / ((abs(denom) < 1.0e-7) ? 1.0e-7 : denom);
+    return b / ((abs(denom) < 1.0e-7) ? -1.0e-7 : denom);
 }
 
 void main()
