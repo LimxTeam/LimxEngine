@@ -672,23 +672,6 @@ Invoke-Step '综合场景自检 (每个子系统都留下痕迹)' -RequiresGpu {
 #
 # 设备不支持光追时这一条判**失败**而不是跳过: 判通过的话它在任何不支持的机器上
 # 都是空的, 而换一台机器正是"不支持"最常见的来源。
-# 双边上采样在深度不连续处到底有没有起作用 —— 需要真实 GPU。
-#
-# 这一条补的是上个周期记下的空白。当时的结论是"双边加权量不出来", 而那其实
-# 是两件事叠在一起: 墙角场景根本没有深度不连续 (0 个像素), 以及
-# LinearizeDepth 的分母符号写错了 —— 线性深度成了负数且随距离减小, 权重全数
-# 下溢, 那时**根本没有双边加权**。
-#
-# 符号修掉之后场景仍然要换: 综合场景有 15.7 万个深度不连续像素。统计量取的是
-# 渗色像素计数 (半分辨率与全分辨率相差超过 0.2 的) 而不是均值 —— 渗色本来
-# 就是少数像素上的大偏差, 15.7 万个像素的均值会把它摊平 (均值差 8.4%,
-# 计数差 41%)。
-#
-# 已知盲点写在代码里: 这条判据分得开"上采样太糊", 分不开"太锐"。
-Invoke-Step 'AO 双边上采样 (深度不连续处的渗色)' -RequiresGpu {
-    Invoke-Engine '--showcase --gpu-driven --gtao --taa --bloom --clustered --frames 20 --warmup 5 --ao-edge-check'
-}
-
 Invoke-Step '光追加速结构 (GPU 遍历与 CPU 解析解逐条比对)' -RequiresGpu {
     Invoke-Engine '--scene Content/TestScene/testscene.obj --frames 5 --warmup 2 --rt-check'
 }

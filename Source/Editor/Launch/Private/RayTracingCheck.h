@@ -30,4 +30,15 @@ class FRenderContext;
 LIMX_NODISCARD bool RunRayTracingChecks(IRHIDevice* device,
                                         FRenderContext* context);
 
+/// 光追深度与光栅化深度的逐像素比对
+///
+/// 光栅器与 BVH 是两条彻底独立的路径 —— 一条按三角形扫描填深度, 一条按
+/// 射线遍历树。它们对同一个像素给出同一个深度, 才说明加速结构里装的确实
+/// 是屏幕上那个场景。
+///
+/// 这条判据覆盖的是上一条 (手搭方片) 覆盖不到的部分: 真实网格的顶点跨度、
+/// 子网格的索引偏移、每个物体的变换、以及"渲染对象列表与 BLAS 的对应关系"。
+LIMX_NODISCARD bool RunRayTracingDepthCheck(FRenderContext* context,
+                                            FRenderer& renderer);
+
 } // namespace Limx

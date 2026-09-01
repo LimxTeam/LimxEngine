@@ -1035,3 +1035,152 @@ LIMX_TEST(FFrustum, CullingKeepsEveryVisibleBoxOfAGrid)
     // 扫描区域必须真的落在视锥里, 否则这条用例什么都没测到
     LIMX_EXPECT_GT(visibleCount, 0u);
 }
+
+// ============================================================================
+// FMatrix::Inverse — 逆矩阵
+//
+// 这组用例补的是一个空白: Inverse() 此前**一个测试都没有**, 而它是屏幕空间
+// 反投影 (光追射线生成、SSR、体积雾) 的地基。透视投影矩阵不是仿射的 ——
+// 只按仿射情形写的逆矩阵在旋转平移上完全正确, 一遇到投影就整个错掉, 而那时
+// 的表现是"射线朝着一个说不出哪里不对的方向发出去"。
+// ============================================================================
+
+namespace
+{
+
+/// 两个矩阵之间的最大逐元素偏差
+///
+/// 断言留给调用方 —— LIMX_EXPECT_* 依赖测试宏注入的上下文, 在普通函数里
+/// 用不了。返回一个数比在辅助函数里断言更好: 失败时日志上直接看得到差多少。
+Float32 MaxMatrixDifference(const FMatrix& a, const FMatrix& b)
+{
+    Float32 worst = 0.0f;
+
+    for (Int32 row = 0; row < 4; ++row)
+    {
+        for (Int32 col = 0; col < 4; ++col)
+        {
+            worst = FMath::Max(worst,
+                               FMath::Abs(a.M[row][col] - b.M[row][col]));
+        }
+    }
+
+    return worst;
+}
+
+} // namespace
+
+LIMX_TEST(Matrix, InverseOfTranslationRoundTrips)
+{
+    const FMatrix m = FMatrix::Translation(FVector3(3.0f, -7.0f, 11.0f));
+
+    LIMX_EXPECT_LT(MaxMatrixDifference(m * m.Inverse(), FMatrix::kIdentity),
+                   1.0e-5f);
+    LIMX_EXPECT_LT(MaxMatrixDifference(m.Inverse() * m, FMatrix::kIdentity),
+                   1.0e-5f);
+}
+
+LIMX_TEST(Matrix, InverseOfRotationRoundTrips)
+{
+    const FMatrix m = FMatrix::RotationY(0.7f) * FMatrix::RotationX(-0.3f);
+
+    LIMX_EXPECT_LT(MaxMatrixDifference(m * m.Inverse(), FMatrix::kIdentity),
+                   1.0e-5f);
+    LIMX_EXPECT_LT(MaxMatrixDifference(m.Inverse() * m, FMatrix::kIdentity),
+                   1.0e-5f);
+}
+
+LIMX_TEST(Matrix, InverseOfPerspectiveRoundTrips)
+{
+    // 透视矩阵的最后一行是 (0,0,-1,0) —— 非仿射。仿射逆的实现在这里必错。
+    const FMatrix m = FMatrix::Perspective(
+        FMath::kPi * 0.25f, 16.0f / 9.0f, 0.1f, 100.0f);
+
+    LIMX_EXPECT_LT(MaxMatrixDifference(m * m.Inverse(), FMatrix::kIdentity),
+                   1.0e-4f);
+    LIMX_EXPECT_LT(MaxMatrixDifference(m.Inverse() * m, FMatrix::kIdentity),
+                   1.0e-4f);
+}
+
+LIMX_TEST(Matrix, InverseOfViewProjectionRoundTrips)
+{
+    // 屏幕空间反投影用的就是这个乘积的逆
+    const FMatrix view = FMatrix::LookAt(
+        FVector3(4.0f, 3.0f, 8.0f),
+        FVector3(0.0f, 1.0f, 0.0f),
+        FVector3(0.0f, 1.0f, 0.0f));
+
+    const FMatrix projection = FMatrix::Perspective(
+        FMath::kPi / 3.0f, 1280.0f / 720.0f, 0.1f, 100.0f);
+
+    const FMatrix viewProj = projection * view;
+
+    LIMX_EXPECT_LT(MaxMatrixDifference(viewProj * viewProj.Inverse(),
+                                       FMatrix::kIdentity),
+                   1.0e-3f);
+}
+
+LIMX_TEST(Matrix, InverseUnprojectsNdcBackToWorld)
+{
+    // 这条才是反投影真正要的性质: 把一个世界点投到 NDC 再反投影回来,
+    // 必须回到原处。
+    //
+    // 只验 M * M^-1 = I 是不够的 —— 转置了的逆同样满足"乘起来接近单位阵"
+    // 的**某些**检查方式, 而它反投影出来的点是错的。这里逐点验。
+    const FMatrix view = FMatrix::LookAt(
+        FVector3(2.0f, 5.0f, -6.0f),
+        FVector3(1.0f, 0.5f, 1.0f),
+        FVector3(0.0f, 1.0f, 0.0f));
+
+    const FMatrix projection = FMatrix::Perspective(
+        FMath::kPi / 3.0f, 1280.0f / 720.0f, 0.1f, 100.0f);
+
+    const FMatrix viewProj    = projection * view;
+    const FMatrix invViewProj = viewProj.Inverse();
+
+    const FVector3 samples[5] =
+    {
+        FVector3( 1.0f,  0.5f,   1.0f),
+        FVector3(-3.0f,  2.0f,   4.0f),
+        FVector3( 6.0f, -1.0f,  -2.0f),
+        FVector3( 0.0f,  0.0f,   0.0f),
+        FVector3(-8.0f,  4.0f,  10.0f),
+    };
+
+    UInt32 checkedCount = 0;
+
+    for (UInt32 i = 0; i < 5; ++i)
+    {
+        const FVector3& world = samples[i];
+
+        // 世界 -> 裁剪
+        const FVector4 clip = viewProj.TransformVector4(
+            FVector4(world.X, world.Y, world.Z, 1.0f));
+
+        // 相机背后或退化的点跳过 —— 它们不在这条性质的定义域里
+        if (clip.W <= 1.0e-4f)
+        {
+            continue;
+        }
+
+        const FVector3 ndc(clip.X / clip.W, clip.Y / clip.W, clip.Z / clip.W);
+
+        // NDC -> 世界
+        const FVector4 back = invViewProj.TransformVector4(
+            FVector4(ndc.X, ndc.Y, ndc.Z, 1.0f));
+
+        LIMX_EXPECT_GT(FMath::Abs(back.W), 1.0e-6f);
+
+        const FVector3 restored(back.X / back.W, back.Y / back.W,
+                                back.Z / back.W);
+
+        LIMX_EXPECT_NEAR(restored.X, world.X, 1.0e-2f);
+        LIMX_EXPECT_NEAR(restored.Y, world.Y, 1.0e-2f);
+        LIMX_EXPECT_NEAR(restored.Z, world.Z, 1.0e-2f);
+
+        ++checkedCount;
+    }
+
+    // 样本全被跳过的话这条用例什么都没验
+    LIMX_EXPECT_GT(checkedCount, 2u);
+}

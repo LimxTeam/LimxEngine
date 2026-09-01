@@ -37,6 +37,11 @@
 #include "RHI/RHI/IRHICommandBuffer.h"
 #include "RenderCore/Renderer/FRenderContext.h"
 #include "RenderCore/Shaders/FShaderManager.h"
+#include "RenderCore/Camera/FCamera.h"
+#include "Renderer/Renderer/FRenderer.h"
+#include "Renderer/RenderPass/FDepthPrePass.h"
+#include "Renderer/RenderPass/FPassManager.h"
+#include "Renderer/RayTracing/FRayTracingScene.h"
 
 namespace Limx
 {
@@ -1046,6 +1051,540 @@ bool RunRayTracingChecks(IRHIDevice* device, FRenderContext* context)
              "[光追自检] {}", passed ? "通过" : "失败");
 
     res.Destroy(device);
+
+    return passed;
+}
+
+// ============================================================================
+// RunRayTracingDepthCheck — 光追深度 vs 光栅化深度
+// ============================================================================
+
+namespace
+{
+
+/// rt_depth.comp 的推送常量 (128 字节)
+struct FRtDepthPushConstants
+{
+    FMatrix InvViewProj;
+
+    Float32 CameraX = 0.0f;
+    Float32 CameraY = 0.0f;
+    Float32 CameraZ = 0.0f;
+    Float32 CameraPad = 0.0f;
+
+    Float32 ForwardX = 0.0f;
+    Float32 ForwardY = 0.0f;
+    Float32 ForwardZ = 0.0f;
+    Float32 ForwardPad = 0.0f;
+
+    UInt32 Width  = 0;
+    UInt32 Height = 0;
+    UInt32 Pad0   = 0;
+    UInt32 Pad1   = 0;
+
+    Float32 NearPlane = 0.0f;
+    Float32 FarPlane  = 0.0f;
+    Float32 PlanePad0 = 0.0f;
+    Float32 PlanePad1 = 0.0f;
+};
+
+static_assert(sizeof(FRtDepthPushConstants) == 128,
+              "FRtDepthPushConstants 必须是 128 字节 — 与 rt_depth.comp 的 "
+              "push constant 块逐字段一致");
+
+/// 每像素一对深度: x = 光追, y = 光栅化 (都已线性化到沿相机前向的距离)
+struct FDepthPair
+{
+    Float32 RayTraced = -1.0f;
+    Float32 Rasterized = -1.0f;
+};
+
+static_assert(sizeof(FDepthPair) == 8,
+              "FDepthPair 必须是 8 字节 — 与着色器的 vec2 对应");
+
+} // namespace
+
+bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
+{
+    if (context == nullptr)
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    if (device == nullptr || !device->IsRayTracingSupported())
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] 设备不支持光线追踪 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    if (!renderer.SetRayTracingEnabled(true))
+    {
+        LIMX_LOG(LogRayTracingCheck, Error, "[光追深度] 无法启用光追场景");
+        return false;
+    }
+
+    FDepthPrePass* const depthPass = renderer.GetDepthPrePass();
+
+    if (depthPass == nullptr)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error, "[光追深度] 深度预通道不可用");
+        return false;
+    }
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    const UInt64 resultBytes =
+        static_cast<UInt64>(pixelCount) * sizeof(FDepthPair);
+
+    // ------------------------------------------------------------------
+    // 资源
+    // ------------------------------------------------------------------
+    FRHIBufferHandle resultBuffer;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Size        = resultBytes;
+        desc.Usage       = EBufferUsage::StorageBuffer;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "RtDepth.Result";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, resultBuffer)))
+        {
+            return false;
+        }
+    }
+
+    // 先填成不可能出现的值 (0xFF 解释成 float 是 NaN)。
+    //
+    // 清零的话"着色器一次都没跑"会表现成"全部深度为 0", 而 0 是合法深度 ——
+    // 失败模式又落在通过上了。
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(resultBuffer, &mapped)) &&
+            mapped != nullptr)
+        {
+            Memory::MemSet(mapped, 0xFF, static_cast<SizeType>(resultBytes));
+            device->UnmapBuffer(resultBuffer);
+        }
+    }
+
+    FRHIDescSetLayoutHandle   setLayout;
+    FRHIDescriptorSetHandle   descriptorSet;
+    FRHIPipelineLayoutHandle  pipelineLayout;
+    FRHIComputePipelineHandle pipeline;
+    FRHIShaderHandle          shader;
+    FRHISamplerHandle         depthSampler;
+
+    const auto cleanup = [&]()
+    {
+        device->DestroyComputePipeline(pipeline);
+        device->DestroyPipelineLayout(pipelineLayout);
+        device->FreeDescriptorSet(descriptorSet);
+        device->DestroyDescSetLayout(setLayout);
+        device->DestroyShader(shader);
+        device->DestroySampler(depthSampler);
+        device->DestroyBuffer(resultBuffer);
+    };
+
+    {
+        FRHISamplerDesc samplerDesc = {};
+        // 最近邻 + 钳边。着色器用的是 texelFetch, 采样器的过滤其实不
+        // 参与, 但描述符要求有一个 —— 填成不插值的, 免得将来有人改成
+        // texture() 时静默地多出一层双线性。
+        samplerDesc.MinFilter    = EFilter::Nearest;
+        samplerDesc.MagFilter    = EFilter::Nearest;
+        samplerDesc.MipmapMode   = ESamplerMipmapMode::Nearest;
+        samplerDesc.AddressModeU = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.AddressModeV = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.AddressModeW = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.IsAnisotropyEnabled = false;
+
+        if (!IsRHISuccess(device->CreateSampler(samplerDesc, depthSampler)))
+        {
+            LIMX_LOG(LogRayTracingCheck, Error, "[光追深度] 采样器创建失败");
+            cleanup();
+            return false;
+        }
+    }
+
+    {
+        FRHIDescriptorBinding bindings[3] = {};
+
+        bindings[0].Binding    = 0;
+        bindings[0].Type       = EDescriptorType::AccelerationStructure;
+        bindings[0].Count      = 1;
+        bindings[0].StageFlags = EShaderStage::Compute;
+
+        bindings[1].Binding    = 1;
+        bindings[1].Type       = EDescriptorType::StorageBuffer;
+        bindings[1].Count      = 1;
+        bindings[1].StageFlags = EShaderStage::Compute;
+
+        bindings[2].Binding    = 2;
+        bindings[2].Type       = EDescriptorType::CombinedImageSampler;
+        bindings[2].Count      = 1;
+        bindings[2].StageFlags = EShaderStage::Compute;
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 3;
+        layoutDesc.DebugName    = "RtDepth.SetLayout";
+
+        if (!IsRHISuccess(device->CreateDescSetLayout(layoutDesc, setLayout)) ||
+            !IsRHISuccess(device->AllocateDescriptorSet(setLayout,
+                                                        descriptorSet)))
+        {
+            LIMX_LOG(LogRayTracingCheck, Error, "[光追深度] 描述符集创建失败");
+            cleanup();
+            return false;
+        }
+    }
+
+    FShaderManager& shaders = FShaderManager::Get();
+
+    if (!shaders.IsInitialized())
+    {
+        shaders.Initialize();
+    }
+
+    if (!IsRHISuccess(shaders.CreateShaderModule(
+            device, FString("Builtin/rt_depth.comp"),
+            EShaderStage::Compute, shader)))
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] rt_depth.comp 加载失败");
+        cleanup();
+        return false;
+    }
+
+    {
+        FRHIPushConstantRange pushRange = {};
+        pushRange.StageFlags = EShaderStage::Compute;
+        pushRange.Offset     = 0;
+        pushRange.Size       = sizeof(FRtDepthPushConstants);
+
+        FRHIPipelineLayoutDesc layoutDesc = {};
+        layoutDesc.SetLayouts             = &setLayout;
+        layoutDesc.SetLayoutCount         = 1;
+        layoutDesc.PushConstantRanges     = &pushRange;
+        layoutDesc.PushConstantRangeCount = 1;
+        layoutDesc.DebugName              = "RtDepth.PipelineLayout";
+
+        if (!IsRHISuccess(device->CreatePipelineLayout(layoutDesc,
+                                                        pipelineLayout)))
+        {
+            cleanup();
+            return false;
+        }
+
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Shader     = shader;
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+        pipelineDesc.PipelineLayout           = pipelineLayout;
+        pipelineDesc.DebugName                = "RtDepth.Pipeline";
+
+        if (!IsRHISuccess(device->CreateComputePipeline(pipelineDesc,
+                                                         pipeline)))
+        {
+            cleanup();
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 先把一帧完整渲染出来, 再单独开一个命令缓冲区发射线
+    //
+    // 不挂帧内回调: 那条路上有并行录制、二级命令缓冲区、各通道自己的屏障,
+    // 变量太多。帧渲染完再读, 深度图的内容就是确定的, 与帧怎么录制无关。
+    // ------------------------------------------------------------------
+    const FRHITextureViewHandle depthView =
+        renderer.GetPassManager()->GetSharedDepthView();
+
+    const FRHITextureHandle depthTexture = depthPass->GetSharedDepthTexture();
+
+
+    renderer.RenderFrame();
+
+    device->WaitIdle();
+
+    {
+        FRHIDescriptorWrite writes[3];
+
+        writes[0] = FRHIDescriptorWrite();
+        writes[0].DescriptorSet = descriptorSet;
+        writes[0].Binding       = 0;
+        writes[0].Type          = EDescriptorType::AccelerationStructure;
+        writes[0].AccelStruct   = renderer.GetRayTracingScene().GetTlas();
+
+        writes[1] = FRHIDescriptorWrite::StorageBuffer(
+            descriptorSet, 1, resultBuffer, 0, resultBytes);
+
+        writes[2] = FRHIDescriptorWrite();
+        writes[2].DescriptorSet = descriptorSet;
+        writes[2].Binding       = 2;
+        writes[2].Type          = EDescriptorType::CombinedImageSampler;
+        writes[2].ImageView     = depthView;
+        writes[2].Sampler       = depthSampler;
+        writes[2].ImageLayout   = EImageLayout::ShaderReadOnly;
+
+        device->UpdateDescriptorSets(writes, 3);
+    }
+
+    IRHICommandBuffer* cmd = context->BeginSingleTimeCommands();
+
+    if (cmd == nullptr)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error, "[光追深度] 命令缓冲区分配失败");
+        cleanup();
+        return false;
+    }
+
+    // 深度此刻停在 DepthStencilAttachment (深度预通道与前向通道的
+    // FinalLayout)。计算着色器要采样它, 必须转成着色器只读。
+    cmd->TransitionImageLayout(
+        depthTexture,
+        EImageLayout::DepthStencilAttachment,
+        EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::LateFragmentTests,
+        EPipelineStageFlags::ComputeShader,
+        EAccessFlags::DepthStencilAttachmentWrite,
+        EAccessFlags::ShaderRead);
+
+    const FCamera& camera = renderer.GetCamera();
+
+    const FMatrix viewProj =
+        camera.GetProjectionMatrix() * camera.GetViewMatrix();
+
+    FRtDepthPushConstants push;
+    push.InvViewProj = viewProj.Inverse();
+
+    const FVector3 position = camera.GetPosition();
+    push.CameraX = position.X;
+    push.CameraY = position.Y;
+    push.CameraZ = position.Z;
+
+    const FVector3 forward = camera.GetForwardVector();
+    push.ForwardX = forward.X;
+    push.ForwardY = forward.Y;
+    push.ForwardZ = forward.Z;
+
+    push.Width  = extent.Width;
+    push.Height = extent.Height;
+
+    push.NearPlane = camera.GetNearPlane();
+    push.FarPlane  = camera.GetFarPlane();
+
+    cmd->BindComputePipeline(pipeline);
+    cmd->BindDescriptorSet(EPipelineBindPoint::Compute, pipelineLayout, 0,
+                            descriptorSet);
+    cmd->PushConstants(pipelineLayout, EShaderStage::Compute, 0,
+                        sizeof(push), &push);
+
+    constexpr UInt32 kGroup = 8;
+    cmd->Dispatch((extent.Width + kGroup - 1) / kGroup,
+                   (extent.Height + kGroup - 1) / kGroup, 1);
+
+    FRHIMemoryBarrier barrier = {};
+    barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+    barrier.DstAccessMask = EAccessFlags::HostRead;
+
+    cmd->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                          EPipelineStageFlags::Host,
+                          &barrier, 1, nullptr, 0, nullptr, 0);
+
+    // 还回去 —— 下一帧的深度预通道以 DepthStencilAttachment 起步
+    cmd->TransitionImageLayout(
+        depthTexture,
+        EImageLayout::ShaderReadOnly,
+        EImageLayout::DepthStencilAttachment,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::EarlyFragmentTests,
+        EAccessFlags::ShaderRead,
+        EAccessFlags::DepthStencilAttachmentWrite);
+
+    context->EndSingleTimeCommands(cmd);
+
+    device->WaitIdle();
+
+    // ------------------------------------------------------------------
+    // 比对
+    // ------------------------------------------------------------------
+    void* mapped = nullptr;
+
+    if (!IsRHISuccess(device->MapBuffer(resultBuffer, &mapped)) ||
+        mapped == nullptr)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error, "[光追深度] 回读映射失败");
+        cleanup();
+        return false;
+    }
+
+    const auto* pairs = static_cast<const FDepthPair*>(mapped);
+
+
+    // 相对容差。
+    //
+    // 两边都是单精度, 走的却是完全不同的路径: 光栅器插值 1/w 再反解,
+    // 光追是 BVH 求交之后投影到相机前向。千分之一留了三个数量级的余量,
+    // 而任何一种"加速结构装错了"造成的偏差都是整个物体的尺度。
+    constexpr Float32 kRelativeTolerance = 1.0e-3f;
+
+    SizeType coveredCount  = 0;
+    SizeType agreeCount    = 0;
+    SizeType rtMissCount   = 0;
+    SizeType rtExtraCount  = 0;
+    SizeType disagreeCount = 0;
+    SizeType uninitCount   = 0;
+
+    Float32 maxRelativeError = 0.0f;
+
+    for (SizeType i = 0; i < pixelCount; ++i)
+    {
+        const Float32 rt     = pairs[i].RayTraced;
+        const Float32 raster = pairs[i].Rasterized;
+
+        // 0xFF 填充解释成 float 是 NaN —— 这一格根本没被着色器写过
+        if (rt != rt || raster != raster)
+        {
+            ++uninitCount;
+            continue;
+        }
+
+        const bool rasterHit = (raster > 0.0f);
+        const bool rtHit     = (rt > 0.0f);
+
+        if (!rasterHit)
+        {
+            if (rtHit)
+            {
+                ++rtExtraCount;
+            }
+            continue;
+        }
+
+        ++coveredCount;
+
+        if (!rtHit)
+        {
+            ++rtMissCount;
+            continue;
+        }
+
+        const Float32 relative =
+            FMath::Abs(raster - rt) / FMath::Max(raster, 1.0e-4f);
+
+        if (relative > maxRelativeError)
+        {
+            maxRelativeError = relative;
+        }
+
+        if (relative <= kRelativeTolerance)
+        {
+            ++agreeCount;
+        }
+        else
+        {
+            ++disagreeCount;
+        }
+    }
+
+    device->UnmapBuffer(resultBuffer);
+
+    const FRayTracingScene& rtScene = renderer.GetRayTracingScene();
+
+    LIMX_LOG(LogRayTracingCheck, Display,
+             "[光追深度] BLAS {} 个 (跳过 {}) 实例 {} 个 | "
+             "光栅覆盖 {} 像素 — 一致 {} 光追缺失 {} 深度不符 {} | "
+             "光追多出 {} | 未写入 {} | 最大相对误差 {}",
+             rtScene.GetBlasCount(), rtScene.GetSkippedCount(),
+             rtScene.GetInstanceCount(),
+             coveredCount, agreeCount, rtMissCount, disagreeCount,
+             rtExtraCount, uninitCount, maxRelativeError);
+
+    bool passed = true;
+
+    // ---- 0. 结果缓冲区必须整块被写过 ----
+    if (uninitCount != 0)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] {} 个像素的结果没被写过 — 派发范围不对?",
+                 uninitCount);
+        passed = false;
+    }
+
+    // ---- 1. 场景里必须真的有东西 ----
+    //
+    // 光栅器一个像素都没画到的话, 下面每一条都自动成立 —— 而那时判据什么
+    // 都没验。空场景与"加速结构全错"在其余判据上完全一样。
+    constexpr SizeType kMinCoveredPixels = 100000;
+
+    if (coveredCount < kMinCoveredPixels)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] 光栅化只覆盖了 {} 个像素 (需要至少 {}) — "
+                 "这个场景判不了",
+                 coveredCount, kMinCoveredPixels);
+        passed = false;
+    }
+
+    // ---- 2. 加速结构里必须真的有几何体 ----
+    if (rtScene.GetInstanceCount() == 0)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] TLAS 里一个实例都没有 — 树是空的");
+        passed = false;
+    }
+
+    if (rtScene.GetSkippedCount() != 0)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] {} 个对象因几何体无效被跳过 — "
+                 "它们在光栅化里画着, 在光追里不存在",
+                 rtScene.GetSkippedCount());
+        passed = false;
+    }
+
+    // ---- 3. 逐像素一致率 ----
+    //
+    // 不要求 100%: 轮廓边上光栅器的覆盖判定与射线求交都压在浮点边界上,
+    // 半个 ULP 就会让两边选到不同的三角形, 而那时深度差是前后两个物体的
+    // 距离。这类像素只出现在轮廓上, 数量与周长成正比。
+    //
+    // 实测值写在上面那行日志里。任何一种"加速结构装错了"都是整片区域不符,
+    // 远超这个阈值。
+    constexpr Float32 kMaxDisagreeFraction = 0.01f;
+
+    const SizeType mismatchTotal = rtMissCount + disagreeCount;
+
+    const Float32 mismatchFraction =
+        (coveredCount > 0)
+            ? static_cast<Float32>(mismatchTotal) /
+              static_cast<Float32>(coveredCount)
+            : 1.0f;
+
+    if (mismatchFraction > kMaxDisagreeFraction)
+    {
+        LIMX_LOG(LogRayTracingCheck, Error,
+                 "[光追深度] {} / {} 个像素对不上 ({}%), 超过上限 {}% — "
+                 "加速结构里的场景与光栅化的不是同一个",
+                 mismatchTotal, coveredCount,
+                 mismatchFraction * 100.0f,
+                 kMaxDisagreeFraction * 100.0f);
+        passed = false;
+    }
+
+    LIMX_LOG(LogRayTracingCheck, Display,
+             "[光追深度] {}", passed ? "通过" : "失败");
+
+    cleanup();
 
     return passed;
 }

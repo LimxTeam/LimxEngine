@@ -373,6 +373,7 @@ void FRenderer::Shutdown()
     m_ForwardPass.Reset();
     m_SkyPass.Reset();
     m_DepthPrePass.Reset();
+    m_RayTracingScene.Shutdown();
     m_GpuCullPass.Reset();
     m_ShadowAtlasPass.Reset();
     m_ShadowPass.Reset();
@@ -407,6 +408,42 @@ void FRenderer::Shutdown()
 // ============================================================================
 // RenderFrame — 单帧渲染
 // ============================================================================
+
+bool FRenderer::SetRayTracingEnabled(bool enabled)
+{
+    if (!enabled)
+    {
+        m_RayTracingEnabled = false;
+        return true;
+    }
+
+    if (m_Context == nullptr || m_Context->GetDevice() == nullptr)
+    {
+        return false;
+    }
+
+    if (!m_Context->GetDevice()->IsRayTracingSupported())
+    {
+        // 返回 false 而不是静默降级。
+        //
+        // 静默降级的后果是调用方以为光追开着, 而任何依赖它的判据都在一棵
+        // 不存在的树上通过 —— "跳过"绝不能表现为"通过"。
+        LIMX_LOG(LogRenderer, Error,
+                 "[光追场景] 设备不支持光线追踪 — 无法启用");
+        return false;
+    }
+
+    if (!m_RayTracingScene.IsValid())
+    {
+        if (!IsRHISuccess(m_RayTracingScene.Initialize(m_Context->GetDevice())))
+        {
+            return false;
+        }
+    }
+
+    m_RayTracingEnabled = true;
+    return true;
+}
 
 void FRenderer::RenderFrame()
 {
@@ -489,6 +526,27 @@ void FRenderer::RenderFrame()
     if (m_ParallelRecording && m_Recorder.IsInitialized())
     {
         m_Recorder.BeginFrame(frameIndex);
+    }
+
+    // ---- 光追加速结构 ----
+    //
+    // 必须排在所有通道之前: 任何读 TLAS 的着色器都要求它这一帧已经建好。
+    // 排在后面的话读到的是上一帧的树 —— 静止场景里那与正确结果完全相同,
+    // 直到物体开始动。
+    //
+    // 用的是**未经相机剔除**的投射体列表: 光线会打到视锥之外的东西,
+    // 拿剔除后的列表建树, 反射里就会缺掉屏幕外的物体。
+    if (m_RayTracingEnabled && m_RayTracingScene.IsValid())
+    {
+        if (!IsRHISuccess(m_RayTracingScene.Update(m_ShadowCasterObjects)))
+        {
+            LIMX_LOG(LogRenderer, Error, "[光追场景] 本帧更新失败");
+        }
+
+        IRHICommandBuffer* rtCommandBuffer =
+            m_Context->GetCurrentCommandBuffer();
+
+        m_RayTracingScene.RecordBuild(rtCommandBuffer);
     }
 
     // 材质表每帧整体上传 —— 见 FBindlessTable::Upload 的说明

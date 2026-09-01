@@ -662,8 +662,21 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
 
     FRHIBufferHandle vertexBuffer;
 
+    // 光追可用时, 网格缓冲区同时也是加速结构的构建输入。
+    //
+    // 这两个用途标志必须在**创建时**就带上 —— 缓冲区建好之后没法追加,
+    // 而漏带的表现不是报错: vkGetBufferDeviceAddress 会安静地返回 0, 于是
+    // 加速结构建在空地址上, 成为一棵空树。所有射线都不命中, 而"什么都没
+    // 照到"与"场景本来就是空的"在画面上一模一样。
+    const EBufferUsage accelUsage =
+        (m_Device != nullptr && m_Device->IsRayTracingSupported())
+            ? (EBufferUsage::AccelStructBuild |
+               EBufferUsage::ShaderDeviceAddress)
+            : EBufferUsage::None;
+
     if (!IsRHISuccess(UploadBuffer(meshData.Vertices.GetData(), vertexBytes,
-                                   EBufferUsage::VertexBuffer, vertexBuffer)))
+                                   EBufferUsage::VertexBuffer | accelUsage,
+                                   vertexBuffer)))
     {
         LIMX_LOG(LogRenderCore, Error,
                  "[资源管理器] 顶点缓冲区上传失败: {} 字节", vertexBytes);
@@ -693,7 +706,8 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
         indexBytes = static_cast<UInt64>(narrowIndices.GetSize()) * sizeof(UInt16);
 
         if (!IsRHISuccess(UploadBuffer(narrowIndices.GetData(), indexBytes,
-                                       EBufferUsage::IndexBuffer, indexBuffer)))
+                                       EBufferUsage::IndexBuffer | accelUsage,
+                                       indexBuffer)))
         {
             m_Device->DestroyBuffer(vertexBuffer);
             LIMX_LOG(LogRenderCore, Error, "[资源管理器] 索引缓冲区上传失败");
@@ -706,7 +720,8 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
             static_cast<UInt64>(meshData.Indices.GetSize()) * sizeof(UInt32);
 
         if (!IsRHISuccess(UploadBuffer(meshData.Indices.GetData(), indexBytes,
-                                       EBufferUsage::IndexBuffer, indexBuffer)))
+                                       EBufferUsage::IndexBuffer | accelUsage,
+                                       indexBuffer)))
         {
             m_Device->DestroyBuffer(vertexBuffer);
             LIMX_LOG(LogRenderCore, Error, "[资源管理器] 索引缓冲区上传失败");
@@ -738,6 +753,7 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
                                                            : EIndexType::UInt32;
     slot.Resource.Bounds            = meshData.Bounds;
     slot.Resource.VertexBufferBytes = vertexBytes;
+    slot.Resource.VertexStride      = sizeof(FMeshVertex);
     slot.Resource.IndexBufferBytes  = indexBytes;
 
     slot.Resource.Sections.Clear();

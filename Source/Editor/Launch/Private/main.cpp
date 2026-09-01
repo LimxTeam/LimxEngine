@@ -222,6 +222,9 @@ struct FLaunchOptions
     /// AO 边缘自检: 双边上采样在深度不连续处有没有起作用, 以退出码报告
     bool AoEdgeCheck = false;
 
+    /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
+    bool RtDepthCheck = false;
+
     /// GTAO 的采样半径 (世界单位)
     Float32 AoRadius = 0.8f;
 
@@ -695,6 +698,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--ao-edge-check"))
         {
             options.AoEdgeCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-depth-check"))
+        {
+            options.RtDepthCheck = true;
         }
         else if (WideEquals(arg, L"--ao-check"))
         {
@@ -4067,6 +4074,28 @@ static bool RunAoHalfChecks(FRenderContext* context, FRenderer& renderer)
 // 渗色本来就是少数像素上的大偏差, 均值会把它摊平。
 // ============================================================================
 
+// !! 这条判据当前**不在 verify.ps1 里** !!
+//
+// 它依赖 ReadAoAndDepth 回读的深度来判定"哪些像素在深度不连续处", 而那份
+// 深度经实测**不是有效的深度图**: 1280x720 里有 26040 个负值与 874 个 NaN,
+// 而 D32_SFLOAT 的深度在渲染之后不可能出现这两种值。同一份数据里只有约
+// 12 万个像素落在 (0,1) 区间。
+//
+// 也就是说这条判据挑出来的"不连续像素"并不是真的轮廓, 而是未初始化显存与
+// 有效数据的边界。它确实能稳定地把纯双线性 (渗色 3793) 与双边 (2694) 分开,
+// 三次重复完全一致 —— 但那个区分**不是它名字所说的那个理由**, 所以不能算
+// 一条判据。
+//
+// 已知的事实 (都量过):
+//   - 缓冲区通路本身没问题: 计算着色器写一个已知斜坡, 921600 个格子全对。
+//   - 光栅化深度经"图像拷回主机"与"着色器里 texelFetch"两条独立路径读出来
+//     是同一份数据 —— 所以不是回读方式的问题。
+//   - 深度预通道写的法线 G-Buffer 也是同样的形态: 中间一小块有结构, 其余
+//     是未初始化内存, 而它的清除值 (2,2) 一处都看不到。
+//   - 与并行录制无关 (--no-parallel-record 结果相同)。
+//
+// 也就是说: **在所有通道跑完之后从外部采样共享深度/法线附件, 读到的不是
+// 这一帧渲染进去的内容**。根因未定。查清之前这条判据不进流水线。
 static bool RunAoEdgeChecks(FRenderContext* context, FRenderer& renderer)
 {
     FGtaoPass* const gtao = renderer.GetGtaoPass();
@@ -8277,6 +8306,7 @@ int WINAPI wWinMain(
     bool    showcaseCheckPassed = true;
     bool    rayTracingCheckPassed = true;
     bool    aoEdgeCheckPassed = true;
+    bool    rtDepthCheckPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -8356,6 +8386,12 @@ int WINAPI wWinMain(
             if (launchOptions.AoEdgeCheck)
             {
                 aoEdgeCheckPassed = RunAoEdgeChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtDepthCheck)
+            {
+                rtDepthCheckPassed =
+                    RunRayTracingDepthCheck(&renderContext, renderer);
             }
 
             if (launchOptions.ShowcaseCheck)
@@ -8551,6 +8587,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.AoEdgeCheck)
     {
         selfCheckCode = FinalizeSelfCheck(aoEdgeCheckPassed, 19, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtDepthCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtDepthCheckPassed, 20, errorSink,
                                           errorsBeforeShutdown);
     }
 

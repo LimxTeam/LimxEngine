@@ -138,6 +138,13 @@ struct FMeshResource
     /// 顶点缓冲区字节数
     UInt64 VertexBufferBytes = 0;
 
+    /// 相邻两个顶点之间的字节跨度
+    ///
+    /// 光追的加速结构构建必须知道它 —— 驱动只读位置那三个分量, 靠跨度
+    /// 跳过其余属性。跨度错了不会报错: 驱动会从错位的地方读出一堆看似
+    /// 合法的坐标, 建出一棵形状完全不对的树。
+    UInt32 VertexStride = 0;
+
     /// 索引缓冲区字节数
     UInt64 IndexBufferBytes = 0;
 

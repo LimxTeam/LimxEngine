@@ -199,6 +199,7 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         FRenderObject object;
         object.VertexBuffer          = mesh->VertexBuffer;
         object.VertexCount           = mesh->VertexCount;
+        object.VertexStride          = mesh->VertexStride;
         object.IndexBuffer           = mesh->IndexBuffer;
         object.IndexOffset           = 0;
         object.IndexCount            = mesh->IndexCount;
@@ -242,6 +243,7 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         FRenderObject object;
         object.VertexBuffer          = mesh->VertexBuffer;
         object.VertexCount           = mesh->VertexCount;
+        object.VertexStride          = mesh->VertexStride;
         object.IndexBuffer           = mesh->IndexBuffer;
         object.IndexOffset           = section.IndexOffset;
         object.IndexCount            = section.IndexCount;

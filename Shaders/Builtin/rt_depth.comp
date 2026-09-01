@@ -1,0 +1,155 @@
+// ============================================================
+// 文件名称：rt_depth.comp
+// 创建时间：2026-08-31
+// 创建者  ：LimxTeam
+// 设计哲学：这支着色器存在的唯一理由，是给"加速结构里的场景与光栅化的
+//          场景是不是同一个"提供一个逐像素可比的数。光栅器与 BVH 是两条
+//          彻底独立的路径 —— 一条按三角形扫描填深度，一条按射线遍历树 ——
+//          它们对同一个像素给出同一个深度，才说明加速结构里装的确实是
+//          屏幕上那个场景。
+// 功能描述：逐像素从相机发一条射线，输出命中点沿相机前向的视空间深度。
+// 技术特性：射线由**逆视图投影矩阵**反投影像素中心得到，与光栅器用的是
+//          同一套矩阵；未命中输出 -1（负深度在几何上不可能出现，与任何
+//          合法深度都分得开）。
+// ============================================================
+
+#version 460
+
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+
+// 每像素两个 float: x = 光追命中深度, y = 光栅化深度线性化之后的值
+layout(std430, set = 0, binding = 1) writeonly buffer DepthBuffer
+{
+    vec2 depths[];
+} depthBuffer;
+
+// 光栅化写出的深度缓冲区
+//
+// 在着色器里 texelFetch 取, 而不是把图像拷回主机再读:
+// 图像到缓冲区的拷贝要求把深度图从压缩的附件布局解出来, 而那条路径在
+// 这个引擎上会给出以 8 像素为块的零值 —— 拷贝确实执行了 (哨兵被覆盖),
+// 出来的数据却是坏的。texelFetch 走的是采样器, 与 GTAO 读深度是同一条
+// 路径, 而那条路径的结果是对的。
+layout(set = 0, binding = 2) uniform sampler2D sceneDepth;
+
+layout(row_major, push_constant) uniform Params
+{
+    // 逆视图投影 —— 把 NDC 反投影回世界空间
+    mat4 InvViewProj;
+
+    // 相机世界位置 (xyz)
+    vec4 CameraPos;
+
+    // 相机前向单位矢量 (xyz)
+    vec4 Forward;
+
+    // x = 宽, y = 高
+    uvec4 Size;
+
+    // x = 近裁剪面, y = 远裁剪面
+    vec4 Planes;
+} pc;
+
+/// NDC 深度还原成沿相机前向的距离
+///
+/// 分母是 (d + a) 而不是 (d - a)。写反的话得到的是负的、随距离减小的
+/// "深度" —— 这个引擎在 gtao_upsample.frag 上栽过一次。
+float LinearizeDepth(float ndcDepth)
+{
+    const float nearPlane = pc.Planes.x;
+    const float farPlane  = pc.Planes.y;
+
+    const float a = farPlane / (nearPlane - farPlane);
+    const float b = farPlane * nearPlane / (nearPlane - farPlane);
+
+    const float denom = ndcDepth + a;
+
+    return b / ((abs(denom) < 1.0e-9) ? -1.0e-9 : denom);
+}
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.Size.x || pixel.y >= pc.Size.y)
+    {
+        return;
+    }
+
+    // 像素中心。加 0.5 是必须的 —— 光栅器判的是像素中心在不在三角形内,
+    // 从像素角发射线会在每一条轮廓边上系统性地差半个像素, 而那种差别
+    // 看起来正像"加速结构的几何体偏了"。
+    const vec2 uv  = (vec2(pixel) + 0.5) / vec2(pc.Size.xy);
+    const vec2 ndc = uv * 2.0 - 1.0;
+
+    // 反投影出近裁剪面与远裁剪面上的两个点。
+    //
+    // 用矩阵反投影而不是"相机位置 + 由视场角算方向": 后者要自己再实现一遍
+    // 投影的约定 (纵横比、Y 翻转、视场角是水平还是垂直), 而只要有一处与
+    // 光栅器不一致, 两边看的就不是同一条射线了。反投影用的是同一个矩阵,
+    // 不存在第二套约定。
+    vec4 nearH = pc.InvViewProj * vec4(ndc, 0.0, 1.0);
+    vec4 farH  = pc.InvViewProj * vec4(ndc, 1.0, 1.0);
+
+    const vec3 nearP = nearH.xyz / nearH.w;
+    const vec3 farP  = farH.xyz  / farH.w;
+
+    const vec3 delta = farP - nearP;
+    const float span = length(delta);
+
+    if (span < 1.0e-6)
+    {
+        depthBuffer.depths[pixel.y * pc.Size.x + pixel.x] = vec2(-1.0, -1.0);
+        return;
+    }
+
+    const vec3 direction = delta / span;
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        topLevel,
+        gl_RayFlagsOpaqueEXT,
+        0xFFu,
+        nearP,
+        0.0,
+        direction,
+        span);
+
+    while (rayQueryProceedEXT(query))
+    {
+    }
+
+    float result = -1.0;
+
+    if (rayQueryGetIntersectionTypeEXT(query, true) ==
+        gl_RayQueryCommittedIntersectionTriangleEXT)
+    {
+        const float t = rayQueryGetIntersectionTEXT(query, true);
+        const vec3 hit = nearP + direction * t;
+
+        // 沿相机前向的投影 —— 这正是深度缓冲区线性化之后的那个量。
+        //
+        // 不能直接用 t: t 是沿射线的距离, 在画面边缘比沿前向的深度大
+        // (斜边比直角边长)。两者在画面中心相等, 于是"用错了"这件事会
+        // 表现为"越靠边差得越多" —— 那看起来很像投影矩阵有问题。
+        result = dot(hit - pc.CameraPos.xyz, pc.Forward.xyz);
+    }
+
+    // 光栅化深度用 texelFetch 取 —— 逐纹素, 不插值, 不需要 UV 约定。
+    // 用 texture() 的话就又多了一套"UV 与像素中心怎么对齐"的约定, 而那
+    // 正是最容易与光栅器错开半个像素的地方。
+    const float rasterNdc =
+        texelFetch(sceneDepth, ivec2(pixel), 0).r;
+
+    // NDC 深度为 1 表示远裁剪面, 即这一像素光栅器什么都没画上。
+    const float rasterDepth =
+        (rasterNdc < 0.999999) ? LinearizeDepth(rasterNdc) : -1.0;
+
+    depthBuffer.depths[pixel.y * pc.Size.x + pixel.x] =
+        vec2(result, rasterDepth);
+}

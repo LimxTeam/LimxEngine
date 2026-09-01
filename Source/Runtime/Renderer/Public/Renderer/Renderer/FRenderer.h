@@ -78,6 +78,7 @@
 #include "RenderCore/Material/FBindlessTable.h"
 #include "RenderCore/Profiling/FGpuProfiler.h"
 #include "Renderer/Recording/FParallelRecorder.h"
+#include "Renderer/RayTracing/FRayTracingScene.h"
 
 namespace Limx
 {
@@ -187,6 +188,16 @@ struct FRenderObject
     /// GPU 顶点缓冲区 (非拥有)
     FRHIBufferHandle VertexBuffer;
     UInt32           VertexCount = 0;
+
+    /// 相邻两个顶点之间的字节跨度
+    ///
+    /// 光栅化路径靠顶点输入布局拿跨度, 用不到这个字段; 光追的加速结构
+    /// 构建则必须显式知道它。
+    ///
+    /// 默认 0 是**故意的无效值**, 不是"用默认布局"。填 sizeof(FMeshVertex)
+    /// 当默认的话, 换一种顶点布局时会静默地建出错误的加速结构; 而 0 会
+    /// 让 FRayTracingScene 跳过这个对象并报出来。
+    UInt32           VertexStride = 0;
 
     /// GPU 索引缓冲区 (非拥有)
     FRHIBufferHandle IndexBuffer;
@@ -482,6 +493,22 @@ public:
         return m_GpuCullPass.Get();
     }
 
+    /// 场景的光追加速结构 (只读)
+    LIMX_NODISCARD const FRayTracingScene& GetRayTracingScene() const
+    {
+        return m_RayTracingScene;
+    }
+
+    /// 打开/关闭光追加速结构的每帧维护
+    ///
+    /// 设备不支持时返回 false —— 调用方必须处理, 不能当成打开了。
+    LIMX_NODISCARD bool SetRayTracingEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsRayTracingEnabled() const
+    {
+        return m_RayTracingEnabled;
+    }
+
     LIMX_NODISCARD FClusterLightPass* GetClusterLightPass() const
     {
         return m_ClusterLightPass.Get();
@@ -729,6 +756,16 @@ private:
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FGpuCullPass>          m_GpuCullPass;
+
+    /// 场景的光追加速结构 —— 设备不支持光追时保持无效
+    FRayTracingScene                  m_RayTracingScene;
+
+    /// 是否启用光追加速结构
+    ///
+    /// 与"设备支不支持"分开: 支持而不启用是合法的 (省下每帧的构建开销),
+    /// 而不支持却启用必须是失败而不是静默降级。
+    bool                              m_RayTracingEnabled = false;
+
 
     /// set 3 (逐物体数据) 的描述符集布局 —— 由本类持有, 供 Pass 分配
     FRHIDescSetLayoutHandle           m_DrawObjectSetLayout;
