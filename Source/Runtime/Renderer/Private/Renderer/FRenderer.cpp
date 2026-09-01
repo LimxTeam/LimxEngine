@@ -71,6 +71,7 @@
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
+#include "Renderer/RenderPass/FRayTracedAoPass.h"
 #include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
 #include "Renderer/RenderPass/FBloomPass.h"
@@ -245,6 +246,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PostProcessPass = MakeUnique<FPostProcessPass>();
     m_PassManager  = MakeUnique<FPassManager>();
     m_RayTracedShadowPass = MakeUnique<FRayTracedShadowPass>();
+    m_RayTracedAoPass     = MakeUnique<FRayTracedAoPass>();
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_GpuCullPass      = MakeUnique<FGpuCullPass>();
@@ -261,6 +263,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager->RegisterPass(m_BloomPass.Get());
     m_PassManager->RegisterPass(m_DepthPrePass.Get());
     m_PassManager->RegisterPass(m_RayTracedShadowPass.Get());
+    m_PassManager->RegisterPass(m_RayTracedAoPass.Get());
     m_PassManager->RegisterPass(m_SkyPass.Get());
     m_PassManager->RegisterPass(m_ForwardPass.Get());
 
@@ -331,6 +334,14 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
                 m_DepthPrePass->GetNormalView());
         }
 
+        if (m_RayTracedAoPass)
+        {
+            m_RayTracedAoPass->SetInputs(
+                m_DepthPrePass->GetSharedDepthTexture(),
+                m_PassManager->GetSharedDepthView(),
+                m_DepthPrePass->GetNormalView());
+        }
+
         m_GtaoPass->SetInputs(m_DepthPrePass->GetSharedDepthTexture(),
                               m_PassManager->GetSharedDepthView(),
                               m_DepthPrePass->GetNormalView());
@@ -386,6 +397,7 @@ void FRenderer::Shutdown()
     m_DepthPrePass.Reset();
     m_RayTracingScene.Shutdown();
     m_RayTracedShadowPass.Reset();
+    m_RayTracedAoPass.Reset();
     m_GpuCullPass.Reset();
     m_ShadowAtlasPass.Reset();
     m_ShadowPass.Reset();
@@ -420,6 +432,33 @@ void FRenderer::Shutdown()
 // ============================================================================
 // RenderFrame — 单帧渲染
 // ============================================================================
+
+bool FRenderer::IsRayTracedAoEnabled() const
+{
+    return m_RayTracedAoPass && m_RayTracedAoPass->IsEnabled();
+}
+
+bool FRenderer::SetRayTracedAoEnabled(bool enabled)
+{
+    if (!m_RayTracedAoPass)
+    {
+        return false;
+    }
+
+    if (!enabled)
+    {
+        m_RayTracedAoPass->SetEnabled(false);
+        return true;
+    }
+
+    if (!SetRayTracingEnabled(true))
+    {
+        return false;
+    }
+
+    m_RayTracedAoPass->SetEnabled(true);
+    return true;
+}
 
 bool FRenderer::IsRayTracedShadowsEnabled() const
 {
@@ -638,6 +677,13 @@ void FRenderer::RenderFrame()
         // 关掉时必须写回 -1, 否则着色器会继续读一张不再更新的掩码 ——
         // 静止场景里那与"还开着"完全一样。
         FLightManager::Get().SetRayTracedShadowLight(-1);
+    }
+
+    if (m_RayTracedAoPass && m_RayTracedAoPass->IsEnabled())
+    {
+        m_RayTracedAoPass->SetTlas(m_RayTracingScene.GetTlas());
+        m_RayTracedAoPass->SetCameraParams(
+            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix());
     }
 
     // 材质表每帧整体上传 —— 见 FBindlessTable::Upload 的说明

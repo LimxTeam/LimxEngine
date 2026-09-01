@@ -1,0 +1,173 @@
+// ============================================================
+// 文件名称：rt_ao.comp
+// 创建时间：2026-08-31
+// 创建者  ：LimxTeam
+// 设计哲学：GTAO 回答的是"深度缓冲区里看得见的东西挡住了多少"，光追回答的是
+//          "半球里有多少方向在半径内撞到了东西"。后者就是环境光遮蔽的定义，
+//          前者是它在屏幕空间的一个近似 —— 屏幕外的、被别的东西挡住的、
+//          背面的几何体，前者一律看不见。
+//          所以这支着色器的正确性有一个**闭式解**可以对：直角凹角处、
+//          搜索半径 R、离墙 d 时，遮蔽率是
+//              (1-c²)/2 - (2/π)∫_c^1 s·arcsin(c/s) ds,  c = d/R
+//          而 GTAO 只能验"朝 0.5 单调收敛"。
+// 功能描述：逐像素在法线半球内按余弦加权采样若干条射线，输出环境光遮蔽。
+// 技术特性：余弦加权采样 —— 估计量就是命中比例本身，不需要再乘权重除以
+//          概率密度，少一处可以写错的地方；Hammersley 低差异序列 + 逐像素
+//          旋转，确定性可复现；TerminateOnFirstHit（遮蔽只关心有没有）。
+// ============================================================
+
+#version 460
+
+#extension GL_EXT_ray_query : require
+
+#include "gbuffer_common.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+
+layout(set = 0, binding = 1) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 2) uniform sampler2D sceneNormal;
+
+layout(set = 0, binding = 3, r8) uniform writeonly image2D aoOutput;
+
+layout(row_major, push_constant) uniform Params
+{
+    mat4 InvViewProj;
+
+    // x = 宽, y = 高, z = 采样数, w = 射线掩码
+    uvec4 Params0;
+
+    // x = 搜索半径 (世界单位), y = 法线偏移, z = 射线 tMin, w = 保留
+    vec4 Params1;
+} pc;
+
+/// Hammersley 低差异序列的第 i 个点
+///
+/// 用它而不是伪随机: 同样的样本数下, 低差异序列的收敛速度是 O(1/N) 量级而
+/// 不是 O(1/sqrt(N))。而且它是确定性的 —— 判据要能复现同一个数。
+vec2 Hammersley(uint i, uint count)
+{
+    // 第二维是二进制反转 (van der Corput)
+    uint bits = i;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+
+    return vec2(float(i) / float(count), float(bits) * 2.3283064365386963e-10);
+}
+
+/// 逐像素的旋转角 —— 让相邻像素的样本图案错开
+///
+/// 不错开的话所有像素用同一组方向, 误差是**相干**的: 整片区域一起偏高或
+/// 偏低, 而那种偏差在按区域求平均的判据里不会被平均掉。
+float PixelRotation(uvec2 pixel)
+{
+    uint h = pixel.x * 73856093u ^ pixel.y * 19349663u;
+    h ^= h >> 13u;
+    h *= 1274126177u;
+    h ^= h >> 16u;
+
+    return float(h) * 2.3283064365386963e-10 * 6.28318530718;
+}
+
+/// 以 n 为 +Z 轴建一组正交基
+///
+/// Duff 等人的无分支构造。用它而不是"取一个不平行的轴再叉乘": 后者要判
+/// 哪个轴不平行, 而判错的那一侧会得到退化的基 (叉乘出零向量), 表现是
+/// 某些朝向的表面 AO 变成 NaN。
+void BuildBasis(vec3 n, out vec3 t, out vec3 b)
+{
+    const float sign = (n.z >= 0.0) ? 1.0 : -1.0;
+    const float a = -1.0 / (sign + n.z);
+    const float c = n.x * n.y * a;
+
+    t = vec3(1.0 + sign * n.x * n.x * a, sign * c, -sign * n.x);
+    b = vec3(c, sign + n.y * n.y * a, -n.y);
+}
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.Params0.x || pixel.y >= pc.Params0.y)
+    {
+        return;
+    }
+
+    const float ndcDepth = texelFetch(sceneDepth, ivec2(pixel), 0).r;
+
+    // 天空: 无遮蔽
+    if (ndcDepth >= 0.999999)
+    {
+        imageStore(aoOutput, ivec2(pixel), vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    const vec2 uv  = (vec2(pixel) + 0.5) / vec2(pc.Params0.xy);
+    const vec2 ndc = uv * 2.0 - 1.0;
+
+    const vec4 worldH = pc.InvViewProj * vec4(ndc, ndcDepth, 1.0);
+    const vec3 worldPos = worldH.xyz / worldH.w;
+
+    const vec2 encodedNormal = texelFetch(sceneNormal, ivec2(pixel), 0).rg;
+    const vec3 normal = DecodeOctahedralNormal(encodedNormal);
+
+    vec3 tangent;
+    vec3 bitangent;
+    BuildBasis(normal, tangent, bitangent);
+
+    const vec3 rayOrigin = worldPos + normal * pc.Params1.y;
+
+    const uint  sampleCount = max(pc.Params0.z, 1u);
+    const float radius      = pc.Params1.x;
+    const float rotation    = PixelRotation(pixel);
+
+    uint occluded = 0u;
+
+    for (uint i = 0u; i < sampleCount; ++i)
+    {
+        const vec2 xi = Hammersley(i, sampleCount);
+
+        // 余弦加权半球采样。
+        //
+        // r = sqrt(u1) 是关键: 它让方向按 cos(theta) 分布, 于是"遮蔽率"
+        // 直接就是命中比例 —— 不需要再乘 cos 再除以概率密度。少一处能写
+        // 错的地方, 而那种错误的表现是"AO 看起来对但数值系统性偏高"。
+        const float r   = sqrt(xi.x);
+        const float phi = 6.28318530718 * xi.y + rotation;
+
+        const vec3 local = vec3(r * cos(phi), r * sin(phi),
+                                sqrt(max(0.0, 1.0 - xi.x)));
+
+        const vec3 direction =
+            tangent * local.x + bitangent * local.y + normal * local.z;
+
+        rayQueryEXT query;
+        rayQueryInitializeEXT(
+            query,
+            topLevel,
+            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+            pc.Params0.w,
+            rayOrigin,
+            pc.Params1.z,
+            direction,
+            radius);
+
+        while (rayQueryProceedEXT(query))
+        {
+        }
+
+        if (rayQueryGetIntersectionTypeEXT(query, true) ==
+            gl_RayQueryCommittedIntersectionTriangleEXT)
+        {
+            ++occluded;
+        }
+    }
+
+    const float ao = 1.0 - float(occluded) / float(sampleCount);
+
+    imageStore(aoOutput, ivec2(pixel), vec4(ao, 0.0, 0.0, 0.0));
+}

@@ -161,6 +161,12 @@ private:
 
     /// 射线的 tMin —— 与法线偏移同理, 防的是掠射角之外的自相交
     Float32 m_RayTMin = 1.0e-3f;
+
+    /// 纹理是否已经离开 Undefined 布局
+    ///
+    /// 通道禁用时也要做这一次转换 —— 它被绑进了描述符集, 而 Vulkan 检查的是
+    /// 描述符声明的布局与图像实际布局是否一致, 与读不读无关。
+    bool m_LayoutInitialized = false;
 };
 
 } // namespace Limx
