@@ -221,6 +221,17 @@ public:
     }
 
     /// 获取描述符集布局 (set 2) — 用于构建管线布局
+    /// 指定哪一盏灯的阴影走光线追踪 (-1 = 都不走)
+    void SetRayTracedShadowLight(Int32 lightIndex)
+    {
+        m_RayTracedShadowLight = lightIndex;
+    }
+
+    LIMX_NODISCARD Int32 GetRayTracedShadowLight() const
+    {
+        return m_RayTracedShadowLight;
+    }
+
     LIMX_NODISCARD FRHIDescSetLayoutHandle GetDescSetLayout() const
     {
         return m_DescSetLayout;
@@ -270,6 +281,9 @@ private:
     Float32                     m_ClusterScreenHeight = 1.0f;
 
     /// 描述符集布局 (set 2, binding 0: UniformBuffer, Vertex+Fragment)
+
+    /// 哪一盏灯走光追阴影 (-1 = 都不走)
+    Int32 m_RayTracedShadowLight = -1;
 
     FRHIDescSetLayoutHandle     m_DescSetLayout;
     

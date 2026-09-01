@@ -608,7 +608,8 @@ void FRenderer::RenderFrame()
         // 它身上不会有任何画面变化, 于是"选错了灯"这件事看不出来。
         const FLightManager& lights = FLightManager::Get();
 
-        bool found = false;
+        bool   found            = false;
+        UInt32 shadowLightIndex = 0;
 
         for (UInt32 i = 0; i < lights.GetActiveLightCount(); ++i)
         {
@@ -617,6 +618,7 @@ void FRenderer::RenderFrame()
             if (light.CastsShadow())
             {
                 m_RayTracedShadowPass->SetLight(light.ToGpuData());
+                shadowLightIndex = i;
                 found = true;
                 break;
             }
@@ -627,6 +629,15 @@ void FRenderer::RenderFrame()
             LIMX_LOG(LogRenderer, Error,
                      "[光追阴影] 场景里没有投影的光源 — 掩码会保持上一帧");
         }
+
+        FLightManager::Get().SetRayTracedShadowLight(
+            found ? static_cast<Int32>(shadowLightIndex) : -1);
+    }
+    else
+    {
+        // 关掉时必须写回 -1, 否则着色器会继续读一张不再更新的掩码 ——
+        // 静止场景里那与"还开着"完全一样。
+        FLightManager::Get().SetRayTracedShadowLight(-1);
     }
 
     // 材质表每帧整体上传 —— 见 FBindlessTable::Upload 的说明
@@ -1712,7 +1723,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         //
         // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
         // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[11];
+        FRHIDescriptorWrite writes[12];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1797,7 +1808,25 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_ShadowAtlasPass->GetAtlasSampler(),
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(writes, 11);
+        // binding 11 — 光追阴影的可见度掩码
+        //
+        // 设备不支持光追时掩码不存在, 这里退回 AO 那张图。
+        //
+        // 退回一张**内容全是 1** 的图是刻意的: 着色器无条件读这个绑定,
+        // 而 UBO 里的"哪一盏灯走光追"在那种情形下是 -1, 所以读到的值根本
+        // 不会被用上。真正要防的是描述符为空 —— 那是管线绑定时的违规,
+        // 与光追支不支持无关。
+        const FRHITextureViewHandle maskView =
+            (m_RayTracedShadowPass &&
+             m_RayTracedShadowPass->GetShadowMaskView().IsValid())
+                ? m_RayTracedShadowPass->GetShadowMaskView()
+                : m_GtaoPass->GetAoView();
+
+        writes[11] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet, 11, maskView, m_LinearClampSampler,
+            EImageLayout::ShaderReadOnly);
+
+        device->UpdateDescriptorSets(writes, 12);
 
         m_LightDescriptorSets.Add(descSet);
     }

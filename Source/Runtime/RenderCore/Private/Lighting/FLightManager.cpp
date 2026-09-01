@@ -114,7 +114,11 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     //   set 2, binding 8 — 屏幕空间环境光遮蔽
     //   set 2, binding 9 — 聚光灯阴影的每块数据 (矩阵 + UV 变换)
     //   set 2, binding 10 — 聚光灯阴影图集 (深度纹理 + 比较采样器)
-    FRHIDescriptorBinding bindings[11] = {};
+    //   set 2, binding 11 — 光追阴影可见度掩码 (全分辨率 R8)
+    //
+    // 与阴影图集并存而不是二选一: 光追阴影一次只处理一盏灯, 其余的仍然
+    // 走图集。着色器按 UBO 里的开关决定这一盏用哪一个。
+    FRHIDescriptorBinding bindings[12] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -186,7 +190,12 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
 
     FRHIDescSetLayoutDesc layoutDesc = {};
     layoutDesc.Bindings     = bindings;
-    layoutDesc.BindingCount = 11;
+    bindings[11].Binding    = 11;
+    bindings[11].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[11].Count      = 1;
+    bindings[11].StageFlags = EShaderStage::Fragment;
+
+    layoutDesc.BindingCount = 12;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -608,7 +617,10 @@ void FLightManager::UploadLightData(
     // 写入全局光照参数
     uboData.LightCount       = static_cast<Float32>(activeLightCount);
     uboData.DirectionalCount = static_cast<Float32>(directionalCount);
-    uboData.LightCountPad1   = 0.0f;
+    // 哪一盏灯走光追阴影 —— 着色器按它决定用掩码还是用阴影贴图
+    uboData.RayTracedShadowLight =
+        static_cast<Float32>(m_RayTracedShadowLight);
+
     uboData.LightCountPad2   = 0.0f;
 
     // 分簇参数

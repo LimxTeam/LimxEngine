@@ -221,7 +221,14 @@ struct FLightingUBO
     // 全部意义就是消掉那个 O(N)。
     Float32 LightCount        = 0.0f;
     Float32 DirectionalCount  = 0.0f;
-    Float32 LightCountPad1 = 0.0f;
+
+    /// 哪一盏灯的阴影走光线追踪, -1 = 都不走
+    ///
+    /// 一次只有一盏: 光追阴影的可见度掩码只有一个通道。由 CPU 侧决定并
+    /// 写进这里, 而不是让着色器去猜 —— 猜错的表现是某盏灯用了另一盏灯的
+    /// 可见度, 那是"有影子、位置完全不对"。
+    Float32 RayTracedShadowLight = -1.0f;
+
     Float32 LightCountPad2 = 0.0f;
 
     // vec4: xyz=相机世界空间位置, w=保留

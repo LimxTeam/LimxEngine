@@ -4392,6 +4392,86 @@ static bool RunRayTracedShadowChecks(FRenderContext* context,
         passed = false;
     }
 
+    // ---- 判据 4: 掩码必须真的接进了着色 ----
+    //
+    // 前三条验的都是掩码本身。掩码算得再对, 只要它没被着色阶段读到,
+    // 画面上的影子仍然是阴影贴图那一版 —— 而那时前三条全部满分通过。
+    //
+    // 这一条抓的正是那个缺口: 抓一帧**着色后的画面**, 用同一条扫描线量
+    // 同一个边界。光追接上了的话误差应当远小于阴影贴图那一版。
+    {
+        FScreenshotCapture shot;
+
+        if (!shot.Request(context))
+        {
+            LIMX_LOG(LogLaunch, Error, "[光追阴影] 画面回读缓冲区准备失败");
+            return false;
+        }
+
+        renderer.SetPostSceneRenderCallback(
+            [&shot, context]() { shot.RecordCopy(context); });
+
+        renderer.RenderFrame();
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        TArray<UInt8> pixels;
+
+        const bool read = shot.ReadPixels(context, pixels);
+
+        shot.Release(context->GetDevice());
+
+        if (!read)
+        {
+            LIMX_LOG(LogLaunch, Error, "[光追阴影] 画面回读失败");
+            return false;
+        }
+
+        const FShadowSpan shaded = FindShadowSpan(
+            pixels, extent.Width, extent.Height, viewProj,
+            0, scanY, -usableRadius, usableRadius, 0.004f, 0.5f);
+
+        if (!shaded.Found)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[光追阴影] 着色后的画面上没找到完整的暗区");
+            return false;
+        }
+
+        const Float32 shadedErrorMin =
+            FMath::Abs(shaded.Enter - expectedXMin);
+        const Float32 shadedErrorMax =
+            FMath::Abs(shaded.Exit  - expectedXMax);
+
+        // 一个像素。
+        //
+        // 着色后的画面比二值掩码还准 —— 影子边界在画面上是一段亮度渐变,
+        // 扫描的线性插值能在一个像素之内定位它, 而掩码只有 0 与 255 两档。
+        //
+        // 实测:
+        //     着色后 (光追)   误差 0.00081 / 0.00043
+        //     掩码   (光追)   误差 0.00153 / 0.00191
+        //     着色后 (阴影贴图) 误差 0.01419 / 0.01294
+        //
+        // 一个像素 (0.00487) 对光追是六倍余量, 而阴影贴图那一版**过不去**
+        // —— 这正是这条判据要的: 掩码没接进着色的话它必然变红。
+        const Float32 shadedTolerance = pixelWorldWidth;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[光追阴影] 着色后的画面 — 影子 [{}, {}] 误差 {} / {} "
+                 "(容差 {} = 一个像素)",
+                 shaded.Enter, shaded.Exit,
+                 shadedErrorMin, shadedErrorMax, shadedTolerance);
+
+        if (shadedErrorMin > shadedTolerance ||
+            shadedErrorMax > shadedTolerance)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[光追阴影] 着色后的影子边界偏离解析位置 —— "
+                     "掩码是不是没接进着色?");
+            passed = false;
+        }
+    }
+
     LIMX_LOG(LogLaunch, Display,
              "[光追阴影] {}", passed ? "通过" : "失败");
 
@@ -8466,6 +8546,20 @@ int WINAPI wWinMain(
 
         LIMX_LOG(LogLaunch, Display,
                  "[Launch] 分簇光照已关闭 — 暴力遍历全部光源");
+    }
+
+    if (launchOptions.RayTracedShadows)
+    {
+        if (renderer.SetRayTracedShadowsEnabled(true))
+        {
+            LIMX_LOG(LogLaunch, Display,
+                     "[Launch] 光追阴影已启用 — 第一盏投影的光源改走射线");
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[启动] --rt-shadows 无法启用 —— 设备不支持光线追踪");
+        }
     }
 
     if (launchOptions.Gtao)

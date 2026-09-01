@@ -210,6 +210,13 @@ layout(row_major, std430, set = 2, binding = 9) readonly buffer SpotShadowBuffer
 // 偏移区分, 不是数组层。
 layout(set = 2, binding = 10) uniform sampler2DShadow spotShadowAtlas;
 
+// 光追阴影的可见度掩码 —— 全分辨率, 0 = 被遮挡, 1 = 见得到光
+//
+// 屏幕空间的一张图, 所以按 gl_FragCoord 取, 不需要任何投影或分块坐标。
+// 阴影贴图那一套里的"投到光源空间、选级联、选图集块、比较深度"在这里
+// 一步都没有 —— 可见度已经在通道里算完了。
+layout(set = 2, binding = 11) uniform sampler2D rayTracedShadowMask;
+
 const int SHADOW_CASCADE_COUNT = 3;
 
 // ── 片段着色器输出 ──
@@ -780,7 +787,23 @@ vec3 ShadeOneLight(LightData light, int lightIndex,
     // 采到另一盏灯的块, 而那是个"有影子、但形状完全不对"的结果。
     float shadow = 1.0;
 
-    if (lightIndex == 0 && int(light.positionAndType.w) == 0)
+    // 光追阴影优先。
+    //
+    // lightCountVec.z 存的是"哪一盏灯走光追", -1 表示都不走。一次只有一盏
+    // 是因为掩码只有一个通道 —— 而这一点必须由 CPU 侧决定并写进 UBO,
+    // 不能在着色器里猜: 猜错的表现是某盏灯用了另一盏灯的可见度, 而那是
+    // "有影子、位置完全不对"。
+    //
+    // 掩码是屏幕空间的, 所以按 gl_FragCoord 直接取 —— 不投影、不选级联、
+    // 不选图集块, 那三步在光追里根本不存在。
+    const int rtShadowLight = int(lighting.lightCountVec.z);
+
+    if (rtShadowLight >= 0 && lightIndex == rtShadowLight)
+    {
+        shadow = texelFetch(rayTracedShadowMask,
+                            ivec2(gl_FragCoord.xy), 0).r;
+    }
+    else if (lightIndex == 0 && int(light.positionAndType.w) == 0)
     {
         shadow = ComputeShadow(fragWorldPos, N, L);
     }
