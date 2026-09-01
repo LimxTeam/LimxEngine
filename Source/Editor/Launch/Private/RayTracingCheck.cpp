@@ -1104,6 +1104,34 @@ static_assert(sizeof(FDepthPair) == 8,
 
 } // namespace
 
+// ── 已知的覆盖边界 (都量过, 不是"没想到") ──────────────────────────────
+//
+// 1. **子网格的索引偏移验不到**。verify.ps1 把这条判据跑在阴影场景上, 而
+//    那里每个物体的 IndexOffset 都是 0 —— "忘了乘索引位宽"这条变异因此
+//    满分通过 (0 乘任何数都是 0)。真正能验它的是从 OBJ 加载的测试场景
+//    (6 个子网格共用一对缓冲区, 字节偏移 0/768/840/912/984/1080), 而那个
+//    场景目前过不去, 原因见下。
+//
+// 2. **综合场景与 OBJ 测试场景目前过不去**, 而原因不在加速结构:
+//    这两个场景里**背景像素的深度回读出来是 NDC 0**, 线性化之后是 0.1
+//    (近平面), 而深度预通道明明把清除值写成 1.0, 清除值的下标也对
+//    (2 个颜色附件 + 1 个深度 = 3 个, 与附件顺序一致)。
+//
+//    已排除的:
+//      - 缓冲区通路: 计算着色器写已知斜坡, 921600 格全对。
+//      - 采样通路:   同一条路读 HDR 颜色目标得到的是一张正常的图。
+//      - 读取方式:   图像拷回主机与着色器 texelFetch 读出同一份数据。
+//      - 布局/解压: 转成 General 与转成 ShaderReadOnly 结果逐字节相同。
+//      - 显存重叠:  逐个资源打印块与偏移, 深度图与邻居无重叠。
+//      - 并行录制、帧数 (1/8/30 帧结果完全一致)。
+//      - 帧本身没错: 同一次运行截图与基线一致 (最大偏差 38/255, 而那
+//        是关掉 GTAO/TAA/泛光造成的)。
+//    而压力场景有 410907 个远平面背景像素, 读回来是正确的 1.0。
+//
+//    也就是说: 某些场景下, 所有通道跑完之后从外部采样共享深度附件,
+//    **被清除过而没被绘制过的区域**读到的是 0 而不是清除值。根因未定。
+//
+//    在查清之前, 判据不因此放宽 —— 阈值是按能通过的场景定的。
 bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
 {
     if (context == nullptr)
@@ -1333,7 +1361,7 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
         writes[2].Type          = EDescriptorType::CombinedImageSampler;
         writes[2].ImageView     = depthView;
         writes[2].Sampler       = depthSampler;
-        writes[2].ImageLayout   = EImageLayout::ShaderReadOnly;
+        writes[2].ImageLayout   = EImageLayout::General;
 
         device->UpdateDescriptorSets(writes, 3);
     }
@@ -1349,10 +1377,15 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
 
     // 深度此刻停在 DepthStencilAttachment (深度预通道与前向通道的
     // FinalLayout)。计算着色器要采样它, 必须转成着色器只读。
+
+
+    // 深度此刻停在 DepthStencilAttachment (深度预通道与前向通道的
+    // FinalLayout)。计算着色器要采样它, 必须先转布局 —— 深度附件在 NVIDIA
+    // 上是压缩存储的, 而解压由布局转换触发。
     cmd->TransitionImageLayout(
         depthTexture,
         EImageLayout::DepthStencilAttachment,
-        EImageLayout::ShaderReadOnly,
+        EImageLayout::General,
         EPipelineStageFlags::LateFragmentTests,
         EPipelineStageFlags::ComputeShader,
         EAccessFlags::DepthStencilAttachmentWrite,
@@ -1401,9 +1434,12 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
                           &barrier, 1, nullptr, 0, nullptr, 0);
 
     // 还回去 —— 下一帧的深度预通道以 DepthStencilAttachment 起步
+
+
+    // 还回去 —— 下一帧的深度预通道以 DepthStencilAttachment 起步
     cmd->TransitionImageLayout(
         depthTexture,
-        EImageLayout::ShaderReadOnly,
+        EImageLayout::General,
         EImageLayout::DepthStencilAttachment,
         EPipelineStageFlags::ComputeShader,
         EPipelineStageFlags::EarlyFragmentTests,
@@ -1430,12 +1466,15 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
     const auto* pairs = static_cast<const FDepthPair*>(mapped);
 
 
+
     // 相对容差。
     //
     // 两边都是单精度, 走的却是完全不同的路径: 光栅器插值 1/w 再反解,
-    // 光追是 BVH 求交之后投影到相机前向。千分之一留了三个数量级的余量,
-    // 而任何一种"加速结构装错了"造成的偏差都是整个物体的尺度。
-    constexpr Float32 kRelativeTolerance = 1.0e-3f;
+    // 光追是 BVH 求交之后投影到相机前向。
+    //
+    // 万分之一。实测阴影场景上最大相对误差 1.1e-5, 所以还留了九倍余量;
+    // 而放宽到千分之一时"射线不加半个像素偏移"那条变异会整条逃掉。
+    constexpr Float32 kRelativeTolerance = 1.0e-4f;
 
     SizeType coveredCount  = 0;
     SizeType agreeCount    = 0;
@@ -1558,9 +1597,15 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
     // 半个 ULP 就会让两边选到不同的三角形, 而那时深度差是前后两个物体的
     // 距离。这类像素只出现在轮廓上, 数量与周长成正比。
     //
-    // 实测值写在上面那行日志里。任何一种"加速结构装错了"都是整片区域不符,
-    // 远超这个阈值。
-    constexpr Float32 kMaxDisagreeFraction = 0.01f;
+    // 阈值定在万分之一 (92 个像素)。这个数是从两个实测点之间取的:
+    //
+    //   阴影场景基线                     不符 0 个
+    //   射线不加半个像素偏移 (变异)       不符 274 个
+    //
+    // 放宽到百分之一的话半像素那条变异就逃掉了 —— 而它正是"射线与光栅器
+    // 采样位置错开"这一整类问题的代表。基线是**精确的零**, 所以留 92 个
+    // 的余量已经足够宽。
+    constexpr Float32 kMaxDisagreeFraction = 1.0e-4f;
 
     const SizeType mismatchTotal = rtMissCount + disagreeCount;
 
