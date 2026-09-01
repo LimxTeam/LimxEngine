@@ -697,10 +697,29 @@ ERHIResult FForwardPass::CreateRenderPass(IRHIDevice*  device,
     // 附件 1: 深度附件 — 使用 FDepthPrePass 写入的深度数据 (LoadOp=Load)
     // InitialLayout=DepthStencilAttachment (prepass 后深度缓冲的布局)
     // FinalLayout=DepthStencilAttachment (保持)
+    //
+    // StoreOp 必须是 Store, 不能是 DontCare。
+    //
+    // DontCare 的语义不是"不需要写回", 而是"通道结束后这个附件的内容**未
+    // 定义**"。而未定义在实际硬件上不是"保持原样": 深度附件是压缩存储的,
+    // 只被清除过、从未被绘制覆盖过的区域并不真的在显存里, 它只是一份"这
+    // 整块都等于清除值"的元数据。DontCare 让驱动可以把那份元数据丢掉,
+    // 于是那些区域回读出来是 0 而不是清除值 1.0。
+    //
+    // 症状极其隐蔽: 被几何体覆盖过的像素读回来完全正确 (它们真的写进了
+    // 显存), 只有背景是错的。而画面本身一点问题都没有 —— 帧内没有任何
+    // 通道在此之后读深度, 所以整整一个周期都没人发现。
+    //
+    // 发现它的是光追深度判据: 光追说背景是 25.6 个世界单位远, 深度缓冲区
+    // 说 0.1 (近平面)。几何体填满整屏的场景 (墙角、阴影) 完全正常, 只有
+    // 有天空背景的场景才现形 —— 而此前所有用到深度回读的判据恰好都跑在
+    // 前一类场景上。
+    //
+    // 代价: 桌面 GPU 上深度本来就在显存里, Store 几乎不额外花钱。
     attachments[1].Format         = kSharedDepthFormat;
     attachments[1].Samples        = ESampleCount::Count1;
     attachments[1].LoadOp         = ELoadOp::Load;
-    attachments[1].StoreOp        = EStoreOp::DontCare;
+    attachments[1].StoreOp        = EStoreOp::Store;
     attachments[1].StencilLoadOp  = ELoadOp::DontCare;
     attachments[1].StencilStoreOp = EStoreOp::DontCare;
     attachments[1].InitialLayout  = EImageLayout::DepthStencilAttachment;

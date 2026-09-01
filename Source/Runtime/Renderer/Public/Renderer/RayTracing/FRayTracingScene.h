@@ -43,6 +43,39 @@ struct FRenderObject;
 // FRayTracingScene — 场景的光追加速结构
 // ============================================================================
 
+// ============================================================================
+// 射线掩码 — 按混合模式给实例分类
+//
+// 不同用途的射线要看见的东西不一样, 而这个差别**不能**靠"建几棵树"来解决
+// (那要多付一份构建开销与显存)。Vulkan 的实例掩码正是为此存在: 一棵树,
+// 射线自己声明要看哪几类。
+//
+// 分类的依据是"这个物体在光栅化里写不写深度":
+//   不透明   写。射线与深度缓冲区应当逐像素一致。
+//   蒙版     写, 但按 alpha 测试挖了洞。ray query 没有 any-hit, 评估不了
+//            alpha, 所以它在光追里是**实心的** —— 这是一个已知的近似,
+//            不是 bug。
+//   半透明   **不写**。把它按不透明算进遮挡是错的: 玻璃后面的东西在深度
+//            缓冲区里是可见的, 在光追里却被挡住。
+// ============================================================================
+
+/// 不透明几何体
+inline constexpr UInt32 kRayMaskOpaque = 0x01u;
+
+/// 蒙版几何体 (alpha 测试)
+inline constexpr UInt32 kRayMaskMasked = 0x02u;
+
+/// 半透明几何体
+inline constexpr UInt32 kRayMaskTranslucent = 0x04u;
+
+/// 会写入深度缓冲区的那一类 —— 与光栅化深度比对时用这个
+inline constexpr UInt32 kRayMaskDepthWriting =
+    kRayMaskOpaque | kRayMaskMasked;
+
+/// 全部
+inline constexpr UInt32 kRayMaskAll =
+    kRayMaskOpaque | kRayMaskMasked | kRayMaskTranslucent;
+
 class LIMX_RENDERER_API FRayTracingScene
 {
 public:
@@ -92,6 +125,15 @@ public:
         return static_cast<UInt32>(m_Blas.GetSize());
     }
 
+    /// 各类实例的数量 (下标用 0=不透明 1=蒙版 2=半透明)
+    ///
+    /// 判据要用: "这个场景里有没有蒙版/半透明"决定了某些比对能不能做。
+    /// 没有的话那条判据就是空的, 而空判据必须与通过分得开。
+    LIMX_NODISCARD UInt32 GetInstanceCountByClass(UInt32 classIndex) const
+    {
+        return (classIndex < 3) ? m_ClassCounts[classIndex] : 0;
+    }
+
     /// 因几何体无效而被跳过的对象数
     ///
     /// 这个数必须能被外部看到。跳过本身可能是对的 (点精灵一类没有三角形
@@ -116,6 +158,9 @@ private:
 
     UInt32 m_InstanceCount = 0;
     UInt32 m_SkippedCount  = 0;
+
+    /// 不透明 / 蒙版 / 半透明 各多少个实例
+    UInt32 m_ClassCounts[3] = {};
 
     /// 上一次建 BLAS 时几何体的签名
     ///

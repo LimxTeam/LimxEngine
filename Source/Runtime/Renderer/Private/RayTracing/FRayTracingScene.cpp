@@ -307,6 +307,10 @@ ERHIResult FRayTracingScene::UpdateInstances(
     TArray<FRHIAccelStructInstance> instances;
     instances.Reserve(blasCount);
 
+    m_ClassCounts[0] = 0;
+    m_ClassCounts[1] = 0;
+    m_ClassCounts[2] = 0;
+
     for (SizeType i = 0; i < blasCount; ++i)
     {
         const UInt32 sourceIndex = m_SourceIndices[i];
@@ -348,8 +352,31 @@ ERHIResult FRayTracingScene::UpdateInstances(
         // 排的。存实例序号的话, 只要有一个对象被跳过, 后面所有物体的
         // 材质就整体错位一格。
         instance.CustomIndex = sourceIndex;
-        instance.Mask        = 0xFF;
         instance.Blas        = m_Blas[i];
+
+        // 掩码按混合模式分 —— 理由见 FRayTracingScene.h 顶部。
+        //
+        // 全部填 0xFF 的后果不是"多看见一些": 半透明几何体在光栅化里
+        // 不写深度, 于是光追说"这里被玻璃挡住了", 深度缓冲区说"这里能看到
+        // 玻璃后面的墙"。两边永远对不上, 而那看起来像加速结构算错了。
+        switch (object.BlendMode)
+        {
+        case EMaterialBlendMode::Masked:
+            instance.Mask = kRayMaskMasked;
+            ++m_ClassCounts[1];
+            break;
+
+        case EMaterialBlendMode::Translucent:
+            instance.Mask = kRayMaskTranslucent;
+            ++m_ClassCounts[2];
+            break;
+
+        case EMaterialBlendMode::Opaque:
+        default:
+            instance.Mask = kRayMaskOpaque;
+            ++m_ClassCounts[0];
+            break;
+        }
 
         instances.Add(instance);
     }

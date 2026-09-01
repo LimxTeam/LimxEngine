@@ -1067,15 +1067,7 @@ struct FRtDepthPushConstants
 {
     FMatrix InvViewProj;
 
-    Float32 CameraX = 0.0f;
-    Float32 CameraY = 0.0f;
-    Float32 CameraZ = 0.0f;
-    Float32 CameraPad = 0.0f;
-
-    Float32 ForwardX = 0.0f;
-    Float32 ForwardY = 0.0f;
-    Float32 ForwardZ = 0.0f;
-    Float32 ForwardPad = 0.0f;
+    FMatrix View;
 
     UInt32 Width  = 0;
     UInt32 Height = 0;
@@ -1086,52 +1078,84 @@ struct FRtDepthPushConstants
     Float32 FarPlane  = 0.0f;
     Float32 PlanePad0 = 0.0f;
     Float32 PlanePad1 = 0.0f;
+
+    UInt32 RayMask  = 0xFFu;
+    UInt32 MaskPad0 = 0;
+    UInt32 MaskPad1 = 0;
+    UInt32 MaskPad2 = 0;
 };
 
-static_assert(sizeof(FRtDepthPushConstants) == 128,
+static_assert(sizeof(FRtDepthPushConstants) == 176,
               "FRtDepthPushConstants 必须是 128 字节 — 与 rt_depth.comp 的 "
               "push constant 块逐字段一致");
 
 /// 每像素一对深度: x = 光追, y = 光栅化 (都已线性化到沿相机前向的距离)
 struct FDepthPair
 {
-    Float32 RayTraced = -1.0f;
+    Float32 RayTraced  = -1.0f;
     Float32 Rasterized = -1.0f;
+    Float32 RasterNdc  = -1.0f;
+    Float32 Instance   = -1.0f;
 };
 
-static_assert(sizeof(FDepthPair) == 8,
-              "FDepthPair 必须是 8 字节 — 与着色器的 vec2 对应");
+static_assert(sizeof(FDepthPair) == 16,
+              "FDepthPair 必须是 16 字节 — 与着色器的 vec4 对应");
+
+/// 一个 NDC 深度值上, 深度缓冲区**能分辨的最小世界距离**
+///
+/// 透视深度在远处压缩得极厉害: 同样一个 float32 的最低位, 在近平面附近代表
+/// 微米, 在远平面附近代表米。拿一个固定的相对容差去判"两边算得一不一样",
+/// 等于对不同的场景用了完全不同的严格程度 —— 而那个差别可以是十倍。
+///
+/// 实测: 同一个 9.63 米处的表面
+///     近 0.1  远 100  → 一个最低位 = 5.5e-5 世界单位
+///     近 0.01 远 36   → 一个最低位 = 5.5e-4 世界单位  (差十倍)
+///
+/// 所以容差按这个量算, 判据就与场景的近远平面无关了, 而且它说的是一句有
+/// 意义的话: "两条路径的结果相差不超过深度缓冲区能分辨的 N 个最低位"。
+Float32 DepthQuantumAt(Float32 ndcDepth, Float32 nearPlane, Float32 farPlane)
+{
+    const Float32 a = farPlane / (nearPlane - farPlane);
+    const Float32 b = farPlane * nearPlane / (nearPlane - farPlane);
+
+    const Float32 denom = ndcDepth + a;
+
+    if (FMath::Abs(denom) < 1.0e-12f)
+    {
+        return 1.0e30f;
+    }
+
+    // d(视空间深度)/d(NDC) = |b| / (ndc + a)^2
+    const Float32 slope = FMath::Abs(b) / (denom * denom);
+
+    // float32 尾数 23 位; NDC 深度在 [0,1], 靠近 1 时指数为 -1,
+    // 于是最低位约为 2^-24。取 ndc 自身的量级更准一些。
+    const Float32 magnitude = FMath::Max(FMath::Abs(ndcDepth), 0.5f);
+    const Float32 ulp = magnitude * 1.1920929e-7f;
+
+    return slope * ulp;
+}
 
 } // namespace
 
-// ── 已知的覆盖边界 (都量过, 不是"没想到") ──────────────────────────────
+// ── 已知的覆盖边界 (量过, 不是"没想到") ────────────────────────────────
 //
-// 1. **子网格的索引偏移验不到**。verify.ps1 把这条判据跑在阴影场景上, 而
-//    那里每个物体的 IndexOffset 都是 0 —— "忘了乘索引位宽"这条变异因此
-//    满分通过 (0 乘任何数都是 0)。真正能验它的是从 OBJ 加载的测试场景
-//    (6 个子网格共用一对缓冲区, 字节偏移 0/768/840/912/984/1080), 而那个
-//    场景目前过不去, 原因见下。
+// 1. **半透明几何体这条路今天不可达**。加速结构是从"阴影投射体列表"建的,
+//    而那份列表按定义就不含半透明。于是 UpdateInstances 里给半透明分掩码
+//    的那个分支一次都没执行过 —— "把半透明的掩码填成 0xFF"这条变异因此
+//    在两个场景上都逃逸。代码留着是为了将来反射要用整棵树时不必重写,
+//    但在那之前它没有判据兜着。
 //
-// 2. **综合场景与 OBJ 测试场景目前过不去**, 而原因不在加速结构:
-//    这两个场景里**背景像素的深度回读出来是 NDC 0**, 线性化之后是 0.1
-//    (近平面), 而深度预通道明明把清除值写成 1.0, 清除值的下标也对
-//    (2 个颜色附件 + 1 个深度 = 3 个, 与附件顺序一致)。
+// 2. **蒙版几何体在光追里是实心的**。ray query 没有 any-hit, 评估不了
+//    alpha 测试。综合场景里有 2 个蒙版物体, 它们贡献的不符像素落在
+//    0.0021% 的基线里。真要处理需要在着色器里自己查纹理, 那是后面的事。
 //
-//    已排除的:
-//      - 缓冲区通路: 计算着色器写已知斜坡, 921600 格全对。
-//      - 采样通路:   同一条路读 HDR 颜色目标得到的是一张正常的图。
-//      - 读取方式:   图像拷回主机与着色器 texelFetch 读出同一份数据。
-//      - 布局/解压: 转成 General 与转成 ShaderReadOnly 结果逐字节相同。
-//      - 显存重叠:  逐个资源打印块与偏移, 深度图与邻居无重叠。
-//      - 并行录制、帧数 (1/8/30 帧结果完全一致)。
-//      - 帧本身没错: 同一次运行截图与基线一致 (最大偏差 38/255, 而那
-//        是关掉 GTAO/TAA/泛光造成的)。
-//    而压力场景有 410907 个远平面背景像素, 读回来是正确的 1.0。
-//
-//    也就是说: 某些场景下, 所有通道跑完之后从外部采样共享深度附件,
-//    **被清除过而没被绘制过的区域**读到的是 0 而不是清除值。根因未定。
-//
-//    在查清之前, 判据不因此放宽 —— 阈值是按能通过的场景定的。
+// 3. 两个场景是互补的, 缺一不可:
+//      综合场景  33 物体 + 天空背景 + 蒙版 —— 抓"射线掩码漏掉蒙版"、
+//                "实例变换错"这一类
+//      OBJ 场景  6 个子网格共用一对缓冲区 —— 是唯一能验到"子网格索引
+//                偏移"的场景 (别的场景 IndexOffset 全是 0, 乘不乘位宽
+//                都一样)
 bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
 {
     if (context == nullptr)
@@ -1398,22 +1422,21 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
 
     FRtDepthPushConstants push;
     push.InvViewProj = viewProj.Inverse();
-
-    const FVector3 position = camera.GetPosition();
-    push.CameraX = position.X;
-    push.CameraY = position.Y;
-    push.CameraZ = position.Z;
-
-    const FVector3 forward = camera.GetForwardVector();
-    push.ForwardX = forward.X;
-    push.ForwardY = forward.Y;
-    push.ForwardZ = forward.Z;
+    push.View        = camera.GetViewMatrix();
 
     push.Width  = extent.Width;
     push.Height = extent.Height;
 
     push.NearPlane = camera.GetNearPlane();
     push.FarPlane  = camera.GetFarPlane();
+
+
+    // 只看会写深度的那一类。
+    //
+    // 半透明几何体在光栅化里不写深度, 把它算进来的话光追会说"被玻璃挡住",
+    // 而深度缓冲区说"看得到玻璃后面" —— 两边永远对不上, 而那不是加速结构
+    // 的错。
+    push.RayMask = kRayMaskDepthWriting;
 
     cmd->BindComputePipeline(pipeline);
     cmd->BindDescriptorSet(EPipelineBindPoint::Compute, pipelineLayout, 0,
@@ -1465,16 +1488,31 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
 
     const auto* pairs = static_cast<const FDepthPair*>(mapped);
 
+    const FCamera& readbackCamera = renderer.GetCamera();
+
+    const Float32 nearPlane = readbackCamera.GetNearPlane();
+    const Float32 farPlane  = readbackCamera.GetFarPlane();
+
 
 
     // 相对容差。
     //
-    // 两边都是单精度, 走的却是完全不同的路径: 光栅器插值 1/w 再反解,
-    // 光追是 BVH 求交之后投影到相机前向。
+    // 容差按**深度缓冲区在这一像素上能分辨多细**算 —— 见 DepthQuantumAt。
     //
-    // 万分之一。实测阴影场景上最大相对误差 1.1e-5, 所以还留了九倍余量;
-    // 而放宽到千分之一时"射线不加半个像素偏移"那条变异会整条逃掉。
-    constexpr Float32 kRelativeTolerance = 1.0e-4f;
+    // 允许的偏差是若干个"最低位"。64 这个数是从实测点之间取的:
+    //
+    //   墙角场景基线    最大 1.9 个最低位   (几何体填满整屏, 无轮廓)
+    //   阴影场景基线    最大 1.4 个最低位   (同上)
+    //   综合场景基线    绝大多数像素 < 64; 15 个轮廓像素超出
+    //   OBJ 场景基线    绝大多数像素 < 64;  6 个轮廓像素超出
+    //
+    // 也就是说: 没有轮廓的场景上, 两条路径的差只有一两个最低位 —— 这个
+    // 判据的分辨率就是深度缓冲区本身的分辨率。64 的余量留给轮廓附近的
+    // 插值差, 而任何一种"几何体装错了"都是成千上万个最低位。
+    //
+    // 用最低位而不是相对误差, 是因为透视深度在远处压缩得极厉害: 同一个
+    // 相对容差在 near=0.1 与 near=0.01 的场景上严格程度差十倍 (实测)。
+    constexpr Float32 kUlpBudget = 64.0f;
 
     SizeType coveredCount  = 0;
     SizeType agreeCount    = 0;
@@ -1484,6 +1522,10 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
     SizeType uninitCount   = 0;
 
     Float32 maxRelativeError = 0.0f;
+
+    // 逐实例的不符计数 —— 失败时报出来, 好知道是全局问题还是某个物体
+    constexpr UInt32 kMismatchBuckets = 64;
+    SizeType mismatchByInstance[kMismatchBuckets] = {};
 
     for (SizeType i = 0; i < pixelCount; ++i)
     {
@@ -1517,21 +1559,34 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
             continue;
         }
 
-        const Float32 relative =
-            FMath::Abs(raster - rt) / FMath::Max(raster, 1.0e-4f);
+        const Float32 quantum =
+            DepthQuantumAt(pairs[i].RasterNdc, nearPlane, farPlane);
 
-        if (relative > maxRelativeError)
+        // 以"多少个最低位"计的偏差
+        const Float32 ulpError =
+            FMath::Abs(raster - rt) / FMath::Max(quantum, 1.0e-12f);
+
+        if (ulpError > maxRelativeError)
         {
-            maxRelativeError = relative;
+            maxRelativeError = ulpError;
         }
 
-        if (relative <= kRelativeTolerance)
+        if (ulpError <= kUlpBudget)
         {
             ++agreeCount;
         }
         else
         {
             ++disagreeCount;
+
+            // 不符落在哪个实例上 —— 失败时唯一有用的线索。
+            // 全场景一片不符与"某一个物体的几何体建错了"在总数上分不开。
+            const Int32 inst = static_cast<Int32>(pairs[i].Instance);
+
+            if (inst >= 0 && inst < static_cast<Int32>(kMismatchBuckets))
+            {
+                ++mismatchByInstance[inst];
+            }
         }
     }
 
@@ -1542,11 +1597,17 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
     LIMX_LOG(LogRayTracingCheck, Display,
              "[光追深度] BLAS {} 个 (跳过 {}) 实例 {} 个 | "
              "光栅覆盖 {} 像素 — 一致 {} 光追缺失 {} 深度不符 {} | "
-             "光追多出 {} | 未写入 {} | 最大相对误差 {}",
+             "光追多出 {} | 未写入 {} | 最大偏差 {} 个最低位",
              rtScene.GetBlasCount(), rtScene.GetSkippedCount(),
              rtScene.GetInstanceCount(),
              coveredCount, agreeCount, rtMissCount, disagreeCount,
              rtExtraCount, uninitCount, maxRelativeError);
+
+    LIMX_LOG(LogRayTracingCheck, Display,
+             "[光追深度] 实例分类 — 不透明 {} 蒙版 {} 半透明 {}",
+             rtScene.GetInstanceCountByClass(0),
+             rtScene.GetInstanceCountByClass(1),
+             rtScene.GetInstanceCountByClass(2));
 
     bool passed = true;
 
@@ -1597,14 +1658,19 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
     // 半个 ULP 就会让两边选到不同的三角形, 而那时深度差是前后两个物体的
     // 距离。这类像素只出现在轮廓上, 数量与周长成正比。
     //
-    // 阈值定在万分之一 (92 个像素)。这个数是从两个实测点之间取的:
+    // 阈值定在万分之一。实测的基线不符率:
     //
-    //   阴影场景基线                     不符 0 个
-    //   射线不加半个像素偏移 (变异)       不符 274 个
+    //   墙角 / 阴影场景   0        (几何体填满整屏, 没有轮廓)
+    //   综合场景          19 / 919234  = 0.0021%
+    //   OBJ 场景          18 / 198364  = 0.0091%
     //
-    // 放宽到百分之一的话半像素那条变异就逃掉了 —— 而它正是"射线与光栅器
-    // 采样位置错开"这一整类问题的代表。基线是**精确的零**, 所以留 92 个
-    // 的余量已经足够宽。
+    // 剩下的都是轮廓像素: 光栅器的覆盖判定与射线求交都压在浮点边界上,
+    // 半个 ULP 就会让两边选到不同的三角形, 而那时深度差是前后两个物体的
+    // 距离 (实测最大近五万个最低位)。这类像素的数量与周长成正比。
+    //
+    // OBJ 场景的 0.0091% 距上限只有一倍余量 —— 它的近平面是 0.01 (别的
+    // 场景是 0.1), 轮廓处的深度插值误差本来就更大。放宽到千分之一的话
+    // "射线不加半个像素偏移"那条变异会整条逃掉。
     constexpr Float32 kMaxDisagreeFraction = 1.0e-4f;
 
     const SizeType mismatchTotal = rtMissCount + disagreeCount;
@@ -1624,6 +1690,19 @@ bool RunRayTracingDepthCheck(FRenderContext* context, FRenderer& renderer)
                  mismatchFraction * 100.0f,
                  kMaxDisagreeFraction * 100.0f);
         passed = false;
+    }
+
+    if (!passed)
+    {
+        for (UInt32 k = 0; k < kMismatchBuckets; ++k)
+        {
+            if (mismatchByInstance[k] > 0)
+            {
+                LIMX_LOG(LogRayTracingCheck, Error,
+                         "[光追深度] 实例 {} 上有 {} 个不符像素",
+                         k, mismatchByInstance[k]);
+            }
+        }
     }
 
     LIMX_LOG(LogRayTracingCheck, Display,

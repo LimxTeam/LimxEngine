@@ -21,10 +21,15 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
 
-// 每像素两个 float: x = 光追命中深度, y = 光栅化深度线性化之后的值
+// 每像素四个 float:
+//   x = 光追命中的视空间深度 (未命中为 -1)
+//   y = 光栅化深度线性化之后的视空间深度 (远平面为 -1)
+//   z = 光栅化的原始 NDC 深度 —— 判据要用它算这个像素上深度缓冲区
+//       **能分辨多细**, 从而定出这一像素的容差
+//   w = 命中的实例自定义下标 (未命中为 -1)
 layout(std430, set = 0, binding = 1) writeonly buffer DepthBuffer
 {
-    vec2 depths[];
+    vec4 depths[];
 } depthBuffer;
 
 // 光栅化写出的深度缓冲区
@@ -41,17 +46,22 @@ layout(row_major, push_constant) uniform Params
     // 逆视图投影 —— 把 NDC 反投影回世界空间
     mat4 InvViewProj;
 
-    // 相机世界位置 (xyz)
-    vec4 CameraPos;
-
-    // 相机前向单位矢量 (xyz)
-    vec4 Forward;
+    // 视图矩阵 —— 世界空间到视空间
+    //
+    // 不传"相机位置 + 前向矢量": 那是同一件事的第二种表示, 两者只要有一点
+    // 不一致 (归一化的舍入, 或者前向由欧拉角重算而视图矩阵由别处得来),
+    // 投影出的深度就会带一个随横向偏移增大的误差 —— 画面中心对得上, 越靠
+    // 边差得越多, 而那看起来像投影矩阵有问题。
+    mat4 View;
 
     // x = 宽, y = 高
     uvec4 Size;
 
     // x = 近裁剪面, y = 远裁剪面
     vec4 Planes;
+
+    // x = 射线的实例掩码 (与实例的 Mask 按位与, 为 0 则跳过该实例)
+    uvec4 Mask;
 } pc;
 
 /// NDC 深度还原成沿相机前向的距离
@@ -103,7 +113,8 @@ void main()
 
     if (span < 1.0e-6)
     {
-        depthBuffer.depths[pixel.y * pc.Size.x + pixel.x] = vec2(-1.0, -1.0);
+        depthBuffer.depths[pixel.y * pc.Size.x + pixel.x] =
+            vec4(-1.0, -1.0, -1.0, -1.0);
         return;
     }
 
@@ -114,7 +125,7 @@ void main()
         query,
         topLevel,
         gl_RayFlagsOpaqueEXT,
-        0xFFu,
+        pc.Mask.x,
         nearP,
         0.0,
         direction,
@@ -125,6 +136,7 @@ void main()
     }
 
     float result = -1.0;
+    float hitInstance = -1.0;
 
     if (rayQueryGetIntersectionTypeEXT(query, true) ==
         gl_RayQueryCommittedIntersectionTriangleEXT)
@@ -132,12 +144,16 @@ void main()
         const float t = rayQueryGetIntersectionTEXT(query, true);
         const vec3 hit = nearP + direction * t;
 
-        // 沿相机前向的投影 —— 这正是深度缓冲区线性化之后的那个量。
+        // 视空间深度 —— 这正是深度缓冲区线性化之后的那个量。
         //
-        // 不能直接用 t: t 是沿射线的距离, 在画面边缘比沿前向的深度大
-        // (斜边比直角边长)。两者在画面中心相等, 于是"用错了"这件事会
-        // 表现为"越靠边差得越多" —— 那看起来很像投影矩阵有问题。
-        result = dot(hit - pc.CameraPos.xyz, pc.Forward.xyz);
+        // 视空间是右手系, -Z 为前方 (见 FMatrix::Perspective), 所以取负。
+        //
+        // 不能直接用 t: t 是沿射线的距离, 在画面边缘比视空间深度大
+        // (斜边比直角边长)。两者只在画面中心相等, 于是"用错了"这件事会
+        // 表现为"越靠边差得越多"。
+        result = -(pc.View * vec4(hit, 1.0)).z;
+        hitInstance = float(
+            rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
     }
 
     // 光栅化深度用 texelFetch 取 —— 逐纹素, 不插值, 不需要 UV 约定。
@@ -151,5 +167,5 @@ void main()
         (rasterNdc < 0.999999) ? LinearizeDepth(rasterNdc) : -1.0;
 
     depthBuffer.depths[pixel.y * pc.Size.x + pixel.x] =
-        vec2(result, rasterDepth);
+        vec4(result, rasterDepth, rasterNdc, hitInstance);
 }
