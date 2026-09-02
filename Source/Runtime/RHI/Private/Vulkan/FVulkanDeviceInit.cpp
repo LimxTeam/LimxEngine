@@ -39,6 +39,20 @@
 namespace Limx
 {
 
+// 验证层 Error 的计数 —— 见 IRHIDevice.h 顶部那段
+static UInt32 GValidationErrorCount = 0;
+
+UInt32 GetValidationErrorCount()
+{
+    return GValidationErrorCount;
+}
+
+void ResetValidationErrorCount()
+{
+    GValidationErrorCount = 0;
+}
+
+
 // ============================================================================
 // 调试回调
 // ============================================================================
@@ -54,6 +68,8 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL VulkanDebugCallback(
 
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
+        ++GValidationErrorCount;
+
         LIMX_LOG(LogRHI, Error, "[Vulkan] {}", callbackData->pMessage);
     }
     else if (messageSeverity >=

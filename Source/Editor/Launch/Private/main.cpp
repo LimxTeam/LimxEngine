@@ -317,6 +317,9 @@ struct FLaunchOptions
     bool MeshSimplifyCheck = false;
     bool MeshletGroupCheck = false;
 
+    /// 命令行里有认不出来的参数
+    bool UnknownArgument = false;
+
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
 
@@ -702,6 +705,17 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.Furnace = true;
         }
+        else if (WideEquals(arg, L"--clustered"))
+        {
+            // 显式打开分簇 —— 默认就是开的, 所以它不改变行为。
+            //
+            // 留着它不是为了"以防万一": verify.ps1 有九步在传这个参数, 用来
+            // 表明"这一步验的是分簇路径"。而在加上下面那条"未知参数直接失败"
+            // 之前, 它是被**静默吞掉**的 —— 也就是说那九步写了一个不存在的
+            // 开关而没人知道。今天恰好无害 (默认为真), 换个默认值就是九步
+            // 集体验错了东西。
+            options.NoClustered = false;
+        }
         else if (WideEquals(arg, L"--no-clustered"))
         {
             options.NoClustered = true;
@@ -933,6 +947,22 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.FurnaceCheck = true;
         }
+        else
+        {
+            // 未知参数**直接失败**, 不许静默吞掉。
+            //
+            // 在此之前这个循环没有 else。后果是 verify.ps1 里九步传的
+            // `--clustered` (那时根本不是一个开关) 一路无声地被丢掉 —— 那九步
+            // 自以为在验分簇路径, 而实际上只是碰巧默认为真。
+            //
+            // 参数拼错的表现与此完全相同: 判据照跑, 只是验的不是你以为的
+            // 那个配置。而那种绿是最没有价值的绿。
+            options.UnknownArgument = true;
+
+            LIMX_LOG(LogLaunch, Error,
+                     "[Launch] 未知的命令行参数 —— 拼错的参数会被当成没写, "
+                     "判据照跑而验的不是你以为的那个配置");
+        }
     }
 
     return options;
@@ -1002,6 +1032,26 @@ static int FinalizeSelfCheck(bool                     passed,
     if (!passed)
     {
         return selfCheckCode;
+    }
+
+    // 验证层的 Error 并进判定。
+    //
+    // 它与应用自己打的 Error 不是一回事: 判据会**故意**制造溢出、故意让某一步
+    // 失败, 那些 Error 是预期之内的; 而验证层报的从来不是。
+    //
+    // 在此之前, 被测那些帧里的验证层报错一条都不影响退出码 —— 自检只看各条
+    // 判据自己的 passed, 而"关闭阶段的 Error"是全部自检跑完之后才开始数的。
+    // 渲染过程中的同步错误、布局错误、越界写, 只要没有哪条判据恰好看得见,
+    // 就一路绿着过去。
+    const UInt32 validationErrors = GetValidationErrorCount();
+
+    if (validationErrors > 0)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[自检] 自检项全部通过, 但验证层报了 {} 条 Error —— "
+                 "判定为失败。验证层的 Error 从来不是故意的",
+                 validationErrors);
+        return 9;
     }
 
     const UInt32 shutdownErrors = errorSink.GetCount() - errorsBeforeShutdown;
@@ -19088,6 +19138,16 @@ int WINAPI wWinMain(
     // ================================================================
 
     const FLaunchOptions launchOptions = ParseLaunchOptions(lpCmdLine);
+
+    // 认不出来的参数直接退出, 不许继续跑。
+    //
+    // 只把标志记下来而不接到退出码上, 就正好是这个项目反复栽的那个形状:
+    // **失败模式落在"通过"上**。第一版就是这么写的 —— ParseLaunchOptions 里
+    // 打了 Error、置了标志, 而 --this-is-not-a-flag 照样返回 0。
+    if (launchOptions.UnknownArgument)
+    {
+        return 2;
+    }
 
     // ================================================================
     // 0b. 设置工作目录为引擎根目录
