@@ -30,6 +30,13 @@ layout(std430, set = 0, binding = 2) readonly buffer ExpandedBuffer {
     uvec2 vertices[];
 } expandedBuffer;
 
+// 可见表 —— 由编号里的槽位查实例
+layout(std430, set = 0, binding = 3) readonly buffer VisibleMeshletBuffer {
+    uvec2 visible[];
+} visibleBuffer;
+
+layout(location = 0) flat out uint outVisibility;
+
 layout(row_major, push_constant) uniform Params {
     mat4 viewProj;
 
@@ -40,7 +47,14 @@ void main()
 {
     const uvec2 entry = expandedBuffer.vertices[gl_VertexIndex];
 
-    const MeshletInstance instance = instanceBuffer.instances[entry.y];
+    outVisibility = entry.y;
+
+    const uint slot = MeshletDecodeSlot(entry.y);
+
+    const uint instanceIndex = visibleBuffer.visible[slot].x;
+
+    const MeshletInstance instance =
+        instanceBuffer.instances[instanceIndex];
 
     const mat4 modelViewProj = pc.viewProj * MeshletInstanceMatrix(instance);
 

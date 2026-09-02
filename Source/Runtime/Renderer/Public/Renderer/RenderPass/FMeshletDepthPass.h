@@ -119,6 +119,16 @@ public:
         return m_DepthTexture;
     }
 
+    /// 可见性缓冲区 (R32_UINT)
+    ///
+    /// 每个像素记的是 (可见记录槽位, 三角形序号) + 1, 0 表示这里没有
+    /// 几何体。可见记录唯一确定实例与 meshlet, 所以不必再存它们 ——
+    /// 存了反而多一层"这几个数一致吗"的问题。
+    LIMX_NODISCARD FRHITextureHandle GetVisibilityTexture() const
+    {
+        return m_VisibilityTexture;
+    }
+
     /// 上一次执行画了多少个 meshlet (由剔除通道的计数器给出)
     LIMX_NODISCARD UInt32 GetDrawnMeshlets() const { return m_DrawnMeshlets; }
 
@@ -143,6 +153,9 @@ private:
 
     FRHITextureHandle     m_DepthTexture;
     FRHITextureViewHandle m_DepthView;
+
+    FRHITextureHandle     m_VisibilityTexture;
+    FRHITextureViewHandle m_VisibilityView;
     FRHIRenderPassHandle  m_RenderPass;
     FRHIFramebufferHandle m_Framebuffer;
 
@@ -176,6 +189,7 @@ private:
 
     FRHIShaderHandle m_MeshShader;
     FRHIShaderHandle m_FragmentShader;
+    FRHIShaderHandle m_FallbackFragmentShader;
     FRHIShaderHandle m_ExpandShader;
     FRHIShaderHandle m_FallbackVertexShader;
 

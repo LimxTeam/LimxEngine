@@ -244,7 +244,32 @@ ERHIResult FMeshletDepthPass::CreateDepthTarget(IRHIDevice* device,
 
     m_Extent = extent;
 
-    return device->CreateTextureView(viewDesc, m_DepthView);
+    result = device->CreateTextureView(viewDesc, m_DepthView);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // ---- 可见性缓冲区 ----
+    texDesc.Format    = EPixelFormat::R32_UINT;
+    texDesc.Usage     = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::ColorAttachment) |
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::TransferSrc));
+    texDesc.DebugName = "MeshletVisibility";
+
+    result = device->CreateTexture(texDesc, m_VisibilityTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    viewDesc.Texture = m_VisibilityTexture;
+    viewDesc.Format  = EPixelFormat::R32_UINT;
+
+    return device->CreateTextureView(viewDesc, m_VisibilityView);
 }
 
 void FMeshletDepthPass::DestroyDepthTarget(IRHIDevice* device)
@@ -253,6 +278,18 @@ void FMeshletDepthPass::DestroyDepthTarget(IRHIDevice* device)
     {
         device->DestroyFramebuffer(m_Framebuffer);
         m_Framebuffer = FRHIFramebufferHandle();
+    }
+
+    if (m_VisibilityView.IsValid())
+    {
+        device->DestroyTextureView(m_VisibilityView);
+        m_VisibilityView = FRHITextureViewHandle();
+    }
+
+    if (m_VisibilityTexture.IsValid())
+    {
+        device->DestroyTexture(m_VisibilityTexture);
+        m_VisibilityTexture = FRHITextureHandle();
     }
 
     if (m_DepthView.IsValid())
@@ -274,35 +311,58 @@ void FMeshletDepthPass::DestroyDepthTarget(IRHIDevice* device)
 
 ERHIResult FMeshletDepthPass::CreateRenderPass(IRHIDevice* device)
 {
-    FRHIAttachmentDesc attachment = {};
-    attachment.Format         = EPixelFormat::D32_SFLOAT;
-    attachment.Samples        = ESampleCount::Count1;
-    attachment.LoadOp         = ELoadOp::Clear;
-    attachment.StoreOp        = EStoreOp::Store;
-    attachment.StencilLoadOp  = ELoadOp::DontCare;
-    attachment.StencilStoreOp = EStoreOp::DontCare;
-    attachment.InitialLayout  = EImageLayout::Undefined;
-    attachment.FinalLayout    = EImageLayout::DepthStencilAttachment;
+    // 附件顺序: [0] = 可见性 (颜色), [1] = 深度。
+    //
+    // **深度必须在最后。** BeginRenderPass 填清除值时先按顺序填全部颜色,
+    // 再无条件把深度追加到末尾 —— 顺序不对清除值就整体错位, 而数量仍然
+    // 对得上, 验证层不报错。FVulkanDevice::CreateRenderPass 里有一条硬检查
+    // 就是为这件事加的。
+    FRHIAttachmentDesc attachments[2] = {};
+
+    attachments[0].Format         = EPixelFormat::R32_UINT;
+    attachments[0].Samples        = ESampleCount::Count1;
+    attachments[0].LoadOp         = ELoadOp::Clear;
+    attachments[0].StoreOp        = EStoreOp::Store;
+    attachments[0].StencilLoadOp  = ELoadOp::DontCare;
+    attachments[0].StencilStoreOp = EStoreOp::DontCare;
+    attachments[0].InitialLayout  = EImageLayout::Undefined;
+    attachments[0].FinalLayout    = EImageLayout::ShaderReadOnly;
+
+    attachments[1].Format         = EPixelFormat::D32_SFLOAT;
+    attachments[1].Samples        = ESampleCount::Count1;
+    attachments[1].LoadOp         = ELoadOp::Clear;
+    attachments[1].StoreOp        = EStoreOp::Store;
+    attachments[1].StencilLoadOp  = ELoadOp::DontCare;
+    attachments[1].StencilStoreOp = EStoreOp::DontCare;
+    attachments[1].InitialLayout  = EImageLayout::Undefined;
+    attachments[1].FinalLayout    = EImageLayout::DepthStencilAttachment;
+
+    FRHIAttachmentReference colorRef = {};
+    colorRef.AttachmentIndex = 0;
+    colorRef.Layout          = EImageLayout::ColorAttachment;
 
     FRHIAttachmentReference depthRef = {};
-    depthRef.AttachmentIndex = 0;
+    depthRef.AttachmentIndex = 1;
     depthRef.Layout          = EImageLayout::DepthStencilAttachment;
 
     FRHISubpassDesc subpass = {};
-    subpass.ColorAttachmentCount   = 0;
+    subpass.ColorAttachments       = &colorRef;
+    subpass.ColorAttachmentCount   = 1;
     subpass.DepthStencilAttachment = &depthRef;
 
     FRHISubpassDependency dependency = {};
     dependency.SrcSubpass    = 0xFFFFFFFF;
     dependency.DstSubpass    = 0;
     dependency.SrcStageMask  = EPipelineStageFlags::TopOfPipe;
-    dependency.DstStageMask  = EPipelineStageFlags::EarlyFragmentTests;
+    dependency.DstStageMask  = EPipelineStageFlags::EarlyFragmentTests |
+                               EPipelineStageFlags::ColorAttachmentOutput;
     dependency.SrcAccessMask = EAccessFlags::None;
-    dependency.DstAccessMask = EAccessFlags::DepthStencilAttachmentWrite;
+    dependency.DstAccessMask = EAccessFlags::DepthStencilAttachmentWrite |
+                               EAccessFlags::ColorAttachmentWrite;
 
     FRHIRenderPassDesc renderPassDesc = {};
-    renderPassDesc.Attachments     = &attachment;
-    renderPassDesc.AttachmentCount = 1;
+    renderPassDesc.Attachments     = attachments;
+    renderPassDesc.AttachmentCount = 2;
     renderPassDesc.Subpasses       = &subpass;
     renderPassDesc.SubpassCount    = 1;
     renderPassDesc.Dependencies    = &dependency;
@@ -316,10 +376,13 @@ ERHIResult FMeshletDepthPass::CreateRenderPass(IRHIDevice* device)
         return result;
     }
 
+    // 视图顺序必须与附件顺序一致 —— [0] 可见性, [1] 深度
+    const FRHITextureViewHandle views[2] = { m_VisibilityView, m_DepthView };
+
     FRHIFramebufferDesc fbDesc = {};
     fbDesc.RenderPass      = m_RenderPass;
-    fbDesc.Attachments     = &m_DepthView;
-    fbDesc.AttachmentCount = 1;
+    fbDesc.Attachments     = views;
+    fbDesc.AttachmentCount = 2;
     fbDesc.Width           = m_Extent.Width;
     fbDesc.Height          = m_Extent.Height;
     fbDesc.Layers          = 1;
@@ -369,7 +432,7 @@ ERHIResult FMeshletDepthPass::CreateDescriptors(IRHIDevice* device,
 
     if (IsRHISuccess(result))
     {
-        result = MakeLayout(3, EShaderStage::Vertex,
+        result = MakeLayout(4, EShaderStage::Vertex,
                             "MeshletFallbackSetLayout", m_FallbackSetLayout);
     }
 
@@ -440,6 +503,13 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
         result = shaders.CreateShaderModule(
             device, FString("Builtin/meshlet_depth_fallback.vert"),
             EShaderStage::Vertex, m_FallbackVertexShader);
+    }
+
+    if (IsRHISuccess(result))
+    {
+        result = shaders.CreateShaderModule(
+            device, FString("Builtin/meshlet_depth_fallback.frag"),
+            EShaderStage::Fragment, m_FallbackFragmentShader);
     }
 
     // 网格着色器模块只在设备支持时创建 —— 不支持时创建会被驱动拒绝,
@@ -523,6 +593,7 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
     // 让两条路径画出不同的深度, 而判据要求它们逐位相同。
     const auto MakeGraphics = [&](FRHIShaderHandle firstStage,
                                   EShaderStage firstStageKind,
+                                  FRHIShaderHandle fragmentStage,
                                   FRHIPipelineLayoutHandle layout,
                                   const AnsiChar* name,
                                   FRHIGraphicsPipelineHandle& out)
@@ -533,7 +604,7 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
         pipelineDesc.ShaderStages[0].Stage      = firstStageKind;
         pipelineDesc.ShaderStages[0].EntryPoint = "main";
 
-        pipelineDesc.ShaderStages[1].Shader     = m_FragmentShader;
+        pipelineDesc.ShaderStages[1].Shader     = fragmentStage;
         pipelineDesc.ShaderStages[1].Stage      = EShaderStage::Fragment;
         pipelineDesc.ShaderStages[1].EntryPoint = "main";
 
@@ -553,11 +624,18 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
 
         pipelineDesc.Multisample.RasterizationSamples = ESampleCount::Count1;
 
+        FRHIColorBlendAttachmentDesc blendAttachment = {};
+        blendAttachment.IsBlendEnabled = false;
+        blendAttachment.ColorWriteMask = EColorWriteMask::All;
+
         pipelineDesc.DepthStencil.IsDepthTestEnabled  = true;
         pipelineDesc.DepthStencil.IsDepthWriteEnabled = true;
         pipelineDesc.DepthStencil.DepthCompareOp      = ECompareOp::Less;
 
-        pipelineDesc.ColorBlend.AttachmentCount = 0;
+        // 一个颜色附件, 不混合。可见性编号是整数, 混合毫无意义 ——
+        // 而 R32_UINT 上开混合会被验证层直接拒绝。
+        pipelineDesc.ColorBlend.Attachments     = &blendAttachment;
+        pipelineDesc.ColorBlend.AttachmentCount = 1;
 
         pipelineDesc.DynamicState.EnabledStates =
             EDynamicState::Viewport | EDynamicState::Scissor;
@@ -573,8 +651,8 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
     if (m_MeshShaderAvailable)
     {
         result = MakeGraphics(m_MeshShader, EShaderStage::Mesh,
-                              m_MeshPipelineLayout, "MeshletDepthMeshPipeline",
-                              m_MeshPipeline);
+                              m_FragmentShader, m_MeshPipelineLayout,
+                              "MeshletDepthMeshPipeline", m_MeshPipeline);
 
         if (!IsRHISuccess(result))
         {
@@ -583,7 +661,7 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
     }
 
     return MakeGraphics(m_FallbackVertexShader, EShaderStage::Vertex,
-                        m_FallbackPipelineLayout,
+                        m_FallbackFragmentShader, m_FallbackPipelineLayout,
                         "MeshletDepthFallbackPipeline", m_FallbackPipeline);
 }
 
@@ -674,7 +752,7 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
 
             m_Device->UpdateDescriptorSets(expandWrites, 7);
 
-            FRHIDescriptorWrite fallbackWrites[3];
+            FRHIDescriptorWrite fallbackWrites[4];
 
             fallbackWrites[0] = FRHIDescriptorWrite::StorageBuffer(
                 m_FallbackSets[i], 0, cull->GetInstanceBuffer(i), 0,
@@ -684,8 +762,11 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
                 cull->GetSceneVertexBytes());
             fallbackWrites[2] = FRHIDescriptorWrite::StorageBuffer(
                 m_FallbackSets[i], 2, m_ExpandedBuffers[i], 0, kExpandedBytes);
+            fallbackWrites[3] = FRHIDescriptorWrite::StorageBuffer(
+                m_FallbackSets[i], 3, cull->GetVisibleMeshletBuffer(i), 0,
+                cull->GetVisibleMeshletBytes());
 
-            m_Device->UpdateDescriptorSets(fallbackWrites, 3);
+            m_Device->UpdateDescriptorSets(fallbackWrites, 4);
         }
 
         m_BoundVertexBuffer = cull->GetSceneVertexBuffer();
@@ -802,7 +883,19 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
     beginInfo.Framebuffer       = m_Framebuffer;
     beginInfo.RenderAreaOffset  = { 0, 0 };
     beginInfo.RenderAreaExtent  = m_Extent;
-    beginInfo.ClearColorCount   = 0;
+    // 可见性缓冲区清成 0 = "这里没有几何体"。
+    //
+    // 清除值走的是浮点通道 (FRHIClearColorValue 只有四个 Float32), 而
+    // R32_UINT 附件上只有 0.0f 的位模式恰好是整数 0 —— 这正是编号里
+    // 加一个 +1 偏移的原因: 让 0 空出来当空值。
+    FRHIClearColorValue clearVisibility = {};
+    clearVisibility.R = 0.0f;
+    clearVisibility.G = 0.0f;
+    clearVisibility.B = 0.0f;
+    clearVisibility.A = 0.0f;
+
+    beginInfo.ClearColors       = &clearVisibility;
+    beginInfo.ClearColorCount   = 1;
     beginInfo.ClearDepthStencil = &clearDepth;
 
     commandBuffer->BeginRenderPass(beginInfo);
@@ -878,10 +971,12 @@ ERHIResult FMeshletDepthPass::OnResize(const FPassResizeDesc& desc)
         return result;
     }
 
+    const FRHITextureViewHandle views[2] = { m_VisibilityView, m_DepthView };
+
     FRHIFramebufferDesc fbDesc = {};
     fbDesc.RenderPass      = m_RenderPass;
-    fbDesc.Attachments     = &m_DepthView;
-    fbDesc.AttachmentCount = 1;
+    fbDesc.Attachments     = views;
+    fbDesc.AttachmentCount = 2;
     fbDesc.Width           = m_Extent.Width;
     fbDesc.Height          = m_Extent.Height;
     fbDesc.Layers          = 1;
@@ -961,6 +1056,7 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
 
     DestroyShader(m_MeshShader);
     DestroyShader(m_FragmentShader);
+    DestroyShader(m_FallbackFragmentShader);
     DestroyShader(m_ExpandShader);
     DestroyShader(m_FallbackVertexShader);
 

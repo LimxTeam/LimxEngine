@@ -29,6 +29,13 @@ layout(local_size_x = 64) in;
 
 layout(triangles, max_vertices = 64, max_primitives = 124) out;
 
+// 逐**图元**的可见性编号。
+//
+// perprimitiveEXT 是网格着色器独有的: 经典管线里一个值要么逐顶点要么逐
+// 绘制, 想做到逐三角形只能靠"给每个三角形三份独立顶点" —— 而那正是回退
+// 路径不得不做的事 (它的顶点流本来就是展开的)。
+layout(location = 0) perprimitiveEXT out uint outVisibility[];
+
 layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
     MeshletInstance instances[];
 } instanceBuffer;
@@ -127,5 +134,7 @@ void main()
         }
 
         gl_PrimitiveTriangleIndicesEXT[t] = corner;
+
+        outVisibility[t] = MeshletEncodeVisibility(slot, t);
     }
 }

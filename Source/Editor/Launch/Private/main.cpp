@@ -5576,6 +5576,183 @@ bool ReadDepthTexture(FRenderContext* context, FRenderer& renderer,
     return ok;
 }
 
+/// 一个像素上解出来的三元组
+///
+/// **不能直接比编号本身。** 编号里的"可见槽位"来自剔除通道的原子追加,
+/// 而原子追加的顺序每帧都不同 —— 同一个 (实例, meshlet) 在两次采集里
+/// 会落在不同的槽位上。实测综合场景 817036 个像素的编号不同, 而它们
+/// 画的是同一批三角形。
+///
+/// 能比的是槽位**解出来**的东西: 实例下标、meshlet 全局下标、三角形序号。
+/// 那三个数是几何本身的属性, 与压实顺序无关。
+struct FVisibilityTriple
+{
+    UInt32 Instance = 0;
+    UInt32 Meshlet  = 0;
+    UInt32 Triangle = 0;
+    UInt32 Valid    = 0;
+};
+
+/// 一次采集: 可见性缓冲区 + 同一帧的可见记录表
+///
+/// 两者必须来自**同一帧** —— 分两次读的话中间隔着帧的推进, 表里已经是
+/// 另一次压实的结果, 解出来的三元组会张冠李戴。所以两次拷贝录在同一个
+/// 帧内回调里。
+bool ReadVisibilityAndTable(FRenderContext* context, FRenderer& renderer,
+                            FRHITextureHandle texture,
+                            TArray<FVisibilityTriple>& outTriples)
+{
+    FMeshletCullPass* const cull = renderer.GetMeshletCullPass();
+
+    if (!texture.IsValid() || cull == nullptr)
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+    FRHIBufferHandle visReadback;
+    FRHIBufferHandle tableReadback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "MeshletVisCheck.Readback";
+
+        desc.Size = pixelCount * 4u;
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, visReadback)))
+        {
+            return false;
+        }
+
+        desc.Size = FMeshletCullPass::GetVisibleMeshletBytes();
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, tableReadback)))
+        {
+            device->DestroyBuffer(visReadback);
+            return false;
+        }
+    }
+
+    const FRHIBufferHandle table = cull->GetVisibleMeshletBuffer(frameIndex);
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, visReadback, tableReadback, table,
+         extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::ColorAttachmentOutput,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ColorAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     visReadback, region);
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::ColorAttachmentOutput,
+                EAccessFlags::TransferRead,
+                EAccessFlags::ColorAttachmentWrite);
+
+            FRHIBufferCopyRegion tableRegion = {};
+            tableRegion.SrcOffset = 0;
+            tableRegion.DstOffset = 0;
+            tableRegion.Size = FMeshletCullPass::GetVisibleMeshletBytes();
+
+            cmd->CopyBuffer(table, tableReadback, tableRegion);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* visMapped   = nullptr;
+        void* tableMapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(visReadback, &visMapped)) &&
+            IsRHISuccess(device->MapBuffer(tableReadback, &tableMapped)) &&
+            visMapped != nullptr && tableMapped != nullptr)
+        {
+            const auto* values = static_cast<const UInt32*>(visMapped);
+            const auto* pairs  = static_cast<const UInt32*>(tableMapped);
+
+            outTriples.Clear();
+            outTriples.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                FVisibilityTriple triple;
+
+                if (values[i] != 0u)
+                {
+                    const UInt32 packed = values[i] - 1u;
+
+                    const UInt32 slot = packed >> 7;
+
+                    triple.Valid    = 1;
+                    triple.Triangle = packed & 127u;
+                    triple.Instance = pairs[slot * 2 + 0];
+                    triple.Meshlet  = pairs[slot * 2 + 1];
+                }
+
+                outTriples.Add(triple);
+            }
+
+            device->UnmapBuffer(tableReadback);
+            device->UnmapBuffer(visReadback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(tableReadback);
+    device->DestroyBuffer(visReadback);
+
+    return ok;
+}
+
 } // namespace
 
 static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
@@ -5602,6 +5779,9 @@ static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
     TArray<Float32> fallbackDepth;
     TArray<Float32> classicDepth;
 
+    TArray<FVisibilityTriple> meshVisibility;
+    TArray<FVisibilityTriple> fallbackVisibility;
+
     // ---- 网格着色器路径 ----
     //
     // 设备不支持时这一段跳过, 但**判据不因此变绿** —— 见下面那条元判据。
@@ -5620,7 +5800,10 @@ static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
 
         if (!ReadDepthTexture(context, renderer, pass->GetDepthTexture(),
                               EImageLayout::DepthStencilAttachment,
-                              meshDepth))
+                              meshDepth) ||
+            !ReadVisibilityAndTable(context, renderer,
+                                    pass->GetVisibilityTexture(),
+                                    meshVisibility))
         {
             LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 网格着色器路径回读失败");
             return false;
@@ -5638,7 +5821,10 @@ static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
 
     if (!ReadDepthTexture(context, renderer, pass->GetDepthTexture(),
                           EImageLayout::DepthStencilAttachment,
-                          fallbackDepth))
+                          fallbackDepth) ||
+        !ReadVisibilityAndTable(context, renderer,
+                                pass->GetVisibilityTexture(),
+                                fallbackVisibility))
     {
         LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 回退路径回读失败");
         return false;
@@ -5697,6 +5883,59 @@ static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
                          "最大差 {}) —— 它们的输入、顶点数学、光栅化状态都是"
                          "同一份, 差别只该在把三角形喂给光栅器的方式上",
                          differ, worst);
+                passed = false;
+            }
+        }
+
+        // ---- 可见性缓冲区也要逐位相同 ----
+        //
+        // 深度相同而编号不同是完全可能的: 两个共面的三角形画出同一个深度,
+        // 而编号不同。那种错在材质解析那一天会变成"这个像素用了别人的材质",
+        // 而深度上一点痕迹都没有。
+        if (meshVisibility.GetSize() != fallbackVisibility.GetSize())
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 可见性缓冲区尺寸对不上");
+            passed = false;
+        }
+        else
+        {
+            SizeType differ = 0;
+            SizeType firstBad = 0;
+
+            for (SizeType i = 0; i < meshVisibility.GetSize(); ++i)
+            {
+                const FVisibilityTriple& a = meshVisibility[i];
+                const FVisibilityTriple& b = fallbackVisibility[i];
+
+                if (a.Valid != b.Valid || a.Instance != b.Instance ||
+                    a.Meshlet != b.Meshlet || a.Triangle != b.Triangle)
+                {
+                    if (differ == 0)
+                    {
+                        firstBad = i;
+                    }
+
+                    ++differ;
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet深度] 可见性 (解出的实例/meshlet/三角形) — "
+                     "两条路径不同的像素 {} 个",
+                     differ);
+
+            if (differ != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet深度] 两条路径解出的 (实例, meshlet, 三角形) "
+                         "不同 ({} 个像素, 第一个在下标 {}: 网格 "
+                         "({},{},{}) vs 回退 ({},{},{}))",
+                         differ, firstBad, meshVisibility[firstBad].Instance,
+                         meshVisibility[firstBad].Meshlet,
+                         meshVisibility[firstBad].Triangle,
+                         fallbackVisibility[firstBad].Instance,
+                         fallbackVisibility[firstBad].Meshlet,
+                         fallbackVisibility[firstBad].Triangle);
                 passed = false;
             }
         }
@@ -5821,7 +6060,77 @@ static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
         passed = false;
     }
 
-    // ---- 判据四: 网格着色器的输出上限必须容得下构建器能产出的最大 meshlet ----
+    // ---- 判据四: 可见性编号与深度的覆盖必须完全一致 ----
+    //
+    // 编号为 0 (空) 的像素上深度必须是 1.0 (没画), 反过来也一样。
+    //
+    // 两者是同一次光栅化的两个附件, 覆盖范围只能相同 —— 不同就说明其中
+    // 一个的清除值、混合状态或者写掩码出了问题。而那种错在画面上要到材质
+    // 解析那一天才现形: 一个"深度上有东西但编号是空"的像素会去解一个不
+    // 存在的三角形。
+    {
+        SizeType coverageMismatch = 0;
+
+        SizeType decodedOutOfRange = 0;
+
+        const UInt32 visibleCount =
+            renderer.GetMeshletCullPass()->GetStats().MeshletsVisible;
+
+        const UInt32 instanceCount = static_cast<UInt32>(
+            renderer.GetMeshletCullPass()->GetInstances().GetSize());
+
+        const UInt32 sceneMeshletCount =
+            renderer.GetMeshletCullPass()->GetSceneMeshletCount();
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            const bool hasVisibility = (fallbackVisibility[i].Valid != 0u);
+            const bool hasDepth      = (fallbackDepth[i] < 1.0f);
+
+            if (hasVisibility != hasDepth)
+            {
+                ++coverageMismatch;
+                continue;
+            }
+
+            if (!hasVisibility)
+            {
+                continue;
+            }
+
+            if (fallbackVisibility[i].Instance >= instanceCount ||
+                fallbackVisibility[i].Meshlet >= sceneMeshletCount ||
+                fallbackVisibility[i].Triangle >= kMaxMeshletTriangles)
+            {
+                ++decodedOutOfRange;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet深度] 覆盖一致性 — 编号与深度不一致的像素 {} 个; "
+                 "解码越界 {} 个 (可见记录 {} 条)",
+                 coverageMismatch, decodedOutOfRange, visibleCount);
+
+        if (coverageMismatch != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet深度] {} 个像素上可见性编号与深度的覆盖不一致 "
+                     "—— 两者是同一次光栅化的两个附件, 覆盖范围只能相同",
+                     coverageMismatch);
+            passed = false;
+        }
+
+        if (decodedOutOfRange != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet深度] {} 个像素的编号解出来越界 —— "
+                     "材质解析会去解一个不存在的三角形",
+                     decodedOutOfRange);
+            passed = false;
+        }
+    }
+
+    // ---- 判据五: 网格着色器的输出上限必须容得下构建器能产出的最大 meshlet ----
     //
     // 这一条把一个**跨语言的耦合**变成可验的。meshlet_depth.mesh 的
     // layout(max_vertices, max_primitives) 是 GLSL 里的常量, C++ 侧读不到;

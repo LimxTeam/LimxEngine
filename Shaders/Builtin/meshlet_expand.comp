@@ -113,8 +113,14 @@ void main()
 
             // 展开时就把顶点下标折算到场景级 —— 顶点着色器那边就不必再
             // 知道基址这回事。两处都折算的话会加两遍。
+            //
+            // 第二个分量存的是**可见性编号**而不是实例下标: 编号里已经
+            // 含了可见槽位, 而槽位唯一确定实例 —— 顶点着色器查一次可见表
+            // 就得到实例。多存一个实例下标的话, 两个数就有了"一不一致"
+            // 的问题, 而那种不一致只在某些帧出现。
             expandedBuffer.vertices[base + k] =
-                uvec2(vertexBase + globalVertex, entry.x);
+                uvec2(vertexBase + globalVertex,
+                      MeshletEncodeVisibility(slot, t));
         }
     }
 }

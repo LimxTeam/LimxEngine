@@ -64,4 +64,58 @@ uint MeshletUnpackIndex(uint packed, uint byteIndex)
     return (packed >> ((byteIndex & 3u) * 8u)) & 0xFFu;
 }
 
+// ============================================================================
+// 可见性缓冲的编号
+//
+// 一个像素上记的是"哪个可见记录的第几个三角形"。可见记录 (visible slot)
+// 已经唯一确定了实例与 meshlet, 所以不必再存它们 —— 存了反而要多一层
+// "这两个数一致吗"的问题。
+//
+// 低 7 位放三角形序号 (上限 124, 7 位够), 高 25 位放可见槽位 (上限
+// 262144, 18 位够, 留了余量)。
+//
+// 0xFFFFFFFF 是"这里没有几何体"。取全一而不是 0: 0 是**合法**的编号
+// (第 0 条可见记录的第 0 个三角形), 拿它当空值的话, 画面左上角那个
+// 三角形与"没画"永远分不开 —— 而那正是本周期反复遇到的那类混淆。
+// ============================================================================
+
+// 存进缓冲区的值是 (编号 + 1), 于是 **0 就是"这里没有几何体"**。
+//
+// 为什么不直接拿 0xFFFFFFFF 当空值: 清除颜色附件走的是浮点通道
+// (FRHIClearColorValue 只有四个 Float32), 而 R32_UINT 附件上只有 0.0f
+// 的位模式恰好是整数 0 —— 别的值都要靠位重解释, 那要动 RHI。
+//
+// 为什么不直接拿 0 当空值而不加偏移: 0 是**合法**的编号 (第 0 条可见记录
+// 的第 0 个三角形)。拿它当空值的话, 那一个三角形与"没画"永远分不开 ——
+// 而那正是本周期反复遇到的那类混淆 (法线哨兵、法线锥哨兵都是同一件事)。
+//
+// 低 7 位放三角形序号 (上限 124), 高位放可见槽位 (上限 262144, 18 位)。
+// 加一之后最大值是 262143*128 + 123 + 1, 远在 32 位之内。
+
+const uint kVisibilityEmpty = 0u;
+
+const uint kVisibilityTriangleBits = 7u;
+const uint kVisibilityTriangleMask = (1u << kVisibilityTriangleBits) - 1u;
+
+uint MeshletEncodeVisibility(uint visibleSlot, uint triangleIndex)
+{
+    return ((visibleSlot << kVisibilityTriangleBits) |
+            (triangleIndex & kVisibilityTriangleMask)) + 1u;
+}
+
+bool MeshletVisibilityValid(uint visibility)
+{
+    return visibility != kVisibilityEmpty;
+}
+
+uint MeshletDecodeSlot(uint visibility)
+{
+    return (visibility - 1u) >> kVisibilityTriangleBits;
+}
+
+uint MeshletDecodeTriangle(uint visibility)
+{
+    return (visibility - 1u) & kVisibilityTriangleMask;
+}
+
 #endif // LIMX_MESHLET_RASTER_COMMON_H
