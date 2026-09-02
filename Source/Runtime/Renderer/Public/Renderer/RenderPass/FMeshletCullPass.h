@@ -76,10 +76,14 @@ struct FMeshletInstanceGpu
 
     /// x = meshlet 起点 (全局), y = meshlet 个数, z = 源对象下标, w = 保留
     UInt32 MeshletRange[4] = { 0, 0, 0, 0 };
+
+    /// 所属网格在三份汇总缓冲区里的起点
+    /// x = 顶点, y = meshlet 局部顶点表, z = meshlet 三角形 (以字节计)
+    UInt32 BufferBases[4] = { 0, 0, 0, 0 };
 };
 
-static_assert(sizeof(FMeshletInstanceGpu) == 64,
-              "FMeshletInstanceGpu 必须是 64 字节 — 与 meshlet_common.h 的 "
+static_assert(sizeof(FMeshletInstanceGpu) == 80,
+              "FMeshletInstanceGpu 必须是 80 字节 — 与 meshlet_common.h 的 "
               "MeshletInstance 逐字段一致");
 
 // ============================================================================
@@ -185,6 +189,26 @@ public:
         return m_SceneMeshlets;
     }
 
+    /// 汇总后的场景顶点 / meshlet 局部顶点表 / meshlet 三角形
+    ///
+    /// 光栅化路径要它们。剔除只看包围球与法线锥, 用不到这三份 —— 但汇总
+    /// 逻辑与 meshlet 头是同一套 (同一批网格、同一个签名), 分成两处做的话
+    /// 两处的基址迟早会不一致。
+    LIMX_NODISCARD FRHIBufferHandle GetSceneVertexBuffer() const
+    {
+        return m_SceneVertices;
+    }
+
+    LIMX_NODISCARD FRHIBufferHandle GetSceneMeshletVertexBuffer() const
+    {
+        return m_SceneMeshletVertices;
+    }
+
+    LIMX_NODISCARD FRHIBufferHandle GetSceneMeshletTriangleBuffer() const
+    {
+        return m_SceneMeshletTriangles;
+    }
+
     LIMX_NODISCARD UInt32 GetSceneMeshletCount() const
     {
         return m_SceneMeshletCount;
@@ -214,6 +238,36 @@ public:
     /// 计数器缓冲区 (uvec4)
     LIMX_NODISCARD FRHIBufferHandle GetCounterBuffer(UInt32 frameIndex) const;
 
+    /// 光栅化用的间接参数 —— (可见 meshlet 数, 1, 1, 0)
+    ///
+    /// 这个数**必须来自 GPU**。CPU 手上只有上一帧的计数器回读值, 而物体
+    /// 一动那个数就不对: 少了就漏画, 多了就去读可见表里上一帧留下的
+    /// (实例, meshlet) 对 —— 那是一块位置完全不对的几何体。
+    ///
+    /// 判据把这件事逮了个正着: 第一版按"场景 meshlet 总数"分派 (14),
+    /// 而可见表里有九十多条 —— 两条光栅化路径各画了任意的 14 条, 于是
+    /// "两条路径逐位相同"这一条报出 28334 个不同的像素。
+    LIMX_NODISCARD FRHIBufferHandle GetRasterArgsBuffer(
+        UInt32 frameIndex) const;
+
+    /// 实例表 (GPU 侧那一份) —— 光栅化路径要按实例下标取变换与基址
+    LIMX_NODISCARD FRHIBufferHandle GetInstanceBuffer(UInt32 frameIndex) const;
+
+    // ====================================================================
+    // 各缓冲区的字节数
+    //
+    // 由本类给出而不是让调用方自己按上限算 —— 上限是本类的内部约定,
+    // 两处各算一遍的话, 改了上限而只改一处就是描述符范围与实际大小不符,
+    // 而那在验证层关掉时是读越界。
+    // ====================================================================
+
+    LIMX_NODISCARD static UInt64 GetInstanceBufferBytes();
+    LIMX_NODISCARD static UInt64 GetSceneMeshletBytes();
+    LIMX_NODISCARD static UInt64 GetVisibleMeshletBytes();
+    LIMX_NODISCARD static UInt64 GetSceneVertexBytes();
+    LIMX_NODISCARD static UInt64 GetSceneMeshletVertexBytes();
+    LIMX_NODISCARD static UInt64 GetSceneMeshletTriangleBytes();
+
 private:
     /// 把场景里所有网格的 meshlet 汇总成一份连续缓冲区
     ///
@@ -241,13 +295,23 @@ private:
 
     IRHIDevice* m_Device = nullptr;
 
-    // ---- 汇总后的场景 meshlet ----
+    // ---- 汇总后的场景数据 ----
     FRHIBufferHandle m_SceneMeshlets;
-    UInt32           m_SceneMeshletCount = 0;
+    FRHIBufferHandle m_SceneVertices;
+    FRHIBufferHandle m_SceneMeshletVertices;
+    FRHIBufferHandle m_SceneMeshletTriangles;
 
-    /// 每个网格的 meshlet 缓冲区在汇总缓冲区里的起点 (以 meshlet 计)
+    UInt32 m_SceneMeshletCount = 0;
+
+    /// 每个网格在四份汇总缓冲区里的起点
+    ///
+    /// 四个数组平行, 下标一致。分成四个 TArray 而不是一个结构体数组,
+    /// 是因为查找只用 m_SourceBuffers 那一列。
     TArray<FRHIBufferHandle> m_SourceBuffers;
     TArray<UInt32>           m_SourceBases;
+    TArray<UInt32>           m_SourceVertexBases;
+    TArray<UInt32>           m_SourceMeshletVertexBases;
+    TArray<UInt32>           m_SourceMeshletTriangleBases;
 
     /// 上一次汇总时的几何签名
     UInt64 m_GeometrySignature = 0;
@@ -260,6 +324,7 @@ private:
     TArray<FRHIBufferHandle> m_VisibleMeshletBuffers;
     TArray<FRHIBufferHandle> m_CounterBuffers;
     TArray<FRHIBufferHandle> m_CounterReadbacks;
+    TArray<FRHIBufferHandle> m_RasterArgsBuffers;
 
     TArray<FRHIDescriptorSetHandle> m_InstanceCullSets;
     TArray<FRHIDescriptorSetHandle> m_MeshletCullSets;

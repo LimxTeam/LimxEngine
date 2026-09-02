@@ -621,8 +621,12 @@ ERHIResult FVulkanDevice::SelectPhysicalDevice()
     // 光追那两个结构挂在链尾。挂之前不需要判扩展在不在 ——
     // vkGetPhysicalDeviceFeatures2 对不认识的结构体会原样跳过并把里面的位
     // 全部置零, 于是"不支持"自然表现为特性位为假。
-    m_AccelStructFeatures.pNext = &m_RayQueryFeatures;
-    m_RayQueryFeatures.pNext    = nullptr;
+    m_MeshShaderFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+
+    m_AccelStructFeatures.pNext  = &m_RayQueryFeatures;
+    m_RayQueryFeatures.pNext     = &m_MeshShaderFeatures;
+    m_MeshShaderFeatures.pNext   = nullptr;
 
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -828,7 +832,7 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     // 少启用其中任何一个, vkCreateDevice 会报 EXTENSION_NOT_PRESENT ——
     // 而那条错误不会告诉你缺的是哪一个。
     // ------------------------------------------------------------------
-    const char* deviceExtensions[8] =
+    const char* deviceExtensions[9] =
     {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
@@ -852,6 +856,31 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
         deviceExtensions[extensionCount++] =
             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
     }
+
+    // 网格着色器。
+    //
+    // 与光追同一个模式: **一个** wantMeshShader 同时决定"启不启用扩展"与
+    // "挂不挂特性"。两处各判一次的话, 扩展启了而特性没挂 (或反过来) 都是
+    // vkCreateDevice 整个失败, 而那条错误不会告诉你缺的是哪一个。
+    //
+    // meshShader 与 taskShader 两个位都要: 只有 meshShader 时无法用任务
+    // 着色器做每工作组的粗剔除, 而那正是网格着色器路径的价值之一。
+    const bool wantMeshShader =
+        HasDeviceExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME) &&
+        m_MeshShaderFeatures.meshShader != VK_FALSE &&
+        m_MeshShaderFeatures.taskShader != VK_FALSE;
+
+    if (wantMeshShader)
+    {
+        deviceExtensions[extensionCount++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+    }
+
+    LIMX_LOG(LogRHI, Display,
+        "[Vulkan] 网格着色器 — 扩展:{} meshShader:{} taskShader:{} → {}",
+        HasDeviceExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME),
+        m_MeshShaderFeatures.meshShader != VK_FALSE,
+        m_MeshShaderFeatures.taskShader != VK_FALSE,
+        wantMeshShader ? "启用" : "不可用");
 
     LIMX_LOG(LogRHI, Display,
         "[Vulkan] 光追 — 扩展齐备:{} 加速结构特性:{} rayQuery 特性:{} "
@@ -959,15 +988,33 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     // 特性链
     features12.pNext = &features13;
 
+    VkPhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures = {};
+    meshShaderFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+    meshShaderFeatures.meshShader = VK_TRUE;
+    meshShaderFeatures.taskShader = VK_TRUE;
+
+    void** tail = nullptr;
+
     if (wantRayTracing)
     {
         features13.pNext        = &accelFeatures;
         accelFeatures.pNext     = &rayQueryFeatures;
         rayQueryFeatures.pNext  = nullptr;
+
+        tail = const_cast<void**>(&rayQueryFeatures.pNext);
     }
     else
     {
         features13.pNext = nullptr;
+
+        tail = &features13.pNext;
+    }
+
+    if (wantMeshShader)
+    {
+        *tail = &meshShaderFeatures;
+        meshShaderFeatures.pNext = nullptr;
     }
 
     VkDeviceCreateInfo createInfo = {};
@@ -1004,6 +1051,10 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     // 扩展函数入口必须在这里载入 —— 它们要 VkDevice, 所以早一步都拿不到。
     // 载入失败会把 m_RayTracingAvailable 再改回假。
     LoadRayTracingFunctions();
+
+    m_MeshShaderAvailable = wantMeshShader;
+
+    LoadMeshShaderFunctions();
 
     LIMX_LOG(LogRHI, Log,
         "[Vulkan] 逻辑设备创建完成 — 图形:{} 计算:{} 传输:{} 呈现:{} 光追:{}",

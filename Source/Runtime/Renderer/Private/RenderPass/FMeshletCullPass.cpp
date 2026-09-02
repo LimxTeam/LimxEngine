@@ -61,6 +61,33 @@ static_assert(sizeof(FMeshletCullPushConstants) == 128,
 constexpr UInt64 kSceneMeshletBytes =
     static_cast<UInt64>(sizeof(FMeshlet)) * kMaxSceneMeshlets;
 
+/// 场景顶点的上限。
+///
+/// meshlet 的局部顶点表指向它, 而每个 meshlet 最多 64 个局部顶点 ——
+/// 但那是**去重后**的, 场景顶点数与 meshlet 数不成固定比例。取 400 万个
+/// (每个 72 字节, 288 MiB) 覆盖到十万级三角形的场景。
+///
+/// 超出时**丢掉整个网格并报错** —— 不是截断。截断的后果是那个网格的
+/// 一部分 meshlet 指向别人的顶点, 画面上是一团乱七八糟的三角形。
+constexpr UInt32 kMaxSceneVertices = 4000000;
+
+constexpr UInt64 kSceneVertexBytes =
+    static_cast<UInt64>(sizeof(FMeshVertex)) * kMaxSceneVertices;
+
+/// meshlet 局部顶点表的上限 —— 每个 meshlet 最多 64 个
+constexpr UInt32 kMaxSceneMeshletVertices = kMaxSceneMeshlets * 64;
+
+constexpr UInt64 kSceneMeshletVertexBytes =
+    static_cast<UInt64>(sizeof(UInt32)) * kMaxSceneMeshletVertices;
+
+/// meshlet 三角形索引的上限 —— 每个 meshlet 最多 124 个三角形, 每个三字节,
+/// 按 UInt32 打包 (四字节一组)
+constexpr UInt32 kMaxSceneMeshletTriangleWords =
+    (kMaxSceneMeshlets * kMaxMeshletTriangles * 3u + 3u) / 4u;
+
+constexpr UInt64 kSceneMeshletTriangleBytes =
+    static_cast<UInt64>(sizeof(UInt32)) * kMaxSceneMeshletTriangleWords;
+
 constexpr UInt64 kInstanceBytes =
     static_cast<UInt64>(sizeof(FMeshletInstanceGpu)) * kMaxMeshletInstances;
 
@@ -76,6 +103,9 @@ constexpr UInt64 kVisibleMeshletBytes =
 
 constexpr UInt64 kDispatchBytes = sizeof(UInt32) * 4;
 constexpr UInt64 kCounterBytes = sizeof(UInt32) * 4;
+
+/// 光栅化间接参数 —— (groupCountX, groupCountY, groupCountZ, 保留)
+constexpr UInt64 kRasterArgsBytes = sizeof(UInt32) * 4;
 
 } // namespace
 
@@ -94,26 +124,47 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
 
     const UInt32 frameCount = desc.MaxFramesInFlight;
 
-    // ---- 汇总后的场景 meshlet ----
+    // ---- 汇总后的场景数据 (四份) ----
     {
-        FRHIBufferDesc bufferDesc = {};
-        bufferDesc.Size = kSceneMeshletBytes;
         // TransferSrc 是给判据用的 —— 它要把上传上去的那份读回来比对。
         // 没有它的话判据只能比 CPU 内存里那份与自己, 上传路径整个不在
         // 覆盖里。
-        bufferDesc.Usage = static_cast<EBufferUsage>(
+        const EBufferUsage usage = static_cast<EBufferUsage>(
             static_cast<UInt32>(EBufferUsage::StorageBuffer) |
             static_cast<UInt32>(EBufferUsage::TransferDst) |
             static_cast<UInt32>(EBufferUsage::TransferSrc));
-        bufferDesc.MemoryUsage = EMemoryUsage::GpuOnly;
-        bufferDesc.DebugName   = "SceneMeshlets";
 
-        const ERHIResult result =
-            device->CreateBuffer(bufferDesc, m_SceneMeshlets);
-
-        if (!IsRHISuccess(result))
+        struct FSceneBuffer
         {
-            return result;
+            UInt64            Size;
+            const AnsiChar*   Name;
+            FRHIBufferHandle* Target;
+        };
+
+        const FSceneBuffer sceneBuffers[4] = {
+            { kSceneMeshletBytes, "SceneMeshlets", &m_SceneMeshlets },
+            { kSceneVertexBytes, "SceneVertices", &m_SceneVertices },
+            { kSceneMeshletVertexBytes, "SceneMeshletVertices",
+              &m_SceneMeshletVertices },
+            { kSceneMeshletTriangleBytes, "SceneMeshletTriangles",
+              &m_SceneMeshletTriangles },
+        };
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            FRHIBufferDesc bufferDesc = {};
+            bufferDesc.Size        = sceneBuffers[i].Size;
+            bufferDesc.Usage       = usage;
+            bufferDesc.MemoryUsage = EMemoryUsage::GpuOnly;
+            bufferDesc.DebugName   = sceneBuffers[i].Name;
+
+            const ERHIResult result =
+                device->CreateBuffer(bufferDesc, *sceneBuffers[i].Target);
+
+            if (!IsRHISuccess(result))
+            {
+                return result;
+            }
         }
     }
 
@@ -215,12 +266,38 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
         m_VisibleMeshletBuffers.Add(visibleMeshlets);
         m_CounterBuffers.Add(counters);
         m_CounterReadbacks.Add(readback);
+
+        // 光栅化的间接参数 —— (可见数, 1, 1, 0)
+        //
+        // 与计数器分开一份而不是让光栅化直接读计数器: 计数器的布局是
+        // (可见, 视锥剔, 背面剔, 测试数), 而间接分派要的是 (x, y, z)。
+        // 让两者共用一份就得把诊断计数挪到别的位置, 那会让"这个数是什么"
+        // 完全取决于谁在读它。
+        FRHIBufferHandle rasterArgs;
+
+        {
+            const ERHIResult argsResult =
+                Create(kRasterArgsBytes,
+                       static_cast<EBufferUsage>(
+                           static_cast<UInt32>(EBufferUsage::StorageBuffer) |
+                           static_cast<UInt32>(EBufferUsage::IndirectBuffer) |
+                           static_cast<UInt32>(EBufferUsage::TransferDst)),
+                       EMemoryUsage::GpuOnly, "MeshletRasterArgs",
+                       rasterArgs);
+
+            if (!IsRHISuccess(argsResult))
+            {
+                return argsResult;
+            }
+        }
+
+        m_RasterArgsBuffers.Add(rasterArgs);
     }
 
     // ---- 归零用的拷贝源 ----
     {
         FRHIBufferDesc bufferDesc = {};
-        bufferDesc.Size        = kCounterBytes + kDispatchBytes;
+        bufferDesc.Size = kCounterBytes + kDispatchBytes + kRasterArgsBytes;
         bufferDesc.Usage       = EBufferUsage::TransferSrc;
         bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
         bufferDesc.DebugName   = "MeshletCullResetSource";
@@ -251,6 +328,12 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
             values[5] = 1;
             values[6] = 1;
             values[7] = 1;
+
+            // 光栅化间接参数: x 由可见数拷进来, y/z 恒为 1
+            values[8]  = 0;
+            values[9]  = 1;
+            values[10] = 1;
+            values[11] = 0;
 
             device->UnmapBuffer(m_ResetSource);
         }
@@ -489,8 +572,14 @@ bool FMeshletCullPass::RebuildSceneMeshlets(
 
     m_SourceBuffers.Clear();
     m_SourceBases.Clear();
+    m_SourceVertexBases.Clear();
+    m_SourceMeshletVertexBases.Clear();
+    m_SourceMeshletTriangleBases.Clear();
 
     UInt32 base = 0;
+    UInt32 vertexBase = 0;
+    UInt32 meshletVertexBase = 0;
+    UInt32 meshletTriangleByteBase = 0;
 
     for (SizeType i = 0; i < objects.GetSize(); ++i)
     {
@@ -534,27 +623,75 @@ bool FMeshletCullPass::RebuildSceneMeshlets(
                                           objects[j].MeshletCount);
         }
 
-        if (base + total > kMaxSceneMeshlets)
+        // meshlet 三角形按四字节一组打包上传, 所以字节数要向上取整到 4。
+        // 不取整的话下一个网格的起点落在字上不对齐的位置, 而着色器是按
+        // uint 数组读的 —— 取到的是两个相邻字节拼出来的垃圾。
+        const UInt32 triangleBytes =
+            ((object.MeshletTriangleTotal * 3u) + 3u) & ~3u;
+
+        if (base + total > kMaxSceneMeshlets ||
+            vertexBase + object.VertexCount > kMaxSceneVertices ||
+            meshletVertexBase + object.MeshletVertexTotal >
+                kMaxSceneMeshletVertices ||
+            (meshletTriangleByteBase + triangleBytes) / 4u >
+                kMaxSceneMeshletTriangleWords)
         {
             LIMX_LOG(LogRenderer, Error,
-                     "[MeshletCull] 场景 meshlet 数超过上限 {} — "
-                     "多出的部分不会被剔除也不会被画",
-                     kMaxSceneMeshlets);
+                     "[MeshletCull] 场景数据超过汇总缓冲区上限 — "
+                     "多出的网格不会被剔除也不会被画 "
+                     "(meshlet {}/{}, 顶点 {}/{})",
+                     base + total, kMaxSceneMeshlets,
+                     vertexBase + object.VertexCount, kMaxSceneVertices);
             break;
         }
 
-        FRHIBufferCopyRegion region = {};
-        region.SrcOffset = 0;
-        region.DstOffset = static_cast<UInt64>(base) * sizeof(FMeshlet);
-        region.Size      = static_cast<UInt64>(total) * sizeof(FMeshlet);
+        // 四次拷贝, 四个独立的基址。
+        //
+        // 基址记在实例表里而不是改写数据里的偏移量: 改写要在 GPU 上再跑
+        // 一遍重定位 (或者把数据搬回 CPU), 而基址只是每个实例多三个 uint,
+        // 汇总本身仍然是纯粹的缓冲区拷贝。
+        const auto Copy = [commandBuffer](FRHIBufferHandle source,
+                                          FRHIBufferHandle target,
+                                          UInt64 dstOffset, UInt64 size)
+        {
+            if (size == 0 || !source.IsValid())
+            {
+                return;
+            }
 
-        commandBuffer->CopyBuffer(object.MeshletBuffer, m_SceneMeshlets,
-                                  region);
+            FRHIBufferCopyRegion region = {};
+            region.SrcOffset = 0;
+            region.DstOffset = dstOffset;
+            region.Size      = size;
+
+            commandBuffer->CopyBuffer(source, target, region);
+        };
+
+        Copy(object.MeshletBuffer, m_SceneMeshlets,
+             static_cast<UInt64>(base) * sizeof(FMeshlet),
+             static_cast<UInt64>(total) * sizeof(FMeshlet));
+
+        Copy(object.VertexBuffer, m_SceneVertices,
+             static_cast<UInt64>(vertexBase) * sizeof(FMeshVertex),
+             static_cast<UInt64>(object.VertexCount) * sizeof(FMeshVertex));
+
+        Copy(object.MeshletVertexBuffer, m_SceneMeshletVertices,
+             static_cast<UInt64>(meshletVertexBase) * sizeof(UInt32),
+             static_cast<UInt64>(object.MeshletVertexTotal) * sizeof(UInt32));
+
+        Copy(object.MeshletTriangleBuffer, m_SceneMeshletTriangles,
+             static_cast<UInt64>(meshletTriangleByteBase), triangleBytes);
 
         m_SourceBuffers.Add(object.MeshletBuffer);
         m_SourceBases.Add(base);
+        m_SourceVertexBases.Add(vertexBase);
+        m_SourceMeshletVertexBases.Add(meshletVertexBase);
+        m_SourceMeshletTriangleBases.Add(meshletTriangleByteBase);
 
         base += total;
+        vertexBase += object.VertexCount;
+        meshletVertexBase += object.MeshletVertexTotal;
+        meshletTriangleByteBase += triangleBytes;
     }
 
     m_SceneMeshletCount = base;
@@ -562,14 +699,29 @@ bool FMeshletCullPass::RebuildSceneMeshlets(
 
     // 拷完要挡一次: 下面的计算着色器要读它
     {
-        FRHIBufferMemoryBarrier barrier = {};
-        barrier.SrcAccessMask = EAccessFlags::TransferWrite;
-        barrier.DstAccessMask = EAccessFlags::ShaderRead;
-        barrier.Buffer        = m_SceneMeshlets;
+        FRHIBufferMemoryBarrier barriers[4] = {};
 
-        commandBuffer->PipelineBarrier(EPipelineStageFlags::Transfer,
-                                       EPipelineStageFlags::ComputeShader,
-                                       nullptr, 0, &barrier, 1, nullptr, 0);
+        const FRHIBufferHandle targets[4] = {
+            m_SceneMeshlets, m_SceneVertices, m_SceneMeshletVertices,
+            m_SceneMeshletTriangles,
+        };
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            barriers[i].SrcAccessMask = EAccessFlags::TransferWrite;
+            barriers[i].DstAccessMask = EAccessFlags::ShaderRead;
+            barriers[i].Buffer        = targets[i];
+        }
+
+        // 目标阶段要把顶点着色器与网格着色器也算上 —— 光栅化路径在同一帧
+        // 里读这几份数据。只写 ComputeShader 的话, 验证层会报, 而关掉验证
+        // 层就是竞态: 光栅化读到的可能是拷贝完成之前的内容。
+        commandBuffer->PipelineBarrier(
+            EPipelineStageFlags::Transfer,
+            EPipelineStageFlags::ComputeShader |
+                EPipelineStageFlags::VertexShader |
+                EPipelineStageFlags::MeshShader,
+            nullptr, 0, barriers, 4, nullptr, 0);
     }
 
     LIMX_LOG(LogRenderer, Log,
@@ -599,6 +751,20 @@ void FMeshletCullPass::BuildInstances(const TArray<FRenderObject>& objects)
             continue;
         }
 
+        // 只收**不透明**批次。
+        //
+        // 蒙版材质要 alpha 测试, 而 meshlet 的光栅化路径现在没有地方放它
+        // (材质解析是后面的事)。收进来的话画出的深度会比经典路径**近** ——
+        // 挖掉的那些洞被画成了实心。
+        //
+        // 排除之后本路径的三角形集合是经典深度预通道的**子集**, 于是每个
+        // 像素上本路径的深度只能等于或者远于经典路径的 —— 而那是一条不需要
+        // 任何容差的判据。
+        if (object.BlendMode != EMaterialBlendMode::Opaque)
+        {
+            continue;
+        }
+
         if (m_Instances.GetSize() >= kMaxMeshletInstances)
         {
             LIMX_LOG(LogRenderer, Error,
@@ -606,16 +772,23 @@ void FMeshletCullPass::BuildInstances(const TArray<FRenderObject>& objects)
             break;
         }
 
-        // 这个网格在汇总缓冲区里的起点
+        // 这个网格在四份汇总缓冲区里的起点
         UInt32 meshBase = 0;
-        bool   found    = false;
+        UInt32 vertexBase = 0;
+        UInt32 meshletVertexBase = 0;
+        UInt32 meshletTriangleByteBase = 0;
+
+        bool found = false;
 
         for (SizeType s = 0; s < m_SourceBuffers.GetSize(); ++s)
         {
             if (m_SourceBuffers[s] == object.MeshletBuffer)
             {
-                meshBase = m_SourceBases[s];
-                found    = true;
+                meshBase                = m_SourceBases[s];
+                vertexBase              = m_SourceVertexBases[s];
+                meshletVertexBase       = m_SourceMeshletVertexBases[s];
+                meshletTriangleByteBase = m_SourceMeshletTriangleBases[s];
+                found                   = true;
                 break;
             }
         }
@@ -651,6 +824,11 @@ void FMeshletCullPass::BuildInstances(const TArray<FRenderObject>& objects)
         instance.MeshletRange[1] = object.MeshletCount;
         instance.MeshletRange[2] = static_cast<UInt32>(i);
         instance.MeshletRange[3] = 0;
+
+        instance.BufferBases[0] = vertexBase;
+        instance.BufferBases[1] = meshletVertexBase;
+        instance.BufferBases[2] = meshletTriangleByteBase;
+        instance.BufferBases[3] = 0;
 
         m_Instances.Add(instance);
 
@@ -807,6 +985,15 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
                                   m_DispatchBuffers[frameIndex],
                                   dispatchRegion);
 
+        FRHIBufferCopyRegion rasterRegion = {};
+        rasterRegion.SrcOffset = kCounterBytes + kDispatchBytes;
+        rasterRegion.DstOffset = 0;
+        rasterRegion.Size      = kRasterArgsBytes;
+
+        commandBuffer->CopyBuffer(m_ResetSource,
+                                  m_RasterArgsBuffers[frameIndex],
+                                  rasterRegion);
+
         FRHIBufferMemoryBarrier barriers[2] = {};
 
         for (UInt32 i = 0; i < 2; ++i)
@@ -820,7 +1007,8 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
         barriers[1].Buffer = m_DispatchBuffers[frameIndex];
 
         commandBuffer->PipelineBarrier(EPipelineStageFlags::Transfer,
-                                       EPipelineStageFlags::ComputeShader,
+                                       EPipelineStageFlags::ComputeShader |
+                                           EPipelineStageFlags::Transfer,
                                        nullptr, 0, barriers, 2, nullptr, 0);
     }
 
@@ -920,7 +1108,7 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
         commandBuffer->DispatchIndirect(m_DispatchBuffers[frameIndex], 0);
     }
 
-    // ---- 计数器回读 ----
+    // ---- 可见数 -> 光栅化的间接参数, 以及计数器回读 ----
     {
         FRHIBufferMemoryBarrier barrier = {};
         barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
@@ -930,6 +1118,28 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
         commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
                                        EPipelineStageFlags::Transfer, nullptr,
                                        0, &barrier, 1, nullptr, 0);
+
+        // 只拷第一个 uint (可见数) —— 后面的 y/z 是复位时写进去的 1。
+        //
+        // 整个拷过去的话 y/z 会被诊断计数 (视锥剔了多少、背面剔了多少)
+        // 覆盖, 于是间接分派的 Y 维变成几十, 同一批 meshlet 被画几十遍。
+        FRHIBufferCopyRegion argsRegion = {};
+        argsRegion.SrcOffset = 0;
+        argsRegion.DstOffset = 0;
+        argsRegion.Size      = sizeof(UInt32);
+
+        commandBuffer->CopyBuffer(m_CounterBuffers[frameIndex],
+                                  m_RasterArgsBuffers[frameIndex], argsRegion);
+
+        FRHIBufferMemoryBarrier argsBarrier = {};
+        argsBarrier.SrcAccessMask = EAccessFlags::TransferWrite;
+        argsBarrier.DstAccessMask = EAccessFlags::IndirectCommandRead;
+        argsBarrier.Buffer        = m_RasterArgsBuffers[frameIndex];
+
+        commandBuffer->PipelineBarrier(EPipelineStageFlags::Transfer,
+                                       EPipelineStageFlags::DrawIndirect,
+                                       nullptr, 0, &argsBarrier, 1, nullptr,
+                                       0);
 
         FRHIBufferCopyRegion region = {};
         region.SrcOffset = 0;
@@ -1020,6 +1230,7 @@ void FMeshletCullPass::Shutdown(IRHIDevice* device)
         buffers.Clear();
     };
 
+    DestroyAll(m_RasterArgsBuffers);
     DestroyAll(m_CounterReadbacks);
     DestroyAll(m_CounterBuffers);
     DestroyAll(m_VisibleMeshletBuffers);
@@ -1028,9 +1239,17 @@ void FMeshletCullPass::Shutdown(IRHIDevice* device)
     DestroyAll(m_InstanceSphereBuffers);
     DestroyAll(m_InstanceBuffers);
 
-    if (m_SceneMeshlets.IsValid())
+    FRHIBufferHandle* const sceneBuffers[4] = {
+        &m_SceneMeshlets, &m_SceneVertices, &m_SceneMeshletVertices,
+        &m_SceneMeshletTriangles,
+    };
+
+    for (UInt32 i = 0; i < 4; ++i)
     {
-        device->DestroyBuffer(m_SceneMeshlets);
+        if (sceneBuffers[i]->IsValid())
+        {
+            device->DestroyBuffer(*sceneBuffers[i]);
+        }
     }
 
     if (m_ResetSource.IsValid())
@@ -1057,6 +1276,42 @@ FRHIBufferHandle FMeshletCullPass::GetCounterBuffer(UInt32 frameIndex) const
     return (frameIndex < m_CounterBuffers.GetSize())
                ? m_CounterBuffers[frameIndex]
                : FRHIBufferHandle();
+}
+
+FRHIBufferHandle FMeshletCullPass::GetRasterArgsBuffer(
+    UInt32 frameIndex) const
+{
+    return (frameIndex < m_RasterArgsBuffers.GetSize())
+               ? m_RasterArgsBuffers[frameIndex]
+               : FRHIBufferHandle();
+}
+
+FRHIBufferHandle FMeshletCullPass::GetInstanceBuffer(UInt32 frameIndex) const
+{
+    return (frameIndex < m_InstanceBuffers.GetSize())
+               ? m_InstanceBuffers[frameIndex]
+               : FRHIBufferHandle();
+}
+
+UInt64 FMeshletCullPass::GetInstanceBufferBytes() { return kInstanceBytes; }
+
+UInt64 FMeshletCullPass::GetSceneMeshletBytes() { return kSceneMeshletBytes; }
+
+UInt64 FMeshletCullPass::GetVisibleMeshletBytes()
+{
+    return kVisibleMeshletBytes;
+}
+
+UInt64 FMeshletCullPass::GetSceneVertexBytes() { return kSceneVertexBytes; }
+
+UInt64 FMeshletCullPass::GetSceneMeshletVertexBytes()
+{
+    return kSceneMeshletVertexBytes;
+}
+
+UInt64 FMeshletCullPass::GetSceneMeshletTriangleBytes()
+{
+    return kSceneMeshletTriangleBytes;
 }
 
 } // namespace Limx

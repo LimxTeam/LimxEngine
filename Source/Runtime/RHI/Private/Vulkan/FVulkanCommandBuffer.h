@@ -109,6 +109,12 @@ public:
                               UInt32 drawCount,
                               UInt32 stride) override;
 
+    void DrawMeshTasks(UInt32 groupCountX, UInt32 groupCountY = 1,
+                       UInt32 groupCountZ = 1) override;
+
+    void DrawMeshTasksIndirect(FRHIBufferHandle buffer, UInt64 offset,
+                               UInt32 drawCount, UInt32 stride) override;
+
     // ====================================================================
     // 计算
     // ====================================================================

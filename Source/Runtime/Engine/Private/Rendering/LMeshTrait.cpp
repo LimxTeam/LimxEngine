@@ -204,6 +204,10 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         object.IndexOffset           = 0;
         object.IndexCount            = mesh->IndexCount;
         object.MeshletBuffer         = mesh->MeshletBuffer;
+        object.MeshletVertexBuffer   = mesh->MeshletVertexBuffer;
+        object.MeshletTriangleBuffer = mesh->MeshletTriangleBuffer;
+        object.MeshletVertexTotal    = mesh->MeshletVertexCount;
+        object.MeshletTriangleTotal  = mesh->MeshletTriangleCount;
         object.MeshletOffset         = 0;
         object.MeshletCount          = mesh->MeshletCount;
         object.MaxMeshletRadius      = mesh->MaxMeshletRadius;
@@ -252,6 +256,10 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         object.IndexOffset           = section.IndexOffset;
         object.IndexCount            = section.IndexCount;
         object.MeshletBuffer         = mesh->MeshletBuffer;
+        object.MeshletVertexBuffer   = mesh->MeshletVertexBuffer;
+        object.MeshletTriangleBuffer = mesh->MeshletTriangleBuffer;
+        object.MeshletVertexTotal    = mesh->MeshletVertexCount;
+        object.MeshletTriangleTotal  = mesh->MeshletTriangleCount;
         object.MeshletOffset         = section.MeshletOffset;
         object.MeshletCount          = section.MeshletCount;
         object.MaxMeshletRadius      = section.MaxMeshletRadius;

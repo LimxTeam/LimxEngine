@@ -206,6 +206,16 @@ struct FRenderPassContext
     /// 它总是从那个 storage buffer 取模型矩阵与材质下标。空指针意味着 GPU
     /// 驱动通道自己都没建起来, 那时只能不画。
     const FGpuCullPass* GpuCull = nullptr;
+
+    /// 两级 meshlet 剔除通道 —— 光栅化 meshlet 的通道要读它的输出
+    ///
+    /// 非 const: 光栅化通道要按本帧的场景缓冲区重写自己的描述符, 而那要
+    /// 从剔除通道取句柄。取句柄本身是只读的, 但 const 指针会让"顺手改一下
+    /// 剔除通道的状态"变得不可能 —— 而那正是应当不可能的事。
+    class FMeshletCullPass* MeshletCull = nullptr;
+
+    /// 本帧的相机 —— 光栅化 meshlet 时要与剔除用同一个视图投影矩阵
+    const FCamera* Camera = nullptr;
 };
 
 // ============================================================================

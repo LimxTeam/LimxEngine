@@ -676,9 +676,16 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
                EBufferUsage::ShaderDeviceAddress)
             : EBufferUsage::None;
 
+    // TransferSrc 是给虚拟几何路径用的: 光栅化 meshlet 时顶点要从一份
+    // 场景级的汇总缓冲区里取, 而各网格的顶点缓冲区是那次拷贝的源。
+    const EBufferUsage vertexUsage = static_cast<EBufferUsage>(
+        static_cast<UInt32>(EBufferUsage::VertexBuffer) |
+        static_cast<UInt32>(EBufferUsage::StorageBuffer) |
+        static_cast<UInt32>(EBufferUsage::TransferSrc) |
+        static_cast<UInt32>(accelUsage));
+
     if (!IsRHISuccess(UploadBuffer(meshData.Vertices.GetData(), vertexBytes,
-                                   EBufferUsage::VertexBuffer | accelUsage,
-                                   vertexBuffer)))
+                                   vertexUsage, vertexBuffer)))
     {
         LIMX_LOG(LogRenderCore, Error,
                  "[资源管理器] 顶点缓冲区上传失败: {} 字节", vertexBytes);
@@ -912,21 +919,24 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
         // 拷进一份汇总缓冲区, 而这个缓冲区是那次拷贝的**源**。
         // 漏了的话不会崩, 验证层会报"用途不含 TRANSFER_SRC", 而关掉验证层
         // 就是未定义行为 —— 汇总缓冲区里可能是任意内容。
-        const EBufferUsage meshletHeaderUsage = static_cast<EBufferUsage>(
+        // 三份都要带 TransferSrc: 剔除通道把各网格的 meshlet 数据拷进
+        // 汇总缓冲区, 而它们是那次拷贝的**源**。
+        //
+        // 漏了不会崩, 验证层会报"用途不含 TRANSFER_SRC", 而关掉验证层就是
+        // 未定义行为 —— 汇总缓冲区里可能是任意内容。
+        const EBufferUsage meshletUsage = static_cast<EBufferUsage>(
             static_cast<UInt32>(EBufferUsage::StorageBuffer) |
             static_cast<UInt32>(EBufferUsage::TransferSrc));
 
         const bool uploaded =
             IsRHISuccess(UploadBuffer(meshlets.Meshlets.GetData(),
-                                      headerBytes, meshletHeaderUsage,
+                                      headerBytes, meshletUsage,
                                       meshletBuffer)) &&
             IsRHISuccess(UploadBuffer(meshlets.MeshletVertices.GetData(),
-                                      localVertexBytes,
-                                      EBufferUsage::StorageBuffer,
+                                      localVertexBytes, meshletUsage,
                                       meshletVertexBuffer)) &&
             IsRHISuccess(UploadBuffer(packedTriangles.GetData(), packedBytes,
-                                      EBufferUsage::StorageBuffer,
-                                      meshletTriangleBuffer));
+                                      meshletUsage, meshletTriangleBuffer));
 
         if (!uploaded)
         {

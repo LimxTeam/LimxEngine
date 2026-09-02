@@ -182,6 +182,8 @@ void FPassManager::ExecuteAll(IRHICommandBuffer*     commandBuffer,
     context.LightingDescriptorSet  = info.LightingDescriptorSet;
     context.BindlessDescriptorSet  = info.BindlessDescriptorSet;
     context.GpuCull                = info.GpuCull;
+    context.MeshletCull            = info.MeshletCull;
+    context.Camera                 = info.Camera;
     context.SharedDepthTexture     = m_SharedDepthTexture;
     context.SharedDepthTextureView = m_SharedDepthTextureView;
 

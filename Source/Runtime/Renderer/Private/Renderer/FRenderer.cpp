@@ -71,6 +71,7 @@
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
 #include "Renderer/RenderPass/FMeshletCullPass.h"
+#include "Renderer/RenderPass/FMeshletDepthPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
 #include "Renderer/RenderPass/FRayTracedReflectionPass.h"
@@ -254,6 +255,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_GpuCullPass      = MakeUnique<FGpuCullPass>();
     m_MeshletCullPass  = MakeUnique<FMeshletCullPass>();
+    m_MeshletDepthPass = MakeUnique<FMeshletDepthPass>();
     m_TaaPass          = MakeUnique<FTaaPass>();
     m_GtaoPass         = MakeUnique<FGtaoPass>();
     m_BloomPass        = MakeUnique<FBloomPass>();
@@ -262,6 +264,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager->RegisterPass(m_ShadowAtlasPass.Get());
     m_PassManager->RegisterPass(m_GpuCullPass.Get());
     m_PassManager->RegisterPass(m_MeshletCullPass.Get());
+    m_PassManager->RegisterPass(m_MeshletDepthPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
     m_PassManager->RegisterPass(m_GtaoPass.Get());
     m_PassManager->RegisterPass(m_TaaPass.Get());
@@ -999,6 +1002,8 @@ void FRenderer::RenderFrame()
         execInfo.TranslucentObjects    = &m_TranslucentObjects;
         execInfo.ShadowCasterObjects   = &m_ShadowCasterObjects;
         execInfo.GpuCull               = m_GpuCullPass.Get();
+        execInfo.MeshletCull           = m_MeshletCullPass.Get();
+        execInfo.Camera                = &m_Camera;
         execInfo.ViewProjDescriptorSet = m_DescriptorSets[frameIndex];
         execInfo.PipelineLayout        = m_PipelineLayout;
         execInfo.LightingDescriptorSet = m_LightDescriptorSets[frameIndex];
@@ -2274,6 +2279,27 @@ bool FRenderer::SetMeshletCullEnabled(bool enabled)
     }
 
     m_MeshletCullPass->SetEnabled(enabled);
+
+    return true;
+}
+
+bool FRenderer::SetMeshletDepthEnabled(bool enabled)
+{
+    if (!m_MeshletDepthPass || !m_MeshletCullPass)
+    {
+        return false;
+    }
+
+    // 打开光栅化就连带打开剔除 —— 它的输入就是剔除的输出。
+    //
+    // 不连带的话, 只开光栅化得到的是一张空深度图, 而"通道没跑"与"场景
+    // 里什么都不可见"在那张图上分不开。
+    if (enabled)
+    {
+        m_MeshletCullPass->SetEnabled(true);
+    }
+
+    m_MeshletDepthPass->SetEnabled(enabled);
 
     return true;
 }

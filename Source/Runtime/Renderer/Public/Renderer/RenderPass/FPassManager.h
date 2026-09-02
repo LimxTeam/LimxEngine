@@ -137,6 +137,12 @@ struct FPassExecuteInfo
     /// GPU 驱动剔除的产物 —— 空表示图形通道走逐物体绘制
     const FGpuCullPass* GpuCull = nullptr;
 
+    /// 两级 meshlet 剔除的产物 —— 光栅化 meshlet 的通道要读它
+    class FMeshletCullPass* MeshletCull = nullptr;
+
+    /// 本帧相机 —— 光栅化 meshlet 要与剔除用同一个视图投影矩阵
+    const class FCamera* Camera = nullptr;
+
     /// GPU 计时器 (可空)
     ///
     /// 非空时 ExecuteAll 会把每个 Pass 包进一个计时作用域。放在这里而不是

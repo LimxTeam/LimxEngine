@@ -482,6 +482,19 @@ public:
         }
     };
 
+    /// 网格着色器扩展函数入口
+    struct FMeshShaderFunctions
+    {
+        PFN_vkCmdDrawMeshTasksEXT DrawMeshTasks = nullptr;
+        PFN_vkCmdDrawMeshTasksIndirectEXT DrawMeshTasksIndirect = nullptr;
+    };
+
+    /// 网格着色器扩展函数入口 —— 命令缓冲区要用
+    LIMX_NODISCARD const FMeshShaderFunctions& GetMeshShaderFunctions() const
+    {
+        return m_MeshShaderFunctions;
+    }
+
     LIMX_NODISCARD const FRayTracingFunctions& GetRayTracingFunctions() const
     {
         return m_RayTracingFunctions;
@@ -668,6 +681,13 @@ private:
         m_AccelStructFeatures = {};
     VkPhysicalDeviceRayQueryFeaturesKHR m_RayQueryFeatures = {};
 
+    /// 网格着色器特性 —— 与光追那两个同样挂在特性链尾
+    ///
+    /// 挂之前不需要判扩展在不在: vkGetPhysicalDeviceFeatures2 对不认识的
+    /// 结构体原样跳过并把里面的位全部置零, 于是"不支持"自然表现为特性
+    /// 位为假。
+    VkPhysicalDeviceMeshShaderFeaturesEXT m_MeshShaderFeatures = {};
+
     /// 查询某个设备扩展在物理设备上是否可用 (全字匹配, 非前缀)
     LIMX_NODISCARD bool HasDeviceExtension(const AnsiChar* name) const;
 
@@ -676,6 +696,12 @@ private:
     /// 在初始化时定下来, 之后只读。原来的 IsRayTracingSupported 每次调用都
     /// 重新枚举一遍扩展 —— 既慢, 又只看扩展不看特性。
     bool m_RayTracingAvailable = false;
+
+    /// 网格着色器是否真的可用 —— 扩展启用**且**函数入口全部取到
+    ///
+    /// 与 m_RayTracingAvailable 同一个约定: "打算启用"与"确实能用"是两回事,
+    /// 后者只有在设备创建成功、函数入口也载入之后才算数。
+    bool m_MeshShaderAvailable = false;
 
     /// 光追扩展函数入口
     FRayTracingFunctions m_RayTracingFunctions;
@@ -688,6 +714,11 @@ private:
 
     /// 载入光追扩展函数, 任何一个取不到就把 m_RayTracingAvailable 置假
     void LoadRayTracingFunctions();
+
+    /// 载入网格着色器扩展函数, 取不到就把 m_MeshShaderAvailable 置假
+    void LoadMeshShaderFunctions();
+
+    FMeshShaderFunctions m_MeshShaderFunctions;
 
     /// 加速结构创建的公共部分 (BLAS 与 TLAS 只有几何描述不同)
     ERHIResult CreateAccelStructCommon(

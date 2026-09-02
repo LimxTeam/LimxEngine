@@ -1,0 +1,120 @@
+#version 450
+
+// ============================================================================
+// meshlet_expand.comp — 回退路径: 把可见 meshlet 展开成一条顶点流
+//
+// 网格着色器不是哪都有。没有它的设备上, 同一批 meshlet 要用经典的顶点
+// 着色器画出来 —— 而经典管线只认"顶点流", 不认"一个工作组一个簇"。
+//
+// 这个通道做的就是那个翻译: 一个工作组一个可见 meshlet, 把它的每个三角形
+// 展开成三个 (全局顶点下标, 实例下标) 对, 原子地追加到一条长流里。顶点
+// 着色器再按 gl_VertexIndex 去读那条流。
+//
+// 为什么不生成索引缓冲区: 索引缓冲区还需要一个"当前实例是谁"的来源, 而
+// 那要么是 firstInstance (每个 meshlet 一次绘制调用, 回到了逐物体绘制),
+// 要么是再来一张与索引平行的表 (那就是这里做的事, 只是多绕一圈)。
+//
+// ── 顺序 ──
+//
+// 追加是原子的, 所以顶点流里 meshlet 的先后**每帧都可能不同**。深度写入
+// 对顺序不敏感 (深度测试是 min), 所以这不影响结果。但它意味着"顶点流逐位
+// 相同"不是一条能用的判据 —— 能用的是画出来的深度缓冲区逐位相同。
+// ============================================================================
+
+#include "meshlet_raster_common.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+} meshletBuffer;
+
+// 实例表 —— 要的是它的基址那一栏。
+//
+// meshlet 头里的偏移量是逐网格的, 而这里读的是场景级的汇总缓冲区。
+layout(std430, set = 0, binding = 6) readonly buffer InstanceBuffer {
+    MeshletInstance instances[];
+} instanceBuffer;
+
+layout(std430, set = 0, binding = 1) readonly buffer VisibleMeshletBuffer {
+    uvec2 visible[];
+} visibleBuffer;
+
+layout(std430, set = 0, binding = 2) readonly buffer MeshletVertexBuffer {
+    uint indices[];
+} meshletVertexBuffer;
+
+layout(std430, set = 0, binding = 3) readonly buffer MeshletTriangleBuffer {
+    uint packed[];
+} meshletTriangleBuffer;
+
+// 展开后的顶点流 —— x = 全局顶点下标, y = 实例下标
+layout(std430, set = 0, binding = 4) writeonly buffer ExpandedBuffer {
+    uvec2 vertices[];
+} expandedBuffer;
+
+// 间接绘制参数 —— 与 VkDrawIndirectCommand 逐字段一致
+layout(std430, set = 0, binding = 5) buffer DrawArgsBuffer {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+} drawArgs;
+
+layout(push_constant) uniform Params {
+    // x = 可见 meshlet 数, y = 顶点流容量 (以顶点计), z/w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uint slot = gl_WorkGroupID.x;
+
+    if (slot >= pc.params.x)
+    {
+        return;
+    }
+
+    const uvec2 entry = visibleBuffer.visible[slot];
+
+    const Meshlet meshlet = meshletBuffer.meshlets[entry.y];
+
+    const MeshletInstance instance = instanceBuffer.instances[entry.x];
+
+    const uint vertexBase          = instance.bufferBases.x;
+    const uint meshletVertexBase   = instance.bufferBases.y;
+    const uint meshletTriangleBase = instance.bufferBases.z;
+
+    for (uint t = gl_LocalInvocationID.x; t < meshlet.triangleCount;
+         t += gl_WorkGroupSize.x)
+    {
+        // 一次原子分配三个顶点 —— 分三次的话同一个三角形的三个顶点会
+        // 被别的三角形插进来, 于是画出来的是一堆互相穿插的碎片。
+        const uint base = atomicAdd(drawArgs.vertexCount, 3u);
+
+        if (base + 3u > pc.params.y)
+        {
+            continue;
+        }
+
+        const uint byteBase =
+            meshletTriangleBase + (meshlet.triangleOffset + t) * 3u;
+
+        for (uint k = 0u; k < 3u; ++k)
+        {
+            const uint byteIndex = byteBase + k;
+
+            const uint local = MeshletUnpackIndex(
+                meshletTriangleBuffer.packed[byteIndex >> 2], byteIndex);
+
+            const uint globalVertex =
+                meshletVertexBuffer.indices[meshletVertexBase +
+                                            meshlet.vertexOffset + local];
+
+            // 展开时就把顶点下标折算到场景级 —— 顶点着色器那边就不必再
+            // 知道基址这回事。两处都折算的话会加两遍。
+            expandedBuffer.vertices[base + k] =
+                uvec2(vertexBase + globalVertex, entry.x);
+        }
+    }
+}

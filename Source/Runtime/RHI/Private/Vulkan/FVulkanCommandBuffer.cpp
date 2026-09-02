@@ -429,6 +429,53 @@ void FVulkanCommandBuffer::DrawIndexedIndirect(
 }
 
 // ============================================================================
+// 网格着色器绘制
+// ============================================================================
+
+void FVulkanCommandBuffer::DrawMeshTasks(UInt32 groupCountX,
+                                         UInt32 groupCountY,
+                                         UInt32 groupCountZ)
+{
+    const auto& functions = m_Device->GetMeshShaderFunctions();
+
+    // 不支持时报错并返回, 而不是静默返回。
+    //
+    // 静默返回的后果是画面上少一整条渲染路径, 而那与"这条路径没启用"
+    // 长得一模一样 —— 又一条失败会落在通过上的路。
+    if (functions.DrawMeshTasks == nullptr)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] DrawMeshTasks — 设备不支持网格着色器, 本次绘制被丢弃");
+        return;
+    }
+
+    functions.DrawMeshTasks(m_CommandBuffer, groupCountX, groupCountY,
+                            groupCountZ);
+}
+
+void FVulkanCommandBuffer::DrawMeshTasksIndirect(FRHIBufferHandle buffer,
+                                                 UInt64 offset,
+                                                 UInt32 drawCount,
+                                                 UInt32 stride)
+{
+    const auto& functions = m_Device->GetMeshShaderFunctions();
+
+    if (functions.DrawMeshTasksIndirect == nullptr)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] DrawMeshTasksIndirect — 设备不支持网格着色器, "
+            "本次绘制被丢弃");
+        return;
+    }
+
+    VkBuffer vkBuffer = m_Device->GetVkBuffer(buffer);
+
+    functions.DrawMeshTasksIndirect(m_CommandBuffer, vkBuffer,
+                                    static_cast<VkDeviceSize>(offset),
+                                    drawCount, stride);
+}
+
+// ============================================================================
 // 计算
 // ============================================================================
 

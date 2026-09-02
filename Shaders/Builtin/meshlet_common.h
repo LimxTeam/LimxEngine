@@ -46,6 +46,14 @@ struct MeshletInstance
 
     // x = meshlet 起点, y = meshlet 个数, z = 源对象下标, w = 保留
     uvec4 meshletRange;
+
+    // 这个实例所属网格在三份汇总缓冲区里的起点:
+    //   x = 顶点, y = meshlet 局部顶点表, z = meshlet 三角形 (以字节计)
+    //
+    // 用**逐实例基址**而不是在汇总时改写数据里的偏移量。改写要在 GPU 上
+    // 再跑一遍重定位 (或者把数据搬回 CPU), 而基址只是每个实例多三个 uint,
+    // 汇总本身仍然是纯粹的缓冲区拷贝。
+    uvec4 bufferBases;
 };
 
 /// 法线锥无效的标记 —— 与 C++ 的 kInvalidConeCosine 同值

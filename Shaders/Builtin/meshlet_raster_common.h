@@ -1,0 +1,67 @@
+// ============================================================
+// 文件名称：meshlet_raster_common.h
+// 创建时间：2026-09-02
+// 创建者  ：LimxTeam
+// 设计哲学：网格着色器路径与计算回退路径必须**逐位**画出同一张图。
+//          两条路径的顶点变换、局部索引解包、三角形取顶点, 全部只有
+//          这一份实现 —— 各写各的话, 判据比的是"两个实现一不一样",
+//          而两个实现可以一起错。
+//
+//          顶点变换的**运算顺序**也在这里钉死: (viewProj * model) * p,
+//          与 depth_only.vert 逐字相同。写成 viewProj * (model * p) 在
+//          数学上等价而在浮点上不等价, 于是深度会差一两个最低位 ——
+//          那不会崩、不会报错, 只会让"与经典路径逐像素相同"这条判据
+//          永远差那么一点点, 而没人说得清是哪里的问题。
+// 功能描述：meshlet 的 GPU 端解包与顶点变换。
+// ============================================================
+
+#ifndef LIMX_MESHLET_RASTER_COMMON_H
+#define LIMX_MESHLET_RASTER_COMMON_H
+
+#include "meshlet_common.h"
+
+// ============================================================================
+// 顶点。与 FMeshVertex 逐字段一致 (72 字节)
+//
+// 只声明本路径要用的前两个字段是不行的 —— 数组步长由结构体大小决定,
+// 少声明一个字段就把步长算小了, 于是取到的是别人的数据。
+// ============================================================================
+
+struct MeshletVertex
+{
+    vec3 position;
+    vec3 normal;
+    vec4 tangent;
+    vec2 texCoord0;
+    vec2 texCoord1;
+    vec4 color;
+};
+
+/// 把实例的 3x4 行主序变换补成 mat4
+///
+/// GLSL 的 mat4 构造函数吃的是**列**向量, 而这三行是行 —— 所以这里是
+/// 逐元素填, 不是把三行直接塞进去。塞进去的话得到的是转置, 而单位变换
+/// 下转置又是恒等的, 于是只有旋转过的物体才出错。
+mat4 MeshletInstanceMatrix(MeshletInstance instance)
+{
+    return mat4(
+        vec4(instance.transformRow0.x, instance.transformRow1.x,
+             instance.transformRow2.x, 0.0),
+        vec4(instance.transformRow0.y, instance.transformRow1.y,
+             instance.transformRow2.y, 0.0),
+        vec4(instance.transformRow0.z, instance.transformRow1.z,
+             instance.transformRow2.z, 0.0),
+        vec4(instance.transformRow0.w, instance.transformRow1.w,
+             instance.transformRow2.w, 1.0));
+}
+
+/// 局部索引缓冲区按 UInt32 打包, 每个字节一个局部下标
+///
+/// GLSL 里没有字节寻址的 storage buffer (要 GL_EXT_shader_8bit_storage),
+/// 所以 C++ 侧按四个一组打包上传, 这里移位取回。
+uint MeshletUnpackIndex(uint packed, uint byteIndex)
+{
+    return (packed >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+}
+
+#endif // LIMX_MESHLET_RASTER_COMMON_H

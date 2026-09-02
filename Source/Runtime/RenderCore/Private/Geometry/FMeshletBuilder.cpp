@@ -788,6 +788,11 @@ FMeshletStatistics FMeshletBuilder::ComputeStatistics(
         totalTriangles += meshlet.TriangleCount;
         totalVertices += meshlet.VertexCount;
 
+        statistics.MaxTriangles =
+            FMath::Max(statistics.MaxTriangles, meshlet.TriangleCount);
+        statistics.MaxVertices =
+            FMath::Max(statistics.MaxVertices, meshlet.VertexCount);
+
         radiusSum += static_cast<Float64>(meshlet.BoundingSphere.W);
 
         if (meshlet.NormalCone.W > kInvalidConeCosine)

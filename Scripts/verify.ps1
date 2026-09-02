@@ -898,6 +898,33 @@ Invoke-Step 'Meshlet 剔除 (两级与 CPU 参考实现逐条相同)' -RequiresG
     Invoke-Engine '--showcase --frames 6 --warmup 2 --meshlet-cull-check'
 }
 
+# meshlet 光栅化 —— 需要真实 GPU 且需要网格着色器。
+#
+# 补的是 Day 9 明写下来的欠账: 那一天的判据全是数值判据, 而数值判据**证明
+# 不了画面**。这一天 meshlet 真的被光栅化了, 于是可以问画面。
+#
+# 四条判据:
+#   网格着色器路径与计算展开回退路径画出的深度**逐位相同** (不留容差);
+#   每个像素上 meshlet 路径的深度 >= 经典深度预通道的 (前者的三角形集合
+#     是后者的子集 —— 只画不透明批次);
+#   恰好相等的像素比例 —— 场景里没有蒙版材质时要求**处处相同**;
+#   网格着色器声明的输出上限容得下构建器实际产出的最大 meshlet。
+#
+# 跑**两个**场景:
+#   墙角  没有蒙版材质, 所以"处处逐位相同"那一档真的会跑 (实测
+#         921600/921600);
+#   综合  两个网格 (逐实例基址非零)、多实例, 所以"基址漏加"这一类缺陷
+#         才显形 —— 而它正是这条判据当场抓到的那个。
+#
+# 变异 12/12。
+Invoke-Step 'Meshlet 光栅化 (墙角: 与经典深度处处逐位相同)' -RequiresGpu {
+    Invoke-Engine '--corner-scene --frames 8 --warmup 3 --meshlet-depth-check'
+}
+
+Invoke-Step 'Meshlet 光栅化 (综合: 两条路径逐位相同)' -RequiresGpu {
+    Invoke-Engine '--showcase --frames 8 --warmup 3 --meshlet-depth-check'
+}
+
 # 图像回归 (综合场景) —— 需要真实 GPU。
 #
 # 与演示场景那一条同一个机制, 但覆盖面完全不同: 演示场景只有一盏方向光与

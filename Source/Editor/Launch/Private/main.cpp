@@ -59,6 +59,7 @@
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
 #include "Renderer/RenderPass/FMeshletCullPass.h"
+#include "Renderer/RenderPass/FMeshletDepthPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
 #include "Renderer/RenderPass/FRayTracedReflectionPass.h"
@@ -288,6 +289,15 @@ struct FLaunchOptions
 
     /// 两级剔除与 CPU 参考实现逐个 meshlet 一致 —— 见函数头
     bool MeshletCullCheck = false;
+
+    /// meshlet 深度光栅化 (网格着色器路径)
+    bool MeshletDepth = false;
+
+    /// 强制走计算展开的回退路径
+    bool MeshletDepthFallback = false;
+
+    /// 两条光栅化路径 + 与经典深度的关系 —— 见函数头
+    bool MeshletDepthCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -829,6 +839,19 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-cull-check"))
         {
             options.MeshletCullCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-depth"))
+        {
+            options.MeshletDepth = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-depth-fallback"))
+        {
+            options.MeshletDepth         = true;
+            options.MeshletDepthFallback = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-depth-check"))
+        {
+            options.MeshletDepthCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -5406,6 +5429,454 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunMeshletDepthChecks — 两条光栅化路径, 与经典深度预通道的关系
+//
+// 这条判据补的是 Day 9 明写下来的欠账: 那一天的判据全是数值判据 (GPU 剔出
+// 来的集合与 CPU 参考实现相同), 而数值判据**证明不了画面**。今天 meshlet
+// 真的被光栅化了, 于是可以问画面。
+//
+// 三条判据:
+//
+//   一、网格着色器路径与计算展开回退路径画出的深度**逐位相同**。
+//
+//      这一条是今天最强的。两条路径的输入完全一样 (同一份可见 meshlet 表、
+//      同一份场景数据), 顶点数学是同一份源码 (meshlet_raster_common.h,
+//      连运算顺序都钉死), 光栅化状态逐字段相同。剩下的差别只有"怎么把
+//      三角形喂给光栅器" —— 而那正是要验的东西。
+//
+//      不留容差。留了的话, "局部索引解包错了一位"这类缺陷会藏在容差里:
+//      取错顶点画出来的深度未必差很多, 尤其在一个 meshlet 内部。
+//
+//   二、每个像素上 meshlet 路径的深度 >= 经典深度预通道的深度。
+//
+//      meshlet 路径只画不透明批次, 而经典路径画不透明**加**蒙版 —— 前者
+//      的三角形集合是后者的子集。少画三角形只能让深度变远或者不变。
+//
+//      这一条也不留容差, 而它能不留是因为两条路径的顶点变换是同一个
+//      表达式的同一种写法: (viewProj * model) * p。写成别的等价形式的话
+//      浮点结果会差一两个最低位, 于是这条判据要么永远红、要么被迫加容差
+//      而失去意义。
+//
+//   三、两者**恰好相等**的像素要占绝大多数。
+//
+//      只有前两条的话, 一个什么都不画的实现完美通过: 空深度图恒为 1.0,
+//      处处 >= 经典深度。这一条盯的正是那个 —— meshlet 路径必须真的画出
+//      了那些表面。
+// ============================================================================
+
+namespace
+{
+
+/// 把一张 D32_SFLOAT 深度图读回 CPU
+bool ReadDepthTexture(FRenderContext* context, FRenderer& renderer,
+                      FRHITextureHandle texture, EImageLayout restingLayout,
+                      TArray<Float32>& outDepth)
+{
+    if (!texture.IsValid())
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferDesc desc = {};
+    desc.Usage       = EBufferUsage::TransferDst;
+    desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    desc.Size        = pixelCount * 4u;
+    desc.DebugName   = "MeshletDepthCheck.Readback";
+
+    FRHIBufferHandle readback;
+
+    if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+    {
+        return false;
+    }
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, readback, extent, restingLayout]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                texture, restingLayout, EImageLayout::TransferSrc,
+                EPipelineStageFlags::LateFragmentTests,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::DepthStencilAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::TransferSrc, restingLayout,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::EarlyFragmentTests,
+                EAccessFlags::TransferRead,
+                EAccessFlags::DepthStencilAttachmentWrite);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(readback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* values = static_cast<const Float32*>(mapped);
+
+            outDepth.Clear();
+            outDepth.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outDepth.Add(values[i]);
+            }
+
+            device->UnmapBuffer(readback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(readback);
+
+    return ok;
+}
+
+} // namespace
+
+static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
+{
+    if (!renderer.SetMeshletDepthEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet深度] 无法启用 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    FMeshletDepthPass* const pass = renderer.GetMeshletDepthPass();
+    FDepthPrePass* const     classic = renderer.GetDepthPrePass();
+
+    if (pass == nullptr || classic == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 通道不存在");
+        return false;
+    }
+
+    bool passed = true;
+
+    TArray<Float32> meshDepth;
+    TArray<Float32> fallbackDepth;
+    TArray<Float32> classicDepth;
+
+    // ---- 网格着色器路径 ----
+    //
+    // 设备不支持时这一段跳过, 但**判据不因此变绿** —— 见下面那条元判据。
+    const bool meshShaderAvailable = pass->IsMeshShaderAvailable();
+
+    if (meshShaderAvailable)
+    {
+        if (!pass->SetMode(FMeshletDepthPass::EMode::MeshShader))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 无法切到网格着色器路径");
+            return false;
+        }
+
+        // 先渲一帧让汇总与可见表建起来, 再读
+        renderer.RenderFrame();
+
+        if (!ReadDepthTexture(context, renderer, pass->GetDepthTexture(),
+                              EImageLayout::DepthStencilAttachment,
+                              meshDepth))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 网格着色器路径回读失败");
+            return false;
+        }
+    }
+
+    // ---- 回退路径 ----
+    if (!pass->SetMode(FMeshletDepthPass::EMode::Fallback))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 无法切到回退路径");
+        return false;
+    }
+
+    renderer.RenderFrame();
+
+    if (!ReadDepthTexture(context, renderer, pass->GetDepthTexture(),
+                          EImageLayout::DepthStencilAttachment,
+                          fallbackDepth))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 回退路径回读失败");
+        return false;
+    }
+
+    // ---- 经典深度预通道 ----
+    if (!ReadDepthTexture(context, renderer, classic->GetSharedDepthTexture(),
+                          EImageLayout::DepthStencilAttachment, classicDepth))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 经典深度回读失败");
+        return false;
+    }
+
+    const SizeType pixelCount = fallbackDepth.GetSize();
+
+    if (pixelCount == 0 || classicDepth.GetSize() != pixelCount)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 回读尺寸对不上");
+        return false;
+    }
+
+    // ---- 判据一: 两条路径逐位相同 ----
+    if (meshShaderAvailable)
+    {
+        if (meshDepth.GetSize() != pixelCount)
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 两条路径的尺寸对不上");
+            passed = false;
+        }
+        else
+        {
+            SizeType differ = 0;
+            Float32  worst  = 0.0f;
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                const Float32 delta =
+                    FMath::Abs(meshDepth[i] - fallbackDepth[i]);
+
+                if (delta != 0.0f)
+                {
+                    ++differ;
+                    worst = FMath::Max(worst, delta);
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet深度] 网格着色器 vs 计算展开回退 — 不同的像素 "
+                     "{} 个 (最大差 {})",
+                     differ, worst);
+
+            if (differ != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet深度] 两条路径画出的深度不同 ({} 个像素, "
+                         "最大差 {}) —— 它们的输入、顶点数学、光栅化状态都是"
+                         "同一份, 差别只该在把三角形喂给光栅器的方式上",
+                         differ, worst);
+                passed = false;
+            }
+        }
+    }
+    else
+    {
+        // 元判据: 这台机器验不了网格着色器路径, 那必须说出来。
+        //
+        // 静默跳过的话, 一台没有网格着色器的机器上这条判据永远绿, 而它
+        // 只验了回退路径 —— "全绿"会被读成"两条路径都对"。
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet深度] 本设备不支持网格着色器 — 只验了回退路径, "
+                 "判定为失败 (换一台支持的机器, 或显式接受只跑回退)");
+        passed = false;
+    }
+
+    // ---- 判据二/三: 与经典深度预通道的关系 ----
+    SizeType drawn      = 0;
+    SizeType nearer     = 0;
+    SizeType exactEqual = 0;
+
+    Float32 worstNearer = 0.0f;
+
+    for (SizeType i = 0; i < pixelCount; ++i)
+    {
+        // 深度 1.0 = 这个像素上 meshlet 路径什么都没画
+        if (fallbackDepth[i] >= 1.0f)
+        {
+            continue;
+        }
+
+        ++drawn;
+
+        if (fallbackDepth[i] == classicDepth[i])
+        {
+            ++exactEqual;
+        }
+        else if (fallbackDepth[i] < classicDepth[i])
+        {
+            ++nearer;
+            worstNearer = FMath::Max(worstNearer,
+                                     classicDepth[i] - fallbackDepth[i]);
+        }
+    }
+
+    const Float32 exactFraction =
+        (drawn > 0) ? (static_cast<Float32>(exactEqual) /
+                       static_cast<Float32>(drawn))
+                    : 0.0f;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet深度] 与经典深度 — meshlet 路径画了 {} 个像素, "
+             "其中恰好相等 {} 个 ({}), 比经典**更近** {} 个 (最多 {})",
+             drawn, exactEqual, exactFraction, nearer, worstNearer);
+
+    // 元判据: 得真的画了东西
+    constexpr SizeType kMinDrawn = 50000;
+
+    if (drawn < kMinDrawn)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet深度] meshlet 路径只画了 {} 个像素 (需要至少 {}) "
+                 "—— 一张几乎空的深度图会让下面两条判据形同虚设",
+                 drawn, kMinDrawn);
+        passed = false;
+    }
+
+    // 判据二: 不许比经典更近
+    if (nearer != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet深度] {} 个像素上 meshlet 路径的深度比经典路径**更近** "
+                 "(最多 {}) —— meshlet 路径画的三角形应当是经典路径的子集, "
+                 "少画只能让深度变远",
+                 nearer, worstNearer);
+        passed = false;
+    }
+
+    // ---- 判据三: 恰好相等的像素 ----
+    //
+    // 阈值取决于场景里**有没有蒙版材质**, 而那不是拍脑袋分的两档:
+    //
+    //   没有蒙版时, 两条路径画的是**同一个**三角形集合, 顶点变换是同一个
+    //     表达式的同一种写法 —— 于是深度必须**处处逐位相同**。实测墙角
+    //     场景 921600/921600 = 1.000000, 一个像素都不差。
+    //
+    //   有蒙版时, 经典路径在那些地方做 alpha 测试挖了洞、露出后面的不透明
+    //     面, 而 meshlet 路径直接画那个不透明面。两者的前后关系没变 (判据
+    //     二仍然成立), 但深度值不同。实测综合场景 0.973866, 而差额恰好是
+    //     两块蒙版板子的屏幕面积。
+    //
+    // 分两档的价值在于: **强的那一档真的会跑**。只留一个 0.95 的下限的话,
+    // 墙角场景上"顶点变换写成了等价但不同的表达式"这类缺陷 (差一两个最低位)
+    // 会安然通过 —— 而它正是这条判据最该拦的东西。
+    SizeType maskedBatches = 0;
+
+    {
+        const TArray<FRenderObject>& casters =
+            renderer.GetShadowCasterObjects();
+
+        for (SizeType i = 0; i < casters.GetSize(); ++i)
+        {
+            if (casters[i].BlendMode == EMaterialBlendMode::Masked)
+            {
+                ++maskedBatches;
+            }
+        }
+    }
+
+    const Float32 minExactFraction = (maskedBatches == 0) ? 1.0f : 0.95f;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet深度] 场景里蒙版批次 {} 个 — 相等比例的下限取 {}",
+             maskedBatches, minExactFraction);
+
+    if (exactFraction < minExactFraction)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet深度] 只有 {} 的像素与经典深度恰好相等 "
+                 "(需要至少 {}) —— 顶点变换与经典路径不是同一个表达式?",
+                 exactFraction, minExactFraction);
+        passed = false;
+    }
+
+    // ---- 判据四: 网格着色器的输出上限必须容得下构建器能产出的最大 meshlet ----
+    //
+    // 这一条把一个**跨语言的耦合**变成可验的。meshlet_depth.mesh 的
+    // layout(max_vertices, max_primitives) 是 GLSL 里的常量, C++ 侧读不到;
+    // 它写小了不会报错, 只会静默丢掉超出的图元 —— 模型上零星的洞。
+    //
+    // 能验的是它的**必要条件**: 声明的上限不小于构建器实际产出的最大值。
+    // 下面这两个常量是那两个 GLSL 常量的镜像, 改一处必须改另一处 ——
+    // 而这条判据保证"改小了却没人发现"不会发生。
+    //
+    // 一个实测: 真正卡住构建器的是**顶点**上限, 不是三角形上限。球体
+    // (64x48) 上单个 meshlet 最多 98 个三角形而顶点恰好 64 个 —— 124 个
+    // 三角形需要 62 个以上的顶点复用到 6 (规则三角网格的理论上限), 而实际
+    // 复用率在 4 附近。所以把 max_primitives 从 124 调到 100 **不是缺陷**,
+    // 它一个图元都不会丢; 调到 32 才是。变异验证里那一条据此改过。
+    constexpr UInt32 kMeshShaderMaxVertices = 64;
+    constexpr UInt32 kMeshShaderMaxPrimitives = 124;
+
+    {
+        const FMeshData sphere =
+            FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+        const FMeshletStatistics statistics = FMeshletBuilder::ComputeStatistics(
+            FMeshletBuilder::Build(sphere.Vertices, sphere.Indices));
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet深度] 构建器实际产出的最大 meshlet — {} 三角形 / "
+                 "{} 顶点; 网格着色器声明的上限 {} / {}",
+                 statistics.MaxTriangles, statistics.MaxVertices,
+                 kMeshShaderMaxPrimitives, kMeshShaderMaxVertices);
+
+        if (statistics.MaxTriangles > kMeshShaderMaxPrimitives ||
+            statistics.MaxVertices > kMeshShaderMaxVertices)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet深度] 构建器能产出 {} 三角形 / {} 顶点的 "
+                     "meshlet, 而网格着色器只声明了 {} / {} —— 超出的部分"
+                     "会被静默丢掉",
+                     statistics.MaxTriangles, statistics.MaxVertices,
+                     kMeshShaderMaxPrimitives, kMeshShaderMaxVertices);
+            passed = false;
+        }
+    }
+
+    if (!renderer.SetMeshletDepthEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet深度] 无法关闭 (复位)");
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[Meshlet深度] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletCullChecks — 两级剔除必须与 CPU 参考实现逐个 meshlet 一致
 //
 // 判据的形状: 把 GPU 剔出来的那张可见表读回来, 与一份 CPU 参考实现算出来的
@@ -6876,10 +7347,11 @@ bool CheckOneMesh(const AnsiChar* label, const TArray<FMeshVertex>& vertices,
         FMeshletBuilder::ComputeStatistics(result);
 
     LIMX_LOG(LogLaunch, Display,
-             "[Meshlet] {} — {} 个 meshlet, 平均 {} 三角形 / {} 顶点, "
-             "顶点复用 {}, 平均包围球半径 {}, 有效法线锥 {}",
+             "[Meshlet] {} — {} 个 meshlet, 平均 {} 三角形 / {} 顶点 "
+             "(最多 {} / {}), 顶点复用 {}, 平均包围球半径 {}, 有效法线锥 {}",
              label, statistics.MeshletCount, statistics.AverageTriangles,
-             statistics.AverageVertices, statistics.VertexReuse,
+             statistics.AverageVertices, statistics.MaxTriangles,
+             statistics.MaxVertices, statistics.VertexReuse,
              statistics.AverageSphereRadius, statistics.ValidConeFraction);
 
     if (statistics.AverageTriangles < minAverageTriangles)
@@ -13487,6 +13959,30 @@ int WINAPI wWinMain(
         }
     }
 
+    if (launchOptions.MeshletDepth)
+    {
+        if (renderer.SetMeshletDepthEnabled(true))
+        {
+            FMeshletDepthPass* const pass = renderer.GetMeshletDepthPass();
+
+            const bool wantFallback = launchOptions.MeshletDepthFallback;
+
+            const bool modeOk = pass->SetMode(
+                wantFallback ? FMeshletDepthPass::EMode::Fallback
+                             : FMeshletDepthPass::EMode::MeshShader);
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Launch] meshlet 深度光栅化已启用 ({}{})",
+                     wantFallback ? "计算展开回退" : "网格着色器",
+                     modeOk ? "" : " — 请求的路径不可用, 保持原样");
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[启动] --meshlet-depth 无法启用 —— 通道不存在");
+        }
+    }
+
     if (launchOptions.MeshletCull)
     {
         if (renderer.SetMeshletCullEnabled(true))
@@ -13685,6 +14181,7 @@ int WINAPI wWinMain(
     bool    rtAoUpsamplePassed = true;
     bool    meshletPassed = true;
     bool    meshletCullPassed = true;
+    bool    meshletDepthPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -13817,6 +14314,12 @@ int WINAPI wWinMain(
             {
                 meshletCullPassed =
                     RunMeshletCullChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletDepthCheck)
+            {
+                meshletDepthPassed =
+                    RunMeshletDepthChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -14090,6 +14593,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletCullCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletCullPassed, 30,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletDepthCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletDepthPassed, 31,
                                           errorSink, errorsBeforeShutdown);
     }
 

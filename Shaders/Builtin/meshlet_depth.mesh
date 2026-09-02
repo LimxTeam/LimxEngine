@@ -1,0 +1,131 @@
+#version 450
+
+// ============================================================================
+// meshlet_depth.mesh — 网格着色器路径: 一个工作组画一个 meshlet
+//
+// 输入是剔除通道压实出来的 (实例, meshlet) 对; 一个工作组消费一条。
+// 输出顶点的裁剪空间位置与图元的三个下标 —— 深度预通道不需要别的。
+//
+// ── 为什么工作组是 64 而不是 128 ──
+//
+// 一个 meshlet 最多 64 个顶点、124 个三角形。工作组开 64 时, 顶点是一趟
+// 做完, 三角形要两趟 (64 + 60)。开 128 的话三角形一趟做完而顶点有一半
+// 线程闲着 —— 而顶点那一趟做的事 (一次 mat4 乘法) 比三角形那一趟 (三次
+// 字节解包) 贵得多。
+//
+// ── 输出上限必须是常量, 而且必须与 C++ 侧的上限一致 ──
+//
+// max_vertices / max_primitives 写小了会静默丢图元 (超出的部分不画),
+// 写大了浪费驱动预留的输出内存。两处不一致的表现是"某些 meshlet 少了
+// 几个三角形", 而那在画面上是模型上零星的洞。
+// ============================================================================
+
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "meshlet_raster_common.h"
+
+layout(local_size_x = 64) in;
+
+layout(triangles, max_vertices = 64, max_primitives = 124) out;
+
+layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
+    MeshletInstance instances[];
+} instanceBuffer;
+
+layout(std430, set = 0, binding = 1) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+} meshletBuffer;
+
+// 剔除通道压实出来的 (实例下标, meshlet 全局下标) 对
+layout(std430, set = 0, binding = 2) readonly buffer VisibleMeshletBuffer {
+    uvec2 visible[];
+} visibleBuffer;
+
+// 全场景的顶点 —— 与 meshlet 的局部顶点表配合使用
+layout(scalar, set = 0, binding = 3) readonly buffer VertexBuffer {
+    MeshletVertex vertices[];
+} vertexBuffer;
+
+// meshlet 的局部顶点表 (全局顶点下标)
+layout(std430, set = 0, binding = 4) readonly buffer MeshletVertexBuffer {
+    uint indices[];
+} meshletVertexBuffer;
+
+// meshlet 的三角形局部索引 (每四个字节打包成一个 uint)
+layout(std430, set = 0, binding = 5) readonly buffer MeshletTriangleBuffer {
+    uint packed[];
+} meshletTriangleBuffer;
+
+layout(row_major, push_constant) uniform Params {
+    mat4 viewProj;
+
+    // x = 可见 meshlet 数, y/z/w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uint slot = gl_WorkGroupID.x;
+
+    if (slot >= pc.params.x)
+    {
+        SetMeshOutputsEXT(0, 0);
+        return;
+    }
+
+    const uvec2 entry = visibleBuffer.visible[slot];
+
+    const MeshletInstance instance = instanceBuffer.instances[entry.x];
+    const Meshlet meshlet = meshletBuffer.meshlets[entry.y];
+
+    SetMeshOutputsEXT(meshlet.vertexCount, meshlet.triangleCount);
+
+    // 与 depth_only.vert 逐字相同的运算顺序: (viewProj * model) * p。
+    // 写成 viewProj * (model * p) 数学上等价而浮点上不等价。
+    const mat4 modelViewProj = pc.viewProj * MeshletInstanceMatrix(instance);
+
+    // meshlet 头里的偏移量是**逐网格**的 —— 它们指向那个网格自己的
+    // 局部顶点表与三角形数组。而这里读的是**场景级**的汇总缓冲区,
+    // 所以每一处都要加上该实例所属网格的基址。
+    //
+    // 漏掉的后果: 第一个网格 (基址为 0) 一切正常, 后面每个网格都去读
+    // 第一个网格的数据。判据把这件事逮了个正着 —— 两条路径都错, 但错的
+    // 方式不同 (一条按可见表顺序读, 另一条按原子追加顺序), 于是"两条
+    // 路径逐位相同"报出一万九千个不同的像素。
+    const uint vertexBase          = instance.bufferBases.x;
+    const uint meshletVertexBase   = instance.bufferBases.y;
+    const uint meshletTriangleBase = instance.bufferBases.z;
+
+    for (uint i = gl_LocalInvocationID.x; i < meshlet.vertexCount;
+         i += gl_WorkGroupSize.x)
+    {
+        const uint globalVertex =
+            meshletVertexBuffer.indices[meshletVertexBase +
+                                        meshlet.vertexOffset + i];
+
+        gl_MeshVerticesEXT[i].gl_Position =
+            modelViewProj *
+            vec4(vertexBuffer.vertices[vertexBase + globalVertex].position,
+                 1.0);
+    }
+
+    for (uint t = gl_LocalInvocationID.x; t < meshlet.triangleCount;
+         t += gl_WorkGroupSize.x)
+    {
+        const uint byteBase =
+            meshletTriangleBase + (meshlet.triangleOffset + t) * 3u;
+
+        uvec3 corner;
+
+        for (uint k = 0u; k < 3u; ++k)
+        {
+            const uint byteIndex = byteBase + k;
+
+            corner[k] = MeshletUnpackIndex(
+                meshletTriangleBuffer.packed[byteIndex >> 2], byteIndex);
+        }
+
+        gl_PrimitiveTriangleIndicesEXT[t] = corner;
+    }
+}

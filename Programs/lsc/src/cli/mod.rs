@@ -146,7 +146,7 @@ pub enum Commands {
         recursive: bool,
 
         /// 文件扩展名过滤 (逗号分隔)
-        #[arg(long, default_value = "vert,frag,comp,geom,tesc,tese,glsl,hlsl")]
+        #[arg(long, default_value = "vert,frag,comp,geom,tesc,tese,task,mesh,glsl,hlsl")]
         extensions: String,
 
         #[command(flatten)]

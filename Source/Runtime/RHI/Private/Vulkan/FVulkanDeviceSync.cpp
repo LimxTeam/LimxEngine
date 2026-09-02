@@ -1202,48 +1202,45 @@ bool FVulkanDevice::IsDrawIndirectFirstInstanceSupported() const
     return m_DeviceFeatures.drawIndirectFirstInstance != VK_FALSE;
 }
 
+void FVulkanDevice::LoadMeshShaderFunctions()
+{
+    if (!m_MeshShaderAvailable || m_Device == VK_NULL_HANDLE)
+    {
+        m_MeshShaderAvailable = false;
+        return;
+    }
+
+    m_MeshShaderFunctions.DrawMeshTasks =
+        reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
+            vkGetDeviceProcAddr(m_Device, "vkCmdDrawMeshTasksEXT"));
+
+    m_MeshShaderFunctions.DrawMeshTasksIndirect =
+        reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectEXT>(
+            vkGetDeviceProcAddr(m_Device, "vkCmdDrawMeshTasksIndirectEXT"));
+
+    // 任何一个取不到就整个关掉。
+    //
+    // 留一半可用是最糟的状态: 直接分派能跑而间接分派是空指针, 于是"支持
+    // 网格着色器"这个查询返回真, 而实际调用时崩在一个与网格着色器毫无
+    // 关系的地方。
+    if (m_MeshShaderFunctions.DrawMeshTasks == nullptr ||
+        m_MeshShaderFunctions.DrawMeshTasksIndirect == nullptr)
+    {
+        LIMX_LOG(LogRHI, Error,
+            "[Vulkan] 网格着色器扩展函数入口缺失 — 已禁用网格着色器路径");
+
+        m_MeshShaderAvailable = false;
+    }
+}
+
 bool FVulkanDevice::IsMeshShaderSupported() const
 {
-    UInt32 extensionCount = 0;
-    vkEnumerateDeviceExtensionProperties(
-        m_PhysicalDevice, nullptr, &extensionCount, nullptr);
-
-    if (extensionCount == 0)
-    {
-        return false;
-    }
-
-    // 取全 — 截断的后果是目标扩展落在看不见的尾巴里, 于是本函数报"不支持",
-    // 而调用方据此关掉一整套功能。没有任何一层会说"我只看了前 512 个"。
-    constexpr SizeType kInlineExtensions = 512;
-    TSmallVector<VkExtensionProperties, kInlineExtensions> extensions;
-    ResizeZeroed(extensions, static_cast<SizeType>(extensionCount));
-
-    UInt32 extQuery = extensionCount;
-    vkEnumerateDeviceExtensionProperties(
-        m_PhysicalDevice, nullptr, &extQuery, extensions.GetData());
-
-    const char* target = VK_EXT_MESH_SHADER_EXTENSION_NAME;
-
-    for (UInt32 i = 0; i < extQuery; ++i)
-    {
-        const char* ext = extensions[i].extensionName;
-        bool isMatch = true;
-        for (Int32 c = 0; target[c] != '\0'; ++c)
-        {
-            if (ext[c] != target[c])
-            {
-                isMatch = false;
-                break;
-            }
-        }
-        if (isMatch)
-        {
-            return true;
-        }
-    }
-
-    return false;
+    // 返回**缓存的**标志, 不是现场再扫一遍扩展列表。
+    //
+    // 现场扫描回答的是"驱动报告了这个扩展吗", 而调用方问的是"我现在能不能
+    // 发 DrawMeshTasks" —— 那要求扩展启用了、特性挂上了、函数入口也取到了。
+    // 两者在"扩展在但没启用"时分道扬镳, 而那正好是最容易写错的一处。
+    return m_MeshShaderAvailable;
 }
 
 // ============================================================================

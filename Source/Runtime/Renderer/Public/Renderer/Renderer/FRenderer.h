@@ -94,6 +94,7 @@ class FDepthPrePass;
 class FClusterLightPass;
 class FGpuCullPass;
 class FMeshletCullPass;
+class FMeshletDepthPass;
 class FRayTracedShadowPass;
 class FRayTracedAoPass;
 class FRayTracedReflectionPass;
@@ -253,6 +254,18 @@ struct FRenderObject
 
     /// 所属网格的 meshlet 头缓冲区 (非拥有)
     FRHIBufferHandle MeshletBuffer;
+
+    /// meshlet 的局部顶点表与三角形索引 (非拥有)
+    ///
+    /// 剔除用不到它们, 光栅化用得到。放在这里而不是让光栅化通道自己去
+    /// 资源管理器里查: 渲染对象列表是渲染器与通道之间**唯一**的场景描述,
+    /// 多一条查询路径就多一处可能与它不同步。
+    FRHIBufferHandle MeshletVertexBuffer;
+    FRHIBufferHandle MeshletTriangleBuffer;
+
+    /// 本网格的 meshlet 局部顶点数与三角形数 (整个网格, 不是本批次)
+    UInt32 MeshletVertexTotal = 0;
+    UInt32 MeshletTriangleTotal = 0;
 
     /// 本批次在该缓冲区里的起点与个数
     UInt32 MeshletOffset = 0;
@@ -530,6 +543,18 @@ public:
     /// 返回 void 的话, "开了但其实没开"与"开了"分不开 —— 而那正是
     /// 本周期反复遇到的那一类。
     LIMX_NODISCARD bool SetMeshletCullEnabled(bool enabled);
+
+    /// meshlet 深度光栅化通道
+    LIMX_NODISCARD FMeshletDepthPass* GetMeshletDepthPass()
+    {
+        return m_MeshletDepthPass.Get();
+    }
+
+    /// 开关 meshlet 深度光栅化
+    ///
+    /// 它依赖剔除通道的输出, 所以打开它会连带打开剔除 —— 只开光栅化的话
+    /// 可见表是空的, 画出来是一张空深度图, 而那与"通道没跑"分不开。
+    LIMX_NODISCARD bool SetMeshletDepthEnabled(bool enabled);
 
     /// 场景的光追加速结构 (只读)
     LIMX_NODISCARD const FRayTracingScene& GetRayTracingScene() const
@@ -832,6 +857,7 @@ private:
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FGpuCullPass>          m_GpuCullPass;
     TUniquePtr<FMeshletCullPass>      m_MeshletCullPass;
+    TUniquePtr<FMeshletDepthPass>     m_MeshletDepthPass;
 
     /// 场景的光追加速结构 —— 设备不支持光追时保持无效
     FRayTracingScene                  m_RayTracingScene;
