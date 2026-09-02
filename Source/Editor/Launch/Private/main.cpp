@@ -311,6 +311,7 @@ struct FLaunchOptions
     /// 遮挡剔除的判据 —— 见函数头
     bool MeshletOcclusionCheck = false;
     bool MeshletScaleCheck = false;
+    bool GpuCullOverflowCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -887,6 +888,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-scale-check"))
         {
             options.MeshletScaleCheck = true;
+        }
+        else if (WideEquals(arg, L"--gpu-cull-overflow-check"))
+        {
+            options.GpuCullOverflowCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -10411,6 +10416,172 @@ static bool RunMeshletCullChecks(FRenderContext* context, FRenderer& renderer)
 // 第三段要紧: 一个"一旦置位就再也不清"的标志在前两段上满分通过, 而它会让
 // 之后每一帧都报溢出。
 // ============================================================================
+// RunGpuCullOverflowChecks — 逐物体缓冲区装不下时不许索引到界外
+//
+// 逐物体缓冲区 (模型矩阵 + 材质下标) 按 kMaxGpuDrawObjects 定容, 分三段:
+// 相机 / 投射体 / 半透明。场景大到三段合计超过容量时, 后面的段会被截断。
+//
+// 截断本身没得选。要命的是**绘制那一侧照着列表长度走**: 各个 Pass 逐物体
+// 绘制时把列表下标当 firstInstance 传进去, 而着色器拿 gl_InstanceIndex
+// 直接索引那个缓冲区。列表比写进去的条目长时, 后面那些物体索引到的是
+// 缓冲区之外。
+//
+// 后果不是"画面上少一块"。读出来的"材质下标"是垃圾, 而它下一步要去索引
+// bindless 材质表 —— GPU 读非法地址, **设备丢失**。
+//
+// 实测: 16130 个物体 (grid 127) 必然复现, 驱动报 READ_INVALID, 而那个地址
+// 不属于任何一个活着的缓冲区; 15877 个 (grid 126) 十次全过。差别只在截断
+// 有没有发生在投射体那一段。
+//
+// 这条判据三件事:
+//
+//   一、场景必须**真的超容量** —— 不超的话这条判据什么都没验到。
+//   二、三段写进去的条目数必须自洽 (各段不超过自己的列表长度, 合计不超
+//      过容量)。
+//   三、跑完不许丢设备、不许有 Error。
+//
+// 第三条看着松, 其实是最硬的: 这个缺陷的表现就是丢设备, 而丢设备之后
+// 引擎的每一帧都在报错。
+// ============================================================================
+
+static bool RunGpuCullOverflowChecks(FRenderContext* context,
+                                     FRenderer&      renderer)
+{
+    LIMX_UNUSED(context);
+
+    FGpuCullPass* const cull = renderer.GetGpuCullPass();
+
+    if (cull == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[GPU剔除溢出] 通道不存在");
+        return false;
+    }
+
+    // 先跑几帧让三段都上传过
+    for (UInt32 i = 0; i < 6; ++i)
+    {
+        renderer.RenderFrame();
+    }
+
+    const SizeType cameraSize = renderer.GetRenderObjects().GetSize();
+    const SizeType casterSize = renderer.GetShadowCasterObjects().GetSize();
+    const SizeType translucentSize =
+        renderer.GetTranslucentObjects().GetSize();
+
+    const SizeType requested = cameraSize + casterSize + translucentSize;
+
+    const UInt32 cameraWritten      = cull->GetCameraCount();
+    const UInt32 casterWritten      = cull->GetObjectCount();
+    const UInt32 translucentWritten = cull->GetTranslucentCount();
+
+    const UInt32 totalWritten =
+        cameraWritten + casterWritten + translucentWritten;
+
+    bool passed = true;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[GPU剔除溢出] 列表 相机 {} / 投射体 {} / 半透明 {} = {} 个; "
+             "写进去 {} / {} / {} = {} 个 (容量 {})",
+             cameraSize, casterSize, translucentSize, requested,
+             cameraWritten, casterWritten, translucentWritten, totalWritten,
+             kMaxGpuDrawObjects);
+
+    // ---- 一、必须真的超容量 ----
+    if (requested <= kMaxGpuDrawObjects)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 三段合计 {} 个没超过容量 {} —— 截断那条路径"
+                 "根本没走到, 这条判据什么都没验。场景要更大",
+                 requested, kMaxGpuDrawObjects);
+        passed = false;
+    }
+
+    // ---- 二、写进去的条目数要自洽 ----
+    if (totalWritten > kMaxGpuDrawObjects)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 三段写进去 {} 个, 超过容量 {} —— 越界写",
+                 totalWritten, kMaxGpuDrawObjects);
+        passed = false;
+    }
+
+    if (cameraWritten > cameraSize || casterWritten > casterSize ||
+        translucentWritten > translucentSize)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 某一段写进去的条目比它的列表还长 "
+                 "({}>{} / {}>{} / {}>{})",
+                 cameraWritten, cameraSize, casterWritten, casterSize,
+                 translucentWritten, translucentSize);
+        passed = false;
+    }
+
+    // 截断必须**确实发生**在某一段上, 否则下面那条"跑完不丢设备"是平凡的
+    if (totalWritten == requested)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 三段一个都没被截断 —— 那条路径没走到");
+        passed = false;
+    }
+
+    // ---- 三、钳位必须**留下痕迹** ----
+    //
+    // "没钳位会怎样"是不可靠的判据: 索引越界读到的内存是不是已映射, 取决于
+    // 当时的堆布局。实测把钳位去掉之后同一个场景有时丢设备、有时安然无恙 ——
+    // 拿"会不会丢设备"当判据等于让判据去赌运气。
+    //
+    // 跳过的绘制数与堆布局无关: 它必须等于三段各自"列表长度减去写进去的
+    // 条目数"之和。
+    const UInt32 skipped   = cull->GetSkippedDraws();
+    const UInt32 maxIssued = cull->GetMaxIssuedIndex();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[GPU剔除溢出] 发出去的最大逐物体下标 {} (写进去 {} 条); "
+             "因为没有条目而跳过 {} 个绘制",
+             maxIssued, totalWritten, skipped);
+
+    if (!cull->HasIssuedDraw())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 一次逐物体绘制都没发出去 —— 判据没验到东西");
+        passed = false;
+    }
+    else if (maxIssued >= totalWritten)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 发出去的最大逐物体下标是 {}, 而只写进去 {} "
+                 "条 —— 那次绘制拿越界的下标去索引逐物体缓冲区, 读出来的"
+                 "材质下标是垃圾, 下一步要去索引 bindless 表 (后果是 GPU "
+                 "读非法地址、设备丢失)",
+                 maxIssued, totalWritten);
+        passed = false;
+    }
+
+    if (skipped == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[GPU剔除溢出] 一个绘制都没被跳过 —— 截断确实发生了 "
+                 "(合计 {} > 写进去 {}), 那些没有条目的物体却全都画出去了",
+                 requested, totalWritten);
+        passed = false;
+    }
+
+    // ---- 四、继续跑, 不许丢设备 ----
+    //
+    // 缺陷复现时是在第三帧丢的, 这里跑十二帧留足余量。丢设备之后引擎每帧
+    // 都会报 Error, 而 FinalizeSelfCheck 会把它们算进去。
+    for (UInt32 i = 0; i < 12; ++i)
+    {
+        renderer.RenderFrame();
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[GPU剔除溢出] {}",
+             passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 
 static bool RunMeshletScaleChecks(FRenderContext* context, FRenderer& renderer)
 {
@@ -16995,6 +17166,64 @@ static void BuildStressScene(LScene* scene, FRenderContext* context,
         groundMesh->SetVisible(true);
     }
 
+    // ---- 一盏投影聚光灯 ----
+    //
+    // 压力场景原本只有方向光, 于是阴影**图集**那一路 (聚光/点光源用) 从来
+    // 没被走到。逐物体缓冲区截断的判据要覆盖三条绘制路径 (级联阴影、阴影
+    // 图集、前向半透明), 少一盏灯就少一条。
+    //
+    // 变异验证是这么发现的: 把图集那一路的钳位删掉, 判据纹丝不动。
+    {
+        FLight spot = FLight::CreateSpot(
+            FVector3(0.0f, 14.0f, 0.0f), FVector3(0.0f, -1.0f, 0.0f),
+            FLinearColor(1.0f, 0.95f, 0.85f, 1.0f), 40.0f, 20.0f, 35.0f,
+            40.0f);
+
+        spot.SetAttenuation(1.0f, 0.0f, 0.0f);
+        spot.SetCastsShadow(true);
+        spot.SetDebugName("StressSpot");
+
+        FLightManager::Get().AddLight(static_cast<FLight&&>(spot));
+    }
+
+    // ---- 一小撮半透明 ----
+    //
+    // 数量少 (8 个), 但**非有不可**: 逐物体缓冲区分三段 (相机 / 投射体 /
+    // 半透明), 半透明是最后一段, 三段合计超容量时它最先被挤没。一个都没有
+    // 的话, "半透明段被截断之后还照着列表长度画"这条路径永远走不到, 而那
+    // 条路径的后果是 GPU 读非法地址。
+    //
+    // 摆在网格中心附近、离地一段 —— 既在相机视野里, 又不至于挡住整片网格。
+    {
+        FMaterial* glass =
+            FMaterialManager::Get().CreateMaterial("StressGlass");
+
+        if (glass != nullptr)
+        {
+            glass->SetBaseColor(FVector4(0.6f, 0.8f, 1.0f, 0.35f));
+            glass->SetMetallic(0.0f);
+            glass->SetRoughness(0.1f);
+            glass->SetBlendMode(EMaterialBlendMode::Translucent);
+
+            for (UInt32 i = 0; i < 8; ++i)
+            {
+                FTransform glassTransform;
+                glassTransform.Translation = FVector3(
+                    -6.0f + static_cast<Float32>(i) * 1.7f, 3.0f,
+                    -halfSpan * 0.25f);
+                glassTransform.Scale3D = FVector3(1.2f, 1.2f, 1.2f);
+
+                LNode* node = scene->SpawnNode<LNode>(FName("StressGlass"),
+                                                      glassTransform);
+
+                LMeshTrait* mesh = node->AddTrait<LMeshTrait>(FName("Mesh"));
+                mesh->SetMesh(&resources, meshHandles[0]);
+                mesh->SetMaterial(glass);
+                mesh->SetVisible(true);
+            }
+        }
+    }
+
     // 交出创建时的所有权 —— 每个节点都已各自加过引用
     for (UInt32 i = 0; i < 3; ++i)
     {
@@ -17977,6 +18206,7 @@ int WINAPI wWinMain(
     bool    meshletResolvePassed = true;
     bool    meshletOcclusionPassed = true;
     bool    meshletScalePassed = true;
+    bool    gpuCullOverflowPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -18133,6 +18363,12 @@ int WINAPI wWinMain(
             {
                 meshletScalePassed =
                     RunMeshletScaleChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.GpuCullOverflowCheck)
+            {
+                gpuCullOverflowPassed =
+                    RunGpuCullOverflowChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -18430,6 +18666,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletScaleCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletScalePassed, 34, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.GpuCullOverflowCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(gpuCullOverflowPassed, 35, errorSink,
                                           errorsBeforeShutdown);
     }
 

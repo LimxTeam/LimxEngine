@@ -949,6 +949,90 @@ ERHIResult FVulkanDevice::Submit(EQueueType queue,
     {
         LIMX_LOG(LogRHI, Error,
             "[Vulkan] vkQueueSubmit 失败: {}", (Int32)vkResult);
+
+        // 丢设备时问一句驱动: 故障地址在哪, 是读还是写。
+        //
+        // 这一句是排查设备丢失的**起点**。没有它只能靠二分, 而二分对
+        // "GPU 读了个非法地址"这类缺陷几乎无效 —— 症状与触发点隔着好几层。
+        if (vkResult == VK_ERROR_DEVICE_LOST)
+        {
+            auto getFault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+                vkGetDeviceProcAddr(m_Device, "vkGetDeviceFaultInfoEXT"));
+
+            if (getFault != nullptr)
+            {
+                VkDeviceFaultCountsEXT counts = {};
+                counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+
+                if (getFault(m_Device, &counts, nullptr) == VK_SUCCESS)
+                {
+                    LIMX_LOG(LogRHI, Error,
+                             "[故障] 地址记录 {} 条, 厂商记录 {} 条",
+                             counts.addressInfoCount, counts.vendorInfoCount);
+
+                    const UInt32 addressCount =
+                        (counts.addressInfoCount < 32u)
+                            ? counts.addressInfoCount
+                            : 32u;
+
+                    const UInt32 vendorCount =
+                        (counts.vendorInfoCount < 32u) ? counts.vendorInfoCount
+                                                       : 32u;
+
+                    VkDeviceFaultAddressInfoEXT addresses[32] = {};
+                    VkDeviceFaultVendorInfoEXT  vendors[32]   = {};
+
+                    VkDeviceFaultInfoEXT info = {};
+                    info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+                    info.pAddressInfos = addresses;
+                    info.pVendorInfos  = vendors;
+
+                    counts.addressInfoCount = addressCount;
+                    counts.vendorInfoCount  = vendorCount;
+                    counts.vendorBinarySize = 0;
+
+                    if (getFault(m_Device, &counts, &info) == VK_SUCCESS)
+                    {
+                        LIMX_LOG(LogRHI, Error, "[故障] 描述: {}",
+                                 static_cast<const char*>(info.description));
+
+                        for (UInt32 i = 0; i < addressCount; ++i)
+                        {
+                            LIMX_LOG(LogRHI, Error,
+                                     "[故障] 地址 {} — 类型 {} 报告地址 {} "
+                                     "精度 {}",
+                                     i,
+                                     static_cast<Int32>(
+                                         addresses[i].addressType),
+                                     static_cast<UInt64>(
+                                         addresses[i].reportedAddress),
+                                     static_cast<UInt64>(
+                                         addresses[i].addressPrecision));
+                        }
+
+                        for (UInt32 i = 0; i < vendorCount; ++i)
+                        {
+                            LIMX_LOG(LogRHI, Error,
+                                     "[故障] 厂商 {} — {} 码 {} 数据 {}",
+                                     i,
+                                     static_cast<const char*>(
+                                         vendors[i].description),
+                                     static_cast<UInt64>(
+                                         vendors[i].vendorFaultCode),
+                                     static_cast<UInt64>(
+                                         vendors[i].vendorFaultData));
+                        }
+                    }
+                }
+            }
+            else
+            {
+                LIMX_LOG(LogRHI, Error,
+                         "[故障] 这台设备不支持 VK_EXT_device_fault —— "
+                         "丢设备的原因只能靠二分找");
+            }
+        }
+
         return ERHIResult::ErrorUnknown;
     }
 

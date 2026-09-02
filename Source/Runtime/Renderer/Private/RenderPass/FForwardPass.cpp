@@ -468,6 +468,22 @@ void FForwardPass::RecordTranslucent(IRHICommandBuffer*        commandBuffer,
                 (context.GpuCull != nullptr)
                     ? context.GpuCull->GetTranslucentBase() : 0u;
 
+            // 没有逐物体条目的就不画 —— 见 FGpuCullPass 里那段说明。
+            // 半透明是**最后**一段, 三段合计超上限时它最先被挤没。
+            if (context.GpuCull != nullptr &&
+                static_cast<UInt32>(i) >=
+                    context.GpuCull->GetTranslucentCount())
+            {
+                context.GpuCull->NoteSkippedDraw();
+                continue;
+            }
+
+            if (context.GpuCull != nullptr)
+            {
+                context.GpuCull->NoteIssuedDraw(base +
+                                                static_cast<UInt32>(i));
+            }
+
             commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
                                        0, base + static_cast<UInt32>(i));
         }

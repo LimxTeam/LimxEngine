@@ -806,6 +806,20 @@ void FShadowPass::RecordCasterRange(IRHICommandBuffer*           commandBuffer,
                 (context.GpuCull != nullptr) ? context.GpuCull->GetCullBase()
                                              : 0u;
 
+            // 没有逐物体条目的就不画 —— 见 FGpuCullPass 里那段说明。
+            if (context.GpuCull != nullptr &&
+                static_cast<UInt32>(i) >= context.GpuCull->GetObjectCount())
+            {
+                context.GpuCull->NoteSkippedDraw();
+                continue;
+            }
+
+            if (context.GpuCull != nullptr)
+            {
+                context.GpuCull->NoteIssuedDraw(base +
+                                                static_cast<UInt32>(i));
+            }
+
             commandBuffer->DrawIndexed(obj.IndexCount, 1, obj.IndexOffset,
                                        0, base + static_cast<UInt32>(i));
         }

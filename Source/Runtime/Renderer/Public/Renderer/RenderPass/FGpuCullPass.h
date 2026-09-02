@@ -170,6 +170,55 @@ public:
     /// 相机段的物体数
     LIMX_NODISCARD UInt32 GetCameraCount() const { return m_CameraCount; }
 
+    /// 半透明段**实际写进去**的条目数
+    ///
+    /// 与列表长度未必相等: 三段合计超过 kMaxGpuDrawObjects 时后面的段会被
+    /// 截断, 极端情况下一条都写不进去。画的时候必须按这个数来 —— 按列表
+    /// 长度画的话, 没有条目的那些会用 gl_InstanceIndex 去读缓冲区之外,
+    /// 读到的"材质下标"是垃圾, 而它下一步要去索引 bindless 表。
+    LIMX_NODISCARD UInt32 GetTranslucentCount() const
+    {
+        return m_TranslucentCount;
+    }
+
+    /// 本帧因为"没有逐物体条目"而被跳过的绘制数
+    ///
+    /// ── 为什么要留这个数 ──
+    ///
+    /// 钳位本身是对的, 但"没钳位会怎样"是不可靠的判据: 索引越界读到的
+    /// 内存是不是已映射, 取决于当时的堆布局。实测把钳位去掉之后, 同一个
+    /// 场景有时丢设备、有时安然无恙 —— 拿"会不会丢设备"当判据, 等于让判据
+    /// 去赌运气。
+    ///
+    /// 所以钳位要留下痕迹: 跳过了几个是能直接比对的量 (列表长度减去写进去
+    /// 的条目数), 与堆布局无关。
+    LIMX_NODISCARD UInt32 GetSkippedDraws() const { return m_SkippedDraws; }
+
+    /// 逐物体条目缺失时由各 Pass 调用 —— 只是记数
+    void NoteSkippedDraw() const { ++m_SkippedDraws; }
+
+    /// 本帧实际发出去的绘制里最大的那个逐物体下标
+    ///
+    /// 这才是要守的那条不变式: 它必须小于三段写进去的条目总数。跳过了
+    /// 几个是**结果**, 而各个 Pass 每帧尝试画多少个与级联、光源、逐通道
+    /// 剔除都有关, 预测不了; 最大下标不用预测。
+    LIMX_NODISCARD UInt32 GetMaxIssuedIndex() const
+    {
+        return m_MaxIssuedIndex;
+    }
+
+    /// 发出一次逐物体绘制时由各 Pass 调用
+    void NoteIssuedDraw(UInt32 objectIndex) const
+    {
+        if (!m_HasIssuedDraw || objectIndex > m_MaxIssuedIndex)
+        {
+            m_MaxIssuedIndex = objectIndex;
+            m_HasIssuedDraw  = true;
+        }
+    }
+
+    LIMX_NODISCARD bool HasIssuedDraw() const { return m_HasIssuedDraw; }
+
     /// 半透明批次在逐物体缓冲区里的起始下标
     ///
     /// 半透明走的是**同一个** pbr.vert, 而那个着色器只有一条路径: 从 set 3
@@ -307,6 +356,15 @@ private:
     UInt32 m_CullBase        = 0;
     UInt32 m_ObjectCount     = 0;
     UInt32 m_TranslucentBase = 0;
+    UInt32 m_TranslucentCount = 0;
+
+    /// 见 GetSkippedDraws。各 Pass 在绘制循环里记, 而那些循环拿到的是
+    /// const 指针 —— 这是个纯统计量, mutable 是它该有的样子。
+    mutable UInt32 m_SkippedDraws = 0;
+
+    /// 见 GetMaxIssuedIndex
+    mutable UInt32 m_MaxIssuedIndex = 0;
+    mutable bool   m_HasIssuedDraw  = false;
     UInt32 m_LastVisible[kMaxCullViews] = {};
     bool   m_Enabled      = false;
     bool   m_IsSupported  = false;

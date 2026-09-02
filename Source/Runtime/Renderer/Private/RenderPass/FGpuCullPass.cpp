@@ -480,10 +480,14 @@ void FGpuCullPass::UploadObjects(const TArray<FRenderObject>* cameraObjects,
 {
     m_Groups.Clear();
 
-    m_CameraCount     = 0;
-    m_CullBase        = 0;
-    m_ObjectCount     = 0;
-    m_TranslucentBase = 0;
+    m_CameraCount      = 0;
+    m_CullBase         = 0;
+    m_ObjectCount      = 0;
+    m_TranslucentBase  = 0;
+    m_TranslucentCount = 0;
+    m_SkippedDraws     = 0;
+    m_MaxIssuedIndex   = 0;
+    m_HasIssuedDraw    = false;
 
     if (frameIndex >= m_ObjectBuffers.GetSize())
     {
@@ -520,8 +524,9 @@ void FGpuCullPass::UploadObjects(const TArray<FRenderObject>* cameraObjects,
     //       不参与剔除: 它必须严格由远及近, 而间接命令的顺序表达不了距离。
     m_TranslucentBase = cursor;
 
-    const UInt32 translucentCount =
-        WriteSegment(gpuObjects, translucent, cursor, false);
+    m_TranslucentCount = WriteSegment(gpuObjects, translucent, cursor, false);
+
+    const UInt32 translucentCount = m_TranslucentCount;
 
     cursor += translucentCount;
 
@@ -536,10 +541,23 @@ void FGpuCullPass::UploadObjects(const TArray<FRenderObject>* cameraObjects,
     {
         // 超上限时明确报出来。静默截断的表现是"场景里少了一部分东西",
         // 而那与资源加载失败长得一样。
+        //
+        // ── 报出来还不够, 画的时候也得按写进去的数来 ──
+        //
+        // 各个 Pass 逐物体绘制时把**列表下标**当作 gl_InstanceIndex 传进去
+        // (firstInstance), 而着色器拿它直接索引逐物体缓冲区。列表比写进去的
+        // 条目长时, 后面那些物体索引到的是缓冲区之外 —— 读出来的"材质下标"
+        // 是垃圾, 而下一步它要去索引 bindless 材质表。
+        //
+        // 那一步的后果不是"画面上少一块", 是 **GPU 读非法地址、设备丢失**。
+        // 实测: 16130 个物体的压力场景, 驱动报 READ_INVALID, 六十帧一帧都
+        // 跑不完; 而那个地址不属于任何一个活着的缓冲区。
         LIMX_LOG(LogRenderer, Warning,
-                 "[GpuCull] 三段合计 {} 个物体超过上限 {} — 只写进了 {} 个, "
-                 "画面上会少东西",
-                 static_cast<UInt64>(requested), kMaxGpuDrawObjects, cursor);
+                 "[GpuCull] 三段合计 {} 个物体超过上限 {} — 只写进了 {} 个 "
+                 "(相机 {} / 投射体 {} / 半透明 {})。写不进去的那些**不会"
+                 "被绘制** —— 画面上会少东西, 但不会读到缓冲区之外",
+                 static_cast<UInt64>(requested), kMaxGpuDrawObjects, cursor,
+                 m_CameraCount, m_ObjectCount, m_TranslucentCount);
     }
 
     m_HasUploaded = true;

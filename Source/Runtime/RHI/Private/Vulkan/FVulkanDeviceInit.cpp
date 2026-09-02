@@ -832,12 +832,33 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     // 少启用其中任何一个, vkCreateDevice 会报 EXTENSION_NOT_PRESENT ——
     // 而那条错误不会告诉你缺的是哪一个。
     // ------------------------------------------------------------------
-    const char* deviceExtensions[9] =
+    const char* deviceExtensions[10] =
     {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
 
     UInt32 extensionCount = 1;
+
+    // ------------------------------------------------------------------
+    // 设备故障报告
+    //
+    // VK_ERROR_DEVICE_LOST 本身什么都不说 —— 它可能是着色器读了非法地址、
+    // 可能是超时被重置、也可能是驱动自己出了问题, 而这三种的排查方向完全
+    // 不同。这个扩展让驱动在丢设备之后回答"故障地址是多少、是读还是写"。
+    //
+    // 有它与没它的差别是实打实的: 一个只在一万六千个物体以上复现的设备
+    // 丢失, 靠二分猜了很久都没到底; 开了它之后驱动一句话说清 —— 某个
+    // 着色器在读一个不属于任何活着的缓冲区的地址, 顺着这条线十分钟就
+    // 找到了根因 (逐物体缓冲区被截断, 而绘制仍按列表长度索引)。
+    //
+    // 没有这个扩展的设备上不启用, 那时丢设备只能看到错误码。
+    // ------------------------------------------------------------------
+    const bool wantDeviceFault = HasDeviceExtension("VK_EXT_device_fault");
+
+    if (wantDeviceFault)
+    {
+        deviceExtensions[extensionCount++] = "VK_EXT_device_fault";
+    }
 
     const bool wantRayTracing =
         HasDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
@@ -1015,6 +1036,21 @@ ERHIResult FVulkanDevice::CreateLogicalDevice()
     {
         *tail = &meshShaderFeatures;
         meshShaderFeatures.pNext = nullptr;
+
+        tail = &meshShaderFeatures.pNext;
+    }
+
+    // 扩展加进列表还不够, **特性**也要开 —— 否则 vkGetDeviceFaultInfoEXT
+    // 的行为未定义。第一版只加了扩展, 结果那个函数一调就把进程带走了。
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures = {};
+    faultFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+    faultFeatures.deviceFault = VK_TRUE;
+
+    if (wantDeviceFault)
+    {
+        *tail = &faultFeatures;
+        faultFeatures.pNext = nullptr;
     }
 
     VkDeviceCreateInfo createInfo = {};
