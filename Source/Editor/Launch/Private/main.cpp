@@ -65,6 +65,7 @@
 #include "Renderer/RenderPass/FRayTracedReflectionPass.h"
 #include "RenderCore/Geometry/FGeometryGenerator.h"
 #include "RenderCore/Geometry/FMeshletBuilder.h"
+#include "RenderCore/Geometry/FMeshSimplifier.h"
 #include "AssetPipeline/FObjLoader.h"
 #include "Core/Containers/TSortAlgorithms.h"
 
@@ -312,6 +313,7 @@ struct FLaunchOptions
     bool MeshletOcclusionCheck = false;
     bool MeshletScaleCheck = false;
     bool GpuCullOverflowCheck = false;
+    bool MeshSimplifyCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -892,6 +894,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--gpu-cull-overflow-check"))
         {
             options.GpuCullOverflowCheck = true;
+        }
+        else if (WideEquals(arg, L"--mesh-simplify-check"))
+        {
+            options.MeshSimplifyCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -10363,6 +10369,688 @@ static bool RunMeshletCullChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunMeshSimplifyChecks — 简化器的判据
+//
+// 这一条判据里最要紧的是**误差是上界**: 把每一个原始顶点到简化后表面的
+// 距离量出来取最大, 必须不超过简化器报出来的那个误差。
+//
+// 为什么是它最要紧: 下游的 LOD 选择靠"把这个误差投到屏幕上与阈值比"来决定
+// 画哪一层。误差报小了, 选择会在该换层的时候不换 —— 表现是"模型突然变糙";
+// 更糟的是相邻两块因此选了不同层而边界对不上, 出现裂缝。而误差是不是上界,
+// 这件事完全不必看画面: 它是一句能证伪的话。
+//
+// 其余五条:
+//
+//   单调        记录的误差是到目前为止的最大值, 不是这一次坍缩的代价。
+//              二次误差在邻居坍缩之后会**变小**, 直接记它会让某一层的误差
+//              小于上一层, 而 LOD 选择规则在那种数据上会同时选中父与子。
+//   不退化      输出里没有两个下标相同的三角形, 也没有零面积的。
+//   不翻转      闭合网格的有符号体积必须与原来同号且接近。单个三角形翻了
+//              在画面上是一块黑, 而体积把它变成一个可比的数。
+//   流形保持    输入每条边恰好两个三角形时, 输出也必须如此。
+//   确定性      同样的输入跑两遍, 输出逐位相同。第三天要拿简化器建 DAG,
+//              而不确定的简化器建出来的 DAG 每次都不一样。
+// ============================================================================
+
+namespace
+{
+
+/// 点到三角形的最短距离平方
+Float32 PointTriangleDistanceSquared(const FVector3& p, const FVector3& a,
+                                     const FVector3& b, const FVector3& c)
+{
+    // Ericson, Real-Time Collision Detection 的分区做法: 先看三个顶点区,
+    // 再看三条边区, 剩下的落在面内。
+    const FVector3 ab = b - a;
+    const FVector3 ac = c - a;
+    const FVector3 ap = p - a;
+
+    const Float32 d1 = FVector3::Dot(ab, ap);
+    const Float32 d2 = FVector3::Dot(ac, ap);
+
+    if (d1 <= 0.0f && d2 <= 0.0f)
+    {
+        return (p - a).LengthSquared();
+    }
+
+    const FVector3 bp = p - b;
+
+    const Float32 d3 = FVector3::Dot(ab, bp);
+    const Float32 d4 = FVector3::Dot(ac, bp);
+
+    if (d3 >= 0.0f && d4 <= d3)
+    {
+        return (p - b).LengthSquared();
+    }
+
+    const Float32 vc = d1 * d4 - d3 * d2;
+
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+    {
+        const Float32 denominator = d1 - d3;
+        const Float32 v = (denominator != 0.0f) ? (d1 / denominator) : 0.0f;
+
+        return (p - (a + ab * v)).LengthSquared();
+    }
+
+    const FVector3 cp = p - c;
+
+    const Float32 d5 = FVector3::Dot(ab, cp);
+    const Float32 d6 = FVector3::Dot(ac, cp);
+
+    if (d6 >= 0.0f && d5 <= d6)
+    {
+        return (p - c).LengthSquared();
+    }
+
+    const Float32 vb = d5 * d2 - d1 * d6;
+
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+    {
+        const Float32 denominator = d2 - d6;
+        const Float32 w = (denominator != 0.0f) ? (d2 / denominator) : 0.0f;
+
+        return (p - (a + ac * w)).LengthSquared();
+    }
+
+    const Float32 va = d3 * d6 - d5 * d4;
+
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    {
+        const Float32 denominator = (d4 - d3) + (d5 - d6);
+        const Float32 w = (denominator != 0.0f) ? ((d4 - d3) / denominator)
+                                                : 0.0f;
+
+        return (p - (b + (c - b) * w)).LengthSquared();
+    }
+
+    const Float32 denominator = va + vb + vc;
+
+    if (denominator == 0.0f)
+    {
+        return (p - a).LengthSquared();
+    }
+
+    const Float32 v = vb / denominator;
+    const Float32 w = vc / denominator;
+
+    return (p - (a + ab * v + ac * w)).LengthSquared();
+}
+
+/// 闭合网格的有符号体积 (散度定理, 对原点取)
+Float64 SignedVolume(const TArray<FMeshVertex>& vertices,
+                     const TArray<UInt32>& indices)
+{
+    Float64 total = 0.0;
+
+    for (SizeType t = 0; t + 2 < indices.GetSize(); t += 3)
+    {
+        const FVector3& a = vertices[indices[t + 0]].Position;
+        const FVector3& b = vertices[indices[t + 1]].Position;
+        const FVector3& c = vertices[indices[t + 2]].Position;
+
+        total += static_cast<Float64>(
+            FVector3::Dot(a, FVector3::Cross(b, c))) / 6.0;
+    }
+
+    return total;
+}
+
+/// 每条无向边被几个三角形用到 —— 闭合流形上处处为 2
+SizeType NonManifoldEdgeCount(const TArray<UInt32>& indices,
+                              SizeType vertexCount)
+{
+    TArray<TArray<UInt32>> neighbours;
+    neighbours.SetSize(vertexCount);
+
+    TArray<TArray<UInt32>> counts;
+    counts.SetSize(vertexCount);
+
+    for (SizeType t = 0; t + 2 < indices.GetSize(); t += 3)
+    {
+        for (UInt32 e = 0; e < 3; ++e)
+        {
+            const UInt32 from = indices[t + e];
+            const UInt32 to   = indices[t + (e + 1) % 3];
+
+            const UInt32 low  = FMath::Min(from, to);
+            const UInt32 high = FMath::Max(from, to);
+
+            bool found = false;
+
+            for (SizeType k = 0; k < neighbours[low].GetSize(); ++k)
+            {
+                if (neighbours[low][k] == high)
+                {
+                    ++counts[low][k];
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                neighbours[low].Add(high);
+                counts[low].Add(1u);
+            }
+        }
+    }
+
+    SizeType bad = 0;
+
+    for (SizeType v = 0; v < neighbours.GetSize(); ++v)
+    {
+        for (SizeType k = 0; k < counts[v].GetSize(); ++k)
+        {
+            if (counts[v][k] != 2u)
+            {
+                ++bad;
+            }
+        }
+    }
+
+    return bad;
+}
+
+/// 一个网格上跑完整套判据
+bool CheckOneSimplify(const AnsiChar* label, const FMeshData& mesh,
+                      Float32 ratio)
+{
+    const SizeType inputTriangles = mesh.Indices.GetSize() / 3;
+
+    FMeshSimplifyOptions options;
+    options.TargetTriangleCount = static_cast<UInt32>(
+        static_cast<Float32>(inputTriangles) * ratio);
+    options.LockOpenBoundary = true;
+
+    const FMeshSimplifyResult result =
+        FMeshSimplifier::Simplify(mesh.Vertices, mesh.Indices, options);
+
+    const SizeType outputTriangles = result.Indices.GetSize() / 3;
+
+    bool passed = true;
+
+    Float32 boundsDiagonal = 0.0f;
+
+    {
+        FVector3 low(3.4e38f, 3.4e38f, 3.4e38f);
+        FVector3 high(-3.4e38f, -3.4e38f, -3.4e38f);
+
+        for (SizeType v = 0; v < mesh.Vertices.GetSize(); ++v)
+        {
+            const FVector3& p = mesh.Vertices[v].Position;
+
+            low  = FVector3(FMath::Min(low.X, p.X), FMath::Min(low.Y, p.Y),
+                            FMath::Min(low.Z, p.Z));
+            high = FVector3(FMath::Max(high.X, p.X), FMath::Max(high.Y, p.Y),
+                            FMath::Max(high.Z, p.Z));
+        }
+
+        boundsDiagonal = (high - low).Length();
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[简化] {} — {} -> {} 三角形 (目标 {}), 坍缩 {} 次, 误差 {}",
+             label, inputTriangles, outputTriangles,
+             options.TargetTriangleCount, result.CollapseCount, result.Error);
+
+    if (outputTriangles == 0 || result.Vertices.IsEmpty())
+    {
+        LIMX_LOG(LogLaunch, Error, "[简化] {} — 输出是空的", label);
+        return false;
+    }
+
+    // ---- 判据一: 真的简化了 ----
+    //
+    // 没有这一条的话, 一个"原样返回"的实现在下面每一条上都满分通过 ——
+    // 误差 0 是任何偏差的上界, 体积分毫不差, 流形当然保持。
+    if (outputTriangles >= inputTriangles)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[简化] {} — 一个三角形都没少 ({} -> {}) —— 简化器什么都"
+                 "没做, 而下面每一条判据对'什么都不做'都是满分",
+                 label, inputTriangles, outputTriangles);
+        passed = false;
+    }
+
+    // ---- 判据二: 误差是真实偏差的上界 ----
+    Float32 worstDistance = 0.0f;
+
+    for (SizeType v = 0; v < mesh.Vertices.GetSize(); ++v)
+    {
+        const FVector3& p = mesh.Vertices[v].Position;
+
+        Float32 nearest = 3.4e38f;
+
+        for (SizeType t = 0; t + 2 < result.Indices.GetSize(); t += 3)
+        {
+            const Float32 distance = PointTriangleDistanceSquared(
+                p, result.Vertices[result.Indices[t + 0]].Position,
+                result.Vertices[result.Indices[t + 1]].Position,
+                result.Vertices[result.Indices[t + 2]].Position);
+
+            nearest = FMath::Min(nearest, distance);
+
+            if (nearest <= 0.0f)
+            {
+                break;
+            }
+        }
+
+        worstDistance = FMath::Max(worstDistance, FMath::Sqrt(nearest));
+    }
+
+    // 容差按输入包围盒的对角线取十万分之一 —— 纯粹是浮点噪声的量级,
+    // 不是给实现留的余地。
+    const Float32 epsilon = boundsDiagonal * 1.0e-5f;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[简化] {} — 原始顶点到简化面的最大距离 {} (报出来的误差 {}, "
+             "松了 {} 倍)",
+             label, worstDistance, result.Error,
+             (worstDistance > 0.0f) ? (result.Error / worstDistance) : 0.0f);
+
+    if (worstDistance > result.Error + epsilon)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[简化] {} — 实际偏差 {} 超过了报出来的误差 {} —— 误差不是"
+                 "上界, 而 LOD 选择整套东西都建立在它是上界之上",
+                 label, worstDistance, result.Error);
+        passed = false;
+    }
+
+    // ---- 包围盒 (下面几条判据的尺度基准) ----
+    FVector3 minimum(3.4e38f, 3.4e38f, 3.4e38f);
+    FVector3 maximum(-3.4e38f, -3.4e38f, -3.4e38f);
+
+    for (SizeType v = 0; v < mesh.Vertices.GetSize(); ++v)
+    {
+        const FVector3& p = mesh.Vertices[v].Position;
+
+        minimum = FVector3(FMath::Min(minimum.X, p.X),
+                           FMath::Min(minimum.Y, p.Y),
+                           FMath::Min(minimum.Z, p.Z));
+        maximum = FVector3(FMath::Max(maximum.X, p.X),
+                           FMath::Max(maximum.Y, p.Y),
+                           FMath::Max(maximum.Z, p.Z));
+    }
+
+    const Float32 diagonal = (maximum - minimum).Length();
+
+    const Float32 degenerateAreaThreshold = diagonal * diagonal * 1.0e-12f;
+
+    // ---- 判据三: 不退化 ----
+    SizeType degenerate = 0;
+
+    for (SizeType t = 0; t + 2 < result.Indices.GetSize(); t += 3)
+    {
+        const UInt32 a = result.Indices[t + 0];
+        const UInt32 b = result.Indices[t + 1];
+        const UInt32 c = result.Indices[t + 2];
+
+        if (a == b || b == c || a == c)
+        {
+            ++degenerate;
+            continue;
+        }
+
+        const FVector3 areaNormal =
+            FVector3::Cross(result.Vertices[b].Position -
+                                result.Vertices[a].Position,
+                            result.Vertices[c].Position -
+                                result.Vertices[a].Position);
+
+        // "恰好为零"是抓不住的: 坍缩留下的退化三角形面积是 1e-14 这个量级,
+        // 不是 0。阈值按包围盒对角线的平方取, 与网格尺度无关。
+        if (areaNormal.LengthSquared() <= degenerateAreaThreshold)
+        {
+            ++degenerate;
+        }
+    }
+
+    if (degenerate != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[简化] {} — {} 个退化三角形 (下标重复或零面积)", label,
+                 degenerate);
+        passed = false;
+    }
+
+    // ---- 判据四: 有符号体积同号且接近 ----
+    const Float64 volumeBefore = SignedVolume(mesh.Vertices, mesh.Indices);
+    const Float64 volumeAfter = SignedVolume(result.Vertices, result.Indices);
+
+    LIMX_LOG(LogLaunch, Display, "[简化] {} — 有符号体积 {} -> {}", label,
+             volumeBefore, volumeAfter);
+
+    if (volumeBefore > 0.0)
+    {
+        // 三角形翻转在单个三角形上看不出来, 但闭合网格的有符号体积会少
+        // 掉那一块 —— 翻一个就是双倍的负贡献。
+        const Float64 relative =
+            (volumeAfter - volumeBefore) / volumeBefore;
+
+        if (volumeAfter <= 0.0 || relative < -0.25 || relative > 0.25)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] {} — 有符号体积从 {} 变成 {} (相对 {}) —— "
+                     "有三角形翻了面",
+                     label, volumeBefore, volumeAfter, relative);
+            passed = false;
+        }
+    }
+
+    // ---- 判据四之二: 没有三角形翻面 ----
+    //
+    // 有符号体积抓不住它: 一个三角形翻过去只让体积差它自己那一份, 一千多个
+    // 三角形里的一个是千分之几, 淹没在简化本身带来的体积变化里。变异验证
+    // 当场证实了这一点 —— 把翻转检查整个删掉, 体积判据纹丝不动。
+    //
+    // 直接问: 每个输出三角形, 找到离它质心最近的那个**原始**三角形, 两者的
+    // 法线不许反向。简化会让法线偏一些, 但不该偏过 90 度 —— 偏过去就是这块
+    // 面翻过来了。
+    {
+        SizeType flipped = 0;
+
+        for (SizeType t = 0; t + 2 < result.Indices.GetSize(); t += 3)
+        {
+            const FVector3& a = result.Vertices[result.Indices[t + 0]].Position;
+            const FVector3& b = result.Vertices[result.Indices[t + 1]].Position;
+            const FVector3& c = result.Vertices[result.Indices[t + 2]].Position;
+
+            const FVector3 normal = FVector3::Cross(b - a, c - a);
+
+            if (normal.LengthSquared() <= degenerateAreaThreshold)
+            {
+                continue;
+            }
+
+            const FVector3 centroid = (a + b + c) / 3.0f;
+
+            Float32  nearest       = 3.4e38f;
+            FVector3 nearestNormal = FVector3(0.0f, 0.0f, 0.0f);
+
+            for (SizeType k = 0; k + 2 < mesh.Indices.GetSize(); k += 3)
+            {
+                const FVector3& p = mesh.Vertices[mesh.Indices[k + 0]].Position;
+                const FVector3& q = mesh.Vertices[mesh.Indices[k + 1]].Position;
+                const FVector3& r = mesh.Vertices[mesh.Indices[k + 2]].Position;
+
+                const Float32 distance =
+                    PointTriangleDistanceSquared(centroid, p, q, r);
+
+                if (distance < nearest)
+                {
+                    nearest = distance;
+
+                    // 用**作者法线**的均值当参考, 不用叉积。
+                    //
+                    // UV 球两极那一圈三角形是退化的细条, 叉积算出来的法线
+                    // 数值上很不稳; 而作者法线在那里仍然是精确的球面外法线。
+                    // 第六周期量过: 叉积与作者法线同向 6450/6450, 两者只在
+                    // 退化处才分家。
+                    nearestNormal =
+                        mesh.Vertices[mesh.Indices[k + 0]].Normal +
+                        mesh.Vertices[mesh.Indices[k + 1]].Normal +
+                        mesh.Vertices[mesh.Indices[k + 2]].Normal;
+                }
+            }
+
+            if (nearestNormal.LengthSquared() > 0.0f &&
+                FVector3::Dot(normal.GetSafeNormal(),
+                              nearestNormal.GetSafeNormal()) < 0.0f)
+            {
+                ++flipped;
+            }
+        }
+
+        if (flipped != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] {} — {} 个三角形与它脚下那片原始表面法线反向 "
+                     "—— 这块面翻过来了, 画出来是一块黑",
+                     label, flipped);
+            passed = false;
+        }
+    }
+
+    // ---- 判据四之三: 简化不许**增加**细条三角形 ----
+    //
+    // 二次误差天生爱造细条: 沿着一条长边坍缩误差很小, 留下的三角形又长又薄。
+    // 细条在画面上是走样的边, 在数值上是不可靠的法线。
+    //
+    // 判据不能写成"不许有细条" —— UV 球两极那一圈本来就是细条, 那是输入
+    // 自带的。写成"不许**变多**": 简化是把三角形减掉, 细条只会跟着少。
+    {
+        const auto Aspect = [](const FVector3& p0, const FVector3& p1,
+                               const FVector3& p2) -> Float32
+        {
+            const Float32 sum = (p1 - p0).LengthSquared() +
+                                (p2 - p1).LengthSquared() +
+                                (p0 - p2).LengthSquared();
+
+            if (sum <= 0.0f)
+            {
+                return 0.0f;
+            }
+
+            const Float32 area =
+                FVector3::Cross(p1 - p0, p2 - p0).Length() * 0.5f;
+
+            return 6.9282032f * area / sum;
+        };
+
+        const auto CountSlivers = [&Aspect](const TArray<FMeshVertex>& verts,
+                                            const TArray<UInt32>& idx) -> SizeType
+        {
+            SizeType count = 0;
+
+            for (SizeType t = 0; t + 2 < idx.GetSize(); t += 3)
+            {
+                if (Aspect(verts[idx[t + 0]].Position,
+                           verts[idx[t + 1]].Position,
+                           verts[idx[t + 2]].Position) < 0.01f)
+                {
+                    ++count;
+                }
+            }
+
+            return count;
+        };
+
+        const SizeType sliversBefore = CountSlivers(mesh.Vertices, mesh.Indices);
+        const SizeType sliversAfter =
+            CountSlivers(result.Vertices, result.Indices);
+
+        LIMX_LOG(LogLaunch, Display, "[简化] {} — 细条三角形 {} -> {}", label,
+                 sliversBefore, sliversAfter);
+
+        if (sliversAfter > sliversBefore)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] {} — 细条三角形从 {} 变成 {} —— 简化把三角形"
+                     "减少了一半, 细条却变多了, 那是坍缩自己造出来的",
+                     label, sliversBefore, sliversAfter);
+            passed = false;
+        }
+    }
+
+    // ---- 判据五: 流形保持 ----
+    const SizeType badBefore =
+        NonManifoldEdgeCount(mesh.Indices, mesh.Vertices.GetSize());
+
+    const SizeType badAfter =
+        NonManifoldEdgeCount(result.Indices, result.Vertices.GetSize());
+
+    if (badBefore == 0 && badAfter != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[简化] {} — 输入是闭合流形而输出不是 ({} 条边不是恰好"
+                 "两个三角形共享)",
+                 label, badAfter);
+        passed = false;
+    }
+
+    // ---- 判据六: 确定性 ----
+    const FMeshSimplifyResult again =
+        FMeshSimplifier::Simplify(mesh.Vertices, mesh.Indices, options);
+
+    bool identical = (again.Indices.GetSize() == result.Indices.GetSize()) &&
+                     (again.Vertices.GetSize() == result.Vertices.GetSize()) &&
+                     (again.Error == result.Error);
+
+    for (SizeType i = 0; identical && i < result.Indices.GetSize(); ++i)
+    {
+        identical = (again.Indices[i] == result.Indices[i]);
+    }
+
+    for (SizeType i = 0; identical && i < result.Vertices.GetSize(); ++i)
+    {
+        const FVector3& p = result.Vertices[i].Position;
+        const FVector3& q = again.Vertices[i].Position;
+
+        identical = (p.X == q.X && p.Y == q.Y && p.Z == q.Z);
+    }
+
+    if (!identical)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[简化] {} — 同样的输入跑两遍结果不同 —— 第三天要拿它建"
+                 "DAG, 而不确定的简化器建出来的 DAG 每次都不一样",
+                 label);
+        passed = false;
+    }
+
+    return passed;
+}
+
+} // namespace
+
+static bool RunMeshSimplifyChecks()
+{
+    bool passed = true;
+
+    // 球体: 闭合流形, 没有开边界, 曲率处处不为零 —— 简化器该最好使
+    {
+        const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 48, 32);
+
+        passed &= CheckOneSimplify("球体 (48x32)", sphere, 0.5f);
+        passed &= CheckOneSimplify("球体 (48x32) 到一成", sphere, 0.1f);
+    }
+
+    // 细分平面: 没有极点、三角形大小均匀 —— 拿它看误差的松紧是不是
+    // UV 球两极那种退化造成的
+    {
+        const FMeshData grid =
+            FGeometryGenerator::GeneratePlane(2.0f, 2.0f, 24, 24);
+
+        passed &= CheckOneSimplify("细分平面 (24x24)", grid, 0.5f);
+    }
+
+    // 立方体: 焊接之前 24 个顶点 8 个位置, 不焊的话一次坍缩都做不了
+    {
+        const FMeshData cube = FGeometryGenerator::GenerateCube();
+
+        const FMeshSimplifyResult result = FMeshSimplifier::Simplify(
+            cube.Vertices, cube.Indices, FMeshSimplifyOptions{});
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[简化] 立方体 — 顶点 {} 焊接后 {}", cube.Vertices.GetSize(),
+                 result.WeldedVertexCount);
+
+        // 立方体的每个位置在数据里有三份 (三个面各带一份法线)。焊不到 8
+        // 个的话每条边都是开边界, 简化器一次坍缩都做不了 —— 而那时上面
+        // 每一条判据仍然满分。
+        if (result.WeldedVertexCount != 8)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] 立方体焊接后应当是 8 个位置, 实际 {} 个 —— "
+                     "不焊的话每条边都是开边界, 简化器一次坍缩都做不了",
+                     result.WeldedVertexCount);
+            passed = false;
+        }
+    }
+
+    // 平面: 有开边界, 锁住之后四条边不许动
+    {
+        const FMeshData plane = FGeometryGenerator::GeneratePlane(2.0f, 2.0f, 8, 8);
+
+        const SizeType inputTriangles = plane.Indices.GetSize() / 3;
+
+        FMeshSimplifyOptions options;
+        options.TargetTriangleCount = 2;
+        options.LockOpenBoundary    = true;
+
+        const FMeshSimplifyResult result =
+            FMeshSimplifier::Simplify(plane.Vertices, plane.Indices, options);
+
+        // 边界锁住之后, 平面的四条边上的顶点一个都不能动。8x8 的平面边界
+        // 上有 32 个顶点, 简化到 2 个三角形是做不到的 —— 而"做不到"必须
+        // 被如实报出来, 不能悄悄留在半路上装作成功。
+        LIMX_LOG(LogLaunch, Display,
+                 "[简化] 平面 (锁边界) — {} -> {} 三角形, 达到目标 {}",
+                 inputTriangles, result.Indices.GetSize() / 3,
+                 result.ReachedTarget ? "是" : "否");
+
+        if (result.ReachedTarget)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] 平面锁住边界之后不可能简化到 2 个三角形, "
+                     "却报告达到了目标 —— 边界没被锁住");
+            passed = false;
+        }
+
+        // 边界顶点必须逐位留在原处
+        SizeType movedBoundary = 0;
+
+        for (SizeType v = 0; v < plane.Vertices.GetSize(); ++v)
+        {
+            const FVector3& p = plane.Vertices[v].Position;
+
+            const bool onBoundary =
+                (FMath::Abs(FMath::Abs(p.X) - 1.0f) < 1.0e-4f) ||
+                (FMath::Abs(FMath::Abs(p.Z) - 1.0f) < 1.0e-4f);
+
+            if (!onBoundary)
+            {
+                continue;
+            }
+
+            bool survives = false;
+
+            for (SizeType k = 0; k < result.Vertices.GetSize(); ++k)
+            {
+                const FVector3& q = result.Vertices[k].Position;
+
+                if (p.X == q.X && p.Y == q.Y && p.Z == q.Z)
+                {
+                    survives = true;
+                    break;
+                }
+            }
+
+            if (!survives)
+            {
+                ++movedBoundary;
+            }
+        }
+
+        if (movedBoundary != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] 平面 — {} 个边界顶点被动过了 —— 锁边界失效, "
+                     "而第二天的无裂缝全靠同一套机制",
+                     movedBoundary);
+            passed = false;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[简化] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -18207,6 +18895,7 @@ int WINAPI wWinMain(
     bool    meshletOcclusionPassed = true;
     bool    meshletScalePassed = true;
     bool    gpuCullOverflowPassed = true;
+    bool    meshSimplifyPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -18369,6 +19058,11 @@ int WINAPI wWinMain(
             {
                 gpuCullOverflowPassed =
                     RunGpuCullOverflowChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshSimplifyCheck)
+            {
+                meshSimplifyPassed = RunMeshSimplifyChecks();
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -18672,6 +19366,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.GpuCullOverflowCheck)
     {
         selfCheckCode = FinalizeSelfCheck(gpuCullOverflowPassed, 35, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshSimplifyCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshSimplifyPassed, 36, errorSink,
                                           errorsBeforeShutdown);
     }
 
