@@ -61,6 +61,10 @@
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
 #include "Renderer/RenderPass/FRayTracedReflectionPass.h"
+#include "RenderCore/Geometry/FGeometryGenerator.h"
+#include "RenderCore/Geometry/FMeshletBuilder.h"
+#include "AssetPipeline/FObjLoader.h"
+#include "Core/Containers/TSortAlgorithms.h"
 
 namespace Limx
 {
@@ -274,6 +278,9 @@ struct FLaunchOptions
 
     /// 双边上采样在深度不连续处不渗色 —— 见函数头
     bool RtAoUpsampleCheck = false;
+
+    /// meshlet 切分无损 —— 见函数头
+    bool MeshletCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -803,6 +810,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--rt-ao-upsample-check"))
         {
             options.RtAoUpsampleCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-check"))
+        {
+            options.MeshletCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -5375,6 +5386,633 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
     }
 
     LIMX_LOG(LogLaunch, Display, "[光追AO] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunMeshletChecks — meshlet 切分必须无损
+//
+// 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
+// **展开全部 meshlet 得到的三角形集合, 与原始索引数组是不是同一个集合。**
+//
+// 为什么这件事值得一条独立的判据: 下游 (剔除、可见性缓冲、材质解析) 全都
+// 假定 meshlet 就是原网格的一个划分。少一个三角形表现为"模型上有个洞",
+// 多一个表现为 Z 冲突 —— 而两者都可能只在某个视角下才看得见, 于是"画面
+// 对不对"这条路上的判据抓不住它。
+//
+// "同一个集合"取的是**多重集**加**绕序**: 同一个三角形出现两次不等于出现
+// 一次; (a,b,c) 与 (a,c,b) 是两个不同的三角形 (法线相反)。只允许旋转
+// ——(a,b,c)、(b,c,a)、(c,a,b) 是同一个三角形, 因为绕序没变。
+//
+// 六条判据:
+//   1. 三角形多重集完全相同 (含绕序)
+//   2. 每个 meshlet 的顶点数与三角形数都在上限之内, 且都大于零
+//   3. 每个局部索引都小于该 meshlet 的顶点数
+//   4. 每个局部顶点的全局下标都在顶点数组之内
+//   5. 包围球真的包住该 meshlet 的每一个顶点
+//   6. 法线锥真的包住该 meshlet 的每一个三角形法线
+//
+// 外加两条**质量**判据。正确但没用的切分是存在的 —— 一个三角形一个
+// meshlet 满足上面六条的每一条, 而它把顶点数据放大三倍、把剔除粒度缩到
+// 没有意义:
+//   7. 平均每个 meshlet 的三角形数不能太低
+//   8. 顶点复用率不能太低 (= 聚类没有把相邻的三角形放到一起)
+// ============================================================================
+
+namespace
+{
+
+/// 归一化过的三角形 —— 旋转到最小下标打头, 绕序不变
+struct FCanonicalTriangle
+{
+    UInt32 A = 0;
+    UInt32 B = 0;
+    UInt32 C = 0;
+};
+
+FCanonicalTriangle Canonicalize(UInt32 a, UInt32 b, UInt32 c)
+{
+    FCanonicalTriangle triangle;
+
+    // 三个旋转里挑第一个角最小的那个。只旋转不交换 —— 交换会翻转绕序,
+    // 而绕序决定正反面, 是判据要守住的东西之一。
+    if (a <= b && a <= c)
+    {
+        triangle.A = a;
+        triangle.B = b;
+        triangle.C = c;
+    }
+    else if (b <= a && b <= c)
+    {
+        triangle.A = b;
+        triangle.B = c;
+        triangle.C = a;
+    }
+    else
+    {
+        triangle.A = c;
+        triangle.B = a;
+        triangle.C = b;
+    }
+
+    return triangle;
+}
+
+bool TriangleLess(const FCanonicalTriangle& x, const FCanonicalTriangle& y)
+{
+    if (x.A != y.A)
+    {
+        return x.A < y.A;
+    }
+
+    if (x.B != y.B)
+    {
+        return x.B < y.B;
+    }
+
+    return x.C < y.C;
+}
+
+bool TriangleEqual(const FCanonicalTriangle& x, const FCanonicalTriangle& y)
+{
+    return x.A == y.A && x.B == y.B && x.C == y.C;
+}
+
+FVector3 GeometricNormal(const FVector3& a, const FVector3& b,
+                         const FVector3& c)
+{
+    const FVector3 ab = b - a;
+    const FVector3 ac = c - a;
+
+    const FVector3 cross(ab.Y * ac.Z - ab.Z * ac.Y,
+                         ab.Z * ac.X - ab.X * ac.Z,
+                         ab.X * ac.Y - ab.Y * ac.X);
+
+    const Float32 length =
+        FMath::Sqrt(cross.X * cross.X + cross.Y * cross.Y +
+                    cross.Z * cross.Z);
+
+    if (length < 1.0e-20f)
+    {
+        return FVector3(0.0f, 0.0f, 0.0f);
+    }
+
+    return FVector3(cross.X / length, cross.Y / length, cross.Z / length);
+}
+
+/// 对一个网格跑完整的八条判据
+bool CheckOneMesh(const AnsiChar* label, const TArray<FMeshVertex>& vertices,
+                  const TArray<UInt32>& indices, Float32 minAverageTriangles,
+                  Float32 minVertexReuse)
+{
+    const FMeshletBuildResult result =
+        FMeshletBuilder::Build(vertices, indices);
+
+    if (!result.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet] {} — 切分失败", label);
+        return false;
+    }
+
+    bool passed = true;
+
+    const SizeType triangleCount = indices.GetSize() / 3;
+
+    // ---- 判据 2/3/4: 上限、局部索引、全局下标 ----
+    SizeType emittedTriangles = 0;
+
+    for (SizeType m = 0; m < result.Meshlets.GetSize(); ++m)
+    {
+        const FMeshlet& meshlet = result.Meshlets[m];
+
+        if (meshlet.VertexCount == 0 || meshlet.TriangleCount == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet] {} — meshlet {} 是空的 ({} 顶点 {} 三角形)",
+                     label, m, meshlet.VertexCount, meshlet.TriangleCount);
+            passed = false;
+            break;
+        }
+
+        if (meshlet.VertexCount > kMaxMeshletVertices ||
+            meshlet.TriangleCount > kMaxMeshletTriangles)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet] {} — meshlet {} 超限: {} 顶点 (上限 {}), "
+                     "{} 三角形 (上限 {})",
+                     label, m, meshlet.VertexCount, kMaxMeshletVertices,
+                     meshlet.TriangleCount, kMaxMeshletTriangles);
+            passed = false;
+            break;
+        }
+
+        if (meshlet.VertexOffset + meshlet.VertexCount >
+            result.MeshletVertices.GetSize())
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet] {} — meshlet {} 的顶点区间越界", label, m);
+            passed = false;
+            break;
+        }
+
+        if ((static_cast<SizeType>(meshlet.TriangleOffset) +
+             meshlet.TriangleCount) * 3 >
+            result.MeshletTriangles.GetSize())
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet] {} — meshlet {} 的三角形区间越界", label, m);
+            passed = false;
+            break;
+        }
+
+        for (UInt32 i = 0; i < meshlet.VertexCount; ++i)
+        {
+            const UInt32 global =
+                result.MeshletVertices[meshlet.VertexOffset + i];
+
+            if (global >= vertices.GetSize())
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet] {} — meshlet {} 的第 {} 个局部顶点指向"
+                         "全局 {}, 而顶点数只有 {}",
+                         label, m, i, global, vertices.GetSize());
+                passed = false;
+                break;
+            }
+        }
+
+        for (UInt32 t = 0; t < meshlet.TriangleCount && passed; ++t)
+        {
+            for (UInt32 k = 0; k < 3; ++k)
+            {
+                const UInt8 local =
+                    result.MeshletTriangles[
+                        (static_cast<SizeType>(meshlet.TriangleOffset) + t) *
+                            3 + k];
+
+                if (local >= meshlet.VertexCount)
+                {
+                    LIMX_LOG(LogLaunch, Error,
+                             "[Meshlet] {} — meshlet {} 的三角形 {} 用了局部"
+                             "索引 {}, 而它只有 {} 个顶点",
+                             label, m, t, local, meshlet.VertexCount);
+                    passed = false;
+                    break;
+                }
+            }
+        }
+
+        emittedTriangles += meshlet.TriangleCount;
+    }
+
+    if (!passed)
+    {
+        return false;
+    }
+
+    // ---- 判据 1: 三角形多重集完全相同 ----
+    TArray<FCanonicalTriangle> original;
+    TArray<FCanonicalTriangle> emitted;
+
+    original.Reserve(triangleCount);
+    emitted.Reserve(emittedTriangles);
+
+    for (SizeType t = 0; t < triangleCount; ++t)
+    {
+        original.Add(Canonicalize(indices[t * 3 + 0], indices[t * 3 + 1],
+                                  indices[t * 3 + 2]));
+    }
+
+    for (SizeType m = 0; m < result.Meshlets.GetSize(); ++m)
+    {
+        const FMeshlet& meshlet = result.Meshlets[m];
+
+        for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+        {
+            const SizeType base =
+                (static_cast<SizeType>(meshlet.TriangleOffset) + t) * 3;
+
+            UInt32 global[3] = {};
+
+            for (UInt32 k = 0; k < 3; ++k)
+            {
+                global[k] = result.MeshletVertices[
+                    meshlet.VertexOffset + result.MeshletTriangles[base + k]];
+            }
+
+            emitted.Add(Canonicalize(global[0], global[1], global[2]));
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet] {} — 原始 {} 个三角形, 展开得到 {} 个",
+             label, original.GetSize(), emitted.GetSize());
+
+    if (original.GetSize() != emitted.GetSize())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — 三角形数对不上: 原始 {}, 展开 {} "
+                 "(差 {} 个)",
+                 label, original.GetSize(), emitted.GetSize(),
+                 static_cast<Int64>(emitted.GetSize()) -
+                     static_cast<Int64>(original.GetSize()));
+        passed = false;
+    }
+    else
+    {
+        Sort(original.GetData(), original.GetSize(), TriangleLess);
+        Sort(emitted.GetData(), emitted.GetSize(), TriangleLess);
+
+        SizeType mismatched = 0;
+        SizeType firstBad = 0;
+
+        for (SizeType i = 0; i < original.GetSize(); ++i)
+        {
+            if (!TriangleEqual(original[i], emitted[i]))
+            {
+                if (mismatched == 0)
+                {
+                    firstBad = i;
+                }
+
+                ++mismatched;
+            }
+        }
+
+        if (mismatched != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet] {} — {} 个三角形对不上, 第一个 (排序后第 {} "
+                     "个): 原始 ({},{},{}) vs 展开 ({},{},{})",
+                     label, mismatched, firstBad,
+                     original[firstBad].A, original[firstBad].B,
+                     original[firstBad].C,
+                     emitted[firstBad].A, emitted[firstBad].B,
+                     emitted[firstBad].C);
+            passed = false;
+        }
+    }
+
+    // ---- 判据 5/6: 包围球与法线锥必须真的包住 ----
+    //
+    // 这两条不是"精度好不好", 是"这个包围体是不是包围体"。不包住的后果是
+    // 剔除掉了可见的东西 —— 画面上少一块, 而那与"这一块本来就在视锥外"
+    // 长得一样。
+    SizeType sphereViolations = 0;
+    SizeType coneViolations = 0;
+
+    Float32 worstSphere = 0.0f;
+    Float32 worstCone = 0.0f;
+
+    // 包围球**紧不紧**, 与包围球**包不包得住**是两件事。
+    //
+    // 半径取到最远顶点这一条让球一定包得住, 球心取哪里都成立 —— 于是
+    // "球心取错"这类缺陷在包含性判据上完全没有痕迹 (实测球心改成局部
+    // 顶点表的第一个点, 上面那条判据一个字都不说, 而平均半径涨了 66%)。
+    //
+    // 紧致度这边有一条**不需要调参**的判据: 球心取包围盒中心时,
+    // 半径必然不超过包围盒对角线的一半 —— 那是"盒内任一点到盒心的距离
+    // 不超过半对角线"这个几何事实, 不是经验值。球心一旦偏离盒心, 半径
+    // 就可能超过它 (球心取到角上时正好是两倍)。
+    SizeType loosenessViolations = 0;
+
+    Float32 worstLooseness = 0.0f;
+
+    // 法线锥的哨兵值只有两种合法形态: 恰好是无效标记, 或者严格为正。
+    // 落在 (-1, 0] 里的余弦表示"锥张过了半球"却没被标记 —— 剔除侧会拿
+    // 一个没有意义的锥去判。这一条今天还没有消费者, 所以它的后果不在
+    // 画面上; 但契约是**现在**定的, 判据也该现在写。
+    SizeType sentinelViolations = 0;
+
+    for (SizeType m = 0; m < result.Meshlets.GetSize(); ++m)
+    {
+        const FMeshlet& meshlet = result.Meshlets[m];
+
+        const FVector3 center(meshlet.BoundingSphere.X,
+                              meshlet.BoundingSphere.Y,
+                              meshlet.BoundingSphere.Z);
+
+        FVector3 minimum(1.0e30f, 1.0e30f, 1.0e30f);
+        FVector3 maximum(-1.0e30f, -1.0e30f, -1.0e30f);
+
+        for (UInt32 i = 0; i < meshlet.VertexCount; ++i)
+        {
+            const FVector3& p =
+                vertices[result.MeshletVertices[meshlet.VertexOffset + i]]
+                    .Position;
+
+            minimum.X = FMath::Min(minimum.X, p.X);
+            minimum.Y = FMath::Min(minimum.Y, p.Y);
+            minimum.Z = FMath::Min(minimum.Z, p.Z);
+
+            maximum.X = FMath::Max(maximum.X, p.X);
+            maximum.Y = FMath::Max(maximum.Y, p.Y);
+            maximum.Z = FMath::Max(maximum.Z, p.Z);
+
+            const FVector3 delta = p - center;
+
+            const Float32 distance =
+                FMath::Sqrt(delta.X * delta.X + delta.Y * delta.Y +
+                            delta.Z * delta.Z);
+
+            const Float32 excess = distance - meshlet.BoundingSphere.W;
+
+            if (excess > 1.0e-4f)
+            {
+                ++sphereViolations;
+                worstSphere = FMath::Max(worstSphere, excess);
+            }
+        }
+
+        // ---- 紧致度: 半径不得超过自身包围盒的半对角线 ----
+        {
+            const FVector3 diagonal = maximum - minimum;
+
+            const Float32 halfDiagonal =
+                0.5f * FMath::Sqrt(diagonal.X * diagonal.X +
+                                   diagonal.Y * diagonal.Y +
+                                   diagonal.Z * diagonal.Z);
+
+            const Float32 excess = meshlet.BoundingSphere.W - halfDiagonal;
+
+            // 容差按尺度走: 半对角线的百万分之一。绝对容差在大网格上
+            // 太紧、在小网格上太松, 而这个网格的尺度是未知的。
+            const Float32 tolerance =
+                FMath::Max(halfDiagonal * 1.0e-6f, 1.0e-6f);
+
+            if (excess > tolerance)
+            {
+                ++loosenessViolations;
+                worstLooseness = FMath::Max(worstLooseness, excess);
+            }
+        }
+
+        // ---- 哨兵: 余弦要么是无效标记, 要么严格为正 ----
+        if (meshlet.NormalCone.W <= 0.0f &&
+            meshlet.NormalCone.W != kInvalidConeCosine)
+        {
+            ++sentinelViolations;
+        }
+
+        if (meshlet.NormalCone.W <= kInvalidConeCosine)
+        {
+            continue;
+        }
+
+        const FVector3 axis(meshlet.NormalCone.X, meshlet.NormalCone.Y,
+                            meshlet.NormalCone.Z);
+
+        for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+        {
+            const SizeType base =
+                (static_cast<SizeType>(meshlet.TriangleOffset) + t) * 3;
+
+            FVector3 corner[3];
+
+            for (UInt32 k = 0; k < 3; ++k)
+            {
+                corner[k] =
+                    vertices[result.MeshletVertices[
+                        meshlet.VertexOffset +
+                        result.MeshletTriangles[base + k]]].Position;
+            }
+
+            const FVector3 normal =
+                GeometricNormal(corner[0], corner[1], corner[2]);
+
+            // 退化三角形没有法线 —— 构建时就把它排除在锥外了
+            if (normal.X == 0.0f && normal.Y == 0.0f && normal.Z == 0.0f)
+            {
+                continue;
+            }
+
+            const Float32 dot = axis.X * normal.X + axis.Y * normal.Y +
+                                axis.Z * normal.Z;
+
+            const Float32 deficit = meshlet.NormalCone.W - dot;
+
+            if (deficit > 1.0e-4f)
+            {
+                ++coneViolations;
+                worstCone = FMath::Max(worstCone, deficit);
+            }
+        }
+    }
+
+    if (sphereViolations != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — {} 个顶点落在自己 meshlet 的包围球外 "
+                 "(最多超出 {}) —— 那个球不是包围球",
+                 label, sphereViolations, worstSphere);
+        passed = false;
+    }
+
+    if (coneViolations != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — {} 个三角形的法线落在自己 meshlet 的法线锥外 "
+                 "(最多差 {}) —— 背面剔除会剔掉正面的东西",
+                 label, coneViolations, worstCone);
+        passed = false;
+    }
+
+    if (loosenessViolations != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — {} 个 meshlet 的包围球半径超过了自身包围盒的"
+                 "半对角线 (最多超 {}) —— 球心没取在包围盒中心? "
+                 "球仍然包得住, 但白白大了一圈, 剔除会漏掉本该剔的",
+                 label, loosenessViolations, worstLooseness);
+        passed = false;
+    }
+
+    if (sentinelViolations != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — {} 个 meshlet 的法线锥余弦落在 (-1, 0] 里 "
+                 "—— 张角超过半球却没标记成无效锥, 剔除侧会拿它去判",
+                 label, sentinelViolations);
+        passed = false;
+    }
+
+    // ---- 判据 7/8: 质量 ----
+    const FMeshletStatistics statistics =
+        FMeshletBuilder::ComputeStatistics(result);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet] {} — {} 个 meshlet, 平均 {} 三角形 / {} 顶点, "
+             "顶点复用 {}, 平均包围球半径 {}, 有效法线锥 {}",
+             label, statistics.MeshletCount, statistics.AverageTriangles,
+             statistics.AverageVertices, statistics.VertexReuse,
+             statistics.AverageSphereRadius, statistics.ValidConeFraction);
+
+    if (statistics.AverageTriangles < minAverageTriangles)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — 平均每个 meshlet 只有 {} 个三角形 "
+                 "(需要至少 {}) —— 切得太碎, 剔除粒度没有意义",
+                 label, statistics.AverageTriangles, minAverageTriangles);
+        passed = false;
+    }
+
+    if (statistics.VertexReuse < minVertexReuse)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet] {} — 顶点复用率只有 {} (需要至少 {}) —— "
+                 "聚类没有把相邻的三角形放到一起",
+                 label, statistics.VertexReuse, minVertexReuse);
+        passed = false;
+    }
+
+    return passed;
+}
+
+} // namespace
+
+static bool RunMeshletChecks(FRenderContext* context, FRenderer& renderer)
+{
+    // 这条判据不碰 GPU —— meshlet 切分全在 CPU 上。两个参数留着是为了与
+    // 别的判据同签名, 调度处不必为它开特例。
+    LIMX_UNUSED(context);
+    LIMX_UNUSED(renderer);
+
+    bool passed = true;
+
+    // ---- 程序化几何: 球体 ----
+    //
+    // 球是最能分辨聚类好坏的形状: 它没有平坦区域, 每个三角形的法线都不同,
+    // 于是法线锥的紧致度直接反映聚类的空间局部性。切得散的话锥会张满半球,
+    // 有效锥占比掉到零。
+    //
+    // 阈值按实测定, 留三成余量:
+    //     平均三角形数  实测 64.0   ->  阈值 48
+    //     顶点复用      实测 4.15   ->  阈值 3.0
+    //
+    // 顶点复用的理论上限接近 6 (规则三角网格上每个顶点被六个三角形共用),
+    // 而 meshlet 边界上的顶点要在两侧各存一份, 所以实际达不到。
+    //
+    // 阈值不敢定得更高: 它们是**质量**判据, 一次合理的算法调整就可能让
+    // 实测值动几个百分点, 而那不该让流水线变红。它们要拦的是数量级的
+    // 退化 —— 比如"按索引顺序每 124 个三角形切一刀"这种完全不看邻接的
+    // 实现 (复用率会掉到 1.2 附近)。
+    {
+        const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+        passed &= CheckOneMesh("球体 (64x48)", sphere.Vertices, sphere.Indices,
+                               48.0f, 3.0f);
+    }
+
+    // ---- 程序化几何: 立方体 ----
+    //
+    // 立方体只有 12 个三角形 —— 一个 meshlet 装得下。这个用例验的是
+    // "小网格不会被切碎", 以及 24 个顶点的立方体每个面独立法线时,
+    // 法线锥必然张满半球 (六个面朝六个方向) —— 那时必须标记成无效锥,
+    // 而不是给出一个假装包住的锥。
+    //
+    // 质量阈值对它没有意义 (总共就 12 个三角形), 所以传 0。
+    {
+        const FMeshData cube = FGeometryGenerator::GenerateCube();
+
+        passed &= CheckOneMesh("立方体", cube.Vertices, cube.Indices,
+                               0.0f, 0.0f);
+    }
+
+    // ---- 真实资产: 场景里正在渲染的网格 ----
+    //
+    // 程序化几何是规则的 —— 顶点顺序整齐、三角形带连续。真实资产不是:
+    // OBJ 的顶点顺序由导出器决定, 子网格共用缓冲区, 还可能有退化三角形。
+    // 只在程序化几何上验的话, "邻接表建错了"这类缺陷会因为输入太整齐而
+    // 不显形。
+    {
+        FAssetScene assetScene;
+
+        const FAssetLoadResult loaded = FObjLoader::LoadFromFile(
+            FString("Content/TestScene/testscene.obj"), assetScene);
+
+        if (!loaded.Succeeded || assetScene.Meshes.IsEmpty())
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet] 无法解析 Content/TestScene/testscene.obj — "
+                     "真实资产那一段判不了, 判定为失败: {}",
+                     loaded.ErrorMessage.GetCStr());
+            passed = false;
+        }
+        else
+        {
+            SizeType meshesChecked = 0;
+
+            for (SizeType i = 0; i < assetScene.Meshes.GetSize(); ++i)
+            {
+                const FMeshData& mesh = assetScene.Meshes[i];
+
+                // 太小的网格上质量阈值没有意义 —— 一个 meshlet 就装完了。
+                // 正确性判据仍然跑。
+                const bool small = (mesh.Indices.GetSize() / 3) < 256;
+
+                passed &= CheckOneMesh(
+                    mesh.Name.GetCStr(), mesh.Vertices, mesh.Indices,
+                    small ? 0.0f : 64.0f, small ? 0.0f : 2.0f);
+
+                ++meshesChecked;
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet] 真实资产 — 验了 {} 个网格", meshesChecked);
+
+            // 元判据: 资产里得真有网格。空场景上前面那个循环一遍都不跑,
+            // 而 passed 保持为真 —— 又一条"失败落在通过上"的路。
+            if (meshesChecked == 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet] 资产里一个网格都没有 — 这一段是空的");
+                passed = false;
+            }
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[Meshlet] {}", passed ? "通过" : "失败");
 
     return passed;
 }
@@ -12012,6 +12650,7 @@ int WINAPI wWinMain(
     bool    rtGeometryTablePassed = true;
     bool    rtHybridPassed = true;
     bool    rtAoUpsamplePassed = true;
+    bool    meshletPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -12133,6 +12772,11 @@ int WINAPI wWinMain(
             {
                 rtAoUpsamplePassed =
                     RunRayTracedAoUpsampleCheck(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletCheck)
+            {
+                meshletPassed = RunMeshletChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -12394,6 +13038,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.RtAoUpsampleCheck)
     {
         selfCheckCode = FinalizeSelfCheck(rtAoUpsamplePassed, 28,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletPassed, 29,
                                           errorSink, errorsBeforeShutdown);
     }
 
