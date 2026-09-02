@@ -803,6 +803,12 @@ private:
     /// 光追阴影通道
     TUniquePtr<FRayTracedShadowPass>  m_RayTracedShadowPass;
 
+    /// 连续多少帧没有找到投影的光源
+    ///
+    /// 启动时光追阴影在场景加载之前打开, 最初几帧必然没有光源 —— 那是正常
+    /// 的启动过程。连续三十帧都没有才报, 而且只报一次。
+    UInt32                            m_RayTracedShadowNoLightFrames = 0;
+
     /// 光追环境光遮蔽通道
     TUniquePtr<FRayTracedAoPass>      m_RayTracedAoPass;
 

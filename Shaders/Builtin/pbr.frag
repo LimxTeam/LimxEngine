@@ -234,6 +234,7 @@ const uint  TEX_EMISSIVE           = 1u << 4;
 // TEX_NORMAL_TWO_CHANNEL 对应
 const uint  TEX_NORMAL_TWO_CHANNEL = 1u << 5;
 const uint  BLEND_MASKED           = 1u;
+const uint  BLEND_TRANSLUCENT      = 2u;
 
 // ============================================================
 // GGX/Trowbridge-Reitz 法线分布函数
@@ -798,7 +799,23 @@ vec3 ShadeOneLight(LightData light, int lightIndex,
     // 不选图集块, 那三步在光追里根本不存在。
     const int rtShadowLight = int(lighting.lightCountVec.z);
 
-    if (rtShadowLight >= 0 && lightIndex == rtShadowLight)
+    // 半透明片元**不能**用这张掩码。
+    //
+    // 掩码是屏幕空间的, 而它是从深度缓冲区算出来的 —— 深度缓冲区里存的是
+    // 半透明面之后那个**不透明**表面。于是半透明片元按 gl_FragCoord 取到的
+    // 是别人的可见度: 玻璃自己在阳光下, 却拿到了玻璃背后地面的阴影值。
+    //
+    // 这一条是把画面截下来看出来的: 综合场景里那块平躺的半透明面板, 换成
+    // 光追阴影之后整块的明暗变了, 而差异图上它是一个**带硬边的矩形**,
+    // 不是阴影边界那种细线。所有逐像素的数值判据都没抓到 —— 它们比的是
+    // 掩码与解析值, 而掩码本身是对的, 错的是"谁该读它"。
+    //
+    // 半透明退回阴影贴图那条路: 它按世界坐标查, 与屏幕上谁挡着谁无关。
+    // 真正的解法是给半透明片元单独发一条射线, 那要等前向通道能发射线。
+    const bool canUseScreenSpaceMask = (material.BlendMode != BLEND_TRANSLUCENT);
+
+    if (rtShadowLight >= 0 && lightIndex == rtShadowLight &&
+        canUseScreenSpaceMask)
     {
         shadow = texelFetch(rayTracedShadowMask,
                             ivec2(gl_FragCoord.xy), 0).r;

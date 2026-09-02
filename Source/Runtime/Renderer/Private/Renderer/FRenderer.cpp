@@ -703,10 +703,31 @@ void FRenderer::RenderFrame()
             }
         }
 
-        if (!found)
+        // 连续若干帧都没有光源才报, 而且只报一次。
+        //
+        // 启动时光追阴影是在场景加载之前打开的, 于是最初几帧必然还没有光源
+        // —— 那是正常的启动过程。每帧一条 Error 的话, 正常启动看起来像出了
+        // 故障, 而**真正持续没有光源**的情形反而淹没在里面。
+        //
+        // 门槛取 30 帧: 场景加载再慢也就几帧, 而持续三十帧没有投影光源
+        // 说明这个场景真的没有 —— 那时光追阴影的掩码一直是陈的, 值得说。
+        constexpr UInt32 kNoLightWarnFrames = 30;
+
+        if (found)
         {
-            LIMX_LOG(LogRenderer, Error,
-                     "[光追阴影] 场景里没有投影的光源 — 掩码会保持上一帧");
+            m_RayTracedShadowNoLightFrames = 0;
+        }
+        else if (m_RayTracedShadowNoLightFrames <= kNoLightWarnFrames)
+        {
+            ++m_RayTracedShadowNoLightFrames;
+
+            if (m_RayTracedShadowNoLightFrames == kNoLightWarnFrames)
+            {
+                LIMX_LOG(LogRenderer, Warning,
+                         "[光追阴影] 连续 {} 帧没有投影的光源 — "
+                         "掩码一直是上一帧的内容",
+                         kNoLightWarnFrames);
+            }
         }
 
         FLightManager::Get().SetRayTracedShadowLight(
