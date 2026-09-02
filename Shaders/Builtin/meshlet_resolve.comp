@@ -1,0 +1,281 @@
+#version 450
+
+// ============================================================================
+// meshlet_resolve.comp — 从可见性编号反解出三角形、重心坐标与属性
+//
+// 可见性缓冲区上一个像素只有一个数: (可见记录槽位, 三角形序号) + 1。
+// 这个通道把它展开回"这个像素上是什么":
+//
+//   槽位  -> 可见记录 -> (实例, meshlet 全局下标)
+//   实例  -> 变换矩阵、缓冲区基址、材质下标
+//   三角形序号 + meshlet -> 三个顶点
+//   三个顶点 + 像素中心 -> 重心坐标 -> 插值出来的属性
+//
+// ── 为什么这条通道的正确性可以**逐像素**验证 ──
+//
+// 重算的深度必须与光栅器写进深度缓冲区的那个值吻合。那不是"差不多",
+// 而是同一个量的两种算法:
+//
+//   光栅器: 顶点变换 -> 屏幕空间线性插值 z/w
+//   这里:   同样的顶点变换 -> 在像素中心解重心坐标 -> 同样的线性插值
+//
+// 两者只在浮点舍入上有差别。所以"重算的深度与深度缓冲区逐像素吻合"这条
+// 判据同时钉住了: 编号解得对不对、可见记录查得对不对、顶点取得对不对、
+// 重心坐标算得对不对。任何一处错了, 深度就落在别的三角形上, 差得远远
+// 超过舍入。
+//
+// 这是 Day 5 那条"位置自洽残差"的同一个招式: **与场景无关的自洽量比与场景
+// 有关的解析值更能分辨对错。**
+// ============================================================================
+
+#extension GL_EXT_scalar_block_layout : require
+
+#include "meshlet_raster_common.h"
+#include "gbuffer_common.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32ui, set = 0, binding = 0) uniform readonly uimage2D visibilityImage;
+
+layout(std430, set = 0, binding = 1) readonly buffer InstanceBuffer {
+    MeshletInstance instances[];
+} instanceBuffer;
+
+layout(std430, set = 0, binding = 2) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+} meshletBuffer;
+
+layout(std430, set = 0, binding = 3) readonly buffer VisibleMeshletBuffer {
+    uvec2 visible[];
+} visibleBuffer;
+
+layout(scalar, set = 0, binding = 4) readonly buffer VertexBuffer {
+    MeshletVertex vertices[];
+} vertexBuffer;
+
+layout(std430, set = 0, binding = 5) readonly buffer MeshletVertexBuffer {
+    uint indices[];
+} meshletVertexBuffer;
+
+layout(std430, set = 0, binding = 6) readonly buffer MeshletTriangleBuffer {
+    uint packed[];
+} meshletTriangleBuffer;
+
+// 逐实例的材质下标 —— 与实例表平行的一张小表
+//
+// 不塞进 MeshletInstance: 那个结构体是剔除通道每帧上传的, 而材质下标
+// 逐帧不变。塞进去的话每帧多传 16384 * 4 字节, 换来的只是少一次绑定。
+layout(std430, set = 0, binding = 7) readonly buffer MaterialBuffer {
+    uint materialIndex[];
+} materialBuffer;
+
+// 解析结果 —— 一个像素一条
+struct ResolveResult
+{
+    // 由重心坐标重算出来的 NDC 深度
+    float depth;
+
+    // 八面体编码的世界法线
+    vec2 normal;
+
+    // bindless 材质下标; 0xFFFFFFFF 表示这个像素上没有几何体
+    uint material;
+
+    // 透视校正插值出来的世界坐标
+    //
+    // 它在这里不是为了着色 (着色用不到它), 而是为了**可验**:
+    // 把它投回屏幕必须落在这个像素的中心上。那一条与场景无关, 而且
+    // 只有透视校正的权重才满足它 —— 屏幕空间权重插出来的点落在三角形
+    // 平面上, 但不是这个像素看到的那个点。
+    //
+    // 判据逼出来的: 只比法线的话, "属性不做透视校正"这条变异逃逸了 ——
+    // 综合场景里法线变化大的三角形 (球) 都很小, 而跨深度大的三角形
+    // (地面) 三个顶点的法线相同, 于是任何权重插出来都一样。
+    vec3 worldPosition;
+};
+
+// **scalar 布局, 不是 std430。**
+//
+// std430 下 vec2 要 8 字节对齐: depth 在 0, normal 会被推到 8, material
+// 到 16, 整个结构体 24 字节。而 C++ 那边是紧凑的 16 字节 —— 两边错位,
+// 读回来的深度是别人的法线。
+//
+// 这类错不会崩、不会报错, 只会让每个数都不对。第一次跑判据时 919234 个
+// 像素里有 909499 个的深度超差, 最大 1687 万个 ULP —— 那个数量级本身就
+// 说明不是精度问题, 是布局问题。
+layout(scalar, set = 0, binding = 8) writeonly buffer ResolveBuffer {
+    ResolveResult results[];
+} resolveBuffer;
+
+layout(row_major, push_constant) uniform Params {
+    mat4 viewProj;
+
+    // x = 宽, y = 高, z/w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.params.x || pixel.y >= pc.params.y)
+    {
+        return;
+    }
+
+    const uint linearIndex = pixel.y * pc.params.x + pixel.x;
+
+    ResolveResult result;
+    result.depth         = 1.0;
+    result.normal        = vec2(0.0);
+    result.material      = 0xFFFFFFFFu;
+    result.worldPosition = vec3(0.0);
+
+    const uint visibility =
+        imageLoad(visibilityImage, ivec2(pixel)).x;
+
+    if (!MeshletVisibilityValid(visibility))
+    {
+        resolveBuffer.results[linearIndex] = result;
+        return;
+    }
+
+    const uint slot     = MeshletDecodeSlot(visibility);
+    const uint triangle = MeshletDecodeTriangle(visibility);
+
+    const uvec2 entry = visibleBuffer.visible[slot];
+
+    const MeshletInstance instance = instanceBuffer.instances[entry.x];
+    const Meshlet meshlet = meshletBuffer.meshlets[entry.y];
+
+    const uint vertexBase          = instance.bufferBases.x;
+    const uint meshletVertexBase   = instance.bufferBases.y;
+    const uint meshletTriangleBase = instance.bufferBases.z;
+
+    // ---- 取三个顶点 ----
+    uint globalVertex[3];
+
+    for (uint k = 0u; k < 3u; ++k)
+    {
+        const uint byteIndex =
+            meshletTriangleBase + (meshlet.triangleOffset + triangle) * 3u + k;
+
+        const uint local = MeshletUnpackIndex(
+            meshletTriangleBuffer.packed[byteIndex >> 2], byteIndex);
+
+        globalVertex[k] = vertexBase +
+            meshletVertexBuffer.indices[meshletVertexBase +
+                                        meshlet.vertexOffset + local];
+    }
+
+    // ---- 顶点变换 —— 与光栅化路径**逐字相同**的运算顺序 ----
+    //
+    // 不同的写法在浮点上得到不同的结果, 而这条通道的判据要求重算的深度
+    // 与光栅器写的吻合到舍入以内。换一种等价写法就会让判据被迫加容差,
+    // 而容差一加, "取错了相邻三角形"这类错误就藏进去了。
+    const mat4 modelViewProj = pc.viewProj * MeshletInstanceMatrix(instance);
+
+    vec4 clip[3];
+    vec3 localNormal[3];
+
+    for (uint k = 0u; k < 3u; ++k)
+    {
+        clip[k] = modelViewProj *
+                  vec4(vertexBuffer.vertices[globalVertex[k]].position, 1.0);
+
+        localNormal[k] = vertexBuffer.vertices[globalVertex[k]].normal;
+    }
+
+    // ---- 屏幕空间重心坐标 ----
+    //
+    // 光栅器在**屏幕空间**做线性插值算深度 (z/w), 所以这里也必须在屏幕
+    // 空间解重心坐标。用裁剪空间或者世界空间解出来的权重是透视校正过的,
+    // 拿它插 z/w 得到的不是深度缓冲区里那个值。
+    vec2 screen[3];
+
+    for (uint k = 0u; k < 3u; ++k)
+    {
+        const vec2 ndc = clip[k].xy / clip[k].w;
+
+        screen[k] = (ndc * 0.5 + 0.5) * vec2(pc.params.xy);
+    }
+
+    // 像素中心。加 0.5 是必须的 —— 光栅器判的是像素中心在不在三角形内。
+    const vec2 point = vec2(pixel) + 0.5;
+
+    const vec2 e0 = screen[1] - screen[0];
+    const vec2 e1 = screen[2] - screen[0];
+    const vec2 e2 = point - screen[0];
+
+    const float area = e0.x * e1.y - e1.x * e0.y;
+
+    // 退化三角形 (面积为零) 上重心坐标没有定义。留原值 (深度 1.0,
+    // 材质无效) —— 那与"这里没有几何体"是同一种表示, 而判据会把它算成
+    // 覆盖不一致并报出来。硬凑一个权重的话它就被藏起来了。
+    if (abs(area) < 1.0e-12)
+    {
+        resolveBuffer.results[linearIndex] = result;
+        return;
+    }
+
+    const float inverseArea = 1.0 / area;
+
+    const float b1 = (e2.x * e1.y - e1.x * e2.y) * inverseArea;
+    const float b2 = (e0.x * e2.y - e2.x * e0.y) * inverseArea;
+    const float b0 = 1.0 - b1 - b2;
+
+    // ---- 深度: 屏幕空间线性插值 z/w ----
+    result.depth = b0 * (clip[0].z / clip[0].w) +
+                   b1 * (clip[1].z / clip[1].w) +
+                   b2 * (clip[2].z / clip[2].w);
+
+    // ---- 属性: 透视校正插值 ----
+    //
+    // 属性 (法线、UV) 在**世界空间**里线性变化, 而屏幕空间不是。所以权重
+    // 要除以各自的 w 再归一化。
+    //
+    // 深度那一行**不能**用这套权重: z/w 恰恰是屏幕空间线性的那个量。
+    // 两者用同一套权重是这类代码最经典的错误, 而它的表现是深度差一点点 ——
+    // 正好落在"看起来像精度问题"的范围里。
+    const float w0 = b0 / clip[0].w;
+    const float w1 = b1 / clip[1].w;
+    const float w2 = b2 / clip[2].w;
+
+    const float inverseSum = 1.0 / (w0 + w1 + w2);
+
+    const vec3 objectNormal =
+        (localNormal[0] * w0 + localNormal[1] * w1 + localNormal[2] * w2) *
+        inverseSum;
+
+    // 法线矩阵是模型矩阵左上 3x3 的逆转置。
+    //
+    // 不能图省事写成 mat3(model): 非等比缩放的物体上那两者不同, 而这条
+    // 通道要与 gbuffer.vert 的法线逐像素吻合 —— 那边用的正是逆转置。
+    const mat3 normalMatrix =
+        transpose(inverse(mat3(MeshletInstanceMatrix(instance))));
+
+    vec3 worldNormal = normalMatrix * objectNormal;
+
+    const float lengthSquared = dot(worldNormal, worldNormal);
+
+    // 退化时给 +Z —— 与 gbuffer.frag 的兜底一致。
+    worldNormal = (lengthSquared > 1e-12)
+                      ? (worldNormal * inversesqrt(lengthSquared))
+                      : vec3(0.0, 0.0, 1.0);
+
+    result.normal = EncodeOctahedralNormal(worldNormal);
+
+    result.material = materialBuffer.materialIndex[entry.x];
+
+    // 世界坐标 —— 与法线用同一套透视校正权重
+    const mat4 model = MeshletInstanceMatrix(instance);
+
+    const vec3 objectPosition =
+        (vertexBuffer.vertices[globalVertex[0]].position * w0 +
+         vertexBuffer.vertices[globalVertex[1]].position * w1 +
+         vertexBuffer.vertices[globalVertex[2]].position * w2) * inverseSum;
+
+    result.worldPosition = (model * vec4(objectPosition, 1.0)).xyz;
+
+    resolveBuffer.results[linearIndex] = result;
+}

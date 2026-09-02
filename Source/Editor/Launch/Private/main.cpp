@@ -299,6 +299,12 @@ struct FLaunchOptions
     /// 两条光栅化路径 + 与经典深度的关系 —— 见函数头
     bool MeshletDepthCheck = false;
 
+    /// 材质解析 (从可见性编号反解属性)
+    bool MeshletResolve = false;
+
+    /// 材质解析的判据 —— 见函数头
+    bool MeshletResolveCheck = false;
+
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
 
@@ -852,6 +858,15 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-depth-check"))
         {
             options.MeshletDepthCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-resolve"))
+        {
+            options.MeshletDepth   = true;
+            options.MeshletResolve = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-resolve-check"))
+        {
+            options.MeshletResolveCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -5424,6 +5439,814 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
     }
 
     LIMX_LOG(LogLaunch, Display, "[光追AO] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunMeshletResolveChecks — 从可见性编号反解出来的东西对不对
+//
+// 可见性缓冲区上一个像素只有一个数。材质解析把它展开回"这个像素上是什么":
+// 哪个实例、哪个 meshlet、哪个三角形、重心坐标多少、法线朝哪、什么材质。
+//
+// 这条链上任何一环错了, 画面上都是"某处的着色不对" —— 而那种错在光栅化
+// 阶段一点痕迹都没有 (深度是对的, 编号也是对的)。
+//
+// 三条判据:
+//
+//   一、**重算的深度与光栅器写的逐像素吻合。**
+//
+//      这是今天最强的一条, 也是本周期第三次用同一个招式 (Day 5 的位置
+//      自洽残差、Day 10 的两条路径逐位相同)。光栅器与解析算的是同一个量:
+//
+//        光栅器: 顶点变换 -> 屏幕空间线性插值 z/w
+//        解析:   同样的顶点变换 -> 在像素中心解重心坐标 -> 同样的插值
+//
+//      两者只在浮点舍入上有差别。所以这一条同时钉住了: 编号解得对不对、
+//      可见记录查得对不对、顶点取得对不对、重心坐标算得对不对。任何一处
+//      错了, 深度就落在别的三角形上, 差得远远超过舍入。
+//
+//      容差按**深度值本身的 ULP** 定, 不是一个绝对数: NDC 深度在近处
+//      接近 0、远处接近 1, 而 float32 在这两处的最低位差着几个数量级。
+//
+//   二、**法线与经典 G-Buffer 的法线吻合。**
+//
+//      经典路径的法线由光栅器插值顶点法线再八面体编码; 解析路径手算重心
+//      坐标做同样的事。两者的差只该来自 RG16_SFLOAT 的量化 (约 5e-4)。
+//
+//      这一条验的是透视校正: 属性必须用**透视校正**的权重插, 而深度必须
+//      用**屏幕空间**的权重。两者用同一套权重是这类代码最经典的错误 ——
+//      而它在深度上只差一点点 (看起来像精度问题), 在法线上却差得明显。
+//
+//   三、**材质下标与源对象的一致。**
+//
+//      实例表里的 MeshletRange[2] 存的是源对象下标, 解析按它查材质。
+//      用实例序号去索引对象列表的话, 只要有一个对象被跳过 (半透明、
+//      无 meshlet), 后面所有物体的材质就整体错位一格 —— 与 Day 5 光追
+//      几何表踩过的是同一个坑。
+// ============================================================================
+
+namespace
+{
+
+/// 与 FMeshletResolveResult 一致
+struct FResolveView
+{
+    Float32 Depth;
+    Float32 NormalX;
+    Float32 NormalY;
+    UInt32  Material;
+    Float32 WorldX;
+    Float32 WorldY;
+    Float32 WorldZ;
+};
+
+static_assert(sizeof(FResolveView) == 28, "与 FMeshletResolveResult 同布局");
+
+/// NDC 深度在这个取值附近的一个最低位有多大
+///
+/// float32 的相邻可表示数之间的距离随数值大小指数变化。用一个绝对容差的话,
+/// 它在近处 (深度接近 0) 松得没有意义, 在远处 (接近 1) 又紧到永远红。
+Float32 DepthUlp(Float32 depth)
+{
+    const Float32 magnitude = FMath::Max(FMath::Abs(depth), 1.0e-6f);
+
+    // 尾数 23 位 —— 一个最低位约是数值的 2^-23
+    return magnitude * 1.1920929e-7f;
+}
+
+/// 八面体解码 —— 与 gbuffer_common.h 的 DecodeOctahedralNormal 逐字对应
+FVector3 DecodeOctahedral(Float32 x, Float32 y)
+{
+    FVector3 n(x, y, 1.0f - FMath::Abs(x) - FMath::Abs(y));
+
+    if (n.Z < 0.0f)
+    {
+        const Float32 signX = (n.X >= 0.0f) ? 1.0f : -1.0f;
+        const Float32 signY = (n.Y >= 0.0f) ? 1.0f : -1.0f;
+
+        const Float32 wrapX = (1.0f - FMath::Abs(n.Y)) * signX;
+        const Float32 wrapY = (1.0f - FMath::Abs(n.X)) * signY;
+
+        n.X = wrapX;
+        n.Y = wrapY;
+    }
+
+    const Float32 length =
+        FMath::Sqrt(n.X * n.X + n.Y * n.Y + n.Z * n.Z);
+
+    return (length > 1.0e-12f)
+               ? FVector3(n.X / length, n.Y / length, n.Z / length)
+               : FVector3(0.0f, 0.0f, 1.0f);
+}
+
+} // namespace
+
+static bool RunMeshletResolveChecks(FRenderContext* context,
+                                    FRenderer&      renderer)
+{
+    if (!renderer.SetMeshletDepthEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet解析] 无法启用光栅化 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    FMeshletDepthPass* const pass = renderer.GetMeshletDepthPass();
+    FDepthPrePass* const     depthPass = renderer.GetDepthPrePass();
+
+    if (pass == nullptr || depthPass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet解析] 通道不存在");
+        return false;
+    }
+
+    pass->SetResolveEnabled(true);
+
+    bool passed = true;
+
+    // 先渲一帧让汇总、实例表、可见表都建起来
+    renderer.RenderFrame();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    IRHIDevice* const device = context->GetDevice();
+
+    // ---- 一帧里把解析结果、光栅化深度、经典法线一起读出来 ----
+    //
+    // 必须同一帧: 分几次读的话中间隔着帧的推进, 而可见记录表每帧重新压实,
+    // 解析结果与深度就不是同一次光栅化的产物了。
+    TArray<UInt8> resolveBytes;
+    TArray<UInt8> depthBytes;
+    TArray<UInt8> normalBytes;
+    TArray<UInt8> visibilityBytes;
+    TArray<UInt8> tableBytes;
+    TArray<UInt8> classicDepthBytes;
+
+    {
+        FRHIBufferHandle resolveStaging;
+        FRHIBufferHandle depthStaging;
+        FRHIBufferHandle normalStaging;
+        FRHIBufferHandle visibilityStaging;
+        FRHIBufferHandle tableStaging;
+        FRHIBufferHandle classicDepthStaging;
+
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "MeshletResolveCheck.Readback";
+
+        desc.Size = static_cast<UInt64>(pixelCount) * sizeof(FResolveView);
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, resolveStaging)))
+        {
+            return false;
+        }
+
+        desc.Size = static_cast<UInt64>(pixelCount) * 4u;
+
+        // 法线是 RG16_SFLOAT —— 每像素四字节, 与深度同宽
+        const bool allocated =
+            IsRHISuccess(device->CreateBuffer(desc, depthStaging)) &&
+            IsRHISuccess(device->CreateBuffer(desc, normalStaging)) &&
+            IsRHISuccess(device->CreateBuffer(desc, visibilityStaging)) &&
+            IsRHISuccess(device->CreateBuffer(desc, classicDepthStaging));
+
+        desc.Size = FMeshletCullPass::GetVisibleMeshletBytes();
+
+        if (!allocated ||
+            !IsRHISuccess(device->CreateBuffer(desc, tableStaging)))
+        {
+            device->DestroyBuffer(classicDepthStaging);
+            device->DestroyBuffer(tableStaging);
+            device->DestroyBuffer(visibilityStaging);
+            device->DestroyBuffer(normalStaging);
+            device->DestroyBuffer(depthStaging);
+            device->DestroyBuffer(resolveStaging);
+            return false;
+        }
+
+        const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+        const FRHIBufferHandle resolveBuffer =
+            pass->GetResolveBuffer(frameIndex);
+
+
+        const FRHITextureHandle depthTexture = pass->GetDepthTexture();
+
+        const FRHITextureHandle normalTexture = depthPass->GetNormalTexture();
+
+        const FRHITextureHandle visibilityTexture =
+            pass->GetVisibilityTexture();
+
+        const FRHIBufferHandle table =
+            renderer.GetMeshletCullPass()->GetVisibleMeshletBuffer(frameIndex);
+
+        const FRHITextureHandle classicDepthTexture =
+            depthPass->GetSharedDepthTexture();
+
+        bool recorded = false;
+
+        renderer.SetPostSceneRenderCallback(
+            [&recorded, context, resolveBuffer, resolveStaging, depthTexture,
+             depthStaging, normalTexture, normalStaging, visibilityTexture,
+             visibilityStaging, table, tableStaging, classicDepthTexture,
+             classicDepthStaging, extent, pixelCount]()
+            {
+                IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+                if (cmd == nullptr)
+                {
+                    return;
+                }
+
+                FRHIBufferCopyRegion region = {};
+                region.SrcOffset = 0;
+                region.DstOffset = 0;
+                region.Size =
+                    static_cast<UInt64>(pixelCount) * sizeof(FResolveView);
+
+                cmd->CopyBuffer(resolveBuffer, resolveStaging, region);
+
+                FRHIBufferTextureCopyRegion imageRegion = {};
+                imageRegion.BufferOffset      = 0;
+                imageRegion.BufferRowLength   = 0;
+                imageRegion.BufferImageHeight = 0;
+                imageRegion.MipLevel          = 0;
+                imageRegion.BaseLayer         = 0;
+                imageRegion.LayerCount        = 1;
+                imageRegion.TextureOffset     = { 0, 0, 0 };
+                imageRegion.TextureExtent = { extent.Width, extent.Height, 1 };
+
+                cmd->TransitionImageLayout(
+                    depthTexture, EImageLayout::DepthStencilAttachment,
+                    EImageLayout::TransferSrc,
+                    EPipelineStageFlags::LateFragmentTests,
+                    EPipelineStageFlags::Transfer,
+                    EAccessFlags::DepthStencilAttachmentWrite,
+                    EAccessFlags::TransferRead);
+
+                cmd->CopyTextureToBuffer(depthTexture,
+                                         EImageLayout::TransferSrc,
+                                         depthStaging, imageRegion);
+
+                cmd->TransitionImageLayout(
+                    depthTexture, EImageLayout::TransferSrc,
+                    EImageLayout::DepthStencilAttachment,
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::EarlyFragmentTests,
+                    EAccessFlags::TransferRead,
+                    EAccessFlags::DepthStencilAttachmentWrite);
+
+                // ---- 经典 G-Buffer 的法线 ----
+                cmd->TransitionImageLayout(
+                    normalTexture, EImageLayout::ShaderReadOnly,
+                    EImageLayout::TransferSrc,
+                    EPipelineStageFlags::FragmentShader,
+                    EPipelineStageFlags::Transfer,
+                    EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+                cmd->CopyTextureToBuffer(normalTexture,
+                                         EImageLayout::TransferSrc,
+                                         normalStaging, imageRegion);
+
+                cmd->TransitionImageLayout(
+                    normalTexture, EImageLayout::TransferSrc,
+                    EImageLayout::ShaderReadOnly,
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::FragmentShader,
+                    EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+                // ---- 可见性编号与同一帧的可见记录表 ----
+                cmd->TransitionImageLayout(
+                    visibilityTexture, EImageLayout::ShaderReadOnly,
+                    EImageLayout::TransferSrc,
+                    EPipelineStageFlags::ColorAttachmentOutput,
+                    EPipelineStageFlags::Transfer,
+                    EAccessFlags::ColorAttachmentWrite,
+                    EAccessFlags::TransferRead);
+
+                cmd->CopyTextureToBuffer(visibilityTexture,
+                                         EImageLayout::TransferSrc,
+                                         visibilityStaging, imageRegion);
+
+                cmd->TransitionImageLayout(
+                    visibilityTexture, EImageLayout::TransferSrc,
+                    EImageLayout::ShaderReadOnly,
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::ColorAttachmentOutput,
+                    EAccessFlags::TransferRead,
+                    EAccessFlags::ColorAttachmentWrite);
+
+                FRHIBufferCopyRegion tableRegion = {};
+                tableRegion.SrcOffset = 0;
+                tableRegion.DstOffset = 0;
+                tableRegion.Size = FMeshletCullPass::GetVisibleMeshletBytes();
+
+                cmd->CopyBuffer(table, tableStaging, tableRegion);
+
+                // ---- 经典深度预通道的深度 ----
+                //
+                // 法线只能在**两条路径画了同一个表面**的像素上比。蒙版材质
+                // 那些地方经典路径挖了洞露出后面的面, 而 meshlet 路径直接
+                // 画那个面 —— 两者的法线本来就该不同, 拿它们比是没有意义的。
+                cmd->TransitionImageLayout(
+                    classicDepthTexture,
+                    EImageLayout::DepthStencilAttachment,
+                    EImageLayout::TransferSrc,
+                    EPipelineStageFlags::LateFragmentTests,
+                    EPipelineStageFlags::Transfer,
+                    EAccessFlags::DepthStencilAttachmentWrite,
+                    EAccessFlags::TransferRead);
+
+                cmd->CopyTextureToBuffer(classicDepthTexture,
+                                         EImageLayout::TransferSrc,
+                                         classicDepthStaging, imageRegion);
+
+                cmd->TransitionImageLayout(
+                    classicDepthTexture, EImageLayout::TransferSrc,
+                    EImageLayout::DepthStencilAttachment,
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::EarlyFragmentTests,
+                    EAccessFlags::TransferRead,
+                    EAccessFlags::DepthStencilAttachmentWrite);
+
+                recorded = true;
+            });
+
+        renderer.RenderFrame();
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        bool ok = recorded;
+
+        if (ok)
+        {
+            device->WaitIdle();
+
+            struct FStagingRead
+            {
+                FRHIBufferHandle Source;
+                SizeType         Bytes;
+                TArray<UInt8>*   Target;
+            };
+
+            const FStagingRead reads[6] = {
+                { resolveStaging, pixelCount * sizeof(FResolveView),
+                  &resolveBytes },
+                { depthStaging, pixelCount * 4, &depthBytes },
+                { normalStaging, pixelCount * 4, &normalBytes },
+                { visibilityStaging, pixelCount * 4, &visibilityBytes },
+                { tableStaging,
+                  static_cast<SizeType>(
+                      FMeshletCullPass::GetVisibleMeshletBytes()),
+                  &tableBytes },
+                { classicDepthStaging, pixelCount * 4, &classicDepthBytes },
+            };
+
+            for (UInt32 r = 0; r < 6; ++r)
+            {
+                void* mapped = nullptr;
+
+                if (!IsRHISuccess(device->MapBuffer(reads[r].Source,
+                                                    &mapped)) ||
+                    mapped == nullptr)
+                {
+                    ok = false;
+                    break;
+                }
+
+                const auto* source = static_cast<const UInt8*>(mapped);
+
+                reads[r].Target->Reserve(reads[r].Bytes);
+
+                for (SizeType i = 0; i < reads[r].Bytes; ++i)
+                {
+                    reads[r].Target->Add(source[i]);
+                }
+
+                device->UnmapBuffer(reads[r].Source);
+            }
+        }
+
+        device->DestroyBuffer(classicDepthStaging);
+        device->DestroyBuffer(tableStaging);
+        device->DestroyBuffer(visibilityStaging);
+        device->DestroyBuffer(normalStaging);
+        device->DestroyBuffer(depthStaging);
+        device->DestroyBuffer(resolveStaging);
+
+        if (!ok)
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet解析] 回读失败");
+            return false;
+        }
+    }
+
+    const auto* resolve =
+        reinterpret_cast<const FResolveView*>(resolveBytes.GetData());
+
+    const auto* rasterDepth =
+        reinterpret_cast<const Float32*>(depthBytes.GetData());
+
+    // ---- 判据一: 重算的深度与光栅器写的吻合 ----
+    SizeType covered      = 0;
+    SizeType depthDiffer  = 0;
+    Float32  worstUlps    = 0.0f;
+
+    SizeType coverageMismatch = 0;
+
+    for (SizeType i = 0; i < pixelCount; ++i)
+    {
+        const bool hasResolve = (resolve[i].Material != 0xFFFFFFFFu);
+        const bool hasRaster  = (rasterDepth[i] < 1.0f);
+
+        if (hasResolve != hasRaster)
+        {
+            ++coverageMismatch;
+            continue;
+        }
+
+        if (!hasResolve)
+        {
+            continue;
+        }
+
+        ++covered;
+
+        const Float32 delta =
+            FMath::Abs(resolve[i].Depth - rasterDepth[i]);
+
+        const Float32 ulps = delta / DepthUlp(rasterDepth[i]);
+
+        worstUlps = FMath::Max(worstUlps, ulps);
+
+        // 阈值 64 个最低位。
+        //
+        // 这个数不是随手取的: 重心坐标要经过两次除法与三次乘加, 每一步
+        // 都在舍入。64 个 ULP 是那串运算的舍入上界的量级, 而"取错了相邻
+        // 三角形"带来的深度差比它大好几个数量级 —— 相邻三角形在屏幕上
+        // 差一个像素, 深度差是梯度乘一个像素, 那是 1e-4 量级, 而一个
+        // ULP 在深度 0.99 处是 6e-8。
+        //
+        // 与光追深度那条判据取同一个数, 理由也是同一个。
+        if (ulps > 64.0f)
+        {
+            ++depthDiffer;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet解析] 深度自洽 — 覆盖 {} 个像素, 超过 64 ULP 的 {} 个 "
+             "(最大 {} ULP); 覆盖不一致 {} 个",
+             covered, depthDiffer, worstUlps, coverageMismatch);
+
+    constexpr SizeType kMinCovered = 50000;
+
+    if (covered < kMinCovered)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet解析] 只覆盖了 {} 个像素 (需要至少 {}) —— "
+                 "一张几乎空的解析结果会让所有判据形同虚设",
+                 covered, kMinCovered);
+        passed = false;
+    }
+
+    if (coverageMismatch != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet解析] {} 个像素上解析与光栅化的覆盖不一致 —— "
+                 "解析读的就是光栅化写的那张可见性图, 覆盖只能相同",
+                 coverageMismatch);
+        passed = false;
+    }
+
+    if (depthDiffer != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet解析] {} 个像素上重算的深度与光栅器写的差超过 "
+                 "64 ULP (最大 {}) —— 编号解错了、顶点取错了, 或者重心坐标"
+                 "算错了",
+                 depthDiffer, worstUlps);
+        passed = false;
+    }
+
+    // ---- 判据二: 法线与经典 G-Buffer 吻合 ----
+    //
+    // 经典路径的法线由光栅器插值顶点法线再八面体编码; 解析路径手算重心
+    // 坐标做同样的事。两者的差只该来自 RG16_SFLOAT 的量化。
+    //
+    // 这一条验的是**透视校正**: 属性必须用透视校正的权重插, 而深度必须用
+    // 屏幕空间的权重。两者用同一套权重是这类代码最经典的错误 —— 而它在
+    // 深度上只差一点点 (看起来像精度问题), 在法线上却差得明显。
+    {
+        const auto* normalSource =
+            reinterpret_cast<const UInt16*>(normalBytes.GetData());
+
+        const auto* classicDepth =
+            reinterpret_cast<const Float32*>(classicDepthBytes.GetData());
+
+        SizeType compared = 0;
+        SizeType exceeded = 0;
+
+        Float64 angleSum   = 0.0;
+        Float32 worstAngle = 0.0f;
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            if (resolve[i].Material == 0xFFFFFFFFu)
+            {
+                continue;
+            }
+
+            const Float32 classicX =
+                Float16ToFloat32(normalSource[i * 2 + 0]);
+            const Float32 classicY =
+                Float16ToFloat32(normalSource[i * 2 + 1]);
+
+            // 哨兵 (2,2) = 经典路径在这里没有几何体。
+            //
+            // meshlet 路径只画不透明批次而经典 G-Buffer 画不透明加蒙版,
+            // 所以反过来 (经典有而 meshlet 没有) 是正常的; 但 meshlet 有
+            // 而经典没有则不可能 —— 那时跳过而不是当成误差, 因为哨兵不是
+            // 一个法线。
+            if (classicX > 1.5f || classicY > 1.5f)
+            {
+                continue;
+            }
+
+            // 只在**两条路径画了同一个表面**的像素上比。
+            //
+            // 蒙版材质那些地方经典路径做 alpha 测试挖了洞、露出后面的
+            // 不透明面, 而 meshlet 路径 (只画不透明) 直接画那个面 ——
+            // 两者的法线本来就该不同。不排除的话实测 2.6% 的像素超差,
+            // 而那 2.6% 恰好是 Day 10 量到的蒙版板子的屏幕面积。
+            //
+            // 判据要问的是"同一个三角形上两条路径插出来的法线一样吗",
+            // 拿不同的三角形去比是在问另一个问题。
+            if (rasterDepth[i] != classicDepth[i])
+            {
+                continue;
+            }
+
+            ++compared;
+
+            const FVector3 a =
+                DecodeOctahedral(resolve[i].NormalX, resolve[i].NormalY);
+
+            const FVector3 b = DecodeOctahedral(classicX, classicY);
+
+            const Float32 dot =
+                FMath::Clamp(a.X * b.X + a.Y * b.Y + a.Z * b.Z, -1.0f, 1.0f);
+
+            const Float32 angle = FMath::RadiansToDegrees(FMath::ACos(dot));
+
+            angleSum += static_cast<Float64>(angle);
+
+            worstAngle = FMath::Max(worstAngle, angle);
+
+            // 阈值 2 度。
+            //
+            // RG16_SFLOAT 的八面体编码本身约 0.03 度; 两条路径的插值权重
+            // 在浮点上略有不同, 再加上三角形边缘上一个像素的中心可能落在
+            // 两个三角形的公共边附近 —— 那时两边解出的法线本来就不同。
+            // 2 度足够松到不被这些噪声顶红, 又足够紧到"用错了权重"
+            // (实测差十几度) 一定会红。
+            if (angle > 2.0f)
+            {
+                ++exceeded;
+            }
+        }
+
+        const Float64 meanAngle =
+            (compared > 0) ? (angleSum / static_cast<Float64>(compared)) : 0.0;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet解析] 法线 — 比了 {} 个像素, 平均夹角 {} 度, "
+                 "最大 {} 度, 超过 2 度的 {} 个",
+                 compared, meanAngle, worstAngle, exceeded);
+
+        if (compared < kMinCovered)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet解析] 只有 {} 个像素能与经典法线比 "
+                     "(需要至少 {})", compared, kMinCovered);
+            passed = false;
+        }
+
+        // 允许千分之一的像素超差 —— 三角形公共边上的像素两边法线本来就
+        // 不同, 而那与"权重用错了"在数量级上差着三个量级 (实测 0.0002)。
+        const Float32 exceededFraction =
+            (compared > 0) ? (static_cast<Float32>(exceeded) /
+                              static_cast<Float32>(compared))
+                           : 1.0f;
+
+        if (exceededFraction > 0.001f)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet解析] {} 的像素法线与经典 G-Buffer 差超过 2 度 "
+                     "(上限 0.001) —— 属性插值没做透视校正?",
+                     exceededFraction);
+            passed = false;
+        }
+    }
+
+    // ---- 判据三: 插值出来的世界坐标投回屏幕必须落在这个像素上 ----
+    //
+    // 这一条与场景无关, 而且**只有透视校正的权重满足它**。屏幕空间权重
+    // 插出来的点也在三角形平面上, 但不是这个像素看到的那个点 —— 投回去
+    // 会落在别处, 偏多少取决于三角形跨了多大的深度。
+    //
+    // 它是判据逼出来的: 只比法线的话, "属性不做透视校正"这条变异逃逸了。
+    // 综合场景里法线变化大的三角形 (球) 都很小, 跨深度大的三角形 (地面)
+    // 三个顶点的法线又相同 —— 于是任何权重插出来都一样。而世界坐标在
+    // **每个**三角形上都随位置变, 这条判据处处有效。
+    {
+        const FCamera& camera = renderer.GetCamera();
+
+        const FMatrix viewProj =
+            camera.GetProjectionMatrix() * camera.GetViewMatrix();
+
+        SizeType compared = 0;
+        SizeType exceeded = 0;
+
+        Float32 worstPixels = 0.0f;
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            if (resolve[i].Material == 0xFFFFFFFFu)
+            {
+                continue;
+            }
+
+            ++compared;
+
+            const Float32 x = resolve[i].WorldX;
+            const Float32 y = resolve[i].WorldY;
+            const Float32 z = resolve[i].WorldZ;
+
+            // FMatrix 是行主序 M[行][列]; 列向量语义下 clip = M * p
+            const Float32 clipX = viewProj.M[0][0] * x + viewProj.M[0][1] * y +
+                                  viewProj.M[0][2] * z + viewProj.M[0][3];
+            const Float32 clipY = viewProj.M[1][0] * x + viewProj.M[1][1] * y +
+                                  viewProj.M[1][2] * z + viewProj.M[1][3];
+            const Float32 clipW = viewProj.M[3][0] * x + viewProj.M[3][1] * y +
+                                  viewProj.M[3][2] * z + viewProj.M[3][3];
+
+            if (FMath::Abs(clipW) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            const Float32 screenX =
+                ((clipX / clipW) * 0.5f + 0.5f) *
+                static_cast<Float32>(extent.Width);
+
+            const Float32 screenY =
+                ((clipY / clipW) * 0.5f + 0.5f) *
+                static_cast<Float32>(extent.Height);
+
+            const SizeType px = i % extent.Width;
+            const SizeType py = i / extent.Width;
+
+            const Float32 dx = screenX - (static_cast<Float32>(px) + 0.5f);
+            const Float32 dy = screenY - (static_cast<Float32>(py) + 0.5f);
+
+            const Float32 distance = FMath::Sqrt(dx * dx + dy * dy);
+
+            worstPixels = FMath::Max(worstPixels, distance);
+
+            // 阈值 0.05 个像素。
+            //
+            // 完美的话是 0 —— 但插值、矩阵乘法与投影各自舍入, 而远处的
+            // 三角形上一点点世界坐标误差会被投影放大。实测最大 **0.0005**
+            // 个像素, 而不做透视校正时是几十个像素 —— 两者差着五个量级,
+            // 阈值取在哪都行, 取 0.05 只是留个整齐的余量。
+            if (distance > 0.05f)
+            {
+                ++exceeded;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet解析] 世界坐标投回屏幕 — 比了 {} 个像素, "
+                 "最大偏离 {} 个像素, 超过 0.05 的 {} 个",
+                 compared, worstPixels, exceeded);
+
+        if (exceeded != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet解析] {} 个像素上插值出来的世界坐标投回屏幕"
+                     "落在别处 (最大偏离 {} 个像素) —— 属性插值没做透视校正?",
+                     exceeded, worstPixels);
+            passed = false;
+        }
+    }
+
+    // ---- 判据四: 材质下标按**源对象下标**查, 不是按实例序号 ----
+    //
+    // 实例表里的 MeshletRange[2] 存的是源对象下标。用实例序号去索引对象
+    // 列表的话, 只要有一个对象被跳过 (半透明、无 meshlet), 后面所有物体
+    // 的材质就整体错位一格 —— 与 Day 5 光追几何表踩过的是同一个坑。
+    //
+    // 判据在 CPU 上独立走一遍同一条链: 可见性编号 -> 槽位 -> 可见记录 ->
+    // 实例 -> 源对象 -> 材质下标, 与着色器写出来的比。
+    {
+        const auto* visibility =
+            reinterpret_cast<const UInt32*>(visibilityBytes.GetData());
+
+        const auto* table =
+            reinterpret_cast<const UInt32*>(tableBytes.GetData());
+
+        const TArray<FMeshletInstanceGpu>& instances =
+            renderer.GetMeshletCullPass()->GetInstances();
+
+        const TArray<FRenderObject>& objects =
+            renderer.GetShadowCasterObjects();
+
+        SizeType compared    = 0;
+        SizeType mismatched  = 0;
+        SizeType firstBad    = 0;
+
+        TSet<UInt32> distinctMaterials;
+
+        for (SizeType i = 0; i < pixelCount; ++i)
+        {
+            if (visibility[i] == 0u || resolve[i].Material == 0xFFFFFFFFu)
+            {
+                continue;
+            }
+
+            const UInt32 slot = (visibility[i] - 1u) >> 7;
+
+            const UInt32 instanceIndex = table[slot * 2 + 0];
+
+            if (instanceIndex >= instances.GetSize())
+            {
+                continue;
+            }
+
+            const UInt32 source = instances[instanceIndex].MeshletRange[2];
+
+            if (source >= objects.GetSize())
+            {
+                continue;
+            }
+
+            ++compared;
+
+            distinctMaterials.Add(resolve[i].Material);
+
+            if (resolve[i].Material != objects[source].BindlessMaterialIndex)
+            {
+                if (mismatched == 0)
+                {
+                    firstBad = i;
+                }
+
+                ++mismatched;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet解析] 材质 — 比了 {} 个像素, 不符 {} 个, "
+                 "不同的材质下标 {} 个",
+                 compared, mismatched, distinctMaterials.GetSize());
+
+        if (mismatched != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet解析] {} 个像素的材质下标与源对象不符 "
+                     "(第一个在 {}: 解析 {}), 按实例序号查的?",
+                     mismatched, firstBad, resolve[firstBad].Material);
+            passed = false;
+        }
+
+        // 元判据: 场景里得有多种材质。
+        //
+        // 只有一种的话, "材质查错了"与"查对了"给出同一个数 —— 这条判据
+        // 就是空的。本周期在光追几何表上栽过同一件事。
+        if (distinctMaterials.GetSize() < 2)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet解析] 解析出来只有 {} 种材质下标 —— "
+                     "这个场景判不了材质查得对不对",
+                     distinctMaterials.GetSize());
+            passed = false;
+        }
+    }
+
+    if (!renderer.SetMeshletDepthEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet解析] 无法关闭 (复位)");
+        passed = false;
+    }
+
+    pass->SetResolveEnabled(false);
+
+    LIMX_LOG(LogLaunch, Display, "[Meshlet解析] {}", passed ? "通过" : "失败");
 
     return passed;
 }
@@ -14280,10 +15103,13 @@ int WINAPI wWinMain(
                 wantFallback ? FMeshletDepthPass::EMode::Fallback
                              : FMeshletDepthPass::EMode::MeshShader);
 
+            pass->SetResolveEnabled(launchOptions.MeshletResolve);
+
             LIMX_LOG(LogLaunch, Display,
-                     "[Launch] meshlet 深度光栅化已启用 ({}{})",
+                     "[Launch] meshlet 深度光栅化已启用 ({}{}), 材质解析 {}",
                      wantFallback ? "计算展开回退" : "网格着色器",
-                     modeOk ? "" : " — 请求的路径不可用, 保持原样");
+                     modeOk ? "" : " — 请求的路径不可用, 保持原样",
+                     launchOptions.MeshletResolve ? "开" : "关");
         }
         else
         {
@@ -14491,6 +15317,7 @@ int WINAPI wWinMain(
     bool    meshletPassed = true;
     bool    meshletCullPassed = true;
     bool    meshletDepthPassed = true;
+    bool    meshletResolvePassed = true;
 
     while (window.ProcessMessages())
     {
@@ -14629,6 +15456,12 @@ int WINAPI wWinMain(
             {
                 meshletDepthPassed =
                     RunMeshletDepthChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletResolveCheck)
+            {
+                meshletResolvePassed =
+                    RunMeshletResolveChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -14908,6 +15741,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletDepthCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletDepthPassed, 31,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletResolveCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletResolvePassed, 32,
                                           errorSink, errorsBeforeShutdown);
     }
 

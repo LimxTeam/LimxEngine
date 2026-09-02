@@ -44,6 +44,36 @@
 namespace Limx
 {
 
+// ============================================================================
+// FMeshletResolveResult — 与 meshlet_resolve.comp 的 ResolveResult 一致
+// ============================================================================
+
+struct FMeshletResolveResult
+{
+    /// 由重心坐标重算的 NDC 深度
+    Float32 Depth = 1.0f;
+
+    /// 八面体编码的世界法线
+    Float32 NormalX = 0.0f;
+    Float32 NormalY = 0.0f;
+
+    /// bindless 材质下标; 0xFFFFFFFF = 这个像素上没有几何体
+    UInt32 Material = 0xFFFFFFFFu;
+
+    /// 透视校正插值出来的世界坐标
+    ///
+    /// 不是给着色用的, 是给判据用的: 把它投回屏幕必须落在这个像素的中心
+    /// 上。那一条与场景无关, 而且只有透视校正的权重才满足它。
+    Float32 WorldX = 0.0f;
+    Float32 WorldY = 0.0f;
+    Float32 WorldZ = 0.0f;
+};
+
+static_assert(sizeof(FMeshletResolveResult) == 28,
+              "FMeshletResolveResult 必须是 28 字节 — 与 "
+              "meshlet_resolve.comp 的 ResolveResult 逐字段一致 "
+              "(那边用 scalar 布局, 所以是紧凑的)");
+
 /// 展开顶点流的容量 (以顶点计)
 ///
 /// 每个顶点 8 字节, 2M 个 = 16 MiB。够 5400 个装满的 meshlet。
@@ -132,6 +162,20 @@ public:
     /// 上一次执行画了多少个 meshlet (由剔除通道的计数器给出)
     LIMX_NODISCARD UInt32 GetDrawnMeshlets() const { return m_DrawnMeshlets; }
 
+    /// 材质解析的结果缓冲区 (每像素 FMeshletResolveResult)
+    ///
+    /// 一个像素一条: 由重心坐标重算的 NDC 深度、八面体编码的世界法线、
+    /// bindless 材质下标 (0xFFFFFFFF = 这里没有几何体)。
+    LIMX_NODISCARD FRHIBufferHandle GetResolveBuffer(UInt32 frameIndex) const;
+
+    /// 材质解析开关
+    ///
+    /// 与光栅化分开: 合在一起的话, "解析整个没跑"与"解析跑了但结果不对"
+    /// 在判据上分不开 —— 前者的输出缓冲区里是上一帧的内容。
+    void SetResolveEnabled(bool enabled) { m_ResolveEnabled = enabled; }
+
+    LIMX_NODISCARD bool IsResolveEnabled() const { return m_ResolveEnabled; }
+
 private:
     ERHIResult CreateDepthTarget(IRHIDevice* device, FRHIExtent2D extent);
     ERHIResult CreateRenderPass(IRHIDevice* device);
@@ -186,6 +230,23 @@ private:
     FRHIGraphicsPipelineHandle m_MeshPipeline;
     FRHIComputePipelineHandle  m_ExpandPipeline;
     FRHIGraphicsPipelineHandle m_FallbackPipeline;
+
+    // ---- 材质解析 ----
+    bool m_ResolveEnabled = false;
+
+    TArray<FRHIBufferHandle> m_ResolveBuffers;
+
+    /// 逐实例的材质下标 —— 与实例表平行
+    TArray<FRHIBufferHandle> m_MaterialBuffers;
+
+    FRHIDescSetLayoutHandle   m_ResolveSetLayout;
+    FRHIPipelineLayoutHandle  m_ResolvePipelineLayout;
+    FRHIComputePipelineHandle m_ResolvePipeline;
+    FRHIShaderHandle          m_ResolveShader;
+
+    TArray<FRHIDescriptorSetHandle> m_ResolveSets;
+
+    FRHITextureViewHandle m_VisibilityStorageView;
 
     FRHIShaderHandle m_MeshShader;
     FRHIShaderHandle m_FragmentShader;

@@ -852,6 +852,30 @@ struct FRHIDescriptorWrite
         return write;
     }
 
+    // 便捷工厂: Storage 图像绑定
+    //
+    // 与 CombinedImageSampler 的区别不只是类型: 存储图像**没有采样器**,
+    // 着色器按整数坐标原样读写。可见性缓冲区这类存整数编号的目标只能这么
+    // 用 —— 走采样器那条路会经过归一化与过滤, 而插值出来的整数编号毫无
+    // 意义, 且不会有任何报错。
+    //
+    // 布局默认给 General: 存储图像在 Vulkan 里只能是 General
+    // (或 ReadOnlyOptimal, 那要 VK_KHR_shared_presentable_image)。
+    static FRHIDescriptorWrite StorageImage(
+        FRHIDescriptorSetHandle set,
+        UInt32 binding,
+        FRHITextureViewHandle imageView,
+        EImageLayout layout = EImageLayout::General)
+    {
+        FRHIDescriptorWrite write;
+        write.DescriptorSet = set;
+        write.Binding       = binding;
+        write.Type          = EDescriptorType::StorageImage;
+        write.ImageView     = imageView;
+        write.ImageLayout   = layout;
+        return write;
+    }
+
     // 便捷工厂: Storage 缓冲区绑定
     static FRHIDescriptorWrite StorageBuffer(
         FRHIDescriptorSetHandle set,

@@ -59,6 +59,21 @@ constexpr UInt64 kExpandedBytes =
 
 constexpr UInt64 kDrawArgsBytes = sizeof(FDrawIndirectCommand);
 
+/// 与 meshlet_resolve.comp 的 push constant 一致
+struct FMeshletResolvePushConstants
+{
+    Float32 ViewProj[16] = {};
+
+    /// x = 宽, y = 高, z/w = 保留
+    UInt32 Params[4] = { 0, 0, 0, 0 };
+};
+
+static_assert(sizeof(FMeshletResolvePushConstants) == 80,
+              "FMeshletResolvePushConstants 必须是 80 字节 — 与 "
+              "meshlet_resolve.comp 的 push constant 块逐字段一致");
+
+constexpr UInt32 kResolveWorkgroupSize = 8;
+
 } // namespace
 
 // ============================================================================
@@ -164,6 +179,54 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
         }
     }
 
+    // ---- 材质解析的缓冲区 ----
+    if (IsRHISuccess(result))
+    {
+        const SizeType pixelCount =
+            static_cast<SizeType>(desc.SwapchainExtent.Width) *
+            desc.SwapchainExtent.Height;
+
+        for (UInt32 i = 0; i < m_FrameCount; ++i)
+        {
+            FRHIBufferDesc bufferDesc = {};
+            bufferDesc.Size = static_cast<UInt64>(pixelCount) *
+                              sizeof(FMeshletResolveResult);
+            bufferDesc.Usage = static_cast<EBufferUsage>(
+                static_cast<UInt32>(EBufferUsage::StorageBuffer) |
+                static_cast<UInt32>(EBufferUsage::TransferSrc));
+            bufferDesc.MemoryUsage = EMemoryUsage::GpuOnly;
+            bufferDesc.DebugName   = "MeshletResolveResults";
+
+            FRHIBufferHandle resolve;
+
+            result = desc.Device->CreateBuffer(bufferDesc, resolve);
+
+            if (!IsRHISuccess(result))
+            {
+                return result;
+            }
+
+            m_ResolveBuffers.Add(resolve);
+
+            bufferDesc.Size =
+                static_cast<UInt64>(sizeof(UInt32)) * kMaxMeshletInstances;
+            bufferDesc.Usage       = EBufferUsage::StorageBuffer;
+            bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+            bufferDesc.DebugName   = "MeshletInstanceMaterials";
+
+            FRHIBufferHandle materials;
+
+            result = desc.Device->CreateBuffer(bufferDesc, materials);
+
+            if (!IsRHISuccess(result))
+            {
+                return result;
+            }
+
+            m_MaterialBuffers.Add(materials);
+        }
+    }
+
     if (IsRHISuccess(result))
     {
         result = CreateDescriptors(desc.Device, m_FrameCount);
@@ -253,9 +316,13 @@ ERHIResult FMeshletDepthPass::CreateDepthTarget(IRHIDevice* device,
 
     // ---- 可见性缓冲区 ----
     texDesc.Format    = EPixelFormat::R32_UINT;
+    // Storage 是给材质解析用的 —— 它按整数坐标原样读这张图。
+    // 走采样器那条路会经过归一化与过滤, 而插值出来的整数编号毫无意义,
+    // 且不会有任何报错。
     texDesc.Usage     = static_cast<ETextureUsage>(
         static_cast<UInt32>(ETextureUsage::ColorAttachment) |
         static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::Storage) |
         static_cast<UInt32>(ETextureUsage::TransferSrc));
     texDesc.DebugName = "MeshletVisibility";
 
@@ -441,11 +508,67 @@ ERHIResult FMeshletDepthPass::CreateDescriptors(IRHIDevice* device,
         return result;
     }
 
+    // 解析那一套的第 0 个绑定是**存储图像**而不是缓冲区 —— 可见性缓冲区
+    // 是一张 R32_UINT 纹理, 而这里要按整数原样读它。当采样纹理读的话会
+    // 走归一化/过滤那条路, 而整数编号被插值出来的值毫无意义。
+    {
+        FRHIDescriptorBinding bindings[9] = {};
+
+        bindings[0].Binding    = 0;
+        bindings[0].Type       = EDescriptorType::StorageImage;
+        bindings[0].Count      = 1;
+        bindings[0].StageFlags = EShaderStage::Compute;
+
+        for (UInt32 i = 1; i < 9; ++i)
+        {
+            bindings[i].Binding    = i;
+            bindings[i].Type       = EDescriptorType::StorageBuffer;
+            bindings[i].Count      = 1;
+            bindings[i].StageFlags = EShaderStage::Compute;
+        }
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 9;
+        layoutDesc.DebugName    = "MeshletResolveSetLayout";
+
+        result = device->CreateDescSetLayout(layoutDesc, m_ResolveSetLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
+    // 可见性缓冲区的**存储图像**视图。
+    //
+    // 与颜色附件那个视图是同一张纹理的两个视图 —— 用途不同, Vulkan 要求
+    // 分开声明。共用一个的话创建时就会被拒绝, 而那条错误信息不会说是
+    // 用途的问题。
+    {
+        FRHITextureViewDesc viewDesc = {};
+        viewDesc.Texture         = m_VisibilityTexture;
+        viewDesc.ViewType        = ETextureType::Texture2D;
+        viewDesc.Format          = EPixelFormat::R32_UINT;
+        viewDesc.BaseMipLevel    = 0;
+        viewDesc.MipLevelCount   = 1;
+        viewDesc.BaseArrayLayer  = 0;
+        viewDesc.ArrayLayerCount = 1;
+
+        result = device->CreateTextureView(viewDesc, m_VisibilityStorageView);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
     for (UInt32 i = 0; i < frameCount; ++i)
     {
         FRHIDescriptorSetHandle meshSet;
         FRHIDescriptorSetHandle expandSet;
         FRHIDescriptorSetHandle fallbackSet;
+        FRHIDescriptorSetHandle resolveSet;
 
         result = device->AllocateDescriptorSet(m_MeshSetLayout, meshSet);
 
@@ -466,9 +589,17 @@ ERHIResult FMeshletDepthPass::CreateDescriptors(IRHIDevice* device,
             return result;
         }
 
+        result = device->AllocateDescriptorSet(m_ResolveSetLayout, resolveSet);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
         m_MeshSets.Add(meshSet);
         m_ExpandSets.Add(expandSet);
         m_FallbackSets.Add(fallbackSet);
+        m_ResolveSets.Add(resolveSet);
     }
 
     return ERHIResult::Success;
@@ -568,6 +699,41 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
     if (!IsRHISuccess(result))
     {
         return result;
+    }
+
+    // ---- 解析的计算管线 ----
+    {
+        result = shaders.CreateShaderModule(
+            device, FString("Builtin/meshlet_resolve.comp"),
+            EShaderStage::Compute, m_ResolveShader);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        result = MakeLayout(m_ResolveSetLayout, EShaderStage::Compute,
+                            sizeof(FMeshletResolvePushConstants),
+                            "MeshletResolveLayout", m_ResolvePipelineLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Shader     = m_ResolveShader;
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+        pipelineDesc.PipelineLayout           = m_ResolvePipelineLayout;
+        pipelineDesc.DebugName                = "MeshletResolvePipeline";
+
+        result = device->CreateComputePipeline(pipelineDesc, m_ResolvePipeline);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
     }
 
     // ---- 展开的计算管线 ----
@@ -767,6 +933,39 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
                 cull->GetVisibleMeshletBytes());
 
             m_Device->UpdateDescriptorSets(fallbackWrites, 4);
+
+            FRHIDescriptorWrite resolveWrites[9];
+
+            resolveWrites[0] = FRHIDescriptorWrite::StorageImage(
+                m_ResolveSets[i], 0, m_VisibilityStorageView,
+                EImageLayout::General);
+            resolveWrites[1] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 1, cull->GetInstanceBuffer(i), 0,
+                cull->GetInstanceBufferBytes());
+            resolveWrites[2] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 2, cull->GetSceneMeshletBuffer(), 0,
+                cull->GetSceneMeshletBytes());
+            resolveWrites[3] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 3, cull->GetVisibleMeshletBuffer(i), 0,
+                cull->GetVisibleMeshletBytes());
+            resolveWrites[4] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 4, cull->GetSceneVertexBuffer(), 0,
+                cull->GetSceneVertexBytes());
+            resolveWrites[5] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 5, cull->GetSceneMeshletVertexBuffer(), 0,
+                cull->GetSceneMeshletVertexBytes());
+            resolveWrites[6] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 6, cull->GetSceneMeshletTriangleBuffer(), 0,
+                cull->GetSceneMeshletTriangleBytes());
+            resolveWrites[7] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 7, m_MaterialBuffers[i], 0,
+                static_cast<UInt64>(sizeof(UInt32)) * kMaxMeshletInstances);
+            resolveWrites[8] = FRHIDescriptorWrite::StorageBuffer(
+                m_ResolveSets[i], 8, m_ResolveBuffers[i], 0,
+                static_cast<UInt64>(m_Extent.Width) * m_Extent.Height *
+                    sizeof(FMeshletResolveResult));
+
+            m_Device->UpdateDescriptorSets(resolveWrites, 9);
         }
 
         m_BoundVertexBuffer = cull->GetSceneVertexBuffer();
@@ -948,7 +1147,110 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
 
     commandBuffer->EndRenderPass();
 
+    // ================================================================
+    // 材质解析
+    // ================================================================
+    if (m_ResolveEnabled)
+    {
+        // 逐实例的材质下标 —— 每帧上传, 因为实例表每帧重建
+        {
+            void* mapped = nullptr;
+
+            if (IsRHISuccess(m_Device->MapBuffer(m_MaterialBuffers[frameIndex],
+                                                 &mapped)) &&
+                mapped != nullptr)
+            {
+                auto* target = static_cast<UInt32*>(mapped);
+
+                const TArray<FMeshletInstanceGpu>& instances =
+                    cull->GetInstances();
+
+                const TArray<FRenderObject>& objects =
+                    *context.ShadowCasterObjects;
+
+                for (SizeType i = 0; i < instances.GetSize(); ++i)
+                {
+                    // MeshletRange[2] 存的是**源对象下标** —— 那是实例表
+                    // 与对象列表之间唯一的对应关系。用实例序号去索引对象
+                    // 列表的话, 只要有一个对象被跳过 (半透明、无 meshlet),
+                    // 后面所有物体的材质就整体错位一格。
+                    //
+                    // 这与 Day 5 光追几何表踩过的是同一个坑。
+                    const UInt32 source = instances[i].MeshletRange[2];
+
+                    target[i] = (source < objects.GetSize())
+                                    ? objects[source].BindlessMaterialIndex
+                                    : 0u;
+                }
+
+                m_Device->UnmapBuffer(m_MaterialBuffers[frameIndex]);
+            }
+        }
+
+        // 可见性纹理从颜色附件转成通用布局 —— 计算着色器要按存储图像读它
+        commandBuffer->TransitionImageLayout(
+            m_VisibilityTexture, EImageLayout::ShaderReadOnly,
+            EImageLayout::General,
+            EPipelineStageFlags::ColorAttachmentOutput,
+            EPipelineStageFlags::ComputeShader,
+            EAccessFlags::ColorAttachmentWrite, EAccessFlags::ShaderRead);
+
+        commandBuffer->BindComputePipeline(m_ResolvePipeline);
+        commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                         m_ResolvePipelineLayout, 0,
+                                         m_ResolveSets[frameIndex]);
+
+        FMeshletResolvePushConstants resolvePush;
+
+        for (UInt32 i = 0; i < 16; ++i)
+        {
+            resolvePush.ViewProj[i] = rasterPush.ViewProj[i];
+        }
+
+        resolvePush.Params[0] = m_Extent.Width;
+        resolvePush.Params[1] = m_Extent.Height;
+
+        commandBuffer->PushConstants(m_ResolvePipelineLayout,
+                                     EShaderStage::Compute, 0,
+                                     sizeof(resolvePush), &resolvePush);
+
+        const UInt32 groupsX =
+            (m_Extent.Width + kResolveWorkgroupSize - 1u) /
+            kResolveWorkgroupSize;
+
+        const UInt32 groupsY =
+            (m_Extent.Height + kResolveWorkgroupSize - 1u) /
+            kResolveWorkgroupSize;
+
+        commandBuffer->Dispatch(groupsX, groupsY, 1);
+
+        // 转回来 —— 描述符里声明的静止布局是 ShaderReadOnly, 而 Vulkan
+        // 在提交时检查声明与实际是否一致, 与有没有人读无关。
+        commandBuffer->TransitionImageLayout(
+            m_VisibilityTexture, EImageLayout::General,
+            EImageLayout::ShaderReadOnly,
+            EPipelineStageFlags::ComputeShader,
+            EPipelineStageFlags::ColorAttachmentOutput,
+            EAccessFlags::ShaderRead, EAccessFlags::ColorAttachmentWrite);
+
+        FRHIBufferMemoryBarrier barrier = {};
+        barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+        barrier.DstAccessMask = EAccessFlags::TransferRead;
+        barrier.Buffer        = m_ResolveBuffers[frameIndex];
+
+        commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                       EPipelineStageFlags::Transfer, nullptr,
+                                       0, &barrier, 1, nullptr, 0);
+    }
+
     commandBuffer->EndDebugLabel();
+}
+
+FRHIBufferHandle FMeshletDepthPass::GetResolveBuffer(UInt32 frameIndex) const
+{
+    return (frameIndex < m_ResolveBuffers.GetSize())
+               ? m_ResolveBuffers[frameIndex]
+               : FRHIBufferHandle();
 }
 
 // ============================================================================
@@ -1022,6 +1324,16 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
         device->DestroyComputePipeline(m_ExpandPipeline);
     }
 
+    if (m_ResolvePipeline.IsValid())
+    {
+        device->DestroyComputePipeline(m_ResolvePipeline);
+    }
+
+    if (m_VisibilityStorageView.IsValid())
+    {
+        device->DestroyTextureView(m_VisibilityStorageView);
+    }
+
     const auto DestroyLayout = [device](FRHIPipelineLayoutHandle& handle)
     {
         if (handle.IsValid())
@@ -1033,6 +1345,7 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroyLayout(m_MeshPipelineLayout);
     DestroyLayout(m_ExpandPipelineLayout);
     DestroyLayout(m_FallbackPipelineLayout);
+    DestroyLayout(m_ResolvePipelineLayout);
 
     const auto DestroySetLayout = [device](FRHIDescSetLayoutHandle& handle)
     {
@@ -1045,6 +1358,7 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroySetLayout(m_MeshSetLayout);
     DestroySetLayout(m_ExpandSetLayout);
     DestroySetLayout(m_FallbackSetLayout);
+    DestroySetLayout(m_ResolveSetLayout);
 
     const auto DestroyShader = [device](FRHIShaderHandle& handle)
     {
@@ -1059,6 +1373,7 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroyShader(m_FallbackFragmentShader);
     DestroyShader(m_ExpandShader);
     DestroyShader(m_FallbackVertexShader);
+    DestroyShader(m_ResolveShader);
 
     const auto DestroyBuffers = [device](TArray<FRHIBufferHandle>& buffers)
     {
@@ -1075,6 +1390,8 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
 
     DestroyBuffers(m_ExpandedBuffers);
     DestroyBuffers(m_DrawArgsBuffers);
+    DestroyBuffers(m_ResolveBuffers);
+    DestroyBuffers(m_MaterialBuffers);
 
     if (m_ResetSource.IsValid())
     {
@@ -1084,6 +1401,7 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     m_MeshSets.Clear();
     m_ExpandSets.Clear();
     m_FallbackSets.Clear();
+    m_ResolveSets.Clear();
 
     m_Device = nullptr;
 }
