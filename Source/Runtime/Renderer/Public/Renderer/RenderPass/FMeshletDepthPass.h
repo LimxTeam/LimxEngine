@@ -347,7 +347,10 @@ private:
     FRHIShaderHandle m_FallbackVertexShader;
 
     /// 上一次描述符指向的那组场景缓冲区 —— 变了才重写描述符
-    FRHIBufferHandle m_BoundVertexBuffer;
+    /// 每个帧下标各记一份"描述符已经指到哪个场景顶点缓冲区了"
+    ///
+    /// 一份是不够的: 那样一次要改所有帧下标的集, 而别的集可能正在被用。
+    TArray<FRHIBufferHandle> m_BoundVertexBuffers;
 
     UInt32 m_DrawnMeshlets = 0;
 };

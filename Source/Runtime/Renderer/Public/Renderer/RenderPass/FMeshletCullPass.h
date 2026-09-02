@@ -128,6 +128,27 @@ struct FMeshletCullStats
 
     /// 第一阶段被遮挡剔掉、进了待定表的数量
     UInt32 MeshletsPending = 0;
+
+    /// 可见表的容量, 以及**要写的条数**
+    ///
+    /// 后者可以大于前者: 着色器里的 atomicAdd 照加不误, 只是超出容量的
+    /// 那几条不写进去。于是这个数本身就是溢出的证据 —— 而第一版没有人读它。
+    ///
+    /// 静默丢弃是最坏的一种失败: 画面上少一块, 日志里一个字都没有, 而且
+    /// 只在场景大到一定程度才出现。
+    UInt32 VisibleCapacity = 0;
+    UInt32 VisibleRequested = 0;
+
+    /// 待定表同理
+    UInt32 PendingCapacity = 0;
+    UInt32 PendingRequested = 0;
+
+    /// 这一帧有没有溢出过
+    LIMX_NODISCARD bool HasOverflow() const
+    {
+        return VisibleRequested > VisibleCapacity ||
+               PendingRequested > PendingCapacity;
+    }
 };
 
 // ============================================================================
@@ -241,6 +262,24 @@ public:
     LIMX_NODISCARD const FMeshletCullStats& GetStats() const
     {
         return m_Stats;
+    }
+
+    /// 判据用: 把可见表的容量压到一个很小的数, 逼出溢出
+    ///
+    /// 溢出处理这条路径靠场景规模是走不到的 —— 可见表按 262144 条开的,
+    /// 而要塞满它得堆出十万级的可见 meshlet, 那种场景跑一次要几分钟。
+    /// 走不到的分支就是没有判据的分支, 所以给判据一个把容量压小的入口。
+    ///
+    /// 0 表示不覆盖。
+    void SetVisibleCapacityOverride(UInt32 capacity)
+    {
+        m_VisibleCapacityOverride = capacity;
+    }
+
+    LIMX_NODISCARD UInt32 GetVisibleCapacity() const
+    {
+        return (m_VisibleCapacityOverride != 0) ? m_VisibleCapacityOverride
+                                                : kMaxSceneMeshlets;
     }
 
     /// 汇总后的场景 meshlet 缓冲区
@@ -424,6 +463,16 @@ private:
 
     /// 上一轮读回来的待定数
     UInt32 m_LastPendingCount = 0;
+
+    /// 判据压小的可见表容量; 0 表示不覆盖
+    UInt32 m_VisibleCapacityOverride = 0;
+
+    /// 第一级压实出来的实例数的回读
+    ///
+    /// 那个数只有 GPU 知道 (第一级是 GPU 上做的压实), 而统计里那一项原来
+    /// **从来没被赋过值** —— 恒为 0。一个恒为 0 的统计项比没有更糟: 它看
+    /// 起来像"第一级把所有实例都剔掉了", 而那种误导会把排查引到别处。
+    TArray<FRHIBufferHandle> m_InstanceReadbacks;
     TArray<FRHIBufferHandle> m_ViewBuffers;
 
     TArray<FRHIDescriptorSetHandle> m_InstanceCullSets;

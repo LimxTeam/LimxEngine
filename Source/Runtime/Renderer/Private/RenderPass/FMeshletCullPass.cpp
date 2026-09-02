@@ -211,8 +211,17 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
 
         if (IsRHISuccess(result))
         {
-            // 分派参数缓冲区既要被计算着色器原子累加, 又要当
-            // vkCmdDispatchIndirect 的源 —— 两个用途缺一不可。
+            // 分派参数缓冲区有四个用途, 缺一不可:
+            //
+            //   计算着色器原子累加          StorageBuffer
+            //   vkCmdDispatchIndirect 的源  IndirectBuffer
+            //   每帧复位时被拷进来          TransferDst
+            //   压实出来的实例数被拷出去    TransferSrc
+            //
+            // 最后一个是补的: 统计里的"可见实例数"要从这里读。少写它的话
+            // 验证层会报 srcBuffer 缺 TRANSFER_SRC, 而驱动照拷不误 —— 于是
+            // 数字是对的, 只有验证层在喊。规模一上去 (grid 128) 就变成了
+            // vkQueueSubmit 返回 DEVICE_LOST。
             result = Create(kDispatchBytes,
                             static_cast<EBufferUsage>(
                                 static_cast<UInt32>(
@@ -220,7 +229,9 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
                                 static_cast<UInt32>(
                                     EBufferUsage::IndirectBuffer) |
                                 static_cast<UInt32>(
-                                    EBufferUsage::TransferDst)),
+                                    EBufferUsage::TransferDst) |
+                                static_cast<UInt32>(
+                                    EBufferUsage::TransferSrc)),
                             EMemoryUsage::GpuOnly, "MeshletDispatchArgs",
                             dispatchArgs);
         }
@@ -329,6 +340,21 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
                 }
             }
 
+            FRHIBufferHandle instanceReadback;
+
+            {
+                const ERHIResult readbackResult =
+                    Create(kDispatchBytes, EBufferUsage::TransferDst,
+                           EMemoryUsage::GpuToCpu, "MeshletInstanceReadback",
+                           instanceReadback);
+
+                if (!IsRHISuccess(readbackResult))
+                {
+                    return readbackResult;
+                }
+            }
+
+            m_InstanceReadbacks.Add(instanceReadback);
             m_PendingReadbacks.Add(pendingReadback);
             m_PendingCounterBuffers.Add(pendingCounter);
             m_ViewBuffers.Add(view);
@@ -1041,6 +1067,26 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
             // 待定数在另一份缓冲区里, 见下面那段。
             m_Stats.MeshletsPending = m_LastPendingCount;
 
+            // ---- 溢出 ----
+            //
+            // counters[0] 是**要写的条数**, 不是写进去的条数: 着色器里的
+            // atomicAdd 照加不误, 超出容量的那几条只是不写。所以这个数大于
+            // 容量就说明丢过东西。
+            m_Stats.VisibleCapacity  = GetVisibleCapacity();
+            m_Stats.VisibleRequested = counters[0];
+            m_Stats.PendingCapacity  = GetVisibleCapacity();
+            m_Stats.PendingRequested = m_LastPendingCount;
+
+            if (m_Stats.HasOverflow())
+            {
+                LIMX_LOG(LogRenderer, Error,
+                         "[MeshletCull] 容量溢出 — 可见表要写 {} 条 (容量 "
+                         "{}), 待定表要写 {} 条 (容量 {})。超出的那些被丢掉"
+                         "了, 画面上会少东西",
+                         m_Stats.VisibleRequested, m_Stats.VisibleCapacity,
+                         m_Stats.PendingRequested, m_Stats.PendingCapacity);
+            }
+
             m_Device->UnmapBuffer(m_CounterReadbacks[context.FrameIndex]);
         }
 
@@ -1054,6 +1100,18 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
                 static_cast<const UInt32*>(pendingMapped)[0];
 
             m_Device->UnmapBuffer(m_PendingReadbacks[context.FrameIndex]);
+        }
+
+        void* instanceMapped = nullptr;
+
+        if (IsRHISuccess(m_Device->MapBuffer(
+                m_InstanceReadbacks[context.FrameIndex], &instanceMapped)) &&
+            instanceMapped != nullptr)
+        {
+            m_Stats.InstancesVisible =
+                static_cast<const UInt32*>(instanceMapped)[0];
+
+            m_Device->UnmapBuffer(m_InstanceReadbacks[context.FrameIndex]);
         }
     }
 
@@ -1359,7 +1417,7 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
         // 所以这里给上限, 让越界判断退化成"不越界"; 真正的边界由
         // 可见实例表的容量保证 (第一级已经卡过一次)。
         push.Params[0] = kMaxMeshletInstances;
-        push.Params[1] = kMaxSceneMeshlets;
+        push.Params[1] = GetVisibleCapacity();
         push.Params[2] = m_BackfaceCull ? 1u : 0u;
 
         // 遮挡剔除要金字塔就绪才开。
@@ -1441,6 +1499,25 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
 
         commandBuffer->CopyBuffer(m_CounterBuffers[frameIndex],
                                   m_CounterReadbacks[frameIndex], region);
+
+        // 第一级压实出来的实例数 —— 它在间接分派参数的 x 里
+        FRHIBufferMemoryBarrier dispatchBarrier = {};
+        dispatchBarrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+        dispatchBarrier.DstAccessMask = EAccessFlags::TransferRead;
+        dispatchBarrier.Buffer        = m_DispatchBuffers[frameIndex];
+
+        commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                       EPipelineStageFlags::Transfer, nullptr,
+                                       0, &dispatchBarrier, 1, nullptr, 0);
+
+        FRHIBufferCopyRegion dispatchRegion = {};
+        dispatchRegion.SrcOffset = 0;
+        dispatchRegion.DstOffset = 0;
+        dispatchRegion.Size      = kDispatchBytes;
+
+        commandBuffer->CopyBuffer(m_DispatchBuffers[frameIndex],
+                                  m_InstanceReadbacks[frameIndex],
+                                  dispatchRegion);
     }
 
     commandBuffer->EndDebugLabel();
@@ -1527,6 +1604,7 @@ void FMeshletCullPass::Shutdown(IRHIDevice* device)
     DestroyAll(m_PendingBuffers);
     DestroyAll(m_PendingCounterBuffers);
     DestroyAll(m_PendingReadbacks);
+    DestroyAll(m_InstanceReadbacks);
     DestroyAll(m_ViewBuffers);
     DestroyAll(m_CounterReadbacks);
     DestroyAll(m_CounterBuffers);

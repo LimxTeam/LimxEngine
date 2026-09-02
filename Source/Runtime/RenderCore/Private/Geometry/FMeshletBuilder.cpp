@@ -373,7 +373,9 @@ void FinalizeMeshlet(const FGrowingMeshlet& growing,
     meshlet.BoundingSphere =
         FVector4(center.X, center.Y, center.Z, FMath::Sqrt(radiusSquared));
 
-    // ---- 法线锥: 单位法线的均值为轴, 全体法线的最小投影为半角余弦 ----
+    // ---- 法线锥: 单位法线的均值为轴, 存的是半角**正弦** ----
+    //
+    // 为什么是正弦不是余弦, 见下面 sqrt(1 - minimumDot^2) 那一段。
     FVector3 axisSum(0.0f, 0.0f, 0.0f);
 
     UInt32 usableTriangles = 0;
@@ -444,9 +446,36 @@ void FinalizeMeshlet(const FGrowingMeshlet& growing,
 
         // 半角超过 90 度的锥对背面剔除没有价值 —— 从任何方向看它都可能
         // 有正面。标记无效, 让剔除侧显式地跳过它。
+        //
+        // ── 存的是半角正弦, 不是余弦 ──
+        //
+        // 锥里每条法线 n 满足 dot(n, axis) >= minimumDot, 也就是半角
+        // α = acos(minimumDot)。设视线方向与轴的夹角为 θ, 则锥内法线在
+        // 视线上的投影的**最小值**是 cos(θ + α)。"整个 meshlet 都背对着"
+        // 要求这个最小值仍然为正:
+        //
+        //     cos(θ + α) > 0  <=>  θ + α < 90°  <=>  cos θ > sin α
+        //
+        // 所以剔除侧要拿 cos θ 与 **sin α** 比, 而不是与 cos α 比。
+        //
+        // 两者的差在 α = 45° 处换向: α < 45° 时 cos α > sin α, 拿余弦比
+        // 只是**漏剔** (保守, 画面对); α > 45° 时 cos α < sin α, 拿余弦比
+        // 就成了**错剔** —— 把还看得见正面的 meshlet 剔掉。
+        //
+        // 这个错是第十四天的规模压力测试量出来的: 综合场景里的球分段密,
+        // 每个 meshlet 的法线散得窄 (α < 45°), 于是一直落在漏剔那一侧,
+        // 画面全对; 而压力场景里的球只有 16×12 段, meshlet 跨的曲率大,
+        // α 越过 45°, 立刻有 1490 个像素画的是背后的东西。
+        //
+        // 第九天的判据没抓住它, 因为那条判据比的是"GPU 与 CPU 参考实现
+        // 逐条相同" —— 而 CPU 参考照着同一个公式写。**两份同样的错互相
+        // 印证不出任何东西**。
+        const Float32 cutoff =
+            FMath::Sqrt(FMath::Max(0.0f, 1.0f - minimumDot * minimumDot));
+
         meshlet.NormalCone =
             FVector4(axis.X, axis.Y, axis.Z,
-                     (minimumDot > 0.0f) ? minimumDot : kInvalidConeCosine);
+                     (minimumDot > 0.0f) ? cutoff : kInvalidConeCosine);
     }
 
     // ---- 落盘 ----

@@ -119,7 +119,11 @@ static_assert(sizeof(FMeshlet) == 48,
 /// 取 -2 而不是 -1: 余弦的合法范围是 [-1,1], -1 是"张角恰好 180 度"这个
 /// 合法值。用 -1 当哨兵的话, 一个真的张满半球的 meshlet 会被误判成无效锥,
 /// 而那**恰好也是安全的** —— 于是这个混淆不会有症状, 会一直留着。
-inline constexpr Float32 kInvalidConeCosine = -2.0f;
+inline constexpr Float32 kInvalidConeCutoff = -2.0f;
+
+/// 旧名 —— 它叫"余弦"是错的, 存进去的是半角正弦。留一个别名免得外部代码
+/// 断掉, 新代码一律用 kInvalidConeCutoff。
+inline constexpr Float32 kInvalidConeCosine = kInvalidConeCutoff;
 
 // ============================================================================
 // FMeshletBuildResult — 切分结果

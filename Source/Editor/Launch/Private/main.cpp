@@ -310,6 +310,7 @@ struct FLaunchOptions
 
     /// 遮挡剔除的判据 —— 见函数头
     bool MeshletOcclusionCheck = false;
+    bool MeshletScaleCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -882,6 +883,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-occlusion-check"))
         {
             options.MeshletOcclusionCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-scale-check"))
+        {
+            options.MeshletScaleCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -9438,6 +9443,566 @@ FCullCapture CaptureMeshletCull(FRenderContext* context, FRenderer& renderer,
 
 } // namespace
 
+// ============================================================================
+// RunBackfaceGroundTruthCheck — 背面剔除的**地面真值**
+//
+// 上面那条"GPU 与 CPU 参考实现逐条相同"只验**转写**, 不验公式对不对: CPU
+// 参考照着同一个公式写, 两份同样的错互相印证不出任何东西。
+//
+// 第十四天的规模压力测试正是这么栽的 —— 法线锥存进去的是半角**余弦**, 而
+// 背面剔除要拿来比的是半角**正弦**。半角小于 45 度时余弦大于正弦, 那个错
+// 只表现为漏剔 (保守, 画面全对); 越过 45 度就翻过来成了错剔。综合场景里的
+// 球分段密, meshlet 跨的曲率小, 半角一直在 45 度以内, 于是 Day 9 的判据、
+// Day 10 的逐位相同、Day 12 的解析判据**全绿**; 换成压力场景里 16x12 段的
+// 球, 立刻有 1490 个像素画的是背后的东西。
+//
+// 这一条不走公式: 对每一个**被背面剔除剔掉的** meshlet, 把它的每个三角形
+// 变换到世界空间, 逐个验它确实背对着相机。这是"背面剔除"这四个字的定义,
+// 与用什么锥、锥怎么存、锥怎么算都无关。
+//
+// 只验一个方向: 剔掉的必须全背对。反过来"全背对的必须被剔掉"是效率而不是
+// 正确性 —— 法线锥本来就是保守近似, 漏剔是它的正常工作方式。
+// ============================================================================
+
+namespace
+{
+
+/// 一个三角形正对着相机吗
+///
+/// 判据: 外法线朝着相机。而"外法线"是 cross(b-a, c-a) —— 这一点不是假设,
+/// 是**量出来的**: 下面那段元判据每次运行都数一遍它与顶点里存的作者法线
+/// 是否同向, 综合场景上是 6450/6450。
+///
+/// ── 为什么不按屏幕空间的绕序判 ──
+///
+/// 第一版按 Vulkan 的定义做: 投到裁剪空间, 算归一化设备坐标里的有符号面积,
+/// 管线声明 FrontFace::CounterClockwise 就取面积为正。那一版的结论与这一版
+/// **恰好相反** (6450 个三角形里只有 8 个一致, 而那 8 个是退化的)。
+///
+/// 差在投影矩阵翻不翻 Y: 翻了的话归一化设备坐标里的绕序就与世界空间反过来。
+/// 从"管线声明了什么"推回世界空间要先知道这一点, 而那是猜。外法线不用猜 ——
+/// 它与作者法线同不同向是能当场数出来的。
+///
+/// 三个顶点里有任何一个与相机重合就返回 false: 那时"朝向"没有定义。
+bool TriangleFacesCamera(const FVector3& a, const FVector3& b,
+                         const FVector3& c, const FVector3& cameraPosition)
+{
+    const FVector3 ab(b.X - a.X, b.Y - a.Y, b.Z - a.Z);
+    const FVector3 ac(c.X - a.X, c.Y - a.Y, c.Z - a.Z);
+
+    const FVector3 normal(ab.Y * ac.Z - ab.Z * ac.Y, ab.Z * ac.X - ab.X * ac.Z,
+                          ab.X * ac.Y - ab.Y * ac.X);
+
+    const FVector3 view(a.X - cameraPosition.X, a.Y - cameraPosition.Y,
+                        a.Z - cameraPosition.Z);
+
+    return (normal.X * view.X + normal.Y * view.Y + normal.Z * view.Z) < 0.0f;
+}
+
+/// 把 meshlet 的第 t 个三角形取出来并变换到世界空间
+bool FetchWorldTriangle(const FMeshletInstanceGpu& instance,
+                        const FMeshletGpuView& meshlet, UInt32 triangle,
+                        const TArray<UInt8>& vertexBytes,
+                        const TArray<UInt32>& meshletVertices,
+                        const TArray<UInt32>& meshletTriangles,
+                        FVector3* outPositions, FVector3* outNormal = nullptr)
+{
+    const UInt32 vertexBase          = instance.BufferBases[0];
+    const UInt32 meshletVertexBase   = instance.BufferBases[1];
+    const UInt32 meshletTriangleBase = instance.BufferBases[2];
+
+    const UInt32 byteBase =
+        meshletTriangleBase + (meshlet.TriangleOffset + triangle) * 3u;
+
+    for (UInt32 k = 0; k < 3; ++k)
+    {
+        const UInt32 byteIndex = byteBase + k;
+        const UInt32 word      = byteIndex >> 2;
+
+        if (word >= meshletTriangles.GetSize())
+        {
+            return false;
+        }
+
+        const UInt32 local =
+            (meshletTriangles[word] >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+
+        const UInt32 tableIndex =
+            meshletVertexBase + meshlet.VertexOffset + local;
+
+        if (local >= meshlet.VertexCount ||
+            tableIndex >= meshletVertices.GetSize())
+        {
+            return false;
+        }
+
+        const UInt32 globalVertex = meshletVertices[tableIndex];
+
+        const SizeType offset =
+            (static_cast<SizeType>(vertexBase) + globalVertex) *
+            sizeof(FMeshVertex);
+
+        if (offset + sizeof(FMeshVertex) > vertexBytes.GetSize())
+        {
+            return false;
+        }
+
+        const auto* vertex = reinterpret_cast<const FMeshVertex*>(
+            vertexBytes.GetData() + offset);
+
+        const FVector3& p = vertex->Position;
+
+        if (k == 0 && outNormal != nullptr)
+        {
+            const FVector3& n = vertex->Normal;
+            *outNormal = FVector3(
+                instance.TransformRow0[0] * n.X +
+                    instance.TransformRow0[1] * n.Y +
+                    instance.TransformRow0[2] * n.Z,
+                instance.TransformRow1[0] * n.X +
+                    instance.TransformRow1[1] * n.Y +
+                    instance.TransformRow1[2] * n.Z,
+                instance.TransformRow2[0] * n.X +
+                    instance.TransformRow2[1] * n.Y +
+                    instance.TransformRow2[2] * n.Z);
+        }
+
+        // 3x4 仿射变换 —— 与着色器里那三行是同一套
+        outPositions[k] = FVector3(
+            instance.TransformRow0[0] * p.X + instance.TransformRow0[1] * p.Y +
+                instance.TransformRow0[2] * p.Z + instance.TransformRow0[3],
+            instance.TransformRow1[0] * p.X + instance.TransformRow1[1] * p.Y +
+                instance.TransformRow1[2] * p.Z + instance.TransformRow1[3],
+            instance.TransformRow2[0] * p.X + instance.TransformRow2[1] * p.Y +
+                instance.TransformRow2[2] * p.Z + instance.TransformRow2[3]);
+    }
+
+    return true;
+}
+
+} // namespace
+
+static bool RunBackfaceGroundTruthCheck(FRenderContext*     context,
+                                        FRenderer&          renderer,
+                                        const FCullCapture& withCull,
+                                        const FCullCapture& withoutCull)
+{
+    FMeshletCullPass* const pass = renderer.GetMeshletCullPass();
+
+    if (pass == nullptr)
+    {
+        return false;
+    }
+
+    const TArray<FMeshletInstanceGpu>& instances = pass->GetInstances();
+
+    const UInt32 meshletCount = pass->GetSceneMeshletCount();
+
+    if (meshletCount == 0 || instances.IsEmpty())
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet背面] 场景是空的 — 判据没验到东西");
+        return false;
+    }
+
+    // ---- 回读几何 ----
+    //
+    // 上界从 meshlet 头与实例基址算出来, 不是猜的: 每个 meshlet 用到的最后
+    // 一个下标就是 (基址 + 偏移 + 个数), 取全场景的最大值。
+    TArray<UInt8> meshletBytes;
+    TArray<UInt8> vertexBytes;
+    TArray<UInt8> meshletVertexBytes;
+    TArray<UInt8> meshletTriangleBytes;
+
+    {
+        FCullReadbackRequest headRequest;
+        headRequest.Source = pass->GetSceneMeshletBuffer();
+        headRequest.Bytes =
+            static_cast<UInt64>(meshletCount) * sizeof(FMeshletGpuView);
+        headRequest.Target = &meshletBytes;
+
+        if (!ReadCullBuffers(context, renderer, &headRequest, 1))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet背面] meshlet 头回读失败");
+            return false;
+        }
+    }
+
+    const auto* meshlets =
+        reinterpret_cast<const FMeshletGpuView*>(meshletBytes.GetData());
+
+    UInt64 vertexBound          = 0;
+    UInt64 meshletVertexBound   = 0;
+    UInt64 meshletTriangleBound = 0;
+
+    for (SizeType i = 0; i < instances.GetSize(); ++i)
+    {
+        const FMeshletInstanceGpu& instance = instances[i];
+
+        const UInt32 first = instance.MeshletRange[0];
+        const UInt32 count = instance.MeshletRange[1];
+
+        for (UInt32 m = 0; m < count; ++m)
+        {
+            const UInt32 index = first + m;
+
+            if (index >= meshletCount)
+            {
+                continue;
+            }
+
+            const FMeshletGpuView& meshlet = meshlets[index];
+
+            meshletVertexBound = FMath::Max(
+                meshletVertexBound,
+                static_cast<UInt64>(instance.BufferBases[1]) +
+                    meshlet.VertexOffset + meshlet.VertexCount);
+
+            meshletTriangleBound = FMath::Max(
+                meshletTriangleBound,
+                static_cast<UInt64>(instance.BufferBases[2]) +
+                    static_cast<UInt64>(meshlet.TriangleOffset +
+                                        meshlet.TriangleCount) *
+                        3u);
+        }
+
+    }
+
+    // 顶点缓冲区的上界要**先读局部表**才知道 —— 表里存的是全局顶点下标,
+    // 而实例表里没有"这份网格有多少顶点"这一项。所以分两趟读: 先读局部表
+    // 与三角形, 从表里数出最大的全局下标, 再按那个数读顶点。
+    //
+    // 拍一个"够大"的数读整个顶点缓冲区是不行的: 它按 400 万顶点开的,
+    // 一次读回来是 288 MiB。
+    {
+        FCullReadbackRequest requests[2];
+
+        requests[0].Source = pass->GetSceneMeshletVertexBuffer();
+        requests[0].Bytes  = meshletVertexBound * sizeof(UInt32);
+        requests[0].Target = &meshletVertexBytes;
+
+        requests[1].Source = pass->GetSceneMeshletTriangleBuffer();
+        requests[1].Bytes  = ((meshletTriangleBound + 3u) / 4u) * 4u;
+        requests[1].Target = &meshletTriangleBytes;
+
+        if (requests[0].Bytes == 0 || requests[1].Bytes == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet背面] 几何上界算出来是 0 — 场景里没有三角形?");
+            return false;
+        }
+
+        if (!ReadCullBuffers(context, renderer, requests, 2))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet背面] 局部表回读失败");
+            return false;
+        }
+    }
+
+    TArray<UInt32> meshletVertices;
+    TArray<UInt32> meshletTriangles;
+
+    {
+        const auto* values =
+            reinterpret_cast<const UInt32*>(meshletVertexBytes.GetData());
+
+        const SizeType count = meshletVertexBytes.GetSize() / sizeof(UInt32);
+
+        meshletVertices.Reserve(count);
+
+        for (SizeType i = 0; i < count; ++i)
+        {
+            meshletVertices.Add(values[i]);
+        }
+    }
+
+    {
+        const auto* values =
+            reinterpret_cast<const UInt32*>(meshletTriangleBytes.GetData());
+
+        const SizeType count = meshletTriangleBytes.GetSize() / sizeof(UInt32);
+
+        meshletTriangles.Reserve(count);
+
+        for (SizeType i = 0; i < count; ++i)
+        {
+            meshletTriangles.Add(values[i]);
+        }
+    }
+
+    // 从局部表里数出最大的全局顶点下标
+    for (SizeType i = 0; i < instances.GetSize(); ++i)
+    {
+        const FMeshletInstanceGpu& instance = instances[i];
+
+        const UInt32 first = instance.MeshletRange[0];
+        const UInt32 count = instance.MeshletRange[1];
+
+        for (UInt32 m = 0; m < count; ++m)
+        {
+            const UInt32 index = first + m;
+
+            if (index >= meshletCount)
+            {
+                continue;
+            }
+
+            const FMeshletGpuView& meshlet = meshlets[index];
+
+            for (UInt32 v = 0; v < meshlet.VertexCount; ++v)
+            {
+                const SizeType tableIndex =
+                    static_cast<SizeType>(instance.BufferBases[1]) +
+                    meshlet.VertexOffset + v;
+
+                if (tableIndex < meshletVertices.GetSize())
+                {
+                    vertexBound = FMath::Max(
+                        vertexBound,
+                        static_cast<UInt64>(instance.BufferBases[0]) +
+                            meshletVertices[tableIndex] + 1u);
+                }
+            }
+        }
+    }
+
+    {
+        FCullReadbackRequest request;
+        request.Source = pass->GetSceneVertexBuffer();
+        request.Bytes  = vertexBound * sizeof(FMeshVertex);
+        request.Target = &vertexBytes;
+
+        if (request.Bytes == 0 ||
+            !ReadCullBuffers(context, renderer, &request, 1))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet背面] 顶点回读失败");
+            return false;
+        }
+    }
+
+    // ---- 元判据: 叉积法线确实是**外**法线 ----
+    //
+    // 整条判据建立在"cross(b-a, c-a) 指向外面"这一句上。它不是假设 —— 每次
+    // 运行都数一遍它与顶点里存的作者法线同不同向。作者法线对生成的几何体
+    // 一律朝外, 于是这个数就是那句话的证据。
+    //
+    // 顺带也验了取几何这一步: 下标算错的话取出来的三个点是别的三角形的,
+    // 叉积与作者法线的同向率会立刻掉下来。
+    const FVector3 cameraPosition = renderer.GetCamera().GetPosition();
+
+    {
+        SizeType matching = 0;
+        SizeType total    = 0;
+        SizeType facing   = 0;
+
+        for (SizeType v = 0; v < withCull.GpuVisible.GetSize(); ++v)
+        {
+            const UInt64 packed = withCull.GpuVisible[v];
+
+            const UInt32 instanceIndex = static_cast<UInt32>(packed >> 32);
+            const UInt32 meshletIndex  = static_cast<UInt32>(packed);
+
+            if (instanceIndex >= instances.GetSize() ||
+                meshletIndex >= meshletCount)
+            {
+                continue;
+            }
+
+            const FMeshletGpuView& meshlet = meshlets[meshletIndex];
+
+            for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+            {
+                FVector3 positions[3];
+                FVector3 authored;
+
+                if (!FetchWorldTriangle(instances[instanceIndex], meshlet, t,
+                                        vertexBytes, meshletVertices,
+                                        meshletTriangles, positions,
+                                        &authored))
+                {
+                    continue;
+                }
+
+                ++total;
+
+                const FVector3 ab(positions[1].X - positions[0].X,
+                                  positions[1].Y - positions[0].Y,
+                                  positions[1].Z - positions[0].Z);
+                const FVector3 ac(positions[2].X - positions[0].X,
+                                  positions[2].Y - positions[0].Y,
+                                  positions[2].Z - positions[0].Z);
+
+                const FVector3 normal(ab.Y * ac.Z - ab.Z * ac.Y,
+                                      ab.Z * ac.X - ab.X * ac.Z,
+                                      ab.X * ac.Y - ab.Y * ac.X);
+
+                if (normal.X * authored.X + normal.Y * authored.Y +
+                        normal.Z * authored.Z >
+                    0.0f)
+                {
+                    ++matching;
+                }
+
+                if (TriangleFacesCamera(positions[0], positions[1],
+                                        positions[2], cameraPosition))
+                {
+                    ++facing;
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet背面] 叉积法线与作者法线同向 {}/{}; 留下来的里面"
+                 "有 {} 个正面三角形",
+                 matching, total, facing);
+
+        if (total == 0 || matching != total)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet背面] 叉积法线与作者法线不是处处同向 "
+                     "({}/{}) —— 要么绕序约定反了, 要么取几何的下标算错了。"
+                     "两种情况下这条判据都不可信",
+                     matching, total);
+            return false;
+        }
+
+        if (facing == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet背面] 留下来的 meshlet 里一个正面三角形都没有 "
+                     "—— 判据没验到东西");
+            return false;
+        }
+    }
+
+    // ---- 被背面剔除剔掉的那一批 ----
+    //
+    // 两次采集用的是**同一个相机**, 只差背面剔除的开关。于是差集恰好是
+    // "被背面剔除剔掉的" —— 视锥那一路在两次里完全一样。
+    TArray<UInt64> culled;
+
+    for (SizeType i = 0; i < withoutCull.GpuVisible.GetSize(); ++i)
+    {
+        const UInt64 packed = withoutCull.GpuVisible[i];
+
+        bool stillVisible = false;
+
+        for (SizeType j = 0; j < withCull.GpuVisible.GetSize(); ++j)
+        {
+            if (withCull.GpuVisible[j] == packed)
+            {
+                stillVisible = true;
+                break;
+            }
+        }
+
+        if (!stillVisible)
+        {
+            culled.Add(packed);
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet背面] 背面剔除剔掉 {} 个 meshlet (开着 {} 个可见, "
+             "关掉 {} 个)",
+             culled.GetSize(), withCull.GpuVisible.GetSize(),
+             withoutCull.GpuVisible.GetSize());
+
+    if (culled.IsEmpty())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet背面] 背面剔除一个都没剔掉 —— 这条判据没验到东西");
+        return false;
+    }
+
+    // ---- 逐个三角形验 ----
+    SizeType violatingMeshlets  = 0;
+    SizeType violatingTriangles = 0;
+    SizeType checkedTriangles   = 0;
+    SizeType fetchFailures      = 0;
+
+    UInt64 firstViolation = 0;
+
+    for (SizeType i = 0; i < culled.GetSize(); ++i)
+    {
+        const UInt64 packed = culled[i];
+
+        const UInt32 instanceIndex = static_cast<UInt32>(packed >> 32);
+        const UInt32 meshletIndex  = static_cast<UInt32>(packed);
+
+        if (instanceIndex >= instances.GetSize() ||
+            meshletIndex >= meshletCount)
+        {
+            ++fetchFailures;
+            continue;
+        }
+
+        const FMeshletGpuView& meshlet = meshlets[meshletIndex];
+
+        SizeType facingHere = 0;
+
+        for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+        {
+            FVector3 positions[3];
+
+            if (!FetchWorldTriangle(instances[instanceIndex], meshlet, t,
+                                    vertexBytes, meshletVertices,
+                                    meshletTriangles, positions))
+            {
+                ++fetchFailures;
+                continue;
+            }
+
+            ++checkedTriangles;
+
+            if (TriangleFacesCamera(positions[0], positions[1], positions[2],
+                                    cameraPosition))
+            {
+                ++facingHere;
+            }
+        }
+
+        if (facingHere != 0)
+        {
+            if (violatingMeshlets == 0)
+            {
+                firstViolation = packed;
+            }
+
+            ++violatingMeshlets;
+            violatingTriangles += facingHere;
+        }
+    }
+
+    bool passed = true;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet背面] 验了 {} 个三角形, 取不到的 {} 个",
+             checkedTriangles, fetchFailures);
+
+    if (fetchFailures != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet背面] {} 个三角形取不到 —— 下标算错了, 判据本身"
+                 "不可信",
+                 fetchFailures);
+        passed = false;
+    }
+
+    if (violatingMeshlets != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet背面] {} 个被剔掉的 meshlet 里还有正对着相机的"
+                 "三角形 (共 {} 个; 第一个在实例 {} 的 meshlet {}) —— "
+                 "画面上那里画的是它背后的东西",
+                 violatingMeshlets, violatingTriangles,
+                 static_cast<UInt32>(firstViolation >> 32),
+                 static_cast<UInt32>(firstViolation));
+        passed = false;
+    }
+
+    return passed;
+}
+
 static bool RunMeshletCullChecks(FRenderContext* context, FRenderer& renderer)
 {
     if (!renderer.SetMeshletCullEnabled(true))
@@ -9631,6 +10196,21 @@ static bool RunMeshletCullChecks(FRenderContext* context, FRenderer& renderer)
     RestoreCamera();
 
     // ================================================================
+    // 判据 3.5: 背面剔除的地面真值
+    //
+    // 前面那条"GPU 与 CPU 参考实现逐条相同"只验转写。这一条不走公式, 直接
+    // 按定义验: 被剔掉的 meshlet 里不许有正对着相机的三角形。
+    //
+    // 相机用 captures[0] / captures[1] 那一组的位置 (两组只差背面剔除的
+    // 开关, 视锥完全一样), 于是两者的差集恰好是"被背面剔除剔掉的"。
+    // ================================================================
+    if (!RunBackfaceGroundTruthCheck(context, renderer, captures[0],
+                                     captures[1]))
+    {
+        passed = false;
+    }
+
+    // ================================================================
     // 判据 4: 背面剔除的单调性
     //
     // 同一组视锥下, 开着背面剔除时可见的 meshlet, 关掉之后必须仍然可见。
@@ -9805,6 +10385,272 @@ static bool RunMeshletCullChecks(FRenderContext* context, FRenderer& renderer)
 // 没有意义:
 //   7. 平均每个 meshlet 的三角形数不能太低
 //   8. 顶点复用率不能太低 (= 聚类没有把相邻的三角形放到一起)
+// ============================================================================
+// RunMeshletScaleChecks — 规模上的判据
+//
+// 虚拟几何的卖点是"规模上去了也不塌", 而"不塌"有两层意思:
+//
+//   一、画面还是对的。这一条由 --meshlet-depth-check 在压力场景上验 ——
+//      第十四天正是它量出法线锥存错了 (存的是半角余弦而剔除要半角正弦),
+//      而综合场景上所有判据都是绿的。
+//
+//   二、**装不下的时候要响**。可见表与待定表都是定容的, 着色器里超出容量
+//      的那几条直接丢掉。丢掉本身没得选 (总不能越界写), 问题在于第一版
+//      **一个字都不说** —— 画面上少一块, 日志里干干净净, 而且只在场景大到
+//      一定程度才出现。这是最坏的一种失败。
+//
+// 这条判据管第二层。它自己造条件: 靠场景规模是走不到溢出的 (可见表按
+// 262144 条开的), 所以判据把容量压到一个很小的数, 逼着那条路径走一遍。
+//
+// 三段:
+//
+//   正常容量   -> 不许报溢出
+//   压小容量   -> 必须报溢出, 而且**写进去的那部分仍然是好的**
+//   恢复容量   -> 又不许报溢出 (标志不是粘住的)
+//
+// 第三段要紧: 一个"一旦置位就再也不清"的标志在前两段上满分通过, 而它会让
+// 之后每一帧都报溢出。
+// ============================================================================
+
+static bool RunMeshletScaleChecks(FRenderContext* context, FRenderer& renderer)
+{
+    if (!renderer.SetMeshletDepthEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 无法启用光栅化 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    FMeshletCullPass* const cull = renderer.GetMeshletCullPass();
+
+    if (cull == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet规模] 剔除通道不存在");
+        return false;
+    }
+
+    bool passed = true;
+
+    // 统计的回读隔着并行帧数, 所以每段都要多走几帧才读得到那一段的数
+    const auto Settle = [&renderer]()
+    {
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            renderer.RenderFrame();
+        }
+    };
+
+    // ---- 第一段: 正常容量 ----
+    cull->SetVisibleCapacityOverride(0);
+
+    Settle();
+
+    const FMeshletCullStats normal = cull->GetStats();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet规模] 正常容量 — 实例 {}/{}, meshlet 测试 {} 可见 {} "
+             "(容量 {})",
+             normal.InstancesVisible, normal.InstancesTotal,
+             normal.MeshletsTested, normal.MeshletsVisible,
+             normal.VisibleCapacity);
+
+    if (normal.MeshletsVisible == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 一个 meshlet 都不可见 —— 判据没验到东西");
+        passed = false;
+    }
+
+    // 两级之间要自洽。
+    //
+    // 这几条是被一个**恒为零的字段**逼出来的: InstancesVisible 从来没被
+    // 赋过值, 而没有人看它, 于是它安安静静地报了不知道多少次"第一级把
+    // 所有实例都剔光了"。补上赋值之后顺手给它一条判据 —— 否则下次它再
+    // 变回 0 也一样没人发现。
+    if (normal.InstancesVisible == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 第一级压实出来 0 个实例, 而第二级却测了 "
+                 "{} 个 meshlet —— 这两个数不可能同时成立",
+                 normal.MeshletsTested);
+        passed = false;
+    }
+
+    if (normal.InstancesVisible > normal.InstancesTotal)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 可见实例 {} 多于总实例 {}",
+                 normal.InstancesVisible, normal.InstancesTotal);
+        passed = false;
+    }
+
+    if (normal.MeshletsVisible > normal.MeshletsTested)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 可见 meshlet {} 多于测试过的 {}",
+                 normal.MeshletsVisible, normal.MeshletsTested);
+        passed = false;
+    }
+
+    if (normal.HasOverflow())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 正常容量下就报了溢出 (可见 {} > 容量 {}) —— "
+                 "要么场景真的超了, 要么溢出判断本身写反了",
+                 normal.VisibleRequested, normal.VisibleCapacity);
+        passed = false;
+    }
+
+    // ---- 第二段: 把容量压到装不下 ----
+    //
+    // 压到可见数的四分之一, 至少留 4 条 —— 留一点是为了让"写进去的那部分
+    // 仍然是好的"这一条有东西可验。压到 0 的话那一条平凡成立。
+    const UInt32 squeezed =
+        FMath::Max(4u, normal.MeshletsVisible / 4u);
+
+    cull->SetVisibleCapacityOverride(squeezed);
+
+    Settle();
+
+    const FMeshletCullStats overflowed = cull->GetStats();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet规模] 压到 {} 条 — 要写 {} 条, 待定要写 {} 条",
+             overflowed.VisibleCapacity, overflowed.VisibleRequested,
+             overflowed.PendingRequested);
+
+    if (!overflowed.HasOverflow())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 容量压到 {} 条还报不出溢出 (要写 {} 条) —— "
+                 "超出容量的那些被静默丢掉了, 画面上少一块而日志里一个字"
+                 "都没有",
+                 overflowed.VisibleCapacity, overflowed.VisibleRequested);
+        passed = false;
+    }
+
+    if (overflowed.VisibleRequested <= overflowed.VisibleCapacity)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 压小容量之后要写的条数也跟着变小了 "
+                 "({} <= {}) —— 计数器被容量夹住了, 那样就再也看不出丢过"
+                 "东西",
+                 overflowed.VisibleRequested, overflowed.VisibleCapacity);
+        passed = false;
+    }
+
+    // 写进去的那部分必须仍然是好的 —— 溢出不该把已经写好的条目搅乱
+    {
+        TArray<UInt8> visibleBytes;
+
+        const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+        FCullReadbackRequest request;
+        request.Source = cull->GetVisibleMeshletBuffer(frameIndex);
+        request.Bytes =
+            static_cast<UInt64>(overflowed.VisibleCapacity) * sizeof(UInt32) *
+            2u;
+        request.Target = &visibleBytes;
+
+        if (!ReadCullBuffers(context, renderer, &request, 1))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet规模] 可见表回读失败");
+            passed = false;
+        }
+        else
+        {
+            const auto* pairs =
+                reinterpret_cast<const UInt32*>(visibleBytes.GetData());
+
+            const UInt32 instanceCount =
+                static_cast<UInt32>(cull->GetInstances().GetSize());
+
+            const UInt32 meshletCount = cull->GetSceneMeshletCount();
+
+            SizeType corrupt = 0;
+
+            const TArray<FMeshletInstanceGpu>& instances =
+                cull->GetInstances();
+
+            for (UInt32 i = 0; i < overflowed.VisibleCapacity; ++i)
+            {
+                const UInt32 instanceIndex = pairs[i * 2 + 0];
+                const UInt32 meshletIndex  = pairs[i * 2 + 1];
+
+                if (instanceIndex >= instanceCount ||
+                    meshletIndex >= meshletCount)
+                {
+                    ++corrupt;
+                    continue;
+                }
+
+                // 两个数还得**互相对得上**: meshlet 必须落在这个实例自己的
+                // 区间里。
+                //
+                // 只验各自在范围内是不够的 —— 一条记录是两个独立的四字节
+                // 写, 两个线程抢同一个槽位时会拼出"甲的实例 + 乙的 meshlet",
+                // 而那两个数各自都合法。撕开的记录画出来是一块位置完全不对
+                // 的几何体。
+                const FMeshletInstanceGpu& instance = instances[instanceIndex];
+
+                const UInt32 first = instance.MeshletRange[0];
+                const UInt32 count = instance.MeshletRange[1];
+
+                if (meshletIndex < first || meshletIndex >= first + count)
+                {
+                    ++corrupt;
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet规模] 溢出时写进去的 {} 条里越界的 {} 条",
+                     overflowed.VisibleCapacity, corrupt);
+
+            if (corrupt != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet规模] 溢出时写进去的条目有 {} 条越界 —— "
+                         "丢弃那一步没拦住越界写",
+                         corrupt);
+                passed = false;
+            }
+        }
+    }
+
+    // ---- 第三段: 恢复容量 ----
+    cull->SetVisibleCapacityOverride(0);
+
+    Settle();
+
+    const FMeshletCullStats restored = cull->GetStats();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet规模] 恢复容量 — 要写 {} 条 (容量 {})",
+             restored.VisibleRequested, restored.VisibleCapacity);
+
+    if (restored.HasOverflow())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 容量恢复之后还在报溢出 —— 标志粘住了, "
+                 "那样它之后永远是真的, 也就永远不再指示任何东西");
+        passed = false;
+    }
+
+    if (restored.MeshletsVisible != normal.MeshletsVisible)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet规模] 容量恢复之后可见数没回到原值 ({} vs {}) —— "
+                 "压容量这件事留下了副作用",
+                 restored.MeshletsVisible, normal.MeshletsVisible);
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[Meshlet规模] {}",
+             passed ? "通过" : "失败");
+
+    return passed;
+}
+
 // ============================================================================
 
 namespace
@@ -10175,17 +11021,29 @@ bool CheckOneMesh(const AnsiChar* label, const TArray<FMeshVertex>& vertices,
             }
         }
 
-        // ---- 哨兵: 余弦要么是无效标记, 要么严格为正 ----
-        if (meshlet.NormalCone.W <= 0.0f &&
-            meshlet.NormalCone.W != kInvalidConeCosine)
+        // ---- 哨兵: 要么是无效标记, 要么落在 [0, 1) ----
+        //
+        // 存的是半角**正弦**。半角超过 90 度的锥对背面剔除没有价值, 那时
+        // 正弦回到 1 附近而无法与"很窄的锥"区分开 —— 所以构建器在那种情形
+        // 直接写无效标记, 而有效值必然落在 [0, 1)。
+        //
+        // 这条判据原来按余弦写 (要求严格为正)。换成正弦之后它立刻报了
+        // 十几条 —— 那正是它该做的: **字段的含义变了而读它的地方没跟上**,
+        // 判据把这件事顶了出来, 而不是默默接受。
+        if (meshlet.NormalCone.W != kInvalidConeCutoff &&
+            (meshlet.NormalCone.W < 0.0f || meshlet.NormalCone.W >= 1.0f))
         {
             ++sentinelViolations;
         }
 
-        if (meshlet.NormalCone.W <= kInvalidConeCosine)
+        if (meshlet.NormalCone.W <= kInvalidConeCutoff)
         {
             continue;
         }
+
+        // 从半角正弦还原半角余弦 —— 下面要拿它与每个三角形的法线投影比
+        const Float32 coneCosine = FMath::Sqrt(FMath::Max(
+            0.0f, 1.0f - meshlet.NormalCone.W * meshlet.NormalCone.W));
 
         const FVector3 axis(meshlet.NormalCone.X, meshlet.NormalCone.Y,
                             meshlet.NormalCone.Z);
@@ -10217,7 +11075,7 @@ bool CheckOneMesh(const AnsiChar* label, const TArray<FMeshVertex>& vertices,
             const Float32 dot = axis.X * normal.X + axis.Y * normal.Y +
                                 axis.Z * normal.Z;
 
-            const Float32 deficit = meshlet.NormalCone.W - dot;
+            const Float32 deficit = coneCosine - dot;
 
             if (deficit > 1.0e-4f)
             {
@@ -10258,8 +11116,8 @@ bool CheckOneMesh(const AnsiChar* label, const TArray<FMeshVertex>& vertices,
     if (sentinelViolations != 0)
     {
         LIMX_LOG(LogLaunch, Error,
-                 "[Meshlet] {} — {} 个 meshlet 的法线锥余弦落在 (-1, 0] 里 "
-                 "—— 张角超过半球却没标记成无效锥, 剔除侧会拿它去判",
+                 "[Meshlet] {} — {} 个 meshlet 的法线锥半角正弦落在 [0, 1) "
+                 "之外 —— 张角超过半球却没标记成无效锥, 剔除侧会拿它去判",
                  label, sentinelViolations);
         passed = false;
     }
@@ -17118,6 +17976,7 @@ int WINAPI wWinMain(
     bool    meshletDepthPassed = true;
     bool    meshletResolvePassed = true;
     bool    meshletOcclusionPassed = true;
+    bool    meshletScalePassed = true;
 
     while (window.ProcessMessages())
     {
@@ -17268,6 +18127,12 @@ int WINAPI wWinMain(
             {
                 meshletOcclusionPassed =
                     RunMeshletOcclusionChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletScaleCheck)
+            {
+                meshletScalePassed =
+                    RunMeshletScaleChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -17560,6 +18425,12 @@ int WINAPI wWinMain(
     {
         selfCheckCode = FinalizeSelfCheck(meshletOcclusionPassed, 33,
                                           errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletScaleCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletScalePassed, 34, errorSink,
+                                          errorsBeforeShutdown);
     }
 
     // 移除日志 Sink 并关闭

@@ -919,6 +919,7 @@ ERHIResult FMeshletDepthPass::CreateDescriptors(IRHIDevice* device,
         }
 
         m_MeshSets.Add(meshSet);
+        m_BoundVertexBuffers.Add(FRHIBufferHandle());
         m_ExpandSets.Add(expandSet);
         m_FallbackSets.Add(fallbackSet);
         m_ResolveSets.Add(resolveSet);
@@ -1309,10 +1310,24 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
     // 场景缓冲区只在几何签名变化时重建, 而描述符要跟着走。每帧无条件重写
     // 也行 (几个 write 而已), 但那会掩盖"缓冲区换了而描述符没换"这类错误 ——
     // 现在只在真的换了时才写, 于是那件事有痕迹。
-    if (m_BoundVertexBuffer != cull->GetSceneVertexBuffer())
+    //
+    // ── 只改**当前帧**那一份 ──
+    //
+    // 第一版一次把所有帧下标的集都改了, 而别的帧下标的集可能正被在飞的
+    // 命令缓冲区用着 —— vkUpdateDescriptorSets 不允许改在用的集。
+    //
+    // 这个错在小场景上不出现: 缓冲区是在预热阶段建好的, 那时还没有帧在飞。
+    // 规模一上去 (grid 128, 一万六千个实例) 场景同步慢下来, 重建落到了有
+    // 帧在飞的时刻, 验证层立刻报出来, 紧接着 vkQueueSubmit 返回 DEVICE_LOST,
+    // 六十帧一帧都没跑完。
+    //
+    // 所以每个帧下标各记一份"已经指到哪个缓冲区了"。
+    if (frameIndex < m_BoundVertexBuffers.GetSize() &&
+        m_BoundVertexBuffers[frameIndex] != cull->GetSceneVertexBuffer())
     {
-        for (UInt32 i = 0; i < m_FrameCount; ++i)
         {
+            const UInt32 i = frameIndex;
+
             FRHIDescriptorWrite meshWrites[6];
 
             meshWrites[0] = FRHIDescriptorWrite::StorageBuffer(
@@ -1439,7 +1454,7 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
             m_Device->UpdateDescriptorSets(phase2Writes, 8);
         }
 
-        m_BoundVertexBuffer = cull->GetSceneVertexBuffer();
+        m_BoundVertexBuffers[frameIndex] = cull->GetSceneVertexBuffer();
     }
 
     m_DrawnMeshlets = cull->GetStats().MeshletsVisible;
