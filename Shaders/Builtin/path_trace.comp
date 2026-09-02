@@ -1,0 +1,455 @@
+// ============================================================
+// 文件名称：path_trace.comp
+// 创建时间：2026-09-02
+// 创建者  ：LimxTeam
+// 设计哲学：这支着色器的用途是当**判据的 oracle** —— 后面所有实时 GI 的
+//          参考答案都从它这里来。所以它的每一个取舍都倒向"可判定"而不是
+//          "快"或"好看"：
+//
+//          一、**用 i.i.d. 伪随机, 不用低差异序列。** 低差异序列收敛更快,
+//              但它的误差不是 σ/√N —— 于是"方差 ∝ 1/N"这条判据不再成立,
+//              而那条判据是唯一能验出"样本之间其实是相关的"的手段。可复现
+//              由确定性哈希保证 (种子是 (像素, 样本号, 试验号) 的函数),
+//              不靠低差异序列。
+//
+//          二、**用几何法线, 不用插值法线。** 插值法线会让采样半球歪出
+//              几何表面, 于是凸物体上也会出现自遮挡 —— 白炉测试立刻不再
+//              是 1.0。着色法线是为了画面好看引入的近似, 而 oracle 不能
+//              带近似。
+//
+//          三、**估计量的权重恒等于反照率。** 余弦加权采样下
+//                  f_r·cosθ/pdf = (a/π)·cosθ·(π/cosθ) = a
+//              π 与 cosθ 全部约掉。少写一次除法, 就少一处能写错的地方 ——
+//              而写错的表现是"画面看着对, 数值系统性偏高/偏低"。
+//
+//          四、**深度截断要留下痕迹。** 达到最大弹射次数仍未逃逸的样本,
+//              单独计一个数写出来。反照率为 1 时截断偏差**恰好等于**这个
+//              比例 (每条还活着的路径本该贡献 1), 于是白炉测试在任何弹射
+//              次数下都有精确的判据: L + 存活比例 ≡ 1。
+//              不写出来的话, 截断损失与"能量不守恒"在数值上分不开。
+// 功能描述：计算着色器路径追踪器 —— 漫反射 BRDF、余弦加权半球采样、
+//          俄罗斯轮盘终止, 逐像素累加辐射度、辐射度平方、存活样本数与
+//          首次命中数。
+// 技术特性：ray query 取最近命中 (不需要光追管线); 顶点/索引/逐三角形
+//          材质走 std430 存储缓冲区; 命中点由重心坐标重建而不是
+//          origin+t·dir (后者在掠射角下误差大得多); PCG 哈希种子,
+//          同一 (像素, 样本号, 试验号) 永远给出同一条路径。
+// ============================================================
+
+#version 460
+
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ── 场景 ──
+//
+// 单 BLAS 单实例的三角形汤: 图元下标直接就是全局三角形序号。
+// 实例化与变换由 --rt-check 那条判据覆盖, 这里不重复 —— oracle 要的是
+// 光能传输本身的正确性, 加速结构的正确性是另一件事。
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+
+layout(std430, set = 0, binding = 1) readonly buffer Positions
+{
+    float data[];
+} positions;
+
+layout(std430, set = 0, binding = 2) readonly buffer Indices
+{
+    uint data[];
+} indices;
+
+layout(std430, set = 0, binding = 3) readonly buffer TriangleMaterials
+{
+    uint data[];
+} triangleMaterials;
+
+struct Material
+{
+    // rgb = 反照率, w = 保留
+    vec4 Albedo;
+
+    // rgb = 自发光辐射度, w = 保留
+    vec4 Emission;
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer Materials
+{
+    Material data[];
+} materials;
+
+// 逐像素两个 vec4:
+//   [2p+0] = (Σ L.rgb, Σ 深度截断样本数)
+//   [2p+1] = (Σ L².rgb, Σ 首次命中样本数)
+layout(std430, set = 0, binding = 5) buffer Accumulation
+{
+    vec4 data[];
+} accum;
+
+layout(push_constant) uniform Params
+{
+    // xyz = 相机世界位置, w = tan(垂直半视角)
+    vec4 CameraPosition;
+
+    // xyz = 相机前向 (单位), w = 宽高比
+    vec4 CameraForward;
+
+    // xyz = 相机右向 (单位), w = 保留
+    vec4 CameraRight;
+
+    // xyz = 相机上向 (单位), w = 保留
+    vec4 CameraUp;
+
+    // x = 宽, y = 高, z = 本次分派的样本数, w = 样本号起点
+    uvec4 Image;
+
+    // x = 最大弹射次数, y = 俄罗斯轮盘起始散射序号, z = 试验号 (种子偏移),
+    // w = 保留
+    uvec4 Sampling;
+
+    // 逃逸方向上的入射辐射度  L_env(ω) = x + y·ω.y
+    //
+    // 梯度那一项不是为了好看, 是为了让判据**看得见采样分布**。
+    // 环境各向同性时, 半球上的余弦加权平均与均匀加权平均给出同一个数 ——
+    // 于是"按余弦采样但按均匀 pdf 算权重"这类错误在纯白炉里完全隐形
+    // (白炉只验能量, 不验分布)。加一项线性梯度之后两者分开了:
+    //     余弦加权:  x + (2/3)·y·(n·ŷ)
+    //     均匀加权:  x + (1/2)·y·(n·ŷ)
+    // 差 1/6·y —— 反照率 1、梯度 1 的水平面上是 10%, 一眼判得出来。
+    vec4 Environment;
+
+    // x = 射线 tMin, y = 沿法线的起点偏移, z = 射线最大距离, w = 保留
+    vec4 Trace;
+} pc;
+
+// ============================================================================
+// 随机数 —— PCG
+//
+// 用哈希而不是"每个线程一个状态往下滚": 判据要求同一 (像素, 样本号, 试验号)
+// 永远给出同一条路径, 而分派是分块的 (几千 spp 一次交不完, 会被 Windows 的
+// GPU 超时打断), 块与块之间没有可以延续的状态。
+// ============================================================================
+
+uint PcgNext(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+
+    const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+
+    return (word >> 22u) ^ word;
+}
+
+/// [0, 1) 上的均匀数
+///
+/// 取高 24 位而不是把 32 位整个乘上 2^-32: 后者的最大值 0.9999999998 在
+/// float32 里会被舍入到 1.0, 于是 sqrt(1-u1) 偶尔取到 -0 的平方根,
+/// 而那条路径的方向恰好贴着切平面 —— 表现是极少数像素上的萤火虫。
+float NextFloat(inout uint state)
+{
+    return float(PcgNext(state) >> 8u) * (1.0 / 16777216.0);
+}
+
+/// 32 位雪崩混合 (Murmur3 的 finalizer 变体)
+uint HashMix(uint x)
+{
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+
+    return x;
+}
+
+/// 由 (像素, 样本号, 试验号) 定出一条独立的随机数流
+///
+/// 三个量**逐个**混合而不是加在一起再混合一次: 相加会让
+/// (像素+1, 样本号-1) 与 (像素, 样本号) 落到同一颗种子上, 于是相邻像素
+/// 的样本成对重复 —— 画面上完全看不出来, 但"方差 ∝ 1/N"那条判据会得到
+/// 一条比 -1 平缓的斜率, 因为有效样本数比名义上少。
+uint SeedRandom(uint pixelIndex, uint sampleIndex, uint trialIndex)
+{
+    uint s = HashMix(pixelIndex + 0x9e3779b9u);
+    s = HashMix(s ^ (sampleIndex + 0x85ebca6bu));
+    s = HashMix(s ^ (trialIndex + 0xc2b2ae35u));
+
+    return s;
+}
+
+// ============================================================================
+// 几何
+// ============================================================================
+
+/// 以 n 为 +Z 轴建一组正交基 (Duff 等人的无分支构造)
+///
+/// 用它而不是"取一个不平行的轴再叉乘": 后者要判哪个轴不平行, 判错的那一侧
+/// 会叉出零向量, 表现是某些朝向的表面辐射度变成 NaN。
+void BuildBasis(vec3 n, out vec3 t, out vec3 b)
+{
+    const float s = (n.z >= 0.0) ? 1.0 : -1.0;
+    const float a = -1.0 / (s + n.z);
+    const float c = n.x * n.y * a;
+
+    t = vec3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = vec3(c, s + n.y * n.y * a, -n.y);
+}
+
+vec3 FetchPosition(uint vertexIndex)
+{
+    const uint base = vertexIndex * 3u;
+
+    return vec3(positions.data[base + 0u],
+                positions.data[base + 1u],
+                positions.data[base + 2u]);
+}
+
+struct HitInfo
+{
+    bool  Hit;
+    vec3  Position;
+    vec3  Normal;
+    uint  Primitive;
+};
+
+/// 最近命中
+///
+/// 不设 TerminateOnFirstHit —— 那是遮蔽查询用的。路径追踪要的是最近命中,
+/// 用错的表现是"墙后面的东西照进来了", 而画面上只是有点亮。
+HitInfo TraceClosest(vec3 origin, vec3 direction)
+{
+    HitInfo hit;
+    hit.Hit       = false;
+    hit.Position  = origin;
+    hit.Normal    = vec3(0.0, 1.0, 0.0);
+    hit.Primitive = 0u;
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, topLevel, gl_RayFlagsOpaqueEXT, 0xFFu,
+                          origin, pc.Trace.x, direction, pc.Trace.z);
+
+    while (rayQueryProceedEXT(query))
+    {
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionTriangleEXT)
+    {
+        return hit;
+    }
+
+    const uint primitive =
+        rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+
+    const vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+
+    const uint i0 = indices.data[primitive * 3u + 0u];
+    const uint i1 = indices.data[primitive * 3u + 1u];
+    const uint i2 = indices.data[primitive * 3u + 2u];
+
+    const vec3 v0 = FetchPosition(i0);
+    const vec3 v1 = FetchPosition(i1);
+    const vec3 v2 = FetchPosition(i2);
+
+    // 命中点由重心坐标重建, 不用 origin + t·direction。
+    //
+    // 后者的绝对误差与 t 成正比 —— 一条掠着地面飞很远才命中的射线, 重建
+    // 出的点会偏离表面好几个法线偏移量, 于是下一次弹射从"表面之下"出发,
+    // 立刻自遮挡。表现是大平面在远处发黑, 看起来像"环境光不够"。
+    //
+    // 实测说明: 把这一行换成 origin + t·direction, 三条判据**一条都不红**
+    // (最大差 3e-6, 远在任何一条预算之下)。原因是判据的场景都只有两个
+    // 世界单位大, t 不超过 4, 而法线偏移是 1e-4 —— 两种重建的差距还不到
+    // 偏移的百分之一。也就是说这一处的取舍在当前判据的**尺度**上不可判定,
+    // 它是为后面那些几十上百单位的场景留的。判据的覆盖边界连着尺度一起记,
+    // 否则下一个人会以为它被验过。
+    const float w = 1.0 - bary.x - bary.y;
+
+    hit.Hit       = true;
+    hit.Position  = v0 * w + v1 * bary.x + v2 * bary.y;
+    hit.Primitive = primitive;
+
+    // 几何法线, 并翻到迎着来向的一侧。
+    //
+    // 双面处理让场景的绕序无关紧要 —— 一个封闭盒子从里面看, 六个面的绕序
+    // 要么全朝内要么全朝外, 而"全朝外"时不翻面的实现会把整个盒子的内壁
+    // 判成背面, 采样半球指向墙里, 结果全黑。
+    vec3 normal = normalize(cross(v1 - v0, v2 - v0));
+
+    if (dot(normal, direction) > 0.0)
+    {
+        normal = -normal;
+    }
+
+    hit.Normal = normal;
+
+    return hit;
+}
+
+/// 逃逸方向上的入射辐射度
+float EnvironmentRadiance(vec3 direction)
+{
+    return pc.Environment.x + pc.Environment.y * direction.y;
+}
+
+// ============================================================================
+// 主循环
+// ============================================================================
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.Image.x || pixel.y >= pc.Image.y)
+    {
+        return;
+    }
+
+    const uint pixelIndex = pixel.y * pc.Image.x + pixel.x;
+
+    const uint  maxBounce    = pc.Sampling.x;
+    const uint  rrStartDepth = pc.Sampling.y;
+    const uint  trialIndex   = pc.Sampling.z;
+    const float normalOffset = pc.Trace.y;
+
+    const float tanHalfY = pc.CameraPosition.w;
+    const float tanHalfX = tanHalfY * pc.CameraForward.w;
+
+    vec3  sumRadiance   = vec3(0.0);
+    vec3  sumRadianceSq = vec3(0.0);
+    float sumAlive      = 0.0;
+    float sumPrimaryHit = 0.0;
+
+    for (uint s = 0u; s < pc.Image.z; ++s)
+    {
+        const uint sampleIndex = pc.Image.w + s;
+
+        uint rng = SeedRandom(pixelIndex, sampleIndex, trialIndex);
+
+        // 像素内抖动 —— 估计量是像素面积上的积分, 不是像素中心的一个点。
+        const vec2 jitter = vec2(NextFloat(rng), NextFloat(rng));
+
+        const vec2 uv  = (vec2(pixel) + jitter) /
+                         vec2(float(pc.Image.x), float(pc.Image.y));
+        const vec2 ndc = uv * 2.0 - 1.0;
+
+        vec3 direction = normalize(pc.CameraForward.xyz
+                                 + pc.CameraRight.xyz * (ndc.x * tanHalfX)
+                                 - pc.CameraUp.xyz    * (ndc.y * tanHalfY));
+
+        vec3 origin = pc.CameraPosition.xyz;
+
+        vec3  throughput = vec3(1.0);
+        vec3  radiance   = vec3(0.0);
+        float alive      = 0.0;
+
+        for (uint depth = 0u; depth <= maxBounce; ++depth)
+        {
+            const HitInfo hit = TraceClosest(origin, direction);
+
+            if (!hit.Hit)
+            {
+                radiance += throughput * EnvironmentRadiance(direction);
+                break;
+            }
+
+            if (depth == 0u)
+            {
+                sumPrimaryHit += 1.0;
+            }
+
+            const uint materialIndex =
+                triangleMaterials.data[hit.Primitive];
+
+            const Material material = materials.data[materialIndex];
+
+            radiance += throughput * material.Emission.rgb;
+
+            // 深度截断 —— 这一条**不是**终止, 是"没算完"。单独记数,
+            // 让判据能把截断损失与能量不守恒分开。
+            if (depth == maxBounce)
+            {
+                alive = 1.0;
+                break;
+            }
+
+            const vec3 albedo = material.Albedo.rgb;
+
+            // ── 余弦加权半球采样 ──
+            //
+            // 先采方向再算权重, 不是为了效率, 是为了让"权重"能写成**独立的
+            // 一行** —— 变异验证要能只改这一行, 而不必把周围的逻辑一起重排。
+            // 重排过的代码与原代码差别太大时, 变异验证验的就不再是那一处了。
+            vec3 tangent;
+            vec3 bitangent;
+            BuildBasis(hit.Normal, tangent, bitangent);
+
+            const float u1 = NextFloat(rng);
+            const float u2 = NextFloat(rng);
+
+            // r = sqrt(u1) 让方向按 cosθ 分布, 于是 pdf = cosθ/π。
+            const float r        = sqrt(u1);
+            const float phi      = 6.28318530718 * u2;
+            const float cosTheta = sqrt(max(0.0, 1.0 - u1));
+
+            const vec3 local = vec3(r * cos(phi), r * sin(phi), cosTheta);
+
+            const vec3 nextDirection = normalize(tangent    * local.x +
+                                                 bitangent  * local.y +
+                                                 hit.Normal * local.z);
+
+            // 估计量的权重 f_r·cosθ/pdf
+            //   = (albedo/π)·cosθ·(π/cosθ)
+            //   = albedo
+            //
+            // π 与 cosθ 全部约掉。cosTheta 在这一行里**不出现**才是对的 ——
+            // 出现了就说明要么少除了一次 pdf, 要么漏乘了余弦。
+            const vec3 weight = albedo;
+
+            vec3 nextThroughput = throughput * weight;
+
+            // ── 俄罗斯轮盘 ──
+            //
+            // 存活概率取"继续下去的通量"的最大分量。反照率为 1 时它恒等于
+            // 1, 轮盘永远不开枪 —— 这是白炉测试成立的前提: 白炉里没有吸收,
+            // 任何提前终止都是能量损失。
+            if (depth >= rrStartDepth)
+            {
+                const float survival = min(1.0,
+                    max(max(nextThroughput.r, nextThroughput.g),
+                        nextThroughput.b));
+
+                if (survival <= 0.0)
+                {
+                    break;
+                }
+
+                if (NextFloat(rng) >= survival)
+                {
+                    break;
+                }
+
+                // 补偿。少了这一除, 每一次轮盘都吃掉 (1-survival) 的能量,
+                // 而画面只是"暗了一点" —— 那种暗看起来完全像"这个场景就
+                // 该这么暗"。
+                nextThroughput /= survival;
+            }
+
+            throughput = nextThroughput;
+            direction  = nextDirection;
+
+            origin = hit.Position + hit.Normal * normalOffset;
+        }
+
+        sumRadiance   += radiance;
+        sumRadianceSq += radiance * radiance;
+        sumAlive      += alive;
+    }
+
+    // 累加而不是覆写 —— 几千 spp 分成若干次分派提交, 一次交完会撞上
+    // Windows 的 GPU 超时重置。同一个像素永远由同一个线程写, 没有竞争。
+    accum.data[pixelIndex * 2u + 0u] +=
+        vec4(sumRadiance, sumAlive);
+
+    accum.data[pixelIndex * 2u + 1u] +=
+        vec4(sumRadianceSq, sumPrimaryHit);
+}

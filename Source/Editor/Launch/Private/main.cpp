@@ -43,6 +43,7 @@
 
 #include "Launch/LaunchMinimal.h"
 #include "RayTracingCheck.h"
+#include "PathTraceCheck.h"
 #include "RenderCore/Material/FMaterialManager.h"
 #include "Engine/Rendering/FSceneLoader.h"
 #include "RenderCore/Environment/FEnvironmentMap.h"
@@ -324,6 +325,20 @@ struct FLaunchOptions
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
 
+    /// 离线参考路径追踪器的判据 —— 白炉、能量守恒、方差标度, 以退出码报告
+    ///
+    /// 它跑的是自己程序生成的场景 (白炉需要可控的环境), 与命令行里的
+    /// 其它场景开关无关 —— 但仍然要 --frames, 因为判据统一在帧循环结束
+    /// 之后跑, 而窗口与设备要先起来。
+    bool PathTraceCheck = false;
+
+    /// 离线渲一张 Cornell 盒参考图并写成二进制 PPM
+    FString PathTraceImagePath;
+
+    /// 参考图的分辨率与每像素样本数
+    UInt32 PathTraceImageSize = 512;
+    UInt32 PathTraceImageSamples = 4096;
+
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
 
@@ -568,6 +583,10 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --cluster-check  分簇剔除自检: 回读簇表与 CPU 参照比对, 以退出码报告
 ///   --no-clustered   关闭分簇, 强制暴力遍历全部光源 (性能对照用)
 ///   --light-cull-check 分簇着色自检: 与暴力法逐像素比对, 以退出码报告
+///   --path-trace-check 离线参考路径追踪器自检: 白炉 + 能量守恒 + 方差标度
+///   --path-trace-image P 离线渲一张 Cornell 盒参考图写入 P (二进制 PPM)
+///   --path-trace-size N  参考图边长 (默认 512)
+///   --path-trace-spp N   参考图每像素样本数 (默认 4096)
 static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
 {
     FLaunchOptions options;
@@ -926,6 +945,23 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-group-check"))
         {
             options.MeshletGroupCheck = true;
+        }
+        else if (WideEquals(arg, L"--path-trace-check"))
+        {
+            options.PathTraceCheck = true;
+        }
+        else if (WideEquals(arg, L"--path-trace-image") &&
+                 (i + 1) < tokenCount)
+        {
+            options.PathTraceImagePath = WideToString(tokens[++i]);
+        }
+        else if (WideEquals(arg, L"--path-trace-size") && (i + 1) < tokenCount)
+        {
+            options.PathTraceImageSize = ParseUInt32(tokens[++i], 512);
+        }
+        else if (WideEquals(arg, L"--path-trace-spp") && (i + 1) < tokenCount)
+        {
+            options.PathTraceImageSamples = ParseUInt32(tokens[++i], 4096);
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -19582,6 +19618,20 @@ int WINAPI wWinMain(
     LIMX_LOG(LogLaunch, Log,
         "[Launch] Limx Engine 启动中...");
 
+    // 所有自检都挂在"跑满 --frames 之后"那个分支上, 所以漏写 --frames 的
+    // 命令行会**一帧不跑就退出, 退出码 0** —— 一条没跑过的判据报了通过。
+    //
+    // 这是本项目栽过的坑 (测量脚本静默报通过), 所以这里显式判掉: 要判据
+    // 就必须给帧数, 给不出就以判据自己的退出码失败。别的自检暂未补上这道
+    // 闸, 但新加的这一条不该重蹈覆辙。
+    if (launchOptions.PathTraceCheck && launchOptions.FrameLimit == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+            "[Launch] --path-trace-check 需要 --frames N (N >= 1): "
+            "自检跑在帧循环结束之后, 不给帧数就等于一条都不跑");
+        return 39;
+    }
+
     // ================================================================
     // 1. 创建窗口
     // ================================================================
@@ -20034,6 +20084,7 @@ int WINAPI wWinMain(
     bool    meshletExpandOverflowPassed = true;
     bool    meshSimplifyPassed = true;
     bool    meshletGroupPassed = true;
+    bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
     {
@@ -20212,6 +20263,26 @@ int WINAPI wWinMain(
             if (launchOptions.MeshletGroupCheck)
             {
                 meshletGroupPassed = RunMeshletGroupChecks();
+            }
+
+            if (launchOptions.PathTraceCheck)
+            {
+                pathTracePassed = RunPathTraceChecks(&renderContext);
+            }
+
+            if (!launchOptions.PathTraceImagePath.IsEmpty())
+            {
+                const UInt32 size =
+                    FMath::Clamp(launchOptions.PathTraceImageSize, 16u, 4096u);
+
+                if (!RenderPathTraceReferenceImage(
+                        &renderContext, launchOptions.PathTraceImagePath,
+                        size, size,
+                        FMath::Max(launchOptions.PathTraceImageSamples, 1u)))
+                {
+                    LIMX_LOG(LogLaunch, Error,
+                             "[Launch] 路径追踪参考图渲染失败");
+                }
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -20533,6 +20604,14 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletGroupCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletGroupPassed, 38, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.PathTraceCheck)
+    {
+        // 39 而不是 37: 37 已经被 --meshlet-expand-overflow-check 占了。
+        // 两条判据是并行做出来的, 各自挑了下一个空号。
+        selfCheckCode = FinalizeSelfCheck(pathTracePassed, 39, errorSink,
                                           errorsBeforeShutdown);
     }
 
