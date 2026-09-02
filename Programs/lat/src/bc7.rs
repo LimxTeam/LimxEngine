@@ -19,9 +19,9 @@
  *   用一种 mode —— 编码器的工作就是替每个块挑 mode、挑分区、拟合端点。
  *
  * ── 实现了哪几种 mode, 为什么 ──────────────────────────────────────────
- *   编码器只产出 4 种 mode。解码器 8 种全支持 (见 `decode_block`) ——
- *   解码器是拿来验编码器的 oracle, 它必须按规范完整实现, 否则"编码器写错、
- *   解码器跟着错"就会互相掩盖。
+ *   八种全产出。解码器同样八种全支持 (见 `decode_block`) —— 解码器是拿来
+ *   验编码器的 oracle, 它必须按规范完整实现, 否则"编码器写错、解码器跟着
+ *   错"就会互相掩盖。
  *
  *   * **Mode 6** — 单子集 / RGBA / 7 位端点 + 每端点 1 位 p / 4 位索引。
  *     唯一给到 4 位 (16 级) 索引的 mode, 也是唯一能同时表达 alpha 与
@@ -46,15 +46,41 @@
  *     插值位置, 边缘会同时出现色渗和 alpha 毛边。mode 7 把阶跃两侧分进
  *     不同子集, 各自的端点各自表达, 问题消失。
  *
- *   放弃的 mode 与代价:
- *   * **Mode 0 / 2 (三子集)** —— 分区表 64 张 × 三子集的搜索空间是双子集的
- *     数倍, 而端点只有 4/5 位。收益集中在"块内有三种明显不同材质"这种
- *     少见形态上, 用双子集拟合它们通常只差 1 dB 以内。留给后续。
- *   * **Mode 4 / 5 (旋转 + 两套独立索引)** —— 它们让 alpha 用独立于颜色的
- *     索引集, 代价是颜色索引只剩 2 位。mode 7 已经用"分区"解决了 alpha
- *     与颜色不相关的主要场景 (阶跃边缘), 剩下的 "alpha 平滑渐变且与颜色
- *     完全无关" 形态在真实贴图里罕见。代价: 这类块目前由 mode 6 承担,
- *     颜色和 alpha 共用索引, 会比理论最优低若干 dB。
+ *   * **Mode 0 / 2 (三子集)** —— 块内有三种明显不同的材质时, 双子集必须
+ *     把其中两种并进一个子集, 而那两种的点张成一个平面, 一条直线盖不住。
+ *     mode 0 有 16 张分区、4 位端点、3 位索引; mode 2 有 64 张分区、5 位
+ *     端点、2 位索引。
+ *
+ *   * **Mode 4 / 5 (旋转 + 两套独立索引)** —— 颜色与某一个通道走势完全
+ *     无关时 (法线贴图的 z、粗糙度塞进 alpha 的打包贴图、抠图边缘),
+ *     一套索引必须让两者共用同一个插值位置, 必然牺牲一个。这两个 mode
+ *     给它们各一套索引; "旋转"决定哪个通道享受独立索引 (0 = alpha,
+ *     1/2/3 = R/G/B)。mode 5 是 7 位颜色 + 8 位 alpha + 两套 2 位索引;
+ *     mode 4 是 5 位颜色 + 6 位 alpha, 两套索引一个 2 位一个 3 位, 外加
+ *     一位选择谁用哪套。
+ *
+ * ── 补齐这四种 mode 值不值 (实测) ───────────────────────────────────────
+ *   Sponza 的三张 1024x1024 贴图, 每张 65536 个块, 拿"八种全开"与"只用
+ *   原来那四种"逐块对比:
+ *
+ *                    八种        四种       增益     mode 4/5 占比  mode 0/2 占比
+ *     albedo A     48.88 dB   48.67 dB   +0.21 dB      10.8%        0.015%
+ *     albedo B     43.99 dB   42.96 dB   +1.03 dB      39.9%        0.03%
+ *     albedo C     45.12 dB   44.12 dB   +1.00 dB      68.9%        1.4%
+ *
+ *   结论分得很开: **mode 4/5 是这次补齐的全部价值**, 而 mode 0/2 在真实
+ *   贴图上几乎不被选中 (最多 1.4%, 最少 15 个块)。
+ *
+ *   代价也量了 (单张 1024x1024 的烘焙时间):
+ *
+ *     原来四种            0.48 秒
+ *     + mode 4/5          0.77 秒   (+60%)
+ *     + mode 0/2          0.89 秒   (+87%)
+ *     八种全开            1.02 秒   (+113%)
+ *
+ *   也就是说三子集那一路要了近一半的额外时间, 换来不到 1.5% 的块。留着
+ *   是因为它在该赢的形态上赢得干净 (见判据 `three_regions_pick_a_three_subset_mode`),
+ *   但要为烘焙速度动刀, 第一刀应该落在这里。
  *
  * ── 误差度量 ────────────────────────────────────────────────────────────
  *   编码器挑 mode/分区/端点时用的是 **RGBA 四通道等权平方误差**, 没有加
@@ -117,8 +143,9 @@ const PARTITION_MASKS_2: [u32; 64] = [
 /// 三子集分区表, 64 张。低 16 位 = 子集 0, 高 16 位 = 子集 1,
 /// 两者都没置位的 texel 属于子集 2。
 ///
-/// 编码器不产出三子集的 mode 0/2, 这张表只服务于解码器 —— 解码器要能
-/// 读任何合法的 BC7 块, 包括别的工具 (texconv / Compressonator) 产出的。
+/// 三子集分区表 —— mode 0 (只用前 16 张) 与 mode 2 (64 张全用) 共用。
+/// 解码器还要能读任何合法的 BC7 块, 包括别的工具 (texconv /
+/// Compressonator) 产出的。
 const PARTITION_MASKS_3: [u32; 64] = [
     0x08CC_0133, 0x8CC8_0037, 0xCC80_006F, 0xEC00_1331, 0x3300_00FF, 0x00CC_3333, 0xFF00_0033,
     0xCCCC_0033, 0x0F00_00FF, 0x0FF0_000F, 0x00F0_000F, 0x4444_3333, 0x6666_1111, 0x2222_1111,
@@ -160,6 +187,15 @@ fn subset_of_2(partition: usize, texel: usize) -> usize {
 }
 
 #[inline]
+/// 按子集数选表 —— 编码与解码共用一个入口, 免得两边各写一份 match
+fn subset_of(subsets: usize, partition: usize, texel: usize) -> usize {
+    match subsets {
+        1 => 0,
+        2 => subset_of_2(partition, texel),
+        _ => subset_of_3(partition, texel),
+    }
+}
+
 fn subset_of_3(partition: usize, texel: usize) -> usize {
     let m = PARTITION_MASKS_3[partition];
     if (m >> texel) & 1 != 0 {
@@ -589,12 +625,20 @@ fn build_palette(e0: [i32; 4], e1: [i32; 4], index_bits: u32) -> [[i32; 4]; 16] 
 /// `alpha_active == false` 时 alpha 不参与选择 (该 mode 的解码 alpha 恒为
 /// 255), 但 (255 - a)² 仍然记进误差 —— 否则挑 mode 时会以为不带 alpha 的
 /// mode 在半透明块上"没有误差", 从而选中它。
+/// `alpha_penalty` = 这个 mode 解码出来的 alpha 恒为 255, 因此源图的 alpha
+/// 与 255 的差要记进误差里。
+///
+/// mode 4/5 是例外: 它们不带 alpha 端点是假象 —— alpha 由**另一套索引**单独
+/// 编码, 只是不走这个函数。那时把 (255-a)² 记进去会让颜色拟合被一个与它
+/// 无关的量牵着走, 选出的端点偏向"让 alpha 看起来对", 而 alpha 根本不由
+/// 这里决定。
 fn assign_indices(
     texels: &[[i32; 4]; 16],
     members: &[usize],
     palette: &[[i32; 4]; 16],
     index_bits: u32,
     alpha_active: bool,
+    alpha_penalty: bool,
     indices: &mut [u32; 16],
 ) -> f64 {
     let count = 1usize << index_bits;
@@ -618,7 +662,7 @@ fn assign_indices(
         }
         indices[t] = best;
         total += best_dist as f64;
-        if !alpha_active {
+        if !alpha_active && alpha_penalty {
             let da = (255 - p[3]) as f64;
             total += da * da;
         }
@@ -750,6 +794,7 @@ fn fit_subset(
     pbits: PBits,
     index_bits: u32,
     anchor: usize,
+    alpha_penalty: bool,
 ) -> SubsetFit {
     let alpha_active = alpha_bits > 0;
     let n = if alpha_active { 4 } else { 3 };
@@ -815,6 +860,7 @@ fn fit_subset(
                 &palette,
                 index_bits,
                 alpha_active,
+                alpha_penalty,
                 &mut indices,
             );
 
@@ -943,6 +989,96 @@ fn partition_residual(
     residual
 }
 
+/// 三子集版本的"便宜的坏度"。
+///
+/// 双子集那一版用增量和省掉了一半的统计 (子集 1 = 全体减子集 0), 三子集
+/// 没有这个便利, 于是老老实实逐子集统计。每块 64 张分区 × 16 个 texel,
+/// 代价可以接受。
+fn partition_residual_3(texels: &[[i32; 4]; 16], partition: usize, n: usize) -> f64 {
+    let mut sum = [[0.0f64; 4]; 3];
+    let mut prod = [[[0.0f64; 4]; 4]; 3];
+    let mut count = [0.0f64; 3];
+
+    for (t, texel) in texels.iter().enumerate() {
+        let s = subset_of_3(partition, t);
+        count[s] += 1.0;
+        for r in 0..n {
+            let vr = texel[r] as f64;
+            sum[s][r] += vr;
+            for c in 0..n {
+                prod[s][r][c] += vr * texel[c] as f64;
+            }
+        }
+    }
+
+    let mut residual = 0.0;
+    for s in 0..3 {
+        if count[s] <= 0.0 {
+            continue;
+        }
+        let mut cov = [[0.0f64; 4]; 4];
+        let mut trace = 0.0;
+        for r in 0..n {
+            for c in 0..n {
+                cov[r][c] = prod[s][r][c] - sum[s][r] * sum[s][c] / count[s];
+            }
+            trace += cov[r][r];
+        }
+
+        let axis = principal_axis(&cov, n);
+        let mut lambda = 0.0;
+        for r in 0..n {
+            for c in 0..n {
+                lambda += axis[r] * cov[r][c] * axis[c];
+            }
+        }
+        residual += (trace - lambda).max(0.0);
+    }
+
+    residual
+}
+
+/// 三子集分区排序 —— 一次排完 64 张, 同时给出 mode 0 能用的那一档。
+///
+/// mode 0 与 mode 2 共用同一张三子集分区表, 只是 mode 0 的分区号只有 4 位
+/// (前 16 张)。一次排完是为了不把那 16 张的残差算两遍。
+///
+/// **它不省时间。** 分开排与合并排在 1024x1024 的贴图上都是 1.02～1.04 秒,
+/// 差在噪声里 —— 贵的是那 64 张的残差本身 (每张 16 个 texel 的三份协方差
+/// 加幂迭代), 而合并前后都要算这 64 张。合并只是少写一遍同样的东西。
+///
+/// 三子集这一路的代价是实测出来的: 单独加它让整张贴图的烘焙从 0.48 秒涨到
+/// 0.89 秒 (+87%), 而它在这张贴图上一共只赢下 10 个块 (65536 个里)。留着是
+/// 因为在三种材质挤在一个块里时它赢得干净利落 (见判据), 但要为烘焙速度
+/// 动刀的话, 这里是第一刀。
+fn rank_partitions_3(
+    texels: &[[i32; 4]; 16],
+    n: usize,
+) -> ([usize; PARTITION_CANDIDATES], [usize; PARTITION_CANDIDATES]) {
+    let mut scored = [(0.0f64, 0usize); 64];
+    for (p, slot) in scored.iter_mut().enumerate() {
+        *slot = (partition_residual_3(texels, p, n), p);
+    }
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let all = std::array::from_fn(|i| scored[i].1);
+
+    // mode 0 只能用编号 < 16 的那些
+    let mut low = [0usize; PARTITION_CANDIDATES];
+    let mut filled = 0;
+    for &(_, p) in scored.iter() {
+        if p < 16 {
+            low[filled] = p;
+            filled += 1;
+            if filled == PARTITION_CANDIDATES {
+                break;
+            }
+        }
+    }
+
+    (all, low)
+}
+
 /// 按 `partition_residual` 排序, 取最好的 `PARTITION_CANDIDATES` 张分区。
 fn rank_partitions(texels: &[[i32; 4]; 16], n: usize) -> [usize; PARTITION_CANDIDATES] {
     let mut total_sum = [0.0f64; 4];
@@ -974,7 +1110,6 @@ fn rank_partitions(texels: &[[i32; 4]; 16], n: usize) -> [usize; PARTITION_CANDI
 /// 只处理编码器实际会产出的形态: 单/双子集、一套索引、无旋转。
 fn encode_with_mode(mode: usize, partition: usize, texels: &[[i32; 4]; 16]) -> (f64, [u8; 16]) {
     let m = MODES[mode];
-    debug_assert!(m.subsets <= 2, "编码器不产出三子集 mode");
     debug_assert!(m.rotation_bits == 0 && m.index_sel_bits == 0 && m.index_bits2 == 0);
 
     let pbits = if m.shared_pbits > 0 {
@@ -986,14 +1121,13 @@ fn encode_with_mode(mode: usize, partition: usize, texels: &[[i32; 4]; 16]) -> (
     };
     let anchors = anchor_texels(&m, partition);
 
-    let mut members: [Vec<usize>; 2] = [Vec::with_capacity(16), Vec::with_capacity(16)];
+    let mut members: [Vec<usize>; 3] = [
+        Vec::with_capacity(16),
+        Vec::with_capacity(16),
+        Vec::with_capacity(16),
+    ];
     for t in 0..16 {
-        let s = if m.subsets == 1 {
-            0
-        } else {
-            subset_of_2(partition, t)
-        };
-        members[s].push(t);
+        members[subset_of(m.subsets, partition, t)].push(t);
     }
 
     let mut fits = Vec::with_capacity(m.subsets);
@@ -1007,6 +1141,7 @@ fn encode_with_mode(mode: usize, partition: usize, texels: &[[i32; 4]; 16]) -> (
             pbits,
             m.index_bits,
             anchors[s],
+            true,
         );
         error += fit.error;
         fits.push(fit);
@@ -1047,13 +1182,203 @@ fn encode_with_mode(mode: usize, partition: usize, texels: &[[i32; 4]; 16]) -> (
     }
 
     for t in 0..16 {
-        let s = if m.subsets == 1 {
-            0
-        } else {
-            subset_of_2(partition, t)
-        };
+        let s = subset_of(m.subsets, partition, t);
         let bits = m.index_bits - u32::from(anchors[..m.subsets].contains(&t));
         w.write(fits[s].indices[t], bits);
+    }
+
+    debug_assert_eq!(w.pos, 128, "mode {} 打包后不是 128 bit", mode);
+    (error, w.bits.to_le_bytes())
+}
+
+
+/// 单通道 (alpha) 的拟合结果
+struct ScalarFit {
+    error: f64,
+    /// 量化后的两个端点 (不含 p 位 —— mode 4/5 没有 p 位)
+    quantized: [u32; 2],
+    indices: [u32; 16],
+}
+
+/// 把一个通道拟合成"两端点 + 一套索引"。
+///
+/// 与 `fit_subset` 是同一套路数, 但只有一维: 起点取极值, 量化, 逐 texel 取
+/// 最近的调色板项, 再按索引做一次最小二乘重拟合。一维下最小二乘有闭式解,
+/// 不必走主成分那一套。
+fn fit_scalar(values: &[i32; 16], bits: u32, index_bits: u32, anchor: usize) -> ScalarFit {
+    let mut lo = values[0] as f64;
+    let mut hi = values[0] as f64;
+    for &v in values.iter() {
+        lo = lo.min(v as f64);
+        hi = hi.max(v as f64);
+    }
+
+    let table = weights(index_bits);
+    let count = 1usize << index_bits;
+
+    let mut best: Option<ScalarFit> = None;
+
+    for _ in 0..REFINE_ROUNDS {
+        let q0 = quantize_component(lo, bits, None);
+        let q1 = quantize_component(hi, bits, None);
+
+        let e0 = expand_to_8(q0, bits);
+        let e1 = expand_to_8(q1, bits);
+
+        let mut palette = [0i32; 16];
+        for (k, slot) in palette.iter_mut().enumerate().take(count) {
+            *slot = i32::from(interpolate(e0, e1, table[k]));
+        }
+
+        let mut indices = [0u32; 16];
+        let mut error = 0.0f64;
+
+        for (t, &v) in values.iter().enumerate() {
+            let mut pick = 0u32;
+            let mut best_dist = i64::MAX;
+            for (k, &p) in palette.iter().enumerate().take(count) {
+                let d = ((v - p) as i64) * ((v - p) as i64);
+                if d < best_dist {
+                    best_dist = d;
+                    pick = k as u32;
+                }
+            }
+            indices[t] = pick;
+            error += best_dist as f64;
+        }
+
+        let improved = best.as_ref().is_none_or(|b| error < b.error);
+        if !improved {
+            break;
+        }
+
+        best = Some(ScalarFit {
+            error,
+            quantized: [q0, q1],
+            indices,
+        });
+
+        // 一维最小二乘: 把 v ≈ a + (b-a)·w 里的 a、b 解出来
+        let (mut s_ww, mut s_w, mut s_1, mut s_vw, mut s_v) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (t, &v) in values.iter().enumerate() {
+            let w = table[indices[t] as usize] as f64 / 64.0;
+            s_ww += w * w;
+            s_w += w;
+            s_1 += 1.0;
+            s_vw += v as f64 * w;
+            s_v += v as f64;
+        }
+        let det = s_1 * s_ww - s_w * s_w;
+        if det.abs() < 1.0e-9 {
+            break;
+        }
+        let a = (s_v * s_ww - s_w * s_vw) / det;
+        let b = (s_1 * s_vw - s_w * s_v) / det;
+        lo = a.clamp(0.0, 255.0);
+        hi = (a + b).clamp(0.0, 255.0);
+    }
+
+    let mut fit = best.expect("至少要产出一轮结果");
+
+    // anchor 约束 —— 与 fit_subset 同理: 权重表关于 32 对称, 交换端点并把
+    // 索引取反之后解码逐位相同。
+    let half = 1u32 << (index_bits - 1);
+    if fit.indices[anchor] >= half {
+        fit.quantized.swap(0, 1);
+        let top = (1u32 << index_bits) - 1;
+        for slot in fit.indices.iter_mut() {
+            *slot = top - *slot;
+        }
+    }
+    debug_assert!(fit.indices[anchor] < half);
+
+    fit
+}
+
+/// mode 4 / 5: 单子集, 旋转, 颜色与 alpha 各用一套索引。
+///
+/// ── 旋转是干什么的 ──
+///
+/// 解码的最后一步把 alpha 与某个颜色通道对调。于是"哪个通道享受独立索引"
+/// 就成了可选的: 旋转 0 给 alpha, 旋转 1/2/3 分别给 R/G/B。对"三个通道里
+/// 有一个走势与另外两个完全不同"的块 (法线贴图的 z、粗糙度塞进 alpha 的
+/// 打包贴图), 这比让四个通道共用一套索引省得多。
+///
+/// 编码侧只要把源 texel 先做同样的对调, 后面就当成普通的 "RGB + 单通道"
+/// 来拟合 —— 误差在对调前后是同一个数, 因为对调只是通道换位置。
+fn encode_with_dual_index(
+    mode: usize,
+    rotation: u32,
+    index_mode: u32,
+    texels: &[[i32; 4]; 16],
+) -> (f64, [u8; 16]) {
+    let m = MODES[mode];
+    debug_assert_eq!(m.subsets, 1);
+    debug_assert!(m.index_bits2 > 0 && m.rotation_bits == 2);
+    debug_assert!(m.endpoint_pbits == 0 && m.shared_pbits == 0);
+
+    // 与解码末尾那次 swap 一致
+    let mut rotated = *texels;
+    if rotation > 0 {
+        let c = (rotation - 1) as usize;
+        for texel in rotated.iter_mut() {
+            texel.swap(c, 3);
+        }
+    }
+
+    let (color_index_bits, alpha_index_bits) = if index_mode == 0 {
+        (m.index_bits, m.index_bits2)
+    } else {
+        (m.index_bits2, m.index_bits)
+    };
+
+    let all: Vec<usize> = (0..16).collect();
+
+    // 颜色: 三通道拟合, **不记** alpha 缺失惩罚 —— alpha 由下面那套索引管
+    let color = fit_subset(
+        &rotated,
+        &all,
+        m.color_bits,
+        0,
+        PBits::None,
+        color_index_bits,
+        0,
+        false,
+    );
+
+    let alpha_values: [i32; 16] = std::array::from_fn(|t| rotated[t][3]);
+    let alpha = fit_scalar(&alpha_values, m.alpha_bits, alpha_index_bits, 0);
+
+    let error = color.error + alpha.error;
+
+    // ── 打包 ──
+    let mut w = BitWriter::default();
+    w.write(1u32 << mode, mode as u32 + 1);
+    w.write(rotation, m.rotation_bits);
+    if m.index_sel_bits > 0 {
+        w.write(index_mode, m.index_sel_bits);
+    }
+
+    for c in 0..3 {
+        w.write(color.quantized[0][c], m.color_bits);
+        w.write(color.quantized[1][c], m.color_bits);
+    }
+    w.write(alpha.quantized[0], m.alpha_bits);
+    w.write(alpha.quantized[1], m.alpha_bits);
+
+    // 存储上的第一套索引宽度恒为 m.index_bits, 第二套恒为 m.index_bits2;
+    // index_mode 只决定**谁用哪一套**, 不改变存储宽度。
+    let (set1, set2) = if index_mode == 0 {
+        (&color.indices, &alpha.indices)
+    } else {
+        (&alpha.indices, &color.indices)
+    };
+
+    for (t, &v) in set1.iter().enumerate() {
+        w.write(v, m.index_bits - u32::from(t == 0));
+    }
+    for (t, &v) in set2.iter().enumerate() {
+        w.write(v, m.index_bits2 - u32::from(t == 0));
     }
 
     debug_assert_eq!(w.pos, 128, "mode {} 打包后不是 128 bit", mode);
@@ -1082,6 +1407,54 @@ pub fn encode_block(src: &[[u8; 4]; 16]) -> [u8; 16] {
     for &partition in rank_partitions(&texels, channels).iter() {
         for &mode in two_subset_modes {
             let (error, block) = encode_with_mode(mode, partition, &texels);
+            if error < best_error {
+                best_error = error;
+                best = block;
+            }
+        }
+    }
+
+    // ── 三子集 (mode 0 / 2) ──
+    //
+    // 两者都不带 alpha, 所以只对不透明块评估 —— 半透明块上它们解码出的
+    // alpha 恒为 255, 误差会被记回来而不至于误选, 但白算一遍不划算。
+    //
+    // mode 0 只有 16 张分区 (4 位分区号), mode 2 有 64 张。分开排序: 拿
+    // 64 张里最好的四张去喂 mode 0, 其中三张它根本编不了。
+    if opaque {
+        let (all, low) = rank_partitions_3(&texels, channels);
+
+        for &partition in low.iter() {
+            let (error, block) = encode_with_mode(0, partition, &texels);
+            if error < best_error {
+                best_error = error;
+                best = block;
+            }
+        }
+        for &partition in all.iter() {
+            let (error, block) = encode_with_mode(2, partition, &texels);
+            if error < best_error {
+                best_error = error;
+                best = block;
+            }
+        }
+    }
+
+    // ── 旋转 + 两套索引 (mode 4 / 5) ──
+    //
+    // 四种旋转都试。不透明块也试 —— 旋转 0 之外的三种把一个**颜色**通道
+    // 挪进独立索引, 而那正是法线贴图 (z 与 xy 走势无关) 这类块受益的地方。
+    // 旋转 0 时 alpha 必须编回 255, mode 5 的 8 位 alpha 端点做得到, 编不
+    // 好的组合会被误差挡在外面。
+    for rotation in 0..4u32 {
+        let (error, block) = encode_with_dual_index(5, rotation, 0, &texels);
+        if error < best_error {
+            best_error = error;
+            best = block;
+        }
+
+        for index_mode in 0..2u32 {
+            let (error, block) = encode_with_dual_index(4, rotation, index_mode, &texels);
             if error < best_error {
                 best_error = error;
                 best = block;
@@ -1512,6 +1885,257 @@ mod tests {
         assert!(worst <= 2, "线性渐变块的最大绝对误差 {} 偏大", worst);
     }
 
+    /// 从码流里读出 mode 号 —— 一元码, 第一个 1 之前有几个 0
+    fn mode_of(block: &[u8; 16]) -> u32 {
+        let bits = u128::from_le_bytes(*block);
+        let mut mode = 0u32;
+        while mode < 8 && (bits >> mode) & 1 == 0 {
+            mode += 1;
+        }
+        mode
+    }
+
+    #[test]
+    fn three_regions_pick_a_three_subset_mode() {
+        // 三块区域, 每块沿**互相正交**的一个颜色轴变化。
+        //
+        // 内容是挑过的。第一版给三块各一种纯色 —— 那个块双子集就能编到
+        // 零误差: 把其中两种颜色放进同一个子集当两个端点, 第三种放另一个
+        // 子集。三种纯色只要三个调色板项, 而双子集有四个。**判据得让两个
+        // 子集装不下才有判别力。**
+        //
+        // 三条正交的线段就装不下: 任意两块并进一个子集, 那两条线段张成的
+        // 是一个平面, 而一个子集只有一条直线。
+        let mut src = [[0u8; 4]; 16];
+        let mut seen = [0usize; 3];
+        for t in 0..16 {
+            let s = subset_of_3(0, t);
+            let step = (seen[s] % 4) as u8;
+            seen[s] += 1;
+
+            let mut px = [20u8, 20, 20, 255];
+            px[s] = 70 + step * 60;
+            src[t] = px;
+        }
+
+        let texels: [[i32; 4]; 16] =
+            std::array::from_fn(|t| std::array::from_fn(|c| src[t][c] as i32));
+
+        // 先把"双子集里最好的"和"三子集里最好的"都算出来 —— 判据要的是
+        // 后者明显更好, 否则这个块选不出三子集的必要性。
+        let mut two_best = encode_with_mode(6, 0, &texels).0;
+        for partition in 0..64 {
+            for mode in [1usize, 3] {
+                two_best = two_best.min(encode_with_mode(mode, partition, &texels).0);
+            }
+        }
+
+        let mut three_best = f64::INFINITY;
+        for partition in 0..64 {
+            three_best = three_best.min(encode_with_mode(2, partition, &texels).0);
+            if partition < 16 {
+                three_best = three_best.min(encode_with_mode(0, partition, &texels).0);
+            }
+        }
+
+        assert!(
+            three_best * 4.0 < two_best,
+            "三子集 {three_best:.1} 没有明显好过双子集 {two_best:.1} —— \
+             这个块选不出三子集的必要性, 换个内容"
+        );
+
+        let mode = mode_of(&encode_block(&src));
+        assert!(
+            mode == 0 || mode == 2,
+            "三条正交线段应当选三子集 mode, 实际选了 mode {mode}"
+        );
+    }
+
+    #[test]
+    fn independent_alpha_picks_a_rotation_mode() {
+        // 颜色是 8 级灰阶, alpha 是与它**无关**的奇偶阶跃。
+        //
+        // 内容同样是挑过的。第一版用了 16 级灰阶 —— 那正好是 mode 6 的
+        // 强项 (4 位索引 = 16 级), 而 mode 5 只有 2 位颜色索引, 于是"两套
+        // 索引"反而更差。**判据的内容要让被验的东西占优, 否则它验的是别的
+        // 东西。**
+        //
+        // 8 级正好是 mode 4 第二套索引的宽度 (3 位), 而奇偶阶跃正好是第一
+        // 套索引的宽度 (2 位)。一套索引的 mode 做不到: 它得让 alpha 跟着
+        // 灰阶单调走, 而 alpha 是跳的。
+        // 灰阶取的是 BC7 两位索引的**四个插值点**: 端点 0 与 255 之间,
+        // 权重表 [0, 21, 43, 64] 插出来正好是 0 / 84 / 171 / 255。用这四个
+        // 值意味着两位索引能把颜色编到**零误差**, 于是判据不必挑阈值 ——
+        // 两套索引的那一路是精确的, 一套索引的那一路不可能精确。
+        //
+        // alpha 走棋盘格, 不是列奇偶: BC7 的双子集分区表里有能把列分开的
+        // 图案, 那时按列切一刀就能把这个块编到零误差, 于是判据验的是分区
+        // 而不是"两套索引"。棋盘格切不开。
+        const LEVELS: [u8; 4] = [0, 84, 171, 255];
+
+        let mut src = [[0u8; 4]; 16];
+        for t in 0..16 {
+            let gray = LEVELS[t % 4];
+            let checker = (t / 4 + t % 4) % 2;
+            src[t] = [gray, gray, gray, if checker == 0 { 0 } else { 255 }];
+        }
+
+        let texels: [[i32; 4]; 16] =
+            std::array::from_fn(|t| std::array::from_fn(|c| src[t][c] as i32));
+
+        let mut single_best = encode_with_mode(6, 0, &texels).0;
+        for partition in 0..64 {
+            single_best = single_best.min(encode_with_mode(7, partition, &texels).0);
+        }
+
+        let mut dual_best = f64::INFINITY;
+        for rotation in 0..4u32 {
+            dual_best = dual_best.min(encode_with_dual_index(5, rotation, 0, &texels).0);
+            for index_mode in 0..2u32 {
+                dual_best =
+                    dual_best.min(encode_with_dual_index(4, rotation, index_mode, &texels).0);
+            }
+        }
+
+        assert!(
+            dual_best * 4.0 < single_best,
+            "两套索引 {dual_best:.1} 没有明显好过一套 {single_best:.1}"
+        );
+
+        let mode = mode_of(&encode_block(&src));
+        assert!(
+            mode == 4 || mode == 5,
+            "颜色与 alpha 各走各的应当选 mode 4/5, 实际选了 mode {mode}"
+        );
+    }
+
+    #[test]
+    fn rotation_moves_the_independent_channel_into_its_own_index_set() {
+        // 与上一条同一个形态, 只是"走势不同的那个通道"是**蓝色**而不是
+        // alpha (alpha 恒为不透明)。旋转 3 把蓝色换到 alpha 的位置。
+        //
+        // 这一条单独立着, 是因为旋转位整个写死成 0 时上一条照样通过 ——
+        // 那时 alpha 本来就在它该在的位置, 旋转没被用到。
+        const LEVELS: [u8; 4] = [0, 84, 171, 255];
+
+        let mut src = [[0u8; 4]; 16];
+        for t in 0..16 {
+            let ramp = LEVELS[t % 4];
+            let checker = (t / 4 + t % 4) % 2;
+            src[t] = [ramp, ramp, if checker == 0 { 0 } else { 255 }, 255];
+        }
+
+        let texels: [[i32; 4]; 16] =
+            std::array::from_fn(|t| std::array::from_fn(|c| src[t][c] as i32));
+
+        let mut no_rotation = f64::INFINITY;
+        let mut with_rotation = f64::INFINITY;
+
+        for index_mode in 0..2u32 {
+            no_rotation = no_rotation.min(encode_with_dual_index(4, 0, index_mode, &texels).0);
+            with_rotation =
+                with_rotation.min(encode_with_dual_index(4, 3, index_mode, &texels).0);
+        }
+        no_rotation = no_rotation.min(encode_with_dual_index(5, 0, 0, &texels).0);
+        with_rotation = with_rotation.min(encode_with_dual_index(5, 3, 0, &texels).0);
+
+        assert!(
+            with_rotation * 4.0 < no_rotation,
+            "把蓝色转进独立索引 ({with_rotation:.1}) 没有明显好过不转 \
+             ({no_rotation:.1}) —— 旋转位没起作用"
+        );
+
+        // 而且整条编码路径要真的挑中它, 并且真的转了。
+        //
+        // 上面那两句是直接调 encode_with_dual_index 算的, 它们证明"转了更
+        // 好", 但证明不了 encode_block **会去试**。把候选循环从四种旋转砍成
+        // 一种, 上面照样通过 —— 变异验证就是这么发现的。
+        let encoded = encode_block(&src);
+        let mode = mode_of(&encoded);
+
+        assert!(
+            mode == 4 || mode == 5,
+            "蓝色独立走势应当选 mode 4/5, 实际选了 mode {mode}"
+        );
+
+        // 旋转位紧跟在一元 mode 码之后 (mode 4/5 没有分区号)
+        let bits = u128::from_le_bytes(encoded);
+        let rotation = ((bits >> (mode + 1)) & 0b11) as u32;
+
+        assert_eq!(
+            rotation, 3,
+            "走势独立的是蓝色, 应当转到 alpha 的位置 (旋转 3), 实际是 旋转 {rotation}"
+        );
+    }
+
+    #[test]
+    fn every_encoder_mode_round_trips_through_the_decoder() {
+        // 编码器产出的每一种 mode 都要能被解码器读回来, 而且读回来的
+        // 结果必须与编码时算的误差一致。
+        //
+        // 这一条防的是"打包顺序与解码顺序对不上": 那种错仍然是 128 bit,
+        // mode 号也对, 只有内容是乱的 —— 而误差是在打包**之前**算的, 所以
+        // 光看编码器自己的误差发现不了。
+        let texels: [[i32; 4]; 16] = std::array::from_fn(|t| {
+            [
+                (t * 13 % 256) as i32,
+                (t * 29 % 256) as i32,
+                (t * 47 % 256) as i32,
+                (t * 17 % 256) as i32,
+            ]
+        });
+
+        let mut checked = 0;
+
+        for (mode, partition) in [(0usize, 3usize), (1, 5), (2, 7), (3, 11), (6, 0), (7, 13)] {
+            let (error, block) = encode_with_mode(mode, partition, &texels);
+            assert_eq!(mode_of(&block), mode as u32, "mode {mode} 的一元码写错了");
+
+            let decoded = decode_block(&block);
+            let mut actual = 0.0f64;
+            for t in 0..16 {
+                let channels = if MODES[mode].alpha_bits > 0 { 4 } else { 3 };
+                for c in 0..channels {
+                    let d = texels[t][c] as f64 - decoded[t][c] as f64;
+                    actual += d * d;
+                }
+                if MODES[mode].alpha_bits == 0 {
+                    let d = texels[t][3] as f64 - 255.0;
+                    actual += d * d;
+                }
+            }
+            assert!(
+                (actual - error).abs() < 1.0e-6,
+                "mode {mode}: 解码后的误差 {actual:.3} 与编码时算的 {error:.3} 不符"
+            );
+            checked += 1;
+        }
+
+        for rotation in 0..4u32 {
+            for (mode, index_mode) in [(5usize, 0u32), (4, 0), (4, 1)] {
+                let (error, block) = encode_with_dual_index(mode, rotation, index_mode, &texels);
+                assert_eq!(mode_of(&block), mode as u32);
+
+                let decoded = decode_block(&block);
+                let mut actual = 0.0f64;
+                for t in 0..16 {
+                    for c in 0..4 {
+                        let d = texels[t][c] as f64 - decoded[t][c] as f64;
+                        actual += d * d;
+                    }
+                }
+                assert!(
+                    (actual - error).abs() < 1.0e-6,
+                    "mode {mode} 旋转 {rotation} 索引集 {index_mode}: \
+                     解码后的误差 {actual:.3} 与编码时算的 {error:.3} 不符"
+                );
+                checked += 1;
+            }
+        }
+
+        assert_eq!(checked, 6 + 12, "有 mode 没被这条判据覆盖到");
+    }
+
     #[test]
     fn hard_color_boundary_uses_two_subsets() {
         // 左半边一种颜色、右半边另一种, 各自还带梯度 —— 单子集必须让一条
@@ -1810,3 +2434,102 @@ mod tests {
     }
 }
 
+
+/// 真实贴图上的测量工具 —— 不是判据, 是产出数字的那把尺子。
+///
+/// 判据能证明"每种 mode 在为它设计的内容上会被选中", 但证明不了"在真实
+/// 贴图上值不值"。后者只能量。这个测量跑一张图上的每个块两遍 —— 一遍用
+/// 全部八种 mode, 一遍只用原来的四种 —— 报出两者的 MSE / PSNR 与 mode
+/// 直方图。
+///
+/// 它带 #[ignore], 不进常规测试 (要读磁盘上的贴图, 而且一张图要跑十几秒)。
+/// 跑法:
+///
+/// ```text
+/// cd Programs
+/// LAT_MEASURE_IMAGE=<绝对路径.png> ///     cargo test --release -p lat measure_real_texture -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod measure {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn measure_real_texture() {
+        let path = std::env::var("LAT_MEASURE_IMAGE").unwrap();
+        let img = crate::image_io::load(std::path::Path::new(&path)).unwrap().image;
+        let (w, h) = (img.width, img.height);
+
+        let mut full = 0.0f64;
+        let mut restricted = 0.0f64;
+        let mut blocks = 0u64;
+        let mut picked = [0u64; 8];
+
+        for by in (0..h / 4 * 4).step_by(4) {
+            for bx in (0..w / 4 * 4).step_by(4) {
+                let mut src = [[0u8; 4]; 16];
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let o = (((by + y) * w + bx + x) * 4) as usize;
+                        src[(y * 4 + x) as usize] =
+                            [img.pixels[o], img.pixels[o + 1], img.pixels[o + 2], img.pixels[o + 3]];
+                    }
+                }
+
+                let texels: [[i32; 4]; 16] =
+                    std::array::from_fn(|t| std::array::from_fn(|c| src[t][c] as i32));
+
+                let encoded = encode_block(&src);
+                let mut mode = 0u32;
+                let bits = u128::from_le_bytes(encoded);
+                while mode < 8 && (bits >> mode) & 1 == 0 {
+                    mode += 1;
+                }
+                if mode < 8 {
+                    picked[mode as usize] += 1;
+                }
+
+                let dec = decode_block(&encoded);
+                for t in 0..16 {
+                    for c in 0..4 {
+                        let d = src[t][c] as f64 - dec[t][c] as f64;
+                        full += d * d;
+                    }
+                }
+
+                let opaque = texels.iter().all(|p| p[3] == 255);
+                let mut best = encode_with_mode(6, 0, &texels).1;
+                let mut best_err = encode_with_mode(6, 0, &texels).0;
+                let modes: &[usize] = if opaque { &[1, 3] } else { &[7] };
+                for partition in 0..64 {
+                    for &m in modes {
+                        let (e, b) = encode_with_mode(m, partition, &texels);
+                        if e < best_err {
+                            best_err = e;
+                            best = b;
+                        }
+                    }
+                }
+                let dec = decode_block(&best);
+                for t in 0..16 {
+                    for c in 0..4 {
+                        let d = src[t][c] as f64 - dec[t][c] as f64;
+                        restricted += d * d;
+                    }
+                }
+
+                blocks += 1;
+            }
+        }
+
+        let n = (blocks * 16 * 4) as f64;
+        let mse_full = full / n;
+        let mse_restricted = restricted / n;
+        let psnr = |m: f64| 10.0 * (255.0f64 * 255.0 / m).log10();
+
+        println!("块数 {blocks}");
+        println!("八种 mode : MSE {mse_full:.4}  PSNR {:.2} dB", psnr(mse_full));
+        println!("原四种    : MSE {mse_restricted:.4}  PSNR {:.2} dB", psnr(mse_restricted));
+        println!("mode 直方图 {picked:?}");
+    }
+}
