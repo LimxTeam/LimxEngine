@@ -928,9 +928,24 @@ FMeshSimplifyResult FMeshSimplifier::Simplify(
     }
 
     // ---- 坍缩 ----
-    const UInt32 target = (options.TargetTriangleCount > 0)
-                              ? options.TargetTriangleCount
-                              : state.AliveTriangles;
+    // 目标三角形数。
+    //
+    // ── 这里原来有一个让"只给误差上限"完全失效的错 ──
+    //
+    // 第一版在没给目标数时把 target 取成**当前**的存活三角形数, 于是循环条件
+    // `AliveTriangles > target` 当场为假 —— 一次坍缩都不做。而头文件明写
+    // "0 表示不按数量停, 只看误差上限"。
+    //
+    // 表现极其安静: 返回的网格与输入一模一样, 误差 0, 而"误差是上界""不退化"
+    // "流形保持""确定性"四条判据全部满分 —— 又一次"什么都不做也满分"。
+    // 第三天要按误差预算建 DAG, 那时每一层都会等于上一层。
+    //
+    // 两个都不给才是"什么都不做": 那时没有任何停止条件, 一直简化下去会把
+    // 网格化成一个点, 而那种结果没有任何调用方想要。
+    const UInt32 target =
+        (options.TargetTriangleCount > 0)
+            ? options.TargetTriangleCount
+            : ((options.MaxError > 0.0f) ? 0u : state.AliveTriangles);
 
     Float64 runningMax = 0.0;
 
@@ -976,13 +991,88 @@ FMeshSimplifyResult FMeshSimplifier::Simplify(
 
         // 误差上限按**偏差**判, 不按二次误差 —— 后者不是距离, 拿它跟一个
         // 以世界单位给的上限比是在比两个不同的量。
+        //
+        // 算的是**这次坍缩之后**的偏差, 不是坍缩之前的。
+        //
+        // 第一版拿的是两端已有的偏差, 而那要求先有一次被放行的坍缩把偏差顶过
+        // 上限 —— 也就是说它永远拦不住**第一次**越界, MaxError 根本不是上界。
+        // 现在把坍缩后的局部表面先算出来 (与 WouldFlip 同一套代换), 拿它量。
         if (options.MaxError > 0.0f)
         {
-            // 便宜的前置筛: 两端已有的偏差就已经超了的话不必往下算。
-            // 真正的偏差要等三角形改写完才知道, 而那时坍缩已经做了 —— 所以
-            // 这里只挡住明显超标的, 剩下的靠 runningMax 如实报出来。
-            const Float32 wouldBe =
-                FMath::Max(state.Deviation[v0], state.Deviation[v1]);
+            Float32 wouldBe = 0.0f;
+
+            for (UInt32 side = 0; side < 2 && wouldBe <= options.MaxError;
+                 ++side)
+            {
+                const UInt32 root = (side == 0) ? v0 : v1;
+
+                for (UInt32 member = state.ClusterHead[root];
+                     member != 0xFFFFFFFFu;
+                     member = state.ClusterNext[member])
+                {
+                    const FVector3& point = state.OriginalPositions[member];
+
+                    Float32 nearest = 3.4e38f;
+
+                    // 坍缩之后 v0 周围会是哪些三角形: 两端各自的入射三角形里,
+                    // 不含另一端的那些 (含另一端的会被这次坍缩吃掉), 并把
+                    // 移动的那个顶点代换成 target3。
+                    for (UInt32 which = 0; which < 2; ++which)
+                    {
+                        const UInt32 vertex = (which == 0) ? v0 : v1;
+                        const UInt32 other  = (which == 0) ? v1 : v0;
+
+                        for (SizeType k = 0;
+                             k < state.Incident[vertex].GetSize(); ++k)
+                        {
+                            const UInt32 tri = state.Incident[vertex][k];
+
+                            if (!IsTriangleAlive(state, tri))
+                            {
+                                continue;
+                            }
+
+                            const UInt32 i0 = state.Triangles[tri * 3 + 0];
+                            const UInt32 i1 = state.Triangles[tri * 3 + 1];
+                            const UInt32 i2 = state.Triangles[tri * 3 + 2];
+
+                            if (i0 == other || i1 == other || i2 == other)
+                            {
+                                continue;
+                            }
+
+                            FVector3 p[3] = {
+                                state.Positions[i0],
+                                state.Positions[i1],
+                                state.Positions[i2],
+                            };
+
+                            for (UInt32 c = 0; c < 3; ++c)
+                            {
+                                if (state.Triangles[tri * 3 + c] == vertex)
+                                {
+                                    p[c] = target3;
+                                }
+                            }
+
+                            nearest = FMath::Min(
+                                nearest,
+                                PointTriangleDistanceSquared(point, p[0], p[1],
+                                                             p[2]));
+                        }
+                    }
+
+                    if (nearest < 3.4e38f)
+                    {
+                        wouldBe = FMath::Max(wouldBe, FMath::Sqrt(nearest));
+
+                        if (wouldBe > options.MaxError)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
 
             if (wouldBe > options.MaxError)
             {

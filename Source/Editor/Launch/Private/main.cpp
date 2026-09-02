@@ -10552,9 +10552,85 @@ Float64 SignedVolume(const TArray<FMeshVertex>& vertices,
     return total;
 }
 
+struct FEdgeManifoldStats
+{
+    /// 被三个及以上三角形共用的边 —— 任何网格上都是缺陷
+    SizeType Excess = 0;
+
+    /// 只被一个三角形用到的边 —— 开边界。闭合网格上为 0
+    SizeType Boundary = 0;
+};
+
+FEdgeManifoldStats NonManifoldEdgeCountWelded(const TArray<UInt32>& weld,
+                                              const TArray<UInt32>& indices,
+                                              SizeType vertexCount);
+
 /// 每条无向边被几个三角形用到 —— 闭合流形上处处为 2
-SizeType NonManifoldEdgeCount(const TArray<UInt32>& indices,
-                              SizeType vertexCount)
+///
+/// 必须按**位置**判, 而且要带容差。
+///
+/// 第一版直接拿索引数组算, 于是 UV 球报 252 条"非流形边"、平面报 96 条 ——
+/// 而判据的条件是 `badBefore == 0 && badAfter != 0`, 前半永远为假, 这条判据
+/// **在三个测试网格上一次都没执行过**。
+///
+/// 按位置判还不够: UV 球的接缝上 sinf(2πf) = 1.748e-07 而不是 0, 南极那一圈
+/// 的 sinf(πf) = -8.74e-08 —— 逐位焊接焊不上, 球在数据里根本不是闭合的。
+/// 所以要给一个相对容差。
+FEdgeManifoldStats NonManifoldEdgeCount(const TArray<FMeshVertex>& vertices,
+                                        const TArray<UInt32>& indices)
+{
+    // 按位置焊接 (容差取包围盒对角线的百万分之一)
+    FVector3 low(3.4e38f, 3.4e38f, 3.4e38f);
+    FVector3 high(-3.4e38f, -3.4e38f, -3.4e38f);
+
+    for (SizeType i = 0; i < vertices.GetSize(); ++i)
+    {
+        const FVector3& p = vertices[i].Position;
+
+        low  = FVector3(FMath::Min(low.X, p.X), FMath::Min(low.Y, p.Y),
+                        FMath::Min(low.Z, p.Z));
+        high = FVector3(FMath::Max(high.X, p.X), FMath::Max(high.Y, p.Y),
+                        FMath::Max(high.Z, p.Z));
+    }
+
+    const Float32 tolerance = (high - low).Length() * 1.0e-6f;
+    const Float32 toleranceSquared = tolerance * tolerance;
+
+    TArray<UInt32>   weld;
+    TArray<FVector3> unique;
+
+    for (SizeType i = 0; i < vertices.GetSize(); ++i)
+    {
+        const FVector3& p = vertices[i].Position;
+
+        UInt32 found = 0xFFFFFFFFu;
+
+        for (SizeType k = 0; k < unique.GetSize(); ++k)
+        {
+            if ((unique[k] - p).LengthSquared() <= toleranceSquared)
+            {
+                found = static_cast<UInt32>(k);
+                break;
+            }
+        }
+
+        if (found == 0xFFFFFFFFu)
+        {
+            found = static_cast<UInt32>(unique.GetSize());
+            unique.Add(p);
+        }
+
+        weld.Add(found);
+    }
+
+    const SizeType vertexCount = unique.GetSize();
+
+    return NonManifoldEdgeCountWelded(weld, indices, vertexCount);
+}
+
+FEdgeManifoldStats NonManifoldEdgeCountWelded(
+    const TArray<UInt32>& weld, const TArray<UInt32>& indices,
+    SizeType vertexCount)
 {
     TArray<TArray<UInt32>> neighbours;
     neighbours.SetSize(vertexCount);
@@ -10566,8 +10642,8 @@ SizeType NonManifoldEdgeCount(const TArray<UInt32>& indices,
     {
         for (UInt32 e = 0; e < 3; ++e)
         {
-            const UInt32 from = indices[t + e];
-            const UInt32 to   = indices[t + (e + 1) % 3];
+            const UInt32 from = weld[indices[t + e]];
+            const UInt32 to   = weld[indices[t + (e + 1) % 3]];
 
             const UInt32 low  = FMath::Min(from, to);
             const UInt32 high = FMath::Max(from, to);
@@ -10592,20 +10668,24 @@ SizeType NonManifoldEdgeCount(const TArray<UInt32>& indices,
         }
     }
 
-    SizeType bad = 0;
+    FEdgeManifoldStats stats;
 
     for (SizeType v = 0; v < neighbours.GetSize(); ++v)
     {
         for (SizeType k = 0; k < counts[v].GetSize(); ++k)
         {
-            if (counts[v][k] != 2u)
+            if (counts[v][k] >= 3u)
             {
-                ++bad;
+                ++stats.Excess;
+            }
+            else if (counts[v][k] == 1u)
+            {
+                ++stats.Boundary;
             }
         }
     }
 
-    return bad;
+    return stats;
 }
 
 /// 一个网格上跑完整套判据
@@ -10932,18 +11012,48 @@ bool CheckOneSimplify(const AnsiChar* label, const FMeshData& mesh,
     }
 
     // ---- 判据五: 流形保持 ----
-    const SizeType badBefore =
-        NonManifoldEdgeCount(mesh.Indices, mesh.Vertices.GetSize());
+    // ---- 判据五: 拓扑 ----
+    //
+    // 第一版写的是"每条边恰好两个三角形", 前置条件是"输入闭合"。两个问题:
+    //
+    //   一、它按**索引**算, 于是 UV 球报 252 条、平面报 96 条,
+    //       `badBefore == 0` 永远为假 —— 这条判据在三个网格上**一次都没
+    //       执行过**。
+    //   二、就算按位置算对了, "闭合"这个前置条件把平面整个排除在外了。而
+    //       第二天起每个 meshlet 组都是**开**网格 —— 那正是这条判据最该管的
+    //       地方。
+    //
+    // 改成两条对开闭都成立的:
+    //
+    //   * 没有边被三个及以上三角形共用 —— 任何网格上都是缺陷, 无前置条件
+    //   * 开边界的边数不许变 —— 边界顶点被锁死, 所以边界边应当原样保留。
+    //     它变了就说明锁定漏了, 而那在第二天就是裂缝。
+    const FEdgeManifoldStats before =
+        NonManifoldEdgeCount(mesh.Vertices, mesh.Indices);
 
-    const SizeType badAfter =
-        NonManifoldEdgeCount(result.Indices, result.Vertices.GetSize());
+    const FEdgeManifoldStats after =
+        NonManifoldEdgeCount(result.Vertices, result.Indices);
 
-    if (badBefore == 0 && badAfter != 0)
+    LIMX_LOG(LogLaunch, Display,
+             "[简化] {} — 三角形共用超过两次的边 {} -> {}, 开边界边 {} -> {}",
+             label, before.Excess, after.Excess, before.Boundary,
+             after.Boundary);
+
+    if (after.Excess > before.Excess)
     {
         LIMX_LOG(LogLaunch, Error,
-                 "[简化] {} — 输入是闭合流形而输出不是 ({} 条边不是恰好"
-                 "两个三角形共享)",
-                 label, badAfter);
+                 "[简化] {} — 被三个及以上三角形共用的边从 {} 变成 {} —— "
+                 "坍缩把表面折叠到自己身上了",
+                 label, before.Excess, after.Excess);
+        passed = false;
+    }
+
+    if (after.Boundary != before.Boundary)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[简化] {} — 开边界的边数从 {} 变成 {} —— 边界顶点是锁死的, "
+                 "边界边应当原样保留; 变了就是锁定漏了",
+                 label, before.Boundary, after.Boundary);
         passed = false;
     }
 
@@ -11023,6 +11133,52 @@ static bool RunMeshSimplifyChecks()
                      "[简化] 立方体焊接后应当是 8 个位置, 实际 {} 个 —— "
                      "不焊的话每条边都是开边界, 简化器一次坍缩都做不了",
                      result.WeldedVertexCount);
+            passed = false;
+        }
+    }
+
+    // 只给误差上限 (不给目标数) —— 这个模式头文件写了, 但它曾经完全失效
+    {
+        const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 48, 32);
+
+        const SizeType inputTriangles = sphere.Indices.GetSize() / 3;
+
+        FMeshSimplifyOptions options;
+        options.TargetTriangleCount = 0;
+        options.MaxError            = 0.02f;
+
+        const FMeshSimplifyResult result =
+            FMeshSimplifier::Simplify(sphere.Vertices, sphere.Indices, options);
+
+        const SizeType outputTriangles = result.Indices.GetSize() / 3;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[简化] 只给误差上限 {} — {} -> {} 三角形, 报出来的误差 {}",
+                 options.MaxError, inputTriangles, outputTriangles,
+                 result.Error);
+
+        // 第一版在没给目标数时把 target 取成**当前**的存活三角形数, 循环条件
+        // 当场为假 —— 一次坍缩都不做, 而其余四条判据全部满分。
+        if (outputTriangles >= inputTriangles)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] 只给误差上限时一个三角形都没少 ({} -> {}) —— "
+                     "这个模式整个失效了, 而第三天要按误差预算建 DAG",
+                     inputTriangles, outputTriangles);
+            passed = false;
+        }
+
+        // 报出来的误差不许超预算太多。
+        //
+        // 不写"不许超过预算": 坍缩的决定是按**局部**表面量的, 而收尾那一遍
+        // 对全局重量, 别的簇后来变粗了会把这个数抬上去。两倍是给那一层抬升
+        // 留的, 不是给"拦不住第一次越界"留的 —— 后者已经修掉了。
+        if (result.Error > options.MaxError * 2.0f)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[简化] 误差预算 {} 而实际报出 {} —— 超过两倍说明上限"
+                     "根本没在拦",
+                     options.MaxError, result.Error);
             passed = false;
         }
     }
