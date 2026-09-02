@@ -305,6 +305,12 @@ struct FLaunchOptions
     /// 材质解析的判据 —— 见函数头
     bool MeshletResolveCheck = false;
 
+    /// 两阶段遮挡剔除
+    bool MeshletOcclusion = false;
+
+    /// 遮挡剔除的判据 —— 见函数头
+    bool MeshletOcclusionCheck = false;
+
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
 
@@ -867,6 +873,15 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-resolve-check"))
         {
             options.MeshletResolveCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-occlusion"))
+        {
+            options.MeshletDepth     = true;
+            options.MeshletOcclusion = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-occlusion-check"))
+        {
+            options.MeshletOcclusionCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -6576,6 +6591,317 @@ bool ReadVisibilityAndTable(FRenderContext* context, FRenderer& renderer,
     return ok;
 }
 
+/// 把金字塔的某一级读回 CPU
+///
+/// 逐级读而不是一次读整张: mip 链在显存里不是连续的一块, 而
+/// CopyTextureToBuffer 一次只能拷一级。
+bool ReadHizLevel(FRenderContext* context, FRenderer& renderer,
+                  FRHITextureHandle texture, FRHIExtent2D baseExtent,
+                  UInt32 level, UInt32 levelCount, TArray<Float32>& outValues)
+{
+    if (!texture.IsValid() || level >= levelCount)
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const UInt32 width  = FMath::Max(baseExtent.Width >> level, 1u);
+    const UInt32 height = FMath::Max(baseExtent.Height >> level, 1u);
+
+    const SizeType texelCount = static_cast<SizeType>(width) * height;
+
+    FRHIBufferDesc desc = {};
+    desc.Usage       = EBufferUsage::TransferDst;
+    desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    desc.Size        = texelCount * 4u;
+    desc.DebugName   = "MeshletHizCheck.Readback";
+
+    FRHIBufferHandle readback;
+
+    if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+    {
+        return false;
+    }
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, readback, width, height, level,
+         levelCount]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = level;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { width, height, 1 };
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc, EPipelineStageFlags::ComputeShader,
+                EPipelineStageFlags::Transfer, EAccessFlags::ShaderRead,
+                EAccessFlags::TransferRead, 0, levelCount);
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly, EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::ComputeShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead, 0,
+                levelCount);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(readback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* values = static_cast<const Float32*>(mapped);
+
+            outValues.Clear();
+            outValues.Reserve(texelCount);
+
+            for (SizeType i = 0; i < texelCount; ++i)
+            {
+                outValues.Add(values[i]);
+            }
+
+            device->UnmapBuffer(readback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(readback);
+
+    return ok;
+}
+
+/// 一帧里同时取深度、可见性与可见记录表
+///
+/// 分三次读是不行的 —— 每次读都会**渲一帧**, 而遮挡剔除的判据要看的正是
+/// 视角跳变的**那一帧**: 那一帧的第一阶段用的是上一个视角的金字塔。
+/// 分三次的话第一次看到的是跳变帧, 第二次看到的已经是金字塔重建之后的
+/// 稳定帧了 —— 两者不是同一次光栅化, 而判据比的是它们。
+///
+/// 这个坑很隐蔽: 判据全绿, 而"第二阶段补回来了几个"恒为 0。绿的原因不是
+/// 实现对, 是**取样取晚了**。
+bool CaptureDepthAndVisibility(FRenderContext* context, FRenderer& renderer,
+                               FRHITextureHandle depthTexture,
+                               FRHITextureHandle visibilityTexture,
+                               TArray<Float32>& outDepth,
+                               TArray<FVisibilityTriple>& outTriples)
+{
+    FMeshletCullPass* const cull = renderer.GetMeshletCullPass();
+
+    if (!depthTexture.IsValid() || !visibilityTexture.IsValid() ||
+        cull == nullptr)
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+    FRHIBufferHandle depthStaging;
+    FRHIBufferHandle visStaging;
+    FRHIBufferHandle tableStaging;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "MeshletOcclusionCheck.Readback";
+
+        desc.Size = pixelCount * 4u;
+
+        const bool ok =
+            IsRHISuccess(device->CreateBuffer(desc, depthStaging)) &&
+            IsRHISuccess(device->CreateBuffer(desc, visStaging));
+
+        desc.Size = FMeshletCullPass::GetVisibleMeshletBytes();
+
+        if (!ok || !IsRHISuccess(device->CreateBuffer(desc, tableStaging)))
+        {
+            device->DestroyBuffer(tableStaging);
+            device->DestroyBuffer(visStaging);
+            device->DestroyBuffer(depthStaging);
+            return false;
+        }
+    }
+
+    const FRHIBufferHandle table = cull->GetVisibleMeshletBuffer(frameIndex);
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, depthTexture, depthStaging, visibilityTexture,
+         visStaging, table, tableStaging, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                depthTexture, EImageLayout::DepthStencilAttachment,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::LateFragmentTests,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::DepthStencilAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(depthTexture, EImageLayout::TransferSrc,
+                                     depthStaging, region);
+
+            cmd->TransitionImageLayout(
+                depthTexture, EImageLayout::TransferSrc,
+                EImageLayout::DepthStencilAttachment,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::EarlyFragmentTests,
+                EAccessFlags::TransferRead,
+                EAccessFlags::DepthStencilAttachmentWrite);
+
+            cmd->TransitionImageLayout(
+                visibilityTexture, EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::ColorAttachmentOutput,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ColorAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(visibilityTexture,
+                                     EImageLayout::TransferSrc, visStaging,
+                                     region);
+
+            cmd->TransitionImageLayout(
+                visibilityTexture, EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly, EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::ColorAttachmentOutput,
+                EAccessFlags::TransferRead,
+                EAccessFlags::ColorAttachmentWrite);
+
+            FRHIBufferCopyRegion tableRegion = {};
+            tableRegion.SrcOffset = 0;
+            tableRegion.DstOffset = 0;
+            tableRegion.Size = FMeshletCullPass::GetVisibleMeshletBytes();
+
+            cmd->CopyBuffer(table, tableStaging, tableRegion);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* depthMapped = nullptr;
+        void* visMapped   = nullptr;
+        void* tableMapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(depthStaging, &depthMapped)) &&
+            IsRHISuccess(device->MapBuffer(visStaging, &visMapped)) &&
+            IsRHISuccess(device->MapBuffer(tableStaging, &tableMapped)) &&
+            depthMapped != nullptr && visMapped != nullptr &&
+            tableMapped != nullptr)
+        {
+            const auto* depthValues = static_cast<const Float32*>(depthMapped);
+            const auto* visValues   = static_cast<const UInt32*>(visMapped);
+            const auto* pairs       = static_cast<const UInt32*>(tableMapped);
+
+            outDepth.Clear();
+            outTriples.Clear();
+
+            outDepth.Reserve(pixelCount);
+            outTriples.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outDepth.Add(depthValues[i]);
+
+                FVisibilityTriple triple;
+
+                if (visValues[i] != 0u)
+                {
+                    const UInt32 packed = visValues[i] - 1u;
+
+                    const UInt32 slot = packed >> 7;
+
+                    triple.Valid    = 1;
+                    triple.Triangle = packed & 127u;
+                    triple.Instance = pairs[slot * 2 + 0];
+                    triple.Meshlet  = pairs[slot * 2 + 1];
+                }
+
+                outTriples.Add(triple);
+            }
+
+            device->UnmapBuffer(tableStaging);
+            device->UnmapBuffer(visStaging);
+            device->UnmapBuffer(depthStaging);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(tableStaging);
+    device->DestroyBuffer(visStaging);
+    device->DestroyBuffer(depthStaging);
+
+    return ok;
+}
+
 } // namespace
 
 static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
@@ -7004,6 +7330,1470 @@ static bool RunMeshletDepthChecks(FRenderContext* context, FRenderer& renderer)
     }
 
     LIMX_LOG(LogLaunch, Display, "[Meshlet深度] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunHizProbeChecks — 直接盯着遮挡测试本身的判据
+//
+// 上面那条"开关遮挡剔除画面必须相同"是**结果**判据, 而两阶段遮挡剔除是
+// 自纠错的: 第一阶段错剔了, 第二阶段拿重建后的金字塔一测就补回来了。于是
+// 结果判据对遮挡测试本身的错误几乎是瞎的 —— 实测十一条变异只红了三条,
+// 剩下八条全都只让第一阶段剔得更狠, 而更狠的那部分被第二阶段原样补回。
+//
+// 那八条损害的是**效率**而不是正确性。要抓它们, 判据得越过画面, 直接盯着
+// 那两个函数的中间量。hiz_probe.comp 把它们摊开, 这里逐个验四条**单向**的
+// 不等式:
+//
+//   1. 投出来的屏幕矩形必须**包得住**球的真实投影
+//   2. 最近深度必须**不大于**球面上的真实最小深度
+//   3. 金字塔查到的最大值必须**不小于**矩形范围内第 0 级的真实最大值
+//   4. 遮挡结论必须等于 (最近深度 > 那个最大值)
+//
+// 参考值是**采样**出来的: 在球面上撒一层点, 逐点投影取包围盒与最小深度。
+// 采样得到的包围盒比真实的略小、最小深度比真实的略大 —— 两个偏差都落在
+// 让判据**更宽松**的一侧, 于是不会假报警, 而实现真缩了的话照样抓得住。
+// ============================================================================
+
+namespace
+{
+
+/// 探针结果缓冲区的头部 —— 与 hiz_probe.comp 里那个 scalar 块逐字节对齐
+struct FHizProbeHeader
+{
+    Float32 ViewProjRows[16];
+    Float32 CameraPosition[4];
+    Float32 ScreenParams[4];
+};
+
+/// 单个探针的结果
+struct FHizProbeResult
+{
+    Float32 Rect[4];
+    Float32 Nearest;
+    Float32 Maximum;
+    Float32 Level;
+    UInt32  Flags;
+};
+
+static_assert(sizeof(FHizProbeHeader) == 96,
+              "探针头部必须与着色器里的 scalar 块一致");
+
+static_assert(sizeof(FHizProbeResult) == 32,
+              "探针结果必须与着色器里的 scalar 块一致");
+
+constexpr UInt32 kHizProbeProjected  = 1u;
+constexpr UInt32 kHizProbeOccluded   = 2u;
+constexpr UInt32 kHizProbeByFunction = 4u;
+constexpr UInt32 kHizProbeAtEquality = 8u;
+
+/// 探针的世界空间包围球
+struct FHizProbeSphere
+{
+    FVector3 Center;
+    Float32  Radius = 0.0f;
+};
+
+/// 球面上采样点的参考值
+struct FHizProbeReference
+{
+    Float32 MinX = 0.0f;
+    Float32 MinY = 0.0f;
+    Float32 MaxX = 0.0f;
+    Float32 MaxY = 0.0f;
+
+    /// 球面上最小的那个深度 (z/w)
+    Float32 MinDepth = 0.0f;
+
+    /// 球面上最小的那个 w —— 小于等于近平面就说明球穿了近平面
+    Float32 MinW = 0.0f;
+
+    bool Valid = false;
+};
+
+/// 按行主序的 4x4 乘一个点
+void HizProbeTransform(const Float32* rows, const FVector3& point,
+                       Float32* outClip)
+{
+    for (UInt32 r = 0; r < 4; ++r)
+    {
+        outClip[r] = rows[r * 4 + 0] * point.X + rows[r * 4 + 1] * point.Y +
+                     rows[r * 4 + 2] * point.Z + rows[r * 4 + 3];
+    }
+}
+
+/// 在球面上撒点, 算出投影包围盒与最小深度
+///
+/// 撒的是经纬网格。点撒得越密参考值越紧, 而参考值偏松的方向 (包围盒偏小、
+/// 最小深度偏大) 恰好是让判据更宽松的方向 —— 所以密度不足只会漏报, 不会
+/// 假报警。这里取 96x49, 对半径几米的球足够到亚像素。
+FHizProbeReference HizProbeReferenceOf(const FHizProbeHeader& header,
+                                       const FHizProbeSphere& sphere)
+{
+    constexpr UInt32 kLongitudes = 96;
+    constexpr UInt32 kLatitudes  = 49;
+
+    FHizProbeReference reference;
+
+    const Float32 screenWidth  = header.ScreenParams[0];
+    const Float32 screenHeight = header.ScreenParams[1];
+
+    for (UInt32 lat = 0; lat < kLatitudes; ++lat)
+    {
+        const Float32 theta = FMath::kPi *
+                              static_cast<Float32>(lat) /
+                              static_cast<Float32>(kLatitudes - 1);
+
+        const Float32 sinTheta = FMath::Sin(theta);
+        const Float32 cosTheta = FMath::Cos(theta);
+
+        for (UInt32 lon = 0; lon < kLongitudes; ++lon)
+        {
+            const Float32 phi = 2.0f * FMath::kPi *
+                                static_cast<Float32>(lon) /
+                                static_cast<Float32>(kLongitudes);
+
+            const FVector3 point = {
+                sphere.Center.X + sphere.Radius * sinTheta * FMath::Cos(phi),
+                sphere.Center.Y + sphere.Radius * cosTheta,
+                sphere.Center.Z + sphere.Radius * sinTheta * FMath::Sin(phi),
+            };
+
+            Float32 clip[4] = {};
+
+            HizProbeTransform(header.ViewProjRows, point, clip);
+
+            if (!reference.Valid || clip[3] < reference.MinW)
+            {
+                reference.MinW = clip[3];
+            }
+
+            if (clip[3] <= 0.0f)
+            {
+                reference.Valid = true;
+                continue;
+            }
+
+            const Float32 ndcX = clip[0] / clip[3];
+            const Float32 ndcY = clip[1] / clip[3];
+            const Float32 depth = clip[2] / clip[3];
+
+            const Float32 screenX = (ndcX * 0.5f + 0.5f) * screenWidth;
+            const Float32 screenY = (ndcY * 0.5f + 0.5f) * screenHeight;
+
+            if (!reference.Valid)
+            {
+                reference.MinX     = screenX;
+                reference.MaxX     = screenX;
+                reference.MinY     = screenY;
+                reference.MaxY     = screenY;
+                reference.MinDepth = depth;
+                reference.Valid    = true;
+                continue;
+            }
+
+            reference.MinX     = FMath::Min(reference.MinX, screenX);
+            reference.MaxX     = FMath::Max(reference.MaxX, screenX);
+            reference.MinY     = FMath::Min(reference.MinY, screenY);
+            reference.MaxY     = FMath::Max(reference.MaxY, screenY);
+            reference.MinDepth = FMath::Min(reference.MinDepth, depth);
+        }
+    }
+
+    return reference;
+}
+
+/// 第 0 级在某个屏幕矩形范围内的最大值 —— 金字塔查询的参考答案
+Float32 HizProbeLevelZeroMax(const TArray<Float32>& level0, UInt32 width,
+                             UInt32 height, const Float32* rect)
+{
+    const Int32 lowerX = static_cast<Int32>(FMath::Floor(rect[0]));
+    const Int32 lowerY = static_cast<Int32>(FMath::Floor(rect[1]));
+    const Int32 upperX = static_cast<Int32>(FMath::Floor(rect[2]));
+    const Int32 upperY = static_cast<Int32>(FMath::Floor(rect[3]));
+
+    const Int32 beginX = FMath::Clamp(lowerX, 0, static_cast<Int32>(width) - 1);
+    const Int32 beginY =
+        FMath::Clamp(lowerY, 0, static_cast<Int32>(height) - 1);
+    const Int32 endX = FMath::Clamp(upperX, 0, static_cast<Int32>(width) - 1);
+    const Int32 endY = FMath::Clamp(upperY, 0, static_cast<Int32>(height) - 1);
+
+    Float32 maximum = 0.0f;
+
+    for (Int32 y = beginY; y <= endY; ++y)
+    {
+        for (Int32 x = beginX; x <= endX; ++x)
+        {
+            const SizeType offset =
+                static_cast<SizeType>(y) * width + static_cast<SizeType>(x);
+
+            if (offset < level0.GetSize())
+            {
+                maximum = FMath::Max(maximum, level0[offset]);
+            }
+        }
+    }
+
+    return maximum;
+}
+
+} // namespace
+
+static bool RunHizProbeChecks(FRenderContext* context, FRenderer& renderer,
+                              const TArray<Float32>& level0)
+{
+    FMeshletDepthPass* const pass = renderer.GetMeshletDepthPass();
+    FMeshletCullPass* const  cull = renderer.GetMeshletCullPass();
+
+    if (pass == nullptr || cull == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Hi-Z探针] 通道不存在");
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = pass->GetHizExtent();
+
+    // ---- 探针 ----
+    //
+    // 前 4 个是**对抗性**的: 相机在球内、球穿近平面。它们要求实现返回
+    // "投影失败", 而不是投一个发散的矩形出来。剩下的按视锥内的格点铺开,
+    // 半径从小到大 —— 小球落在金字塔的细级上, 大球落在粗级上, 两条路径
+    // 都要走到。
+    TArray<FHizProbeSphere> probes;
+
+    const FVector3 cameraPosition = renderer.GetCamera().GetPosition();
+    const FVector3 forward        = renderer.GetCamera().GetForwardVector();
+    const FVector3 right          = renderer.GetCamera().GetRightVector();
+    const FVector3 up             = renderer.GetCamera().GetUpVector();
+
+    probes.Add({ cameraPosition, 2.0f });
+
+    probes.Add({ { cameraPosition.X + forward.X * 0.05f,
+                   cameraPosition.Y + forward.Y * 0.05f,
+                   cameraPosition.Z + forward.Z * 0.05f },
+                 1.0f });
+
+    probes.Add({ { cameraPosition.X + forward.X * 0.4f,
+                   cameraPosition.Y + forward.Y * 0.4f,
+                   cameraPosition.Z + forward.Z * 0.4f },
+                 0.5f });
+
+    probes.Add({ { cameraPosition.X - forward.X * 3.0f,
+                   cameraPosition.Y - forward.Y * 3.0f,
+                   cameraPosition.Z - forward.Z * 3.0f },
+                 1.0f });
+
+    // 穿近平面而**相机在球外**的球
+    //
+    // 这一档非有不可: 前面那几个球虽然也穿近平面, 但相机同时在球内, 于是
+    // "相机在球内"那条判断先返回了 —— 近平面那条判断根本没被走到。把它
+    // 改成恒不成立, 判据毫无反应。
+    //
+    // 球心摆在 (半径 + 近平面的一小半) 处: 相机在球外 (距离 > 半径), 而
+    // 球的最前面伸到近平面之内。
+    {
+        const Float32 nearPlane = renderer.GetCamera().GetNearPlane();
+
+        const Float32 probeRadii[3] = { 0.3f, 1.0f, 3.0f };
+
+        for (UInt32 i = 0; i < 3; ++i)
+        {
+            const Float32 distance = probeRadii[i] + nearPlane * 0.5f;
+
+            probes.Add({ { cameraPosition.X + forward.X * distance,
+                           cameraPosition.Y + forward.Y * distance,
+                           cameraPosition.Z + forward.Z * distance },
+                         probeRadii[i] });
+
+            // 再来一个偏到侧面的 —— 球心视深度更大而最前端照样穿
+            probes.Add({ { cameraPosition.X + forward.X * distance +
+                               right.X * probeRadii[i] * 0.7f,
+                           cameraPosition.Y + forward.Y * distance +
+                               right.Y * probeRadii[i] * 0.7f,
+                           cameraPosition.Z + forward.Z * distance +
+                               right.Z * probeRadii[i] * 0.7f },
+                         probeRadii[i] });
+        }
+    }
+
+    const Float32 radii[4]     = { 0.15f, 0.6f, 2.5f, 8.0f };
+    const Float32 distances[5] = { 2.0f, 5.0f, 11.0f, 24.0f, 55.0f };
+    const Float32 offsets[5]   = { -1.4f, -0.6f, 0.0f, 0.6f, 1.4f };
+
+    for (UInt32 d = 0; d < 5; ++d)
+    {
+        for (UInt32 r = 0; r < 4; ++r)
+        {
+            for (UInt32 ox = 0; ox < 5; ++ox)
+            {
+                for (UInt32 oy = 0; oy < 3; ++oy)
+                {
+                    const Float32 lateral = offsets[ox] * distances[d] * 0.35f;
+                    const Float32 vertical =
+                        offsets[oy + 1] * distances[d] * 0.25f;
+
+                    probes.Add({ { cameraPosition.X + forward.X * distances[d] +
+                                       right.X * lateral + up.X * vertical,
+                                   cameraPosition.Y + forward.Y * distances[d] +
+                                       right.Y * lateral + up.Y * vertical,
+                                   cameraPosition.Z + forward.Z * distances[d] +
+                                       right.Z * lateral + up.Z * vertical },
+                                 radii[r] });
+                }
+            }
+        }
+    }
+
+    const UInt32 probeCount = static_cast<UInt32>(probes.GetSize());
+
+    const SizeType resultBytes =
+        sizeof(FHizProbeHeader) +
+        static_cast<SizeType>(probeCount) * sizeof(FHizProbeResult);
+
+    // ---- 资源 ----
+    FRHIShaderHandle              shader;
+    FRHIDescSetLayoutHandle       setLayout;
+    FRHIPipelineLayoutHandle      pipelineLayout;
+    FRHIComputePipelineHandle     pipeline;
+    FRHIDescriptorSetHandle       descriptorSet;
+    FRHIBufferHandle              probeBuffer;
+    FRHIBufferHandle              resultBuffer;
+    FRHITextureViewHandle         hizView;
+    FRHISamplerHandle             hizSampler;
+
+    bool ok = true;
+
+    {
+        FShaderManager& shaders = FShaderManager::Get();
+
+        if (!shaders.IsInitialized())
+        {
+            shaders.Initialize();
+        }
+
+        ok = IsRHISuccess(shaders.CreateShaderModule(
+            device, FString("Builtin/hiz_probe.comp"), EShaderStage::Compute,
+            shader));
+    }
+
+    if (ok)
+    {
+        FRHIDescriptorBinding bindings[4] = {};
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            bindings[i].Binding    = i;
+            bindings[i].Type       = EDescriptorType::StorageBuffer;
+            bindings[i].Count      = 1;
+            bindings[i].StageFlags = EShaderStage::Compute;
+        }
+
+        bindings[2].Type = EDescriptorType::CombinedImageSampler;
+        bindings[3].Type = EDescriptorType::UniformBuffer;
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 4;
+        layoutDesc.DebugName    = "HizProbeSetLayout";
+
+        ok = IsRHISuccess(device->CreateDescSetLayout(layoutDesc, setLayout));
+    }
+
+    if (ok)
+    {
+        FRHIPushConstantRange pushRange = {};
+        pushRange.StageFlags = EShaderStage::Compute;
+        pushRange.Offset     = 0;
+        pushRange.Size       = sizeof(UInt32) * 4;
+
+        FRHIPipelineLayoutDesc layoutDesc = {};
+        layoutDesc.SetLayouts             = &setLayout;
+        layoutDesc.SetLayoutCount         = 1;
+        layoutDesc.PushConstantRanges     = &pushRange;
+        layoutDesc.PushConstantRangeCount = 1;
+        layoutDesc.DebugName              = "HizProbeLayout";
+
+        ok = IsRHISuccess(
+            device->CreatePipelineLayout(layoutDesc, pipelineLayout));
+    }
+
+    if (ok)
+    {
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Shader     = shader;
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+        pipelineDesc.PipelineLayout           = pipelineLayout;
+        pipelineDesc.DebugName                = "HizProbePipeline";
+
+        ok = IsRHISuccess(device->CreateComputePipeline(pipelineDesc, pipeline));
+    }
+
+    if (ok)
+    {
+        FRHIBufferDesc bufferDesc = {};
+        bufferDesc.Size        = static_cast<UInt64>(probeCount) * 16u;
+        bufferDesc.Usage       = EBufferUsage::StorageBuffer;
+        bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+        bufferDesc.DebugName   = "HizProbeInput";
+
+        ok = IsRHISuccess(device->CreateBuffer(bufferDesc, probeBuffer));
+
+        bufferDesc.Size        = resultBytes;
+        bufferDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        bufferDesc.DebugName   = "HizProbeOutput";
+
+        ok = ok && IsRHISuccess(device->CreateBuffer(bufferDesc, resultBuffer));
+    }
+
+    if (ok)
+    {
+        FRHITextureViewDesc viewDesc = {};
+        viewDesc.Texture         = pass->GetHizTexture();
+        viewDesc.ViewType        = ETextureType::Texture2D;
+        viewDesc.Format          = EPixelFormat::R32_SFLOAT;
+        viewDesc.BaseMipLevel    = 0;
+        viewDesc.MipLevelCount   = pass->GetHizLevelCount();
+        viewDesc.BaseArrayLayer  = 0;
+        viewDesc.ArrayLayerCount = 1;
+
+        ok = IsRHISuccess(device->CreateTextureView(viewDesc, hizView));
+
+        FRHISamplerDesc samplerDesc = {};
+        samplerDesc.MinFilter    = EFilter::Nearest;
+        samplerDesc.MagFilter    = EFilter::Nearest;
+        samplerDesc.MipmapMode   = ESamplerMipmapMode::Nearest;
+        samplerDesc.AddressModeU = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.AddressModeV = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.AddressModeW = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.MaxLod =
+            static_cast<Float32>(pass->GetHizLevelCount());
+
+        ok = ok && IsRHISuccess(device->CreateSampler(samplerDesc, hizSampler));
+    }
+
+    if (ok)
+    {
+        ok = IsRHISuccess(
+            device->AllocateDescriptorSet(setLayout, descriptorSet));
+    }
+
+    // 探针数据上传
+    if (ok)
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(probeBuffer, &mapped)) &&
+            mapped != nullptr)
+        {
+            auto* values = static_cast<Float32*>(mapped);
+
+            for (UInt32 i = 0; i < probeCount; ++i)
+            {
+                values[i * 4 + 0] = probes[i].Center.X;
+                values[i * 4 + 1] = probes[i].Center.Y;
+                values[i * 4 + 2] = probes[i].Center.Z;
+                values[i * 4 + 3] = probes[i].Radius;
+            }
+
+            device->UnmapBuffer(probeBuffer);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+    if (ok)
+    {
+        FRHIDescriptorWrite writes[4];
+
+        writes[0] = FRHIDescriptorWrite::StorageBuffer(
+            descriptorSet, 0, probeBuffer, 0,
+            static_cast<UInt64>(probeCount) * 16u);
+        writes[1] = FRHIDescriptorWrite::StorageBuffer(descriptorSet, 1,
+                                                       resultBuffer, 0,
+                                                       resultBytes);
+        writes[2] = FRHIDescriptorWrite::CombinedImageSampler(
+            descriptorSet, 2, hizView, hizSampler,
+            EImageLayout::ShaderReadOnly);
+        writes[3] = FRHIDescriptorWrite::UniformBuffer(
+            descriptorSet, 3, cull->GetViewBuffer(frameIndex), 0,
+            FMeshletCullPass::GetViewBufferBytes());
+
+        device->UpdateDescriptorSets(writes, 4);
+    }
+
+    // ---- 跑一帧, 在场景之后分派 ----
+    bool recorded = false;
+
+    if (ok)
+    {
+        renderer.SetPostSceneRenderCallback(
+            [&recorded, context, pipeline, pipelineLayout, descriptorSet,
+             resultBuffer, probeCount]()
+            {
+                IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+                if (cmd == nullptr)
+                {
+                    return;
+                }
+
+                cmd->BindComputePipeline(pipeline);
+                cmd->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                       pipelineLayout, 0, descriptorSet);
+
+                UInt32 push[4] = { probeCount, 0, 0, 0 };
+
+                cmd->PushConstants(pipelineLayout, EShaderStage::Compute, 0,
+                                   sizeof(push), push);
+
+                cmd->Dispatch((probeCount + 63u) / 64u, 1, 1);
+
+                FRHIBufferMemoryBarrier barrier = {};
+                barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+                barrier.DstAccessMask = EAccessFlags::HostRead;
+                barrier.Buffer        = resultBuffer;
+
+                cmd->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                     EPipelineStageFlags::Host, nullptr, 0,
+                                     &barrier, 1, nullptr, 0);
+
+                recorded = true;
+            });
+
+        renderer.RenderFrame();
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        ok = recorded;
+    }
+
+    // ---- 验 ----
+    bool passed = ok;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(resultBuffer, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* bytes = static_cast<const UInt8*>(mapped);
+
+            FHizProbeHeader header;
+            Memory::MemCopy(&header, bytes, sizeof(FHizProbeHeader));
+
+            const auto* results = reinterpret_cast<const FHizProbeResult*>(
+                bytes + sizeof(FHizProbeHeader));
+
+            // 亚像素的容差 —— 参考值是采样出来的, 而采样偏差落在让判据更
+            // 宽松的一侧, 所以这个容差只用来吸收浮点噪声。
+            constexpr Float32 kRectEpsilon  = 0.5f;
+            constexpr Float32 kDepthEpsilon = 1.0e-5f;
+
+            SizeType rectViolations    = 0;
+            SizeType looseViolations   = 0;
+            SizeType depthViolations   = 0;
+            SizeType maxViolations     = 0;
+            SizeType logicViolations   = 0;
+            SizeType equalityViolations = 0;
+            SizeType nearPlaneEscapes  = 0;
+            SizeType projectedCount    = 0;
+            SizeType occludedCount     = 0;
+            SizeType degenerateCount   = 0;
+
+            Float32 worstRect  = 0.0f;
+            Float32 worstLoose = 0.0f;
+            Float32 worstDepth = 0.0f;
+            Float32 worstMax   = 0.0f;
+
+            SizeType firstRectIndex = probes.GetSize();
+
+            const Float32 nearPlane = header.ScreenParams[3];
+
+            for (UInt32 i = 0; i < probeCount; ++i)
+            {
+                const FHizProbeResult& result = results[i];
+
+                const bool projected =
+                    (result.Flags & kHizProbeProjected) != 0u;
+
+                const bool occluded = (result.Flags & kHizProbeOccluded) != 0u;
+
+                const FHizProbeReference reference =
+                    HizProbeReferenceOf(header, probes[i]);
+
+                // 判据一: 球穿了近平面 (或相机在球内) 就必须报投影失败
+                const FVector3 delta = {
+                    probes[i].Center.X - header.CameraPosition[0],
+                    probes[i].Center.Y - header.CameraPosition[1],
+                    probes[i].Center.Z - header.CameraPosition[2],
+                };
+
+                const Float32 centerDistance =
+                    FMath::Sqrt(delta.X * delta.X + delta.Y * delta.Y +
+                                delta.Z * delta.Z);
+
+                const bool degenerate = (centerDistance <= probes[i].Radius) ||
+                                        (reference.MinW <= nearPlane);
+
+                if (degenerate)
+                {
+                    ++degenerateCount;
+
+                    if (projected)
+                    {
+                        ++nearPlaneEscapes;
+                    }
+
+                    continue;
+                }
+
+                if (!projected)
+                {
+                    continue;
+                }
+
+                ++projectedCount;
+
+                if (occluded)
+                {
+                    ++occludedCount;
+                }
+
+                // 判据二: 矩形必须包得住真实投影
+                if (reference.Valid)
+                {
+                    const Float32 slack = FMath::Max(
+                        FMath::Max(result.Rect[0] - reference.MinX,
+                                   result.Rect[1] - reference.MinY),
+                        FMath::Max(reference.MaxX - result.Rect[2],
+                                   reference.MaxY - result.Rect[3]));
+
+                    if (slack > kRectEpsilon)
+                    {
+                        ++rectViolations;
+
+                        if (firstRectIndex == probes.GetSize())
+                        {
+                            firstRectIndex = i;
+                        }
+
+                        worstRect = FMath::Max(worstRect, slack);
+                    }
+
+                    // 判据二之二: 矩形还得**紧**
+                    //
+                    // 只验"包得住"是不够的 —— 一个把整个屏幕都圈进去的矩形
+                    // 永远包得住, 而它什么都剔不掉。相机基取错列的那条变异
+                    // 正是这么逃掉的: 投出来的矩形与相机无关, 但恰好比真实
+                    // 投影大, 于是包含判据全绿。
+                    //
+                    // 切线解是**精确**的, 所以这里可以要求它与参考值贴合。
+                    // 容差按参考矩形的尺寸放大一点: 参考值是球面上撒点撒出来
+                    // 的, 球越大采样间隔越粗。
+                    const Float32 referenceSpan =
+                        FMath::Max(reference.MaxX - reference.MinX,
+                                   reference.MaxY - reference.MinY);
+
+                    const Float32 excess = FMath::Max(
+                        FMath::Max(reference.MinX - result.Rect[0],
+                                   reference.MinY - result.Rect[1]),
+                        FMath::Max(result.Rect[2] - reference.MaxX,
+                                   result.Rect[3] - reference.MaxY));
+
+                    const Float32 allowed =
+                        kRectEpsilon + referenceSpan * 0.02f;
+
+                    if (excess > allowed)
+                    {
+                        ++looseViolations;
+
+                        worstLoose = FMath::Max(worstLoose, excess - allowed);
+                    }
+                }
+
+                // 判据三: 最近深度不许比球面上的真实最小深度还大
+                if (reference.Valid &&
+                    result.Nearest > reference.MinDepth + kDepthEpsilon)
+                {
+                    ++depthViolations;
+
+                    worstDepth = FMath::Max(
+                        worstDepth, result.Nearest - reference.MinDepth);
+                }
+
+                // 判据四: 金字塔查到的最大值不许比第 0 级的真实最大值还小
+                const Float32 trueMax = HizProbeLevelZeroMax(
+                    level0, extent.Width, extent.Height, result.Rect);
+
+                if (result.Maximum >= 0.0f &&
+                    result.Maximum < trueMax - kDepthEpsilon)
+                {
+                    ++maxViolations;
+
+                    worstMax = FMath::Max(worstMax, trueMax - result.Maximum);
+                }
+
+                // 判据五: 结论必须与那两个数自洽
+                const bool expected =
+                    (result.Maximum >= 0.0f) && (result.Nearest > result.Maximum);
+
+                const bool byFunction =
+                    (result.Flags & kHizProbeByFunction) != 0u;
+
+                if (expected != occluded || expected != byFunction)
+                {
+                    ++logicViolations;
+                }
+
+                // 判据六: 相等的边界必须判成"没挡住"
+                if ((result.Flags & kHizProbeAtEquality) != 0u)
+                {
+                    ++equalityViolations;
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Hi-Z探针] {} 个探针 — 退化 {}, 投影成功 {}, "
+                     "判为遮挡 {}",
+                     probeCount, degenerateCount, projectedCount,
+                     occludedCount);
+
+            // 三条分支都得走到, 否则判据对它们没有约束力
+            if (degenerateCount == 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] 没有一个退化的球 (相机在球内 / 穿近平面) "
+                         "—— 那条分支没被走到");
+                passed = false;
+            }
+
+            if (nearPlaneEscapes != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个退化的球 (相机在球内 / 穿近平面) "
+                         "被当成投影成功 —— 那时投出来的矩形是发散的, "
+                         "拿它查金字塔的结论没有意义",
+                         nearPlaneEscapes);
+                passed = false;
+            }
+
+            if (rectViolations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个探针的屏幕矩形包不住球的真实投影 "
+                         "(最多缺 {} 像素, 第一个在下标 {}) —— 包不住就会"
+                         "错剔",
+                         rectViolations, worstRect, firstRectIndex);
+                passed = false;
+            }
+
+            if (looseViolations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个探针的屏幕矩形比球的真实投影松得"
+                         "过头 (最多超出容差 {} 像素) —— 切线解是精确的, "
+                         "松了就说明它算的根本不是这个球",
+                         looseViolations, worstLoose);
+                passed = false;
+            }
+
+            if (depthViolations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个探针的最近深度比球面上的真实最小"
+                         "深度还大 (最多大 {}) —— 那会把'球心在遮挡物之后而"
+                         "前半部分露着'的东西剔掉",
+                         depthViolations, worstDepth);
+                passed = false;
+            }
+
+            if (maxViolations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个探针查到的金字塔最大值小于第 0 级"
+                         "在同一矩形上的真实最大值 (最多小 {}) —— 最大值偏小"
+                         "就是把没挡住的判成挡住了",
+                         maxViolations, worstMax);
+                passed = false;
+            }
+
+            if (equalityViolations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个探针在'最近深度恰好等于金字塔最大"
+                         "值'时判成了遮挡 —— 相等意味着那个包围体**就是**"
+                         "那个遮挡物, 剔掉它画面上就少一块",
+                         equalityViolations);
+                passed = false;
+            }
+
+            if (logicViolations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] {} 个探针的遮挡结论与 (最近深度, 最大值) "
+                         "不自洽",
+                         logicViolations);
+                passed = false;
+            }
+
+            if (projectedCount == 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] 没有一个探针投影成功 —— 判据没验到东西");
+                passed = false;
+            }
+
+            if (occludedCount == 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Hi-Z探针] 没有一个探针判为遮挡 —— 遮挡那条分支"
+                         "没被走到, 判据对它没有约束力");
+                passed = false;
+            }
+
+            device->UnmapBuffer(resultBuffer);
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error, "[Hi-Z探针] 结果回读失败");
+            passed = false;
+        }
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Error, "[Hi-Z探针] 资源创建失败");
+    }
+
+    device->DestroySampler(hizSampler);
+    device->DestroyTextureView(hizView);
+    device->DestroyBuffer(resultBuffer);
+    device->DestroyBuffer(probeBuffer);
+    device->DestroyComputePipeline(pipeline);
+    device->DestroyPipelineLayout(pipelineLayout);
+    device->DestroyDescSetLayout(setLayout);
+    device->DestroyShader(shader);
+
+    return passed;
+}
+
+// ============================================================================
+// RunMeshletOcclusionChecks — 遮挡剔除不许改变画面
+//
+// 遮挡剔除是**纯粹的优化**: 它只该让 GPU 少画一些看不见的东西, 而不该让
+// 画面变化一个像素。所以判据的形状很直接 —— 开关它, 画出来的深度与可见性
+// 必须完全相同。
+//
+// 这条判据能立住, 全靠两阶段。单阶段用的是**上一帧**的金字塔, 而这一帧
+// 才露出来的东西会被它判成"挡住了" —— 表现为物体闪一帧才出现, 而那正是
+// 这条判据会报出来的差异。
+//
+// 四条判据:
+//
+//   一、深度逐位相同。不留容差 —— 画的是同一批三角形, 同一套顶点数学。
+//
+//   二、可见性解出来的 (实例, meshlet, 三角形) 逐像素相同。深度相同而
+//      编号不同是可能的 (两个共面三角形), 而那在材质解析那一步会变成
+//      "这个像素用了别人的材质"。
+//
+//   三、金字塔的归约性质: 每一级的每个纹素必须是上一级对应区域的**最大**
+//      值。这一条与场景无关, 而且是遮挡测试保守性的全部依据 —— 取成最小
+//      或者平均, 剔除就会把只挡住一角的物体整个剔掉。
+//
+//   四、元判据: 遮挡剔除必须**真的剔掉了东西**。一个什么都不剔的实现在
+//      前两条判据上满分通过, 只是白跑了两遍。
+// ============================================================================
+
+static bool RunMeshletOcclusionChecks(FRenderContext* context,
+                                      FRenderer&      renderer)
+{
+    if (!renderer.SetMeshletDepthEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet遮挡] 无法启用光栅化 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    FMeshletDepthPass* const pass = renderer.GetMeshletDepthPass();
+    FMeshletCullPass* const  cull = renderer.GetMeshletCullPass();
+
+    if (pass == nullptr || cull == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet遮挡] 通道不存在");
+        return false;
+    }
+
+    bool passed = true;
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    TArray<Float32>           depthOff;
+    TArray<Float32>           depthOn;
+    TArray<FVisibilityTriple> visibilityOff;
+    TArray<FVisibilityTriple> visibilityOn;
+
+    // ================================================================
+    // 判据自己造条件
+    //
+    // 第一版直接在默认视角上开关遮挡剔除, 十条变异只红了两条。成因不是
+    // 判据不严, 是**这个视角下几乎没有遮挡**: 197 个 meshlet 里只有 6 个
+    // 被遮挡剔掉, 而且相机不动 —— 于是上一帧的金字塔永远是对的, 第二阶段
+    // 整个删掉都不会红。
+    //
+    // 所以判据自己把相机摆到有遮挡的地方, 并且**制造一次视角跳变**:
+    //
+    //   1. 相机放到柱子环的中心 —— 近处的柱子挡住远处的柱子与背墙,
+    //      于是遮挡剔除真的有东西可剔;
+    //   2. 先在**另一个**位置渲几帧, 让金字塔建在那里;
+    //   3. 跳回目标位置, 只渲一帧。
+    //
+    // 第三步是关键: 第一阶段拿到的是**另一个视角**的金字塔, 结论必然是
+    // 错的。单阶段的话画面会缺一块, 而两阶段会在这一帧里把它补回来 ——
+    // 这正是两阶段存在的全部理由, 而现在它可验了。
+    // ================================================================
+    FCamera& camera = renderer.GetCamera();
+
+    const FVector3 originalPosition = camera.GetPosition();
+    const Float32  originalYaw      = camera.GetYaw();
+    const Float32  originalPitch    = camera.GetPitch();
+
+    // 相机摆位是**量出来的**, 不是随手挑的。
+    //
+    // 在六个候选摆位上量了"第一阶段被遮挡剔掉多少":
+    //     (0, 1.6, 0)  环心平视        1 / 98
+    //     (0, 2, 6)    默认视角附近     2 / 193
+    //     (0, 1.2, 2)                 0 / 98
+    //     (11, 1.75, 0) 贴着柱子       34 / 197
+    //     (0, 1, 10)   隔着一排物体看   **101 / 197**
+    //     (0, 5, -20)  隔着背墙看      175 / 201
+    //
+    // 取 (0, 1, 10): 遮挡够多 (一半以上), 而且不是"整幅画面被一堵墙挡住"
+    // 那种退化情形 —— 后者虽然数字最大, 但它只走到"整个矩形都在墙后面"
+    // 这一条路径, 而边界情形 (矩形跨纹素、部分遮挡) 一个都碰不到。
+    const FVector3 targetPosition(0.0f, 1.0f, 10.0f);
+
+    const Float32 targetYaw   = 0.0f;
+    const Float32 targetPitch = 0.0f;
+
+    // 金字塔要建在**稍微**不同的位置。
+    //
+    // "稍微"是关键。离得太远的话, 上一帧的金字塔在这一帧的屏幕上几乎处处
+    // 是空的 (深度 1.0), 于是第一阶段什么都剔不掉 —— 遮挡这条路径根本没
+    // 被走到。第一版把诱饵放在 (0, 12, 18), 结果被剔的数量掉到 4 个。
+    //
+    // 挪三个单位: 大部分遮挡关系不变 (于是第一阶段真的在剔), 而边缘上
+    // 新露出来的东西会被上一帧的金字塔错判成"挡住了" —— 那正是第二阶段
+    // 要补回来的。
+    const FVector3 decoyPosition(0.0f, 1.0f, 10.0f);
+
+    const auto Restore = [&camera, originalPosition, originalYaw,
+                          originalPitch]()
+    {
+        camera.SetPosition(originalPosition);
+        camera.SetRotation(originalYaw, originalPitch);
+    };
+
+    camera.SetPosition(targetPosition);
+    camera.SetRotation(targetYaw, targetPitch);
+
+    // ---- 关掉遮挡剔除 ----
+    pass->SetOcclusionCullEnabled(false);
+    cull->SetOcclusionCullEnabled(false);
+
+    renderer.RenderFrame();
+
+    if (!CaptureDepthAndVisibility(context, renderer, pass->GetDepthTexture(),
+                                   pass->GetVisibilityTexture(), depthOff,
+                                   visibilityOff))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet遮挡] 关闭态回读失败");
+        return false;
+    }
+
+    // ---- 打开遮挡剔除, 并制造一次视角跳变 ----
+    pass->SetOcclusionCullEnabled(true);
+    cull->SetOcclusionCullEnabled(true);
+
+    // 先在诱饵位置渲几帧 —— 金字塔建在那里
+    camera.SetPosition(decoyPosition);
+    camera.SetRotation(targetYaw + 0.2f, targetPitch);
+
+    for (UInt32 i = 0; i < 4; ++i)
+    {
+        renderer.RenderFrame();
+    }
+
+    // 跳回目标位置, 取样的就是**跳变的那一帧**。
+    //
+    // 这一点是踩出来的: 第一版在跳回来之后先 RenderFrame() 一次再读, 而
+    // 读的那个函数自己又渲一帧 —— 于是取到的是跳变之后的**第三**帧, 那时
+    // 金字塔早在新位置重建好了, 第一阶段的结论又变对了。
+    //
+    // 表现是判据全绿而"第二阶段补回来几个"恒为 0。绿的原因不是实现对,
+    // 是取样取晚了。
+    camera.SetPosition(targetPosition);
+    camera.SetRotation(targetYaw, targetPitch);
+
+    if (!CaptureDepthAndVisibility(context, renderer, pass->GetDepthTexture(),
+                                   pass->GetVisibilityTexture(), depthOn,
+                                   visibilityOn))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet遮挡] 开启态回读失败");
+        return false;
+    }
+
+    // ---- 跳变那一帧的统计 ----
+    //
+    // 统计的回读隔着并行帧数 (这里是 2): 第 N 帧读到的是第 N-2 帧写的。
+    // 所以要拿到跳变帧的数, 得在它之后再走两帧。
+    //
+    // 相机已经停在目标位置, 这两帧不会改变刚才抓下来的那两张图 —— 它们
+    // 已经读回 CPU 了。
+    renderer.RenderFrame();
+    renderer.RenderFrame();
+
+    const FMeshletCullStats stats = cull->GetStats();
+
+    const UInt32 phase2Admitted = pass->GetPhase2Meshlets();
+
+    // ---- 判据一: 深度逐位相同 ----
+    {
+        SizeType differ = 0;
+        Float32  worst  = 0.0f;
+
+        for (SizeType i = 0; i < pixelCount && i < depthOff.GetSize() &&
+                             i < depthOn.GetSize();
+             ++i)
+        {
+            const Float32 delta = FMath::Abs(depthOff[i] - depthOn[i]);
+
+            if (delta != 0.0f)
+            {
+                ++differ;
+                worst = FMath::Max(worst, delta);
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet遮挡] 深度 — 开关之间不同的像素 {} 个 (最大差 {})",
+                 differ, worst);
+
+        if (differ != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet遮挡] 开关遮挡剔除画出的深度不同 ({} 个像素, "
+                     "最大差 {}) —— 遮挡剔除剔掉了看得见的东西",
+                     differ, worst);
+            passed = false;
+        }
+    }
+
+    // ---- 判据二: 可见性解出来的三元组逐像素相同 ----
+    {
+        SizeType differ   = 0;
+        SizeType firstBad = 0;
+
+        for (SizeType i = 0; i < visibilityOff.GetSize() &&
+                             i < visibilityOn.GetSize();
+             ++i)
+        {
+            const FVisibilityTriple& a = visibilityOff[i];
+            const FVisibilityTriple& b = visibilityOn[i];
+
+            if (a.Valid != b.Valid || a.Instance != b.Instance ||
+                a.Meshlet != b.Meshlet || a.Triangle != b.Triangle)
+            {
+                if (differ == 0)
+                {
+                    firstBad = i;
+                }
+
+                ++differ;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet遮挡] 可见性 — 开关之间不同的像素 {} 个", differ);
+
+        if (differ != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet遮挡] 开关遮挡剔除解出的 (实例, meshlet, 三角形) "
+                     "不同 ({} 个像素, 第一个在下标 {}: 关 ({},{},{}) vs "
+                     "开 ({},{},{}))",
+                     differ, firstBad, visibilityOff[firstBad].Instance,
+                     visibilityOff[firstBad].Meshlet,
+                     visibilityOff[firstBad].Triangle,
+                     visibilityOn[firstBad].Instance,
+                     visibilityOn[firstBad].Meshlet,
+                     visibilityOn[firstBad].Triangle);
+            passed = false;
+        }
+    }
+
+    // ---- 判据三: 金字塔的内容与归约性质 ----
+    //
+    // 这两条都在**稳定态**上验, 不在跳变帧上。
+    //
+    // 逐级回读要一级渲一帧 (十一级就是十一帧), 而那期间相机早停在目标
+    // 位置了 —— 拿跳变帧的深度去与它们比是跨帧比对, 差多少都说明不了
+    // 问题。第一版就是这么写的, 报出 66774 个纹素不符, 而那个数恰好等于
+    // 跳变帧与稳定帧之间的差 —— 一眼看去像是"拷贝没生效"。
+    {
+        const UInt32 levelCount = pass->GetHizLevelCount();
+
+        TArray<TArray<Float32>> levels;
+
+        bool readOk = (levelCount >= 2);
+
+        // 先在稳定态抓一张深度, 与第 0 级比内容
+        TArray<Float32>           settledDepth;
+        TArray<FVisibilityTriple> settledVisibility;
+
+        readOk = readOk &&
+                 CaptureDepthAndVisibility(context, renderer,
+                                           pass->GetDepthTexture(),
+                                           pass->GetVisibilityTexture(),
+                                           settledDepth, settledVisibility);
+
+        for (UInt32 level = 0; level < levelCount && readOk; ++level)
+        {
+            TArray<Float32> data;
+
+            readOk = ReadHizLevel(context, renderer, pass->GetHizTexture(),
+                                  extent, level, levelCount, data);
+
+            levels.Add(data);
+        }
+
+        if (!readOk)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet遮挡] 金字塔回读失败 (共 {} 级)", levelCount);
+            passed = false;
+        }
+        else
+        {
+            SizeType violations = 0;
+            Float32  worst      = 0.0f;
+
+            for (UInt32 level = 1; level < levelCount; ++level)
+            {
+                const UInt32 sourceWidth =
+                    FMath::Max(extent.Width >> (level - 1), 1u);
+                const UInt32 sourceHeight =
+                    FMath::Max(extent.Height >> (level - 1), 1u);
+
+                const UInt32 targetWidth =
+                    FMath::Max(extent.Width >> level, 1u);
+                const UInt32 targetHeight =
+                    FMath::Max(extent.Height >> level, 1u);
+
+                for (UInt32 y = 0; y < targetHeight; ++y)
+                {
+                    for (UInt32 x = 0; x < targetWidth; ++x)
+                    {
+                        // 与 hiz_build.comp 同一套覆盖规则: 最后一个纹素
+                        // 一直收到源的边界。
+                        const UInt32 lastX =
+                            (x + 1 == targetWidth)
+                                ? (sourceWidth - 1)
+                                : FMath::Min(x * 2 + 1, sourceWidth - 1);
+
+                        const UInt32 lastY =
+                            (y + 1 == targetHeight)
+                                ? (sourceHeight - 1)
+                                : FMath::Min(y * 2 + 1, sourceHeight - 1);
+
+                        Float32 expected = 0.0f;
+
+                        for (UInt32 sy = y * 2; sy <= lastY; ++sy)
+                        {
+                            for (UInt32 sx = x * 2; sx <= lastX; ++sx)
+                            {
+                                expected = FMath::Max(
+                                    expected,
+                                    levels[level - 1][sy * sourceWidth + sx]);
+                            }
+                        }
+
+                        const Float32 actual =
+                            levels[level][y * targetWidth + x];
+
+                        const Float32 delta = FMath::Abs(actual - expected);
+
+                        if (delta != 0.0f)
+                        {
+                            ++violations;
+                            worst = FMath::Max(worst, delta);
+                        }
+                    }
+                }
+            }
+
+            // ---- 第 0 级必须**就是**深度缓冲区 ----
+            //
+            // 归约那一条只验"每一级是上一级的最大值", 它对内容一无所知 ——
+            // 整张金字塔全是 0 也满分通过。而全是 0 意味着"最近", 于是
+            // 一切都被判成挡住了。
+            //
+            // 这一条把内容钉住: 第 0 级是深度缓冲区的逐纹素拷贝, 差一个
+            // 都不行。
+            SizeType contentDiffer = 0;
+            Float32  contentWorst  = 0.0f;
+
+            for (SizeType i = 0; i < levels[0].GetSize() &&
+                                 i < settledDepth.GetSize();
+                 ++i)
+            {
+                const Float32 delta =
+                    FMath::Abs(levels[0][i] - settledDepth[i]);
+
+                if (delta != 0.0f)
+                {
+                    ++contentDiffer;
+                    contentWorst = FMath::Max(contentWorst, delta);
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet遮挡] 金字塔第 0 级 vs 深度缓冲区 — 不同的"
+                     "纹素 {} 个 (最大差 {})",
+                     contentDiffer, contentWorst);
+
+            if (contentDiffer != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet遮挡] 金字塔第 0 级与深度缓冲区不符 "
+                         "({} 个纹素, 最大差 {}) —— 拷贝那一步没生效? "
+                         "全零的金字塔意味着'最近', 于是一切都被判成挡住了",
+                         contentDiffer, contentWorst);
+                passed = false;
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet遮挡] 金字塔 — {} 级, 归约不符的纹素 {} 个 "
+                     "(最大差 {})",
+                     levelCount, violations, worst);
+
+            if (violations != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet遮挡] {} 个纹素不是上一级对应区域的最大值 "
+                         "(最大差 {}) —— 取成最小或平均的话, 遮挡测试会把"
+                         "只挡住一角的物体整个剔掉",
+                         violations, worst);
+                passed = false;
+            }
+        }
+    }
+
+    // ---- 判据四: 遮挡剔除必须真的剔掉了东西 ----
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet遮挡] 第一阶段被遮挡剔掉 {} 个 meshlet (测试 {} 个)",
+             stats.MeshletsPending, stats.MeshletsTested);
+
+    if (stats.MeshletsPending == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet遮挡] 第一阶段一个 meshlet 都没被遮挡剔掉 —— "
+                 "这个场景/视角下判据是空的, 前两条判据对它满分通过");
+        passed = false;
+    }
+
+    // ---- 判据五: 第二阶段必须真的补回来过东西 ----
+    //
+    // 这一条是被一个实打实的缺陷逼出来的: 第二阶段的间接分派参数忘了把
+    // y/z 置 1, 于是 (n, 0, 0) —— 一个工作组都不起, 整个第二阶段是死代码。
+    //
+    // 而"开关遮挡剔除画面相同"那两条判据对它**满分通过**: 第一阶段剔掉的
+    // 那些恰好真的被挡住了, 补不补都一样。
+    //
+    // 判据要盯的是"这条路径被走到了", 而不只是"结果看起来对"。这与 Day 9
+    // 的分支覆盖是同一件事的另一个形状。
+    LIMX_LOG(LogLaunch, Display,
+             "[Meshlet遮挡] 第二阶段补回来 {} 个 meshlet", phase2Admitted);
+
+    if (phase2Admitted == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet遮挡] 第二阶段一个 meshlet 都没补回来 —— "
+                 "要么它整个没跑 (分派参数?), 要么这次视角跳变没造出"
+                 "\"上一帧挡住而这一帧露出来\"的情形");
+        passed = false;
+    }
+
+    pass->SetOcclusionCullEnabled(false);
+    cull->SetOcclusionCullEnabled(false);
+
+    // ================================================================
+    // 第二个摆位: 相机埋进柱子里
+    //
+    // 上面那个摆位走不到"投影失败"这条路径 —— 场景里没有一个 meshlet 的
+    // 包围球会穿到近平面之内。于是第二阶段里"投影失败就保留"那一句怎么
+    // 改都不会红: 把它改成"投影失败就剔掉", 判据全绿。
+    //
+    // 这是**场景不够**, 不是判据不严。补法是把相机放到 0 号柱子内部
+    // (9.3, 1.75, 0) —— 柱子自己的 meshlet 把相机包在里面, 它们的包围球
+    // 穿近平面, 投影必然失败。那时"存疑不剔"是画面正确的唯一依据。
+    //
+    // 判据的形状与上面那个一样: 开关遮挡剔除, 画面必须逐像素相同。
+    // ================================================================
+    {
+        // 柱子摆在半径 6 * 1.55 = 9.3 的环上, 0 号在 angle = 0 处,
+        // 中心高度 1.75 —— 见综合场景里那段 Spawn。
+        const FVector3 pillarPosition(9.3f, 1.75f, 0.0f);
+
+        TArray<Float32>           pillarDepthOff;
+        TArray<Float32>           pillarDepthOn;
+        TArray<FVisibilityTriple> pillarVisibilityOff;
+        TArray<FVisibilityTriple> pillarVisibilityOn;
+
+        camera.SetPosition(pillarPosition);
+        camera.SetRotation(0.6f, -0.1f);
+
+        pass->SetOcclusionCullEnabled(false);
+        cull->SetOcclusionCullEnabled(false);
+
+        renderer.RenderFrame();
+
+        bool pillarOk = CaptureDepthAndVisibility(
+            context, renderer, pass->GetDepthTexture(),
+            pass->GetVisibilityTexture(), pillarDepthOff, pillarVisibilityOff);
+
+        pass->SetOcclusionCullEnabled(true);
+        cull->SetOcclusionCullEnabled(true);
+
+        // 同样先在诱饵位置建金字塔, 再跳回来
+        camera.SetRotation(0.8f, -0.1f);
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            renderer.RenderFrame();
+        }
+
+        camera.SetRotation(0.6f, -0.1f);
+
+        pillarOk = pillarOk &&
+                   CaptureDepthAndVisibility(context, renderer,
+                                             pass->GetDepthTexture(),
+                                             pass->GetVisibilityTexture(),
+                                             pillarDepthOn, pillarVisibilityOn);
+
+        if (!pillarOk)
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet遮挡] 柱内摆位回读失败");
+            passed = false;
+        }
+        else
+        {
+            SizeType depthDiffer = 0;
+            Float32  depthWorst  = 0.0f;
+
+            for (SizeType i = 0; i < pillarDepthOff.GetSize() &&
+                                 i < pillarDepthOn.GetSize();
+                 ++i)
+            {
+                const Float32 delta =
+                    FMath::Abs(pillarDepthOff[i] - pillarDepthOn[i]);
+
+                if (delta != 0.0f)
+                {
+                    ++depthDiffer;
+                    depthWorst = FMath::Max(depthWorst, delta);
+                }
+            }
+
+            SizeType visibilityDiffer = 0;
+
+            for (SizeType i = 0; i < pillarVisibilityOff.GetSize() &&
+                                 i < pillarVisibilityOn.GetSize();
+                 ++i)
+            {
+                const FVisibilityTriple& a = pillarVisibilityOff[i];
+                const FVisibilityTriple& b = pillarVisibilityOn[i];
+
+                if (a.Valid != b.Valid || a.Instance != b.Instance ||
+                    a.Meshlet != b.Meshlet || a.Triangle != b.Triangle)
+                {
+                    ++visibilityDiffer;
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[Meshlet遮挡] 柱内摆位 — 深度不同 {} 个像素 "
+                     "(最大差 {}), 可见性不同 {} 个像素",
+                     depthDiffer, depthWorst, visibilityDiffer);
+
+            if (depthDiffer != 0 || visibilityDiffer != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet遮挡] 相机埋在柱子里时开关遮挡剔除画面"
+                         "不同 —— 包围球穿近平面时投影会失败, 而那时"
+                         "**必须保留**: 剔了就没有下一次机会了");
+                passed = false;
+            }
+        }
+    }
+
+    // ================================================================
+    // Hi-Z 探针 —— 相机**必须歪着**
+    //
+    // 上面那两个摆位的 yaw 与 pitch 都接近 0, 而那时视图矩阵的旋转部分是
+    // 单位阵 —— 视图投影矩阵的第 0 行与第 0 列**恰好相等**。于是"相机右
+    // 方向取列而不是取行"这条变异在那里完全看不出来: 两个取法拿到同一个
+    // 向量。实测把它改成取列, 探针的每一个数都分毫不差。
+    //
+    // 这是**判据的场景不够**, 不是判据不严。所以探针自己摆一个 yaw 与
+    // pitch 都不为零的姿态 —— 那时旋转矩阵没有一个零元素, 行与列差得很开。
+    //
+    // 金字塔的第 0 级也要在这个姿态下重新读: 探针拿它当参考答案, 而它必须
+    // 与探针看到的是同一帧的同一个金字塔。
+    // ================================================================
+    {
+        camera.SetPosition(targetPosition);
+        camera.SetRotation(0.9f, -0.35f);
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            renderer.RenderFrame();
+        }
+
+        TArray<Float32> probeLevel0;
+
+        if (!ReadHizLevel(context, renderer, pass->GetHizTexture(), extent, 0,
+                          pass->GetHizLevelCount(), probeLevel0))
+        {
+            LIMX_LOG(LogLaunch, Error, "[Hi-Z探针] 第 0 级回读失败");
+            passed = false;
+        }
+        else if (!RunHizProbeChecks(context, renderer, probeLevel0))
+        {
+            passed = false;
+        }
+    }
+
+    Restore();
+
+    if (!renderer.SetMeshletDepthEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet遮挡] 无法关闭 (复位)");
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[Meshlet遮挡] {}", passed ? "通过" : "失败");
 
     return passed;
 }
@@ -15105,6 +16895,15 @@ int WINAPI wWinMain(
 
             pass->SetResolveEnabled(launchOptions.MeshletResolve);
 
+            pass->SetOcclusionCullEnabled(launchOptions.MeshletOcclusion);
+
+            if (FMeshletCullPass* const cullPass =
+                    renderer.GetMeshletCullPass())
+            {
+                cullPass->SetOcclusionCullEnabled(
+                    launchOptions.MeshletOcclusion);
+            }
+
             LIMX_LOG(LogLaunch, Display,
                      "[Launch] meshlet 深度光栅化已启用 ({}{}), 材质解析 {}",
                      wantFallback ? "计算展开回退" : "网格着色器",
@@ -15318,6 +17117,7 @@ int WINAPI wWinMain(
     bool    meshletCullPassed = true;
     bool    meshletDepthPassed = true;
     bool    meshletResolvePassed = true;
+    bool    meshletOcclusionPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -15462,6 +17262,12 @@ int WINAPI wWinMain(
             {
                 meshletResolvePassed =
                     RunMeshletResolveChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletOcclusionCheck)
+            {
+                meshletOcclusionPassed =
+                    RunMeshletOcclusionChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -15747,6 +17553,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletResolveCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletResolvePassed, 32,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletOcclusionCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletOcclusionPassed, 33,
                                           errorSink, errorsBeforeShutdown);
     }
 

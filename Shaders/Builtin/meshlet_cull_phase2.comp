@@ -1,0 +1,123 @@
+#version 450
+
+// ============================================================================
+// meshlet_cull_phase2.comp — 两阶段遮挡剔除的第二阶段
+//
+// 第一阶段用**上一帧**的金字塔剔了一遍。那个结论可能是错的: 这一帧才露
+// 出来的东西会被判成"挡住了"。单阶段的话那表现为物体闪一帧才出现。
+//
+// 这一遍在**这一帧**的深度画完、金字塔重建之后, 把第一阶段剔掉的那些
+// 重新测一次。活下来的追加到可见表的末尾, 由第二次绘制画出来。
+//
+// ── 为什么这样就不再有近似 ──
+//
+// 第二阶段用的金字塔来自第一阶段画出来的深度。一个物体如果真的被挡住,
+// 那些遮挡物一定在第一阶段就画出来了 (它们自己没被挡住, 否则递归下去
+// 总有一层是没被挡的) —— 所以新金字塔里有它们, 结论正确。
+//
+// 一个物体如果没被挡住, 新金字塔里那片区域的深度就不会比它近, 它活下来。
+//
+// 剩下的唯一近似是第一阶段那些**被错误保留**的 (上一帧没挡住而这一帧
+// 挡住了): 它们被画了一遍, 属于多画, 不影响正确性。
+// ============================================================================
+
+#include "meshlet_common.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
+    MeshletInstance instances[];
+} instanceBuffer;
+
+layout(std430, set = 0, binding = 1) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+} meshletBuffer;
+
+layout(std430, set = 0, binding = 2) readonly buffer PendingBuffer {
+    uvec2 pending[];
+} pendingBuffer;
+
+layout(std430, set = 0, binding = 3) buffer VisibleMeshletBuffer {
+    uvec2 visible[];
+} outputBuffer;
+
+layout(std430, set = 0, binding = 4) buffer CounterBuffer {
+    uvec4 counters;
+} counterBuffer;
+
+layout(set = 0, binding = 5) uniform sampler2D hizPyramid;
+
+// 待定数 —— 越界判断要用**真实的**那个数
+//
+// push constant 里给不了它: 那个数在 GPU 上, 而 push constant 是 CPU 填的。
+// CPU 手上只有上一帧的值, 而物体一动就不对了。
+//
+// 间接分派的 x 是"工作组数", 而这里的工作组是 64 个线程 —— 所以按待定数
+// 分派会多起 64 倍的线程。多出来的线程靠这个数退出, 代价是每个工作组
+// 一次缓冲区读。
+layout(std430, set = 0, binding = 7) readonly buffer PendingCounterBuffer {
+    uvec4 counters;
+} pendingCounter;
+
+layout(row_major, set = 0, binding = 6) uniform ViewBuffer {
+    MeshletCullView view;
+} viewBuffer;
+
+layout(push_constant) uniform Params {
+    // x = 待定数, y = 输出表容量, z/w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+
+    // 用**真实的**待定数判越界, 不是 push constant 里那个上限。
+    //
+    // 拿上限判的话, 越界的线程会去读待定表里上一帧留下的记录 —— 而那是
+    // 一块位置完全不对的几何体, 会被当成"这一帧新露出来的"补画出来。
+    if (index >= pendingCounter.counters.x || index >= pc.params.x)
+    {
+        return;
+    }
+
+    const uvec2 entry = pendingBuffer.pending[index];
+
+    const MeshletInstance instance = instanceBuffer.instances[entry.x];
+    const Meshlet meshlet = meshletBuffer.meshlets[entry.y];
+
+    const vec4 worldSphere = MeshletWorldSphere(
+        meshlet.boundingSphere, instance.transformRow0,
+        instance.transformRow1, instance.transformRow2);
+
+    vec4  rect    = vec4(0.0);
+    float nearest = 0.0;
+
+    const bool projected = MeshletProjectSphere(
+        worldSphere, viewBuffer.view.viewProj, viewBuffer.view.cameraPosition.xyz, viewBuffer.view.hizParams.xy,
+        viewBuffer.view.hizParams.w, rect, nearest);
+
+    // 投影失败就**保留** —— 存疑不剔。第二阶段更要这样: 这里是最后一道
+    // 关口, 剔错了就没有下一次机会了。
+    //
+    // 这里的 projected 恒为真, 而且是**构造上**恒为真: 待定表里的记录都是
+    // 第一阶段判成"挡住了"才追加进来的, 而那一步要求投影成功; 第二阶段与
+    // 第一阶段在同一帧、同一个视图、同一个包围球上重算, 结果必然一样。
+    //
+    // 所以这一句不会红 —— 变异验证里它是唯一一条**构造上不可达**的。留着
+    // 它不是防御性代码 (退一万步, 投影失败时 rect 是全零, 退化矩形本身就
+    // 让遮挡测试返回"没挡住"), 而是把"存疑不剔"这个意图写在明面上。
+    if (projected &&
+        MeshletHizOccluded(rect, nearest, hizPyramid, viewBuffer.view.hizParams.xy,
+                           viewBuffer.view.hizParams.z))
+    {
+        return;
+    }
+
+    const uint slot = atomicAdd(counterBuffer.counters.x, 1u);
+
+    if (slot < pc.params.y)
+    {
+        outputBuffer.visible[slot] = entry;
+    }
+}

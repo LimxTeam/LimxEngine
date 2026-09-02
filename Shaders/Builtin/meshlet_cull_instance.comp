@@ -46,9 +46,11 @@ layout(std430, set = 0, binding = 3) buffer DispatchBuffer {
     uvec4 args;
 } dispatchBuffer;
 
-layout(push_constant) uniform Params {
-    vec4  planes[6];
+layout(row_major, set = 0, binding = 4) uniform ViewBuffer {
+    MeshletCullView view;
+} viewBuffer;
 
+layout(push_constant) uniform Params {
     // x = 实例总数, y = 可见实例表的容量, z/w = 保留
     uvec4 params;
 } pc;
@@ -62,7 +64,7 @@ void main()
         return;
     }
 
-    if (!MeshletSphereVisible(sphereBuffer.spheres[index], pc.planes))
+    if (!MeshletSphereVisible(sphereBuffer.spheres[index], viewBuffer.view.planes))
     {
         return;
     }

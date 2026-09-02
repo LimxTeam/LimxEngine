@@ -1,0 +1,37 @@
+#version 450
+
+// ============================================================================
+// hiz_copy.comp — 把深度缓冲区拷进金字塔的第 0 级
+//
+// 不用 vkCmdCopyImage: 深度是 D32_SFLOAT 而金字塔是 R32_SFLOAT, 格式不同,
+// 拷贝命令要求两者格式兼容。走计算着色器还顺带解决了一件事 —— 金字塔的
+// 尺寸是**向上取整到二的幂之外的**原始尺寸, 与深度图一致, 不必对齐。
+//
+// 深度图按采样纹理读 (深度附件不能当存储图像), 金字塔按存储图像写。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depthTexture;
+layout(r32f, set = 0, binding = 1) uniform writeonly image2D targetLevel;
+
+layout(push_constant) uniform Params {
+    // x = 宽, y = 高, z/w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.params.x || pixel.y >= pc.params.y)
+    {
+        return;
+    }
+
+    // texelFetch 而不是 texture(): 要的是那一个纹素的原值, 不是过滤后的
+    // 结果。深度是非线性的, 插值出来的"深度"不对应任何一个真实表面。
+    const float depth = texelFetch(depthTexture, ivec2(pixel), 0).x;
+
+    imageStore(targetLevel, ivec2(pixel), vec4(depth, 0.0, 0.0, 0.0));
+}

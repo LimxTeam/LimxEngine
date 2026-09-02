@@ -1,0 +1,168 @@
+#version 450
+
+// ============================================================================
+// hiz_probe.comp — 遮挡测试的探针
+//
+// 这个着色器不参与渲染, 只为判据存在: 把 MeshletProjectSphere 与
+// MeshletHizMaxDepth 的**中间量**原样吐出来, 让 CPU 侧能逐个验它们的
+// 保守性。
+//
+// ── 为什么非要有它 ──
+//
+// 两阶段遮挡剔除是**自纠错**的: 第一阶段错剔了, 第二阶段拿重建后的金字塔
+// 一测就补回来了。于是"开关遮挡剔除画面必须相同"那条判据对遮挡测试本身的
+// 错误几乎是瞎的 —— 十一条变异里有八条它看不见, 因为它们全都只让第一阶段
+// 剔得**更狠**, 而更狠的那部分被第二阶段原封不动地补了回来。
+//
+// 画面是对的, 代价是第二阶段要重画一大堆。也就是说: 那八条变异损害的是
+// **效率**, 不是正确性 —— 而效率上的损害不该靠画面判据去抓。
+//
+// 所以要一条直接盯着这个函数的判据。探针把它的输入输出都摊开:
+//
+//   * 投出来的屏幕矩形    -> 必须**包得住**球的真实投影
+//   * 最近深度            -> 必须**不大于**球面上的真实最小深度
+//   * 金字塔查到的最大值  -> 必须**不小于**矩形范围内第 0 级的真实最大值
+//   * 遮挡结论            -> 必须等于 (最近深度 > 那个最大值)
+//
+// 四条都是**单向**的不等式 —— 保守的方向留着余量, 激进的方向一步都不让。
+// 错剔只可能来自激进的那一侧。
+// ============================================================================
+
+#extension GL_EXT_scalar_block_layout : require
+
+#include "meshlet_common.h"
+
+layout(local_size_x = 64) in;
+
+// 待测的包围球 (世界空间, xyz = 球心, w = 半径)
+layout(scalar, set = 0, binding = 0) readonly buffer ProbeBuffer {
+    vec4 spheres[];
+} probeBuffer;
+
+// 每个探针的结果
+//
+// 用 scalar 布局: std430 会把 vec4 之后的 float 挪到 16 字节的边界上, 而
+// C++ 侧那个结构体是紧排的。这个坑第十二天踩过一次 —— 表现是回读出来的
+// 数字整体错位, 而不是某个字段不对。
+struct ProbeResult {
+    vec4  rect;
+    float nearest;
+    float maximum;
+    float level;
+    uint  flags;      // 位 0 = 投影成功, 位 1 = 判定为遮挡
+};
+
+layout(scalar, set = 0, binding = 1) writeonly buffer ResultBuffer {
+    // 头部: 着色器**实际用的**视图矩阵与相机位置。
+    //
+    // CPU 侧要拿它算参考值。让着色器自己吐出来而不是 CPU 那边再算一遍,
+    // 是为了消掉"两边的矩阵约定不一致"这个可能 —— 那种不一致会让判据报
+    // 一堆假警报, 而假警报比漏报更容易让人把判据关掉。
+    // 逐**行**写出来, 不是写一个 mat4。
+    //
+    // mat4 在 scalar 存储缓冲区里按列存, 而 UBO 那边是 row_major —— 两个
+    // 约定摆在一句赋值的两侧, 读回 CPU 时到底是哪个顺序全靠猜。逐行取
+    // 一个下标一个下标地写就没得猜了。
+    vec4  viewProjRows[4];
+    vec4  cameraPosition;
+    vec4  screenParams;   // xy = 屏幕尺寸, z = 最高级数, w = 近平面
+
+    ProbeResult results[];
+} resultBuffer;
+
+layout(set = 0, binding = 2) uniform sampler2D hizPyramid;
+
+layout(row_major, set = 0, binding = 3) uniform ViewBuffer {
+    MeshletCullView view;
+} viewBuffer;
+
+layout(push_constant) uniform Params {
+    // x = 探针个数
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+
+    if (index == 0u)
+    {
+        for (int r = 0; r < 4; ++r)
+        {
+            // m[c][r] 是第 c 列第 r 行 —— 取一整行要固定 r 扫 c
+            resultBuffer.viewProjRows[r] = vec4(
+                viewBuffer.view.viewProj[0][r], viewBuffer.view.viewProj[1][r],
+                viewBuffer.view.viewProj[2][r],
+                viewBuffer.view.viewProj[3][r]);
+        }
+
+        resultBuffer.cameraPosition = vec4(viewBuffer.view.cameraPosition.xyz,
+                                           0.0);
+        resultBuffer.screenParams   = vec4(viewBuffer.view.hizParams.xy,
+                                           viewBuffer.view.hizParams.z,
+                                           viewBuffer.view.hizParams.w);
+    }
+
+    if (index >= pc.params.x)
+    {
+        return;
+    }
+
+    const vec4 sphere = probeBuffer.spheres[index];
+
+    vec4  rect    = vec4(0.0);
+    float nearest = 0.0;
+
+    const bool projected = MeshletProjectSphere(
+        sphere, viewBuffer.view.viewProj,
+        viewBuffer.view.cameraPosition.xyz, viewBuffer.view.hizParams.xy,
+        viewBuffer.view.hizParams.w, rect, nearest);
+
+    float level   = 0.0;
+    float maximum = -1.0;
+
+    if (projected)
+    {
+        maximum = MeshletHizMaxDepth(rect, hizPyramid,
+                                     viewBuffer.view.hizParams.xy,
+                                     viewBuffer.view.hizParams.z, level);
+    }
+
+    const bool occluded = projected && (maximum >= 0.0) && (nearest > maximum);
+
+    // 判定函数**本身**也要吐出来。
+    //
+    // 上面那个 occluded 是探针自己按 (最近深度, 最大值) 算的, 而实际参与
+    // 剔除的是 MeshletHizOccluded。两者必须一致 —— 不一致说明判定函数在
+    // 这两个数之外还掺了别的东西。
+    const bool byFunction =
+        projected && MeshletHizOccluded(rect, nearest, hizPyramid,
+                                        viewBuffer.view.hizParams.xy,
+                                        viewBuffer.view.hizParams.z);
+
+    // 相等的边界 —— 把查到的最大值**原样**当成最近深度喂回去。
+    //
+    // 判定用的是严格大于: 相等时那个包围体就是那个遮挡物 (自己挡自己),
+    // 剔掉它画面上就少一块。改成大于等于的话画面上确实会少东西, 但那要求
+    // 两个浮点数**恰好**相等 —— 真实场景里包围球的最近点严格在几何体前面,
+    // 这个条件的测度是零, 于是那条变异在任何画面判据下都逃得掉。
+    //
+    // 这里把相等造出来: 同一个矩形查出来的最大值再喂回同一个函数, 两边
+    // 逐位相同。正确的实现必然返回"没挡住"。
+    const bool atEquality =
+        projected && (maximum >= 0.0) &&
+        MeshletHizOccluded(rect, maximum, hizPyramid,
+                           viewBuffer.view.hizParams.xy,
+                           viewBuffer.view.hizParams.z);
+
+    ProbeResult result;
+
+    result.rect    = rect;
+    result.nearest = nearest;
+    result.maximum = maximum;
+    result.level   = level;
+    result.flags   = (projected ? 1u : 0u) | (occluded ? 2u : 0u) |
+                     (byFunction ? 4u : 0u) | (atEquality ? 8u : 0u);
+
+    resultBuffer.results[index] = result;
+}

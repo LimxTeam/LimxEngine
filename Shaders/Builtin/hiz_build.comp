@@ -1,0 +1,78 @@
+#version 450
+
+// ============================================================================
+// hiz_build.comp — 层次深度金字塔的一级
+//
+// 每一级的一个纹素 = 上一级对应 2x2 区域的**最大**深度。
+//
+// ── 为什么是最大而不是最小 ──
+//
+// 遮挡测试问的是"这个包围体是不是被完全挡住了"。要说"完全", 就得保证它
+// 覆盖的**每一个**像素上都有更近的东西挡着 —— 于是要拿那片区域里**最远**
+// 的那个遮挡物来比: 连最远的遮挡物都比它近, 才算全挡住。
+//
+// 取最小的话得到的是"至少有一个像素被挡住", 而那会把只挡住一角的物体整个
+// 剔掉 —— 画面上凭空少一块, 且只在特定视角出现。
+//
+// ── 奇数尺寸 ──
+//
+// 每一级的尺寸是上一级除以二**向上取整**。向下取整的话最后一行/列会被丢掉,
+// 而那一条边上的遮挡信息就没了 —— 边缘的物体会被判成"没有遮挡物"从而不剔,
+// 那是保守的 (不会错剔), 但白白损失剔除率。
+//
+// 向上取整之后, 边界处的 2x2 里有一半落在上一级之外; 那时用钳边取样, 于是
+// 取到的是同一个纹素两次 —— 最大值不变, 仍然保守。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, set = 0, binding = 0) uniform readonly image2D sourceLevel;
+layout(r32f, set = 0, binding = 1) uniform writeonly image2D targetLevel;
+
+layout(push_constant) uniform Params {
+    // x = 上一级宽, y = 上一级高, z = 本级宽, w = 本级高
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.params.z || pixel.y >= pc.params.w)
+    {
+        return;
+    }
+
+    const uvec2 sourceSize = pc.params.xy;
+
+    const uvec2 base = pixel * 2u;
+
+    // 收哪几个纹素。
+    //
+    // 通常是 2x2。但 Vulkan 的 mip 尺寸是**向下取整**的, 于是上一级尺寸是
+    // 奇数时最后一行/列没有对应的目标纹素 —— 不收的话那一行的遮挡信息就
+    // 丢了, 而丢了会让最大值**偏小**。
+    //
+    // 偏小是**错剔**的方向: 遮挡测试是"包围体最近处比这片区域最远的遮挡物
+    // 还远就剔", 最大值偏小意味着更容易成立。画面上少一块, 而那与"这一块
+    // 本来就该被剔"长得一样。
+    //
+    // 所以最后一个目标纹素要一直收到源的边界 —— 最多 3x3。
+    const uvec2 last = uvec2(
+        (pixel.x + 1u == pc.params.z) ? (sourceSize.x - 1u)
+                                      : min(base.x + 1u, sourceSize.x - 1u),
+        (pixel.y + 1u == pc.params.w) ? (sourceSize.y - 1u)
+                                      : min(base.y + 1u, sourceSize.y - 1u));
+
+    float maximum = 0.0;
+
+    for (uint y = base.y; y <= last.y; ++y)
+    {
+        for (uint x = base.x; x <= last.x; ++x)
+        {
+            maximum = max(maximum, imageLoad(sourceLevel, ivec2(x, y)).x);
+        }
+    }
+
+    imageStore(targetLevel, ivec2(pixel), vec4(maximum, 0.0, 0.0, 0.0));
+}

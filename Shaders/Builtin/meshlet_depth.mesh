@@ -73,7 +73,13 @@ layout(row_major, push_constant) uniform Params {
 
 void main()
 {
-    const uint slot = gl_WorkGroupID.x;
+    // params.y 是起始槽位。
+    //
+    // 两阶段遮挡剔除下这个通道要跑两次: 第一次从 0 开始画第一阶段的结果,
+    // 第二次从第一阶段的末尾开始画第二阶段补上来的。没有这个偏移的话
+    // 第二次会把第一阶段的东西再画一遍 —— 深度测试下画面看不出来, 但
+    // 那是白白多一倍的光栅化。
+    const uint slot = pc.params.y + gl_WorkGroupID.x;
 
     if (slot >= pc.params.x)
     {

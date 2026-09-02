@@ -168,6 +168,34 @@ public:
     /// bindless 材质下标 (0xFFFFFFFF = 这里没有几何体)。
     LIMX_NODISCARD FRHIBufferHandle GetResolveBuffer(UInt32 frameIndex) const;
 
+    /// 两阶段遮挡剔除开关
+    ///
+    /// 打开之后本通道多做三件事: 画完第一阶段就地建一次金字塔、把第一阶段
+    /// 被遮挡剔掉的重测一遍、把活下来的补画一遍。
+    ///
+    /// **单阶段是不够的。** 第一阶段用的是上一帧的金字塔, 而这一帧才露出来
+    /// 的东西会被它判成"挡住了" —— 表现为物体闪一帧才出现。第二阶段用这一
+    /// 帧的深度重测, 那条近似就没了。
+    void SetOcclusionCullEnabled(bool enabled);
+
+    LIMX_NODISCARD bool IsOcclusionCullEnabled() const
+    {
+        return m_OcclusionCull;
+    }
+
+    /// 层次深度金字塔 —— 只作诊断与判据
+    LIMX_NODISCARD FRHITextureHandle GetHizTexture() const
+    {
+        return m_HizTexture;
+    }
+
+    LIMX_NODISCARD UInt32 GetHizLevelCount() const { return m_HizLevels; }
+
+    LIMX_NODISCARD FRHIExtent2D GetHizExtent() const { return m_Extent; }
+
+    /// 第二阶段补画了多少个 meshlet (上一帧的数)
+    LIMX_NODISCARD UInt32 GetPhase2Meshlets() const { return m_Phase2Meshlets; }
+
     /// 材质解析开关
     ///
     /// 与光栅化分开: 合在一起的话, "解析整个没跑"与"解析跑了但结果不对"
@@ -181,6 +209,9 @@ private:
     ERHIResult CreateRenderPass(IRHIDevice* device);
     ERHIResult CreatePipelines(IRHIDevice* device);
     ERHIResult CreateDescriptors(IRHIDevice* device, UInt32 frameCount);
+    ERHIResult CreateHizResources(IRHIDevice* device, FRHIExtent2D extent);
+
+    void BuildHiz(IRHICommandBuffer* commandBuffer, UInt32 frameIndex);
 
     void DestroyDepthTarget(IRHIDevice* device);
 
@@ -202,6 +233,20 @@ private:
     FRHITextureViewHandle m_VisibilityView;
     FRHIRenderPassHandle  m_RenderPass;
     FRHIFramebufferHandle m_Framebuffer;
+
+    /// 第二遍用的渲染通道 —— 附件**加载**而不是清除
+    ///
+    /// 与第一遍只差 LoadOp 与初始布局。Vulkan 要求管线与渲染通道兼容,
+    /// 而"兼容"不看 LoadOp —— 但清除值的语义不同, 所以还是分成两个,
+    /// 免得靠"兼容性恰好允许"来成立。
+    FRHIRenderPassHandle  m_LoadRenderPass;
+    FRHIFramebufferHandle m_LoadFramebuffer;
+
+    FRHIGraphicsPipelineHandle m_MeshPipelineLoad;
+    FRHIGraphicsPipelineHandle m_FallbackPipelineLoad;
+
+    /// 建管线时选哪个渲染通道 —— 只在 CreatePipelines 里短暂为真
+    bool m_UseLoadRenderPass = false;
 
     /// 展开出来的顶点流与间接绘制参数 (逐并行帧)
     TArray<FRHIBufferHandle> m_ExpandedBuffers;
@@ -230,6 +275,53 @@ private:
     FRHIGraphicsPipelineHandle m_MeshPipeline;
     FRHIComputePipelineHandle  m_ExpandPipeline;
     FRHIGraphicsPipelineHandle m_FallbackPipeline;
+
+    // ---- 两阶段遮挡剔除 ----
+    bool m_OcclusionCull = false;
+
+    /// 层次深度金字塔 —— mip 0 与深度图同尺寸, 逐级减半 (向上取整)
+    ///
+    /// 尺寸不对齐到二的幂: 对齐要么放大 (浪费显存与带宽) 要么缩小
+    /// (丢掉边上的遮挡信息)。向上取整的逐级减半在边界上用钳边取样,
+    /// 取到同一个纹素两次 —— 最大值不变, 仍然保守。
+    FRHITextureHandle              m_HizTexture;
+    TArray<FRHITextureViewHandle>  m_HizLevelViews;
+    FRHITextureViewHandle          m_HizFullView;
+    FRHISamplerHandle              m_HizSampler;
+
+    UInt32 m_HizLevels = 0;
+
+    FRHIDescSetLayoutHandle   m_HizCopySetLayout;
+    FRHIDescSetLayoutHandle   m_HizBuildSetLayout;
+    FRHIPipelineLayoutHandle  m_HizCopyLayout;
+    FRHIPipelineLayoutHandle  m_HizBuildLayout;
+    FRHIComputePipelineHandle m_HizCopyPipeline;
+    FRHIComputePipelineHandle m_HizBuildPipeline;
+    FRHIShaderHandle          m_HizCopyShader;
+    FRHIShaderHandle          m_HizBuildShader;
+
+    FRHIDescriptorSetHandle         m_HizCopySet;
+    TArray<FRHIDescriptorSetHandle> m_HizBuildSets;
+
+    FRHISamplerHandle m_DepthSampler;
+
+    /// 第二阶段
+    FRHIDescSetLayoutHandle         m_Phase2SetLayout;
+    FRHIPipelineLayoutHandle        m_Phase2Layout;
+    FRHIComputePipelineHandle       m_Phase2Pipeline;
+    FRHIShaderHandle                m_Phase2Shader;
+    TArray<FRHIDescriptorSetHandle> m_Phase2Sets;
+
+    /// 第二阶段的间接分派参数与第二次绘制的间接参数
+    TArray<FRHIBufferHandle> m_Phase2DispatchBuffers;
+    TArray<FRHIBufferHandle> m_Phase2RasterArgsBuffers;
+
+    /// 第一阶段画完时的可见数 —— 第二次绘制从这里往后画
+    TArray<FRHIBufferHandle> m_Phase1CountBuffers;
+    TArray<FRHIBufferHandle> m_Phase1Readbacks;
+    TArray<FRHIBufferHandle> m_Phase2FinalReadbacks;
+
+    UInt32 m_Phase2Meshlets = 0;
 
     // ---- 材质解析 ----
     bool m_ResolveEnabled = false;

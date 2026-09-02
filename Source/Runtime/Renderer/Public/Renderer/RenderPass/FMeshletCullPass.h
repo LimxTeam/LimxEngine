@@ -87,6 +87,32 @@ static_assert(sizeof(FMeshletInstanceGpu) == 80,
               "MeshletInstance 逐字段一致");
 
 // ============================================================================
+// FMeshletCullViewGpu — 与 meshlet_common.h 的 MeshletCullView 一致
+//
+// 逐视图的剔除参数。放 UBO 而不是 push constant: 六个平面 + 视图投影矩阵
+// + 相机位置 + 金字塔参数是 192 字节, 而 Vulkan 只保证 push constant 有
+// **128 字节**。在这台机器上塞得下是碰巧, 而靠碰巧成立的东西会在别人的
+// 机器上让 vkCreatePipelineLayout 直接失败。
+// ============================================================================
+
+struct FMeshletCullViewGpu
+{
+    Float32 Planes[6][4] = {};
+
+    /// 行主序, 与着色器的 row_major 声明一致
+    Float32 ViewProj[16] = {};
+
+    Float32 CameraPosition[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    /// x = 屏幕宽, y = 屏幕高, z = 金字塔最高级, w = 近裁剪面
+    Float32 HizParams[4] = { 0.0f, 0.0f, 0.0f, 0.1f };
+};
+
+static_assert(sizeof(FMeshletCullViewGpu) == 192,
+              "FMeshletCullViewGpu 必须是 192 字节 — 与 meshlet_common.h 的 "
+              "MeshletCullView 逐字段一致");
+
+// ============================================================================
 // FMeshletCullStats — 一次剔除的结果
 // ============================================================================
 
@@ -99,6 +125,9 @@ struct FMeshletCullStats
     UInt32 MeshletsVisible = 0;
     UInt32 MeshletsCulledByFrustum = 0;
     UInt32 MeshletsCulledByBackface = 0;
+
+    /// 第一阶段被遮挡剔掉、进了待定表的数量
+    UInt32 MeshletsPending = 0;
 };
 
 // ============================================================================
@@ -161,6 +190,37 @@ public:
     {
         return m_CameraPosition;
     }
+
+    /// 遮挡剔除开关
+    ///
+    /// 与视锥/背面分开, 理由同: 合在一起的话"遮挡整个没生效"与"视锥多剔了
+    /// 一点"在总数上分不开。
+    void SetOcclusionCullEnabled(bool enabled) { m_OcclusionCull = enabled; }
+
+    LIMX_NODISCARD bool IsOcclusionCullEnabled() const
+    {
+        return m_OcclusionCull;
+    }
+
+    /// 上一帧的层次深度金字塔 —— 由光栅化通道在画完之后填给它
+    ///
+    /// 传空视图表示"还没有可用的金字塔", 那时遮挡剔除自动不生效 (而不是
+    /// 拿一张未初始化的图去判)。
+    void SetHizPyramid(FRHITextureViewHandle view, FRHISamplerHandle sampler,
+                       UInt32 width, UInt32 height, UInt32 levelCount);
+
+    /// 待定表 (第一阶段被遮挡剔掉的) 与它的计数器
+    LIMX_NODISCARD FRHIBufferHandle GetPendingBuffer(UInt32 frameIndex) const;
+
+    LIMX_NODISCARD FRHIBufferHandle GetPendingCounterBuffer(
+        UInt32 frameIndex) const;
+
+    /// 逐视图参数的 UBO —— 第二阶段也要用同一份
+    LIMX_NODISCARD FRHIBufferHandle GetViewBuffer(UInt32 frameIndex) const;
+
+    LIMX_NODISCARD static UInt64 GetPendingBufferBytes();
+
+    LIMX_NODISCARD static UInt64 GetViewBufferBytes();
 
     /// 背面剔除 (法线锥) 开关 —— 独立于视锥剔除
     ///
@@ -282,6 +342,39 @@ private:
 
     bool m_Enabled = false;
     bool m_BackfaceCull = true;
+    bool m_OcclusionCull = false;
+
+    /// 上一帧的金字塔 —— 空表示还没有
+    FRHITextureViewHandle m_HizView;
+    FRHISamplerHandle     m_HizSampler;
+
+    UInt32 m_HizWidth = 0;
+    UInt32 m_HizHeight = 0;
+    UInt32 m_HizLevels = 0;
+
+    /// 逐帧记"这一帧的描述符集里绑的是哪个金字塔"
+    ///
+    /// 一次把所有帧的集都改掉是不行的: 别的帧下标的描述符集可能正在被
+    /// 在飞的命令缓冲区用着, 而 vkUpdateDescriptorSets 不允许改在用的集
+    /// (除非开 descriptor_indexing 的 UPDATE_AFTER_BIND)。
+    ///
+    /// 只改**当前帧**那一个 —— 那一个的栅栏刚等过, 一定不在飞。
+    TArray<FRHITextureViewHandle> m_BoundHizViews;
+
+    /// 1x1 的"没有遮挡物"纹理
+    ///
+    /// 描述符集里**不能有没写过的绑定** —— Vulkan 在提交时就拒绝, 与着色器
+    /// 里那个 if 判不判无关。着色器静态引用了这个采样器, 所以它必须始终
+    /// 指向一张合法的图。
+    ///
+    /// 内容是 1.0 (最远)。遮挡测试拿它比的话恒为"没挡住" —— 于是即使
+    /// 那个开关判错了, 退化行为也是"不剔", 而不是把整个场景剔光。
+    /// 与法线哨兵同一个思路: 兜底值要让错误落在安全的那一侧。
+    FRHITextureHandle     m_DummyHizTexture;
+    FRHITextureViewHandle m_DummyHizView;
+    FRHISamplerHandle     m_HizDefaultSampler;
+
+    bool m_DummyHizInitialized = false;
 
     FFrustum m_Frustum;
     FVector3 m_CameraPosition = FVector3(0.0f, 0.0f, 0.0f);
@@ -325,6 +418,13 @@ private:
     TArray<FRHIBufferHandle> m_CounterBuffers;
     TArray<FRHIBufferHandle> m_CounterReadbacks;
     TArray<FRHIBufferHandle> m_RasterArgsBuffers;
+    TArray<FRHIBufferHandle> m_PendingBuffers;
+    TArray<FRHIBufferHandle> m_PendingCounterBuffers;
+    TArray<FRHIBufferHandle> m_PendingReadbacks;
+
+    /// 上一轮读回来的待定数
+    UInt32 m_LastPendingCount = 0;
+    TArray<FRHIBufferHandle> m_ViewBuffers;
 
     TArray<FRHIDescriptorSetHandle> m_InstanceCullSets;
     TArray<FRHIDescriptorSetHandle> m_MeshletCullSets;

@@ -51,13 +51,30 @@ layout(std430, set = 0, binding = 4) buffer CounterBuffer {
     uvec4 counters;
 } counterBuffer;
 
+// 第一阶段被**遮挡**剔掉的 (实例, meshlet) 对。
+//
+// 只收被遮挡剔掉的, 不收被视锥或背面剔掉的: 后两者与相机的关系这一帧
+// 不会再变, 重测一遍是纯浪费。而遮挡用的是**上一帧**的金字塔, 这一帧
+// 的深度画完之后结论可能翻转 —— 那正是第二阶段存在的理由。
+layout(std430, set = 0, binding = 5) writeonly buffer PendingBuffer {
+    uvec2 pending[];
+} pendingBuffer;
+
+// x = 待定数, y/z/w = 保留
+layout(std430, set = 0, binding = 6) buffer PendingCounterBuffer {
+    uvec4 counters;
+} pendingCounter;
+
+// 上一帧的层次深度金字塔
+layout(set = 0, binding = 7) uniform sampler2D hizPyramid;
+
+layout(row_major, set = 0, binding = 8) uniform ViewBuffer {
+    MeshletCullView view;
+} viewBuffer;
+
 layout(push_constant) uniform Params {
-    vec4 planes[6];
-
-    // xyz = 相机世界位置, w = 保留
-    vec4 cameraPosition;
-
-    // x = 可见实例数, y = 输出表容量, z = 背面剔除开关, w = 保留
+    // x = 可见实例数, y = 输出表容量, z = 背面剔除开关,
+    // w = 遮挡剔除开关 (0 = 关; 金字塔无效时 C++ 侧就传 0)
     uvec4 params;
 } pc;
 
@@ -90,7 +107,7 @@ void main()
 
         atomicAdd(counterBuffer.counters.w, 1u);
 
-        if (!MeshletSphereVisible(worldSphere, pc.planes))
+        if (!MeshletSphereVisible(worldSphere, viewBuffer.view.planes))
         {
             atomicAdd(counterBuffer.counters.y, 1u);
             continue;
@@ -98,12 +115,46 @@ void main()
 
         if (pc.params.z != 0u &&
             MeshletBackfaceCull(meshlet.normalCone, worldSphere,
-                                pc.cameraPosition.xyz, instance.transformRow0,
+                                viewBuffer.view.cameraPosition.xyz, instance.transformRow0,
                                 instance.transformRow1,
                                 instance.transformRow2))
         {
             atomicAdd(counterBuffer.counters.z, 1u);
             continue;
+        }
+
+        // ---- 遮挡剔除 ----
+        //
+        // 用的是**上一帧**的金字塔, 所以结论可能是错的 (这一帧才露出来的
+        // 东西会被判成挡住)。被它剔掉的进待定表, 等这一帧的深度画完、
+        // 金字塔重建之后再测一遍 —— 那是第二阶段。
+        //
+        // 单阶段的话这里就是最终答案, 而"上一帧挡住这一帧露出来"表现为
+        // 物体闪一帧才出现。两阶段之后这条路上不再有近似。
+        if (pc.params.w != 0u)
+        {
+            vec4  rect    = vec4(0.0);
+            float nearest = 0.0;
+
+            const bool projected = MeshletProjectSphere(
+                worldSphere, viewBuffer.view.viewProj, viewBuffer.view.cameraPosition.xyz,
+                viewBuffer.view.hizParams.xy, viewBuffer.view.hizParams.w, rect, nearest);
+
+            if (projected &&
+                MeshletHizOccluded(rect, nearest, hizPyramid,
+                                   viewBuffer.view.hizParams.xy, viewBuffer.view.hizParams.z))
+            {
+                const uint pendingSlot =
+                    atomicAdd(pendingCounter.counters.x, 1u);
+
+                if (pendingSlot < pc.params.y)
+                {
+                    pendingBuffer.pending[pendingSlot] =
+                        uvec2(instanceIndex, meshletIndex);
+                }
+
+                continue;
+            }
         }
 
         const uint slot = atomicAdd(counterBuffer.counters.x, 1u);

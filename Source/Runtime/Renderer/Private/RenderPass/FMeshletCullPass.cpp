@@ -28,34 +28,19 @@ namespace
 
 constexpr UInt32 kCullWorkgroupSize = 64;
 
-/// 与 meshlet_cull_instance.comp 的 push constant 块逐字段一致
-struct FInstanceCullPushConstants
+/// 三个剔除着色器共用的 push constant 形状
+///
+/// 逐视图的东西 (平面、矩阵、相机、金字塔参数) 全在 UBO 里 —— 见
+/// FMeshletCullViewGpu 上面那段。留在 push constant 里的只有这一帧的
+/// 计数与开关, 十六个字节。
+struct FCullPushConstants
 {
-    Float32 Planes[6][4] = {};
-
-    /// x = 实例总数, y = 可见实例表容量, z/w = 保留
     UInt32 Params[4] = { 0, 0, 0, 0 };
 };
 
-static_assert(sizeof(FInstanceCullPushConstants) == 112,
-              "FInstanceCullPushConstants 必须是 112 字节 — 与 "
-              "meshlet_cull_instance.comp 的 push constant 块逐字段一致");
-
-/// 与 meshlet_cull.comp 的 push constant 块逐字段一致
-struct FMeshletCullPushConstants
-{
-    Float32 Planes[6][4] = {};
-
-    /// xyz = 相机世界位置, w = 保留
-    Float32 CameraPosition[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-    /// x = 可见实例数, y = 输出表容量, z = 背面剔除开关, w = 保留
-    UInt32 Params[4] = { 0, 0, 0, 0 };
-};
-
-static_assert(sizeof(FMeshletCullPushConstants) == 128,
-              "FMeshletCullPushConstants 必须是 128 字节 — 与 "
-              "meshlet_cull.comp 的 push constant 块逐字段一致");
+static_assert(sizeof(FCullPushConstants) == 16,
+              "FCullPushConstants 必须是 16 字节 — 与三个剔除着色器的 "
+              "push constant 块逐字段一致");
 
 /// 汇总缓冲区的字节数
 constexpr UInt64 kSceneMeshletBytes =
@@ -106,6 +91,13 @@ constexpr UInt64 kCounterBytes = sizeof(UInt32) * 4;
 
 /// 光栅化间接参数 —— (groupCountX, groupCountY, groupCountZ, 保留)
 constexpr UInt64 kRasterArgsBytes = sizeof(UInt32) * 4;
+
+/// 待定表 —— 与可见表同样大 (最坏情况下每个 meshlet 都被遮挡剔掉)
+constexpr UInt64 kPendingBytes = kVisibleMeshletBytes;
+
+constexpr UInt64 kPendingCounterBytes = sizeof(UInt32) * 4;
+
+constexpr UInt64 kViewBytes = sizeof(FMeshletCullViewGpu);
 
 } // namespace
 
@@ -292,12 +284,66 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
         }
 
         m_RasterArgsBuffers.Add(rasterArgs);
+
+        // 待定表 + 它的计数器 + 逐视图 UBO
+        {
+            FRHIBufferHandle pending;
+            FRHIBufferHandle pendingCounter;
+            FRHIBufferHandle view;
+
+            ERHIResult extra =
+                Create(kPendingBytes, storageAndTransfer,
+                       EMemoryUsage::GpuOnly, "MeshletPending", pending);
+
+            if (IsRHISuccess(extra))
+            {
+                extra = Create(kPendingCounterBytes, storageAndTransfer,
+                               EMemoryUsage::GpuOnly, "MeshletPendingCounter",
+                               pendingCounter);
+            }
+
+            if (IsRHISuccess(extra))
+            {
+                extra = Create(kViewBytes, EBufferUsage::UniformBuffer,
+                               EMemoryUsage::CpuToGpu, "MeshletCullView",
+                               view);
+            }
+
+            if (!IsRHISuccess(extra))
+            {
+                return extra;
+            }
+
+            m_PendingBuffers.Add(pending);
+            FRHIBufferHandle pendingReadback;
+
+            {
+                const ERHIResult readbackResult =
+                    Create(kPendingCounterBytes, EBufferUsage::TransferDst,
+                           EMemoryUsage::GpuToCpu, "MeshletPendingReadback",
+                           pendingReadback);
+
+                if (!IsRHISuccess(readbackResult))
+                {
+                    return readbackResult;
+                }
+            }
+
+            m_PendingReadbacks.Add(pendingReadback);
+            m_PendingCounterBuffers.Add(pendingCounter);
+            m_ViewBuffers.Add(view);
+        }
     }
 
     // ---- 归零用的拷贝源 ----
     {
         FRHIBufferDesc bufferDesc = {};
-        bufferDesc.Size = kCounterBytes + kDispatchBytes + kRasterArgsBytes;
+        // 多四个字节放 1.0f —— 兜底金字塔的清除值。
+        //
+        // 不能拿前面那些 0 去清: 0.0f 是"最近", 拿它当遮挡深度的话**一切
+        // 都被判成挡住了**, 整个场景消失。兜底值必须落在安全的那一侧。
+        bufferDesc.Size =
+            kCounterBytes + kDispatchBytes + kRasterArgsBytes + sizeof(UInt32);
         bufferDesc.Usage       = EBufferUsage::TransferSrc;
         bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
         bufferDesc.DebugName   = "MeshletCullResetSource";
@@ -335,15 +381,81 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
             values[10] = 1;
             values[11] = 0;
 
+            // 兜底金字塔的清除值: 1.0f 的位模式 = 最远 = 什么都挡不住
+            values[12] = 0x3F800000u;
+
             device->UnmapBuffer(m_ResetSource);
         }
     }
 
+    // ---- 1x1 的"没有遮挡物"纹理 ----
+    //
+    // 见头文件里那段: 描述符集里不能有没写过的绑定。
+    {
+        FRHITextureDesc texDesc = {};
+        texDesc.Type        = ETextureType::Texture2D;
+        texDesc.Format      = EPixelFormat::R32_SFLOAT;
+        texDesc.Extent      = { 1, 1, 1 };
+        texDesc.MipLevels   = 1;
+        texDesc.ArrayLayers = 1;
+        texDesc.Samples     = ESampleCount::Count1;
+        texDesc.Usage       = static_cast<ETextureUsage>(
+            static_cast<UInt32>(ETextureUsage::Sampled) |
+            static_cast<UInt32>(ETextureUsage::TransferDst));
+        texDesc.MemoryUsage = EMemoryUsage::GpuOnly;
+        texDesc.DebugName   = "MeshletHizDummy";
+
+        ERHIResult result = device->CreateTexture(texDesc, m_DummyHizTexture);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHITextureViewDesc viewDesc = {};
+        viewDesc.Texture         = m_DummyHizTexture;
+        viewDesc.ViewType        = ETextureType::Texture2D;
+        viewDesc.Format          = EPixelFormat::R32_SFLOAT;
+        viewDesc.BaseMipLevel    = 0;
+        viewDesc.MipLevelCount   = 1;
+        viewDesc.BaseArrayLayer  = 0;
+        viewDesc.ArrayLayerCount = 1;
+
+        result = device->CreateTextureView(viewDesc, m_DummyHizView);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        // 金字塔的采样器: 最近邻 + 钳边。
+        //
+        // 线性过滤是错的 —— 插值出来的"最大深度"不是任何一片区域的最大
+        // 深度, 而遮挡测试的保守性正建立在"那个数确实是最大值"上。
+        FRHISamplerDesc samplerDesc = {};
+        samplerDesc.MinFilter    = EFilter::Nearest;
+        samplerDesc.MagFilter    = EFilter::Nearest;
+        samplerDesc.MipmapMode   = ESamplerMipmapMode::Nearest;
+        samplerDesc.AddressModeU = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.AddressModeV = ESamplerAddressMode::ClampToEdge;
+        samplerDesc.AddressModeW = ESamplerAddressMode::ClampToEdge;
+
+
+        result = device->CreateSampler(samplerDesc, m_HizDefaultSampler);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        m_HizSampler = m_HizDefaultSampler;
+    }
+
     // ---- 描述符 ----
     {
-        FRHIDescriptorBinding bindings[5] = {};
+        FRHIDescriptorBinding bindings[9] = {};
 
-        for (UInt32 i = 0; i < 5; ++i)
+        for (UInt32 i = 0; i < 9; ++i)
         {
             bindings[i].Binding    = i;
             bindings[i].Type       = EDescriptorType::StorageBuffer;
@@ -351,9 +463,12 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
             bindings[i].StageFlags = EShaderStage::Compute;
         }
 
+        // 第一级: 0..3 是存储缓冲区, 4 是逐视图 UBO
+        bindings[4].Type = EDescriptorType::UniformBuffer;
+
         FRHIDescSetLayoutDesc layoutDesc = {};
         layoutDesc.Bindings     = bindings;
-        layoutDesc.BindingCount = 4;
+        layoutDesc.BindingCount = 5;
         layoutDesc.DebugName    = "MeshletInstanceCullSetLayout";
 
         ERHIResult result =
@@ -364,7 +479,12 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
             return result;
         }
 
-        layoutDesc.BindingCount = 5;
+        // 第二级: 0..6 是存储缓冲区, 7 是金字塔 (采样器), 8 是逐视图 UBO
+        bindings[4].Type = EDescriptorType::StorageBuffer;
+        bindings[7].Type = EDescriptorType::CombinedImageSampler;
+        bindings[8].Type = EDescriptorType::UniformBuffer;
+
+        layoutDesc.BindingCount = 9;
         layoutDesc.DebugName    = "MeshletCullSetLayout";
 
         result = device->CreateDescSetLayout(layoutDesc, m_MeshletCullSetLayout);
@@ -386,7 +506,7 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
                 return result;
             }
 
-            FRHIDescriptorWrite instanceWrites[4];
+            FRHIDescriptorWrite instanceWrites[5];
 
             instanceWrites[0] = FRHIDescriptorWrite::StorageBuffer(
                 instanceSet, 0, m_InstanceBuffers[i], 0, kInstanceBytes);
@@ -398,8 +518,10 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
                 kVisibleInstanceBytes);
             instanceWrites[3] = FRHIDescriptorWrite::StorageBuffer(
                 instanceSet, 3, m_DispatchBuffers[i], 0, kDispatchBytes);
+            instanceWrites[4] = FRHIDescriptorWrite::UniformBuffer(
+                instanceSet, 4, m_ViewBuffers[i], 0, kViewBytes);
 
-            device->UpdateDescriptorSets(instanceWrites, 4);
+            device->UpdateDescriptorSets(instanceWrites, 5);
 
             m_InstanceCullSets.Add(instanceSet);
 
@@ -413,7 +535,13 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
                 return result;
             }
 
-            FRHIDescriptorWrite meshletWrites[5];
+            // 金字塔那一格 (binding 7) 在这里先不写 —— 它要等光栅化
+            // 通道把纹理建好。Execute 里看到金字塔换了就补写。
+            //
+            // 描述符集里有未写的绑定时**不能**提交给使用它的管线, 所以
+            // 遮挡剔除在金字塔就绪之前必须是关的 —— C++ 侧那个开关就是
+            // 这么用的, 而不是"传个 0 让着色器自己跳过"。
+            FRHIDescriptorWrite meshletWrites[8];
 
             meshletWrites[0] = FRHIDescriptorWrite::StorageBuffer(
                 meshletSet, 0, m_InstanceBuffers[i], 0, kInstanceBytes);
@@ -427,8 +555,24 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
                 kVisibleMeshletBytes);
             meshletWrites[4] = FRHIDescriptorWrite::StorageBuffer(
                 meshletSet, 4, m_CounterBuffers[i], 0, kCounterBytes);
+            meshletWrites[5] = FRHIDescriptorWrite::StorageBuffer(
+                meshletSet, 5, m_PendingBuffers[i], 0, kPendingBytes);
+            meshletWrites[6] = FRHIDescriptorWrite::StorageBuffer(
+                meshletSet, 6, m_PendingCounterBuffers[i], 0,
+                kPendingCounterBytes);
+            meshletWrites[7] = FRHIDescriptorWrite::UniformBuffer(
+                meshletSet, 8, m_ViewBuffers[i], 0, kViewBytes);
 
-            device->UpdateDescriptorSets(meshletWrites, 5);
+            device->UpdateDescriptorSets(meshletWrites, 8);
+
+            // 金字塔那一格先指向 1x1 的兜底图。真的金字塔就绪之后
+            // Execute 会补写。
+            const FRHIDescriptorWrite hizWrite =
+                FRHIDescriptorWrite::CombinedImageSampler(
+                    meshletSet, 7, m_DummyHizView, m_HizDefaultSampler,
+                    EImageLayout::ShaderReadOnly);
+
+            device->UpdateDescriptorSets(&hizWrite, 1);
 
             m_MeshletCullSets.Add(meshletSet);
         }
@@ -464,7 +608,7 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
         FRHIPushConstantRange pushRange = {};
         pushRange.StageFlags = EShaderStage::Compute;
         pushRange.Offset     = 0;
-        pushRange.Size       = sizeof(FInstanceCullPushConstants);
+        pushRange.Size       = sizeof(FCullPushConstants);
 
         FRHIPipelineLayoutDesc layoutDesc = {};
         layoutDesc.SetLayouts             = &m_InstanceCullSetLayout;
@@ -481,7 +625,6 @@ ERHIResult FMeshletCullPass::Setup(const FPassSetupDesc& desc)
             return result;
         }
 
-        pushRange.Size            = sizeof(FMeshletCullPushConstants);
         layoutDesc.SetLayouts     = &m_MeshletCullSetLayout;
         layoutDesc.DebugName      = "MeshletCullLayout";
 
@@ -895,7 +1038,22 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
             m_Stats.MeshletsCulledByBackface = counters[2];
             m_Stats.MeshletsTested           = counters[3];
 
+            // 待定数在另一份缓冲区里, 见下面那段。
+            m_Stats.MeshletsPending = m_LastPendingCount;
+
             m_Device->UnmapBuffer(m_CounterReadbacks[context.FrameIndex]);
+        }
+
+        void* pendingMapped = nullptr;
+
+        if (IsRHISuccess(m_Device->MapBuffer(
+                m_PendingReadbacks[context.FrameIndex], &pendingMapped)) &&
+            pendingMapped != nullptr)
+        {
+            m_LastPendingCount =
+                static_cast<const UInt32*>(pendingMapped)[0];
+
+            m_Device->UnmapBuffer(m_PendingReadbacks[context.FrameIndex]);
         }
     }
 
@@ -905,6 +1063,42 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
     }
 
     commandBuffer->BeginDebugLabel("MeshletCullPass", 0.9f, 0.6f, 0.3f);
+
+    // 首帧把兜底金字塔清成 1.0 (最远)。
+    //
+    // Setup 里没有命令缓冲区可用, 所以只能挪到这里。不清的话它是未初始化
+    // 的显存 —— 虽然开关关着时着色器不会去采它, 但"靠一个分支不被走到来
+    // 保证正确"是本周期反复否定过的那类推理。
+    if (!m_DummyHizInitialized)
+    {
+        commandBuffer->TransitionImageLayout(
+            m_DummyHizTexture, EImageLayout::Undefined,
+            EImageLayout::TransferDst, EPipelineStageFlags::TopOfPipe,
+            EPipelineStageFlags::Transfer, EAccessFlags::None,
+            EAccessFlags::TransferWrite);
+
+        FRHIBufferTextureCopyRegion region = {};
+        region.BufferOffset =
+            kCounterBytes + kDispatchBytes + kRasterArgsBytes;
+        region.BufferRowLength   = 0;
+        region.BufferImageHeight = 0;
+        region.MipLevel          = 0;
+        region.BaseLayer         = 0;
+        region.LayerCount        = 1;
+        region.TextureOffset     = { 0, 0, 0 };
+        region.TextureExtent     = { 1, 1, 1 };
+
+        commandBuffer->CopyBufferToTexture(m_ResetSource, m_DummyHizTexture,
+                                           EImageLayout::TransferDst, region);
+
+        commandBuffer->TransitionImageLayout(
+            m_DummyHizTexture, EImageLayout::TransferDst,
+            EImageLayout::ShaderReadOnly, EPipelineStageFlags::Transfer,
+            EPipelineStageFlags::ComputeShader, EAccessFlags::TransferWrite,
+            EAccessFlags::ShaderRead);
+
+        m_DummyHizInitialized = true;
+    }
 
     const UInt32 frameIndex = context.FrameIndex;
 
@@ -994,9 +1188,19 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
                                   m_RasterArgsBuffers[frameIndex],
                                   rasterRegion);
 
-        FRHIBufferMemoryBarrier barriers[2] = {};
+        // 待定表的计数器也要归零 —— 它与可见计数器同布局, 拷同一段。
+        FRHIBufferCopyRegion pendingRegion = {};
+        pendingRegion.SrcOffset = 0;
+        pendingRegion.DstOffset = 0;
+        pendingRegion.Size      = kPendingCounterBytes;
 
-        for (UInt32 i = 0; i < 2; ++i)
+        commandBuffer->CopyBuffer(m_ResetSource,
+                                  m_PendingCounterBuffers[frameIndex],
+                                  pendingRegion);
+
+        FRHIBufferMemoryBarrier barriers[3] = {};
+
+        for (UInt32 i = 0; i < 3; ++i)
         {
             barriers[i].SrcAccessMask = EAccessFlags::TransferWrite;
             barriers[i].DstAccessMask =
@@ -1005,14 +1209,91 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
 
         barriers[0].Buffer = m_CounterBuffers[frameIndex];
         barriers[1].Buffer = m_DispatchBuffers[frameIndex];
+        barriers[2].Buffer = m_PendingCounterBuffers[frameIndex];
 
         commandBuffer->PipelineBarrier(EPipelineStageFlags::Transfer,
                                        EPipelineStageFlags::ComputeShader |
                                            EPipelineStageFlags::Transfer,
-                                       nullptr, 0, barriers, 2, nullptr, 0);
+                                       nullptr, 0, barriers, 3, nullptr, 0);
     }
 
     const FFrustum& frustum = m_Frustum;
+
+    // ---- 逐视图 UBO ----
+    //
+    // 三个剔除着色器读同一份。分开传的话, 实例级与 meshlet 级用了不同的
+    // 视锥这种事会悄悄发生 —— 而它只在物体压着视锥边界时现形。
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(m_Device->MapBuffer(m_ViewBuffers[frameIndex],
+                                             &mapped)) &&
+            mapped != nullptr)
+        {
+            auto* view = static_cast<FMeshletCullViewGpu*>(mapped);
+
+            for (Int32 p = 0; p < FFrustum::kPlaneCount; ++p)
+            {
+                view->Planes[p][0] = frustum.Planes[p].Normal.X;
+                view->Planes[p][1] = frustum.Planes[p].Normal.Y;
+                view->Planes[p][2] = frustum.Planes[p].Normal.Z;
+                view->Planes[p][3] = frustum.Planes[p].D;
+            }
+
+            const FMatrix viewProj =
+                (context.Camera != nullptr)
+                    ? (context.Camera->GetProjectionMatrix() *
+                       context.Camera->GetViewMatrix())
+                    : FMatrix::kIdentity;
+
+            for (UInt32 row = 0; row < 4; ++row)
+            {
+                for (UInt32 col = 0; col < 4; ++col)
+                {
+                    view->ViewProj[row * 4 + col] = viewProj.M[row][col];
+                }
+            }
+
+            view->CameraPosition[0] = m_CameraPosition.X;
+            view->CameraPosition[1] = m_CameraPosition.Y;
+            view->CameraPosition[2] = m_CameraPosition.Z;
+
+            view->HizParams[0] = static_cast<Float32>(m_HizWidth);
+            view->HizParams[1] = static_cast<Float32>(m_HizHeight);
+            view->HizParams[2] =
+                (m_HizLevels > 0) ? static_cast<Float32>(m_HizLevels - 1) : 0.0f;
+            view->HizParams[3] = (context.Camera != nullptr)
+                                     ? context.Camera->GetNearPlane()
+                                     : 0.1f;
+
+            m_Device->UnmapBuffer(m_ViewBuffers[frameIndex]);
+        }
+    }
+
+    // ---- 金字塔换了才补写描述符 ----
+    //
+    // 只改**当前帧**那一个集。别的帧下标的集可能正被在飞的命令缓冲区用着,
+    // 而 vkUpdateDescriptorSets 不允许改在用的集 —— 验证层会明确报出来。
+    //
+    // 每帧无条件重写也行, 但那会掩盖"金字塔换了而描述符没换"这类错误。
+    if (m_BoundHizViews.GetSize() < m_MeshletCullSets.GetSize())
+    {
+        m_BoundHizViews.SetSize(m_MeshletCullSets.GetSize(),
+                                FRHITextureViewHandle());
+    }
+
+    if (m_HizView.IsValid() && frameIndex < m_BoundHizViews.GetSize() &&
+        m_BoundHizViews[frameIndex] != m_HizView)
+    {
+        const FRHIDescriptorWrite write =
+            FRHIDescriptorWrite::CombinedImageSampler(
+                m_MeshletCullSets[frameIndex], 7, m_HizView, m_HizSampler,
+                EImageLayout::ShaderReadOnly);
+
+        m_Device->UpdateDescriptorSets(&write, 1);
+
+        m_BoundHizViews[frameIndex] = m_HizView;
+    }
 
     // ---- 第一级: 实例 ----
     {
@@ -1021,15 +1302,7 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
                                          m_InstanceCullLayout, 0,
                                          m_InstanceCullSets[frameIndex]);
 
-        FInstanceCullPushConstants push;
-
-        for (Int32 p = 0; p < FFrustum::kPlaneCount; ++p)
-        {
-            push.Planes[p][0] = frustum.Planes[p].Normal.X;
-            push.Planes[p][1] = frustum.Planes[p].Normal.Y;
-            push.Planes[p][2] = frustum.Planes[p].Normal.Z;
-            push.Planes[p][3] = frustum.Planes[p].D;
-        }
+        FCullPushConstants push;
 
         push.Params[0] = static_cast<UInt32>(m_Instances.GetSize());
         push.Params[1] = kMaxMeshletInstances;
@@ -1079,19 +1352,7 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
                                          m_MeshletCullLayout, 0,
                                          m_MeshletCullSets[frameIndex]);
 
-        FMeshletCullPushConstants push;
-
-        for (Int32 p = 0; p < FFrustum::kPlaneCount; ++p)
-        {
-            push.Planes[p][0] = frustum.Planes[p].Normal.X;
-            push.Planes[p][1] = frustum.Planes[p].Normal.Y;
-            push.Planes[p][2] = frustum.Planes[p].Normal.Z;
-            push.Planes[p][3] = frustum.Planes[p].D;
-        }
-
-        push.CameraPosition[0] = m_CameraPosition.X;
-        push.CameraPosition[1] = m_CameraPosition.Y;
-        push.CameraPosition[2] = m_CameraPosition.Z;
+        FCullPushConstants push;
 
         // x 由 DispatchIndirect 从缓冲区取, 这里给的是着色器自己用来
         // 判越界的那个数 —— 两者必须是同一个值, 而着色器读不到分派参数。
@@ -1101,11 +1362,43 @@ void FMeshletCullPass::Execute(IRHICommandBuffer*        commandBuffer,
         push.Params[1] = kMaxSceneMeshlets;
         push.Params[2] = m_BackfaceCull ? 1u : 0u;
 
+        // 遮挡剔除要金字塔就绪才开。
+        //
+        // 没就绪时传 0 而不是"让着色器判一下": 描述符集里那一格还没写过,
+        // 而 Vulkan 不允许提交带未写绑定的描述符集 —— 着色器里判不判都
+        // 已经晚了。
+        push.Params[3] =
+            (m_OcclusionCull && m_HizView.IsValid()) ? 1u : 0u;
+
         commandBuffer->PushConstants(m_MeshletCullLayout,
                                      EShaderStage::Compute, 0, sizeof(push),
                                      &push);
 
         commandBuffer->DispatchIndirect(m_DispatchBuffers[frameIndex], 0);
+    }
+
+    // ---- 待定数回读 ----
+    //
+    // 与可见计数器同一条路: 拷进一份 GpuToCpu 的缓冲区, 下一轮同一个帧
+    // 下标再读。判据要拿它判"遮挡剔除是不是真的剔掉了东西" —— 没有这个数
+    // 的话, 一个什么都不剔的实现在"开关画面相同"那两条判据上满分通过。
+    {
+        FRHIBufferMemoryBarrier barrier = {};
+        barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+        barrier.DstAccessMask = EAccessFlags::TransferRead;
+        barrier.Buffer        = m_PendingCounterBuffers[frameIndex];
+
+        commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                       EPipelineStageFlags::Transfer, nullptr,
+                                       0, &barrier, 1, nullptr, 0);
+
+        FRHIBufferCopyRegion region = {};
+        region.SrcOffset = 0;
+        region.DstOffset = 0;
+        region.Size      = kPendingCounterBytes;
+
+        commandBuffer->CopyBuffer(m_PendingCounterBuffers[frameIndex],
+                                  m_PendingReadbacks[frameIndex], region);
     }
 
     // ---- 可见数 -> 光栅化的间接参数, 以及计数器回读 ----
@@ -1231,6 +1524,10 @@ void FMeshletCullPass::Shutdown(IRHIDevice* device)
     };
 
     DestroyAll(m_RasterArgsBuffers);
+    DestroyAll(m_PendingBuffers);
+    DestroyAll(m_PendingCounterBuffers);
+    DestroyAll(m_PendingReadbacks);
+    DestroyAll(m_ViewBuffers);
     DestroyAll(m_CounterReadbacks);
     DestroyAll(m_CounterBuffers);
     DestroyAll(m_VisibleMeshletBuffers);
@@ -1255,6 +1552,21 @@ void FMeshletCullPass::Shutdown(IRHIDevice* device)
     if (m_ResetSource.IsValid())
     {
         device->DestroyBuffer(m_ResetSource);
+    }
+
+    if (m_HizDefaultSampler.IsValid())
+    {
+        device->DestroySampler(m_HizDefaultSampler);
+    }
+
+    if (m_DummyHizView.IsValid())
+    {
+        device->DestroyTextureView(m_DummyHizView);
+    }
+
+    if (m_DummyHizTexture.IsValid())
+    {
+        device->DestroyTexture(m_DummyHizTexture);
     }
 
     m_InstanceCullSets.Clear();
@@ -1292,6 +1604,42 @@ FRHIBufferHandle FMeshletCullPass::GetInstanceBuffer(UInt32 frameIndex) const
                ? m_InstanceBuffers[frameIndex]
                : FRHIBufferHandle();
 }
+
+void FMeshletCullPass::SetHizPyramid(FRHITextureViewHandle view,
+                                     FRHISamplerHandle sampler, UInt32 width,
+                                     UInt32 height, UInt32 levelCount)
+{
+    m_HizView    = view;
+    m_HizSampler = sampler;
+    m_HizWidth   = width;
+    m_HizHeight  = height;
+    m_HizLevels  = levelCount;
+}
+
+FRHIBufferHandle FMeshletCullPass::GetPendingBuffer(UInt32 frameIndex) const
+{
+    return (frameIndex < m_PendingBuffers.GetSize())
+               ? m_PendingBuffers[frameIndex]
+               : FRHIBufferHandle();
+}
+
+FRHIBufferHandle FMeshletCullPass::GetPendingCounterBuffer(
+    UInt32 frameIndex) const
+{
+    return (frameIndex < m_PendingCounterBuffers.GetSize())
+               ? m_PendingCounterBuffers[frameIndex]
+               : FRHIBufferHandle();
+}
+
+FRHIBufferHandle FMeshletCullPass::GetViewBuffer(UInt32 frameIndex) const
+{
+    return (frameIndex < m_ViewBuffers.GetSize()) ? m_ViewBuffers[frameIndex]
+                                                  : FRHIBufferHandle();
+}
+
+UInt64 FMeshletCullPass::GetPendingBufferBytes() { return kPendingBytes; }
+
+UInt64 FMeshletCullPass::GetViewBufferBytes() { return kViewBytes; }
 
 UInt64 FMeshletCullPass::GetInstanceBufferBytes() { return kInstanceBytes; }
 

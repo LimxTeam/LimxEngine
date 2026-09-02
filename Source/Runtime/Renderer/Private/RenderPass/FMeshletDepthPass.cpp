@@ -74,6 +74,63 @@ static_assert(sizeof(FMeshletResolvePushConstants) == 80,
 
 constexpr UInt32 kResolveWorkgroupSize = 8;
 
+/// 与 hiz_copy.comp / hiz_build.comp 的 push constant 一致
+struct FHizPushConstants
+{
+    /// copy: x = 宽, y = 高; build: x/y = 上一级, z/w = 本级
+    UInt32 Params[4] = { 0, 0, 0, 0 };
+};
+
+/// 与 meshlet_cull_phase2.comp 的 push constant 一致
+struct FPhase2PushConstants
+{
+    /// x = 待定数, y = 输出表容量, z/w = 保留
+    UInt32 Params[4] = { 0, 0, 0, 0 };
+};
+
+constexpr UInt32 kHizWorkgroupSize = 8;
+
+/// 金字塔级数 —— **必须与 Vulkan 的 mip 约定一致**
+///
+/// Vulkan 的第 i 级尺寸是 max(1, floor(base / 2^i)), 而 mipLevels 的上限是
+/// floor(log2(max(w,h))) + 1。第一版按"向上取整地逐级减半"算, 1280x720 得到
+/// 12 级, 而 Vulkan 只允许 11 —— vkCreateImage 当场拒绝。
+///
+/// 向下取整会丢掉奇数尺寸那一行/列, 而那一行的遮挡信息缺失会让上一级的
+/// 最大值**偏小** —— 偏小意味着更容易判成"挡住了", 那是**错剔**的方向。
+/// 所以归约着色器在最后一个纹素上要多收一行/列, 见 hiz_build.comp。
+UInt32 ComputeHizLevels(UInt32 width, UInt32 height)
+{
+    UInt32 levels = 1;
+
+    UInt32 size = FMath::Max(width, height);
+
+    while (size > 1)
+    {
+        size /= 2u;
+        ++levels;
+    }
+
+    return levels;
+}
+
+/// 第 level 级的尺寸 —— Vulkan 的约定
+FRHIExtent2D HizLevelExtent(FRHIExtent2D base, UInt32 level)
+{
+    FRHIExtent2D extent = base;
+
+    for (UInt32 i = 0; i < level; ++i)
+    {
+        extent.Width  = extent.Width / 2u;
+        extent.Height = extent.Height / 2u;
+    }
+
+    extent.Width  = FMath::Max(extent.Width, 1u);
+    extent.Height = FMath::Max(extent.Height, 1u);
+
+    return extent;
+}
+
 } // namespace
 
 // ============================================================================
@@ -143,6 +200,84 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
             }
 
             m_DrawArgsBuffers.Add(drawArgs);
+
+            // 第二阶段的间接分派参数 + 第二次绘制的间接参数 +
+            // 第一阶段结束时的可见数
+            bufferDesc.Size  = sizeof(UInt32) * 4;
+            bufferDesc.Usage = static_cast<EBufferUsage>(
+                static_cast<UInt32>(EBufferUsage::StorageBuffer) |
+                static_cast<UInt32>(EBufferUsage::IndirectBuffer) |
+                static_cast<UInt32>(EBufferUsage::TransferDst) |
+                static_cast<UInt32>(EBufferUsage::TransferSrc));
+
+            FRHIBufferHandle phase2Dispatch;
+            FRHIBufferHandle phase2RasterArgs;
+            FRHIBufferHandle phase1Count;
+
+            bufferDesc.DebugName = "MeshletPhase2Dispatch";
+
+            result = desc.Device->CreateBuffer(bufferDesc, phase2Dispatch);
+
+            if (IsRHISuccess(result))
+            {
+                bufferDesc.DebugName = "MeshletPhase2RasterArgs";
+                result =
+                    desc.Device->CreateBuffer(bufferDesc, phase2RasterArgs);
+            }
+
+            if (IsRHISuccess(result))
+            {
+                bufferDesc.DebugName = "MeshletPhase1Count";
+                result = desc.Device->CreateBuffer(bufferDesc, phase1Count);
+            }
+
+            if (!IsRHISuccess(result))
+            {
+                return result;
+            }
+
+            // 第一阶段可见数的回读 —— 判据要拿它算"第二阶段补回来了多少"
+            FRHIBufferHandle phase1Readback;
+
+            {
+                FRHIBufferDesc readbackDesc = {};
+                readbackDesc.Size        = sizeof(UInt32) * 4;
+                readbackDesc.Usage       = EBufferUsage::TransferDst;
+                readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+                readbackDesc.DebugName   = "MeshletPhase1Readback";
+
+                const ERHIResult readbackResult =
+                    desc.Device->CreateBuffer(readbackDesc, phase1Readback);
+
+                if (!IsRHISuccess(readbackResult))
+                {
+                    return readbackResult;
+                }
+            }
+
+            FRHIBufferHandle finalReadback;
+
+            {
+                FRHIBufferDesc readbackDesc = {};
+                readbackDesc.Size        = sizeof(UInt32) * 4;
+                readbackDesc.Usage       = EBufferUsage::TransferDst;
+                readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+                readbackDesc.DebugName   = "MeshletPhase2FinalReadback";
+
+                const ERHIResult readbackResult =
+                    desc.Device->CreateBuffer(readbackDesc, finalReadback);
+
+                if (!IsRHISuccess(readbackResult))
+                {
+                    return readbackResult;
+                }
+            }
+
+            m_Phase2FinalReadbacks.Add(finalReadback);
+            m_Phase1Readbacks.Add(phase1Readback);
+            m_Phase2DispatchBuffers.Add(phase2Dispatch);
+            m_Phase2RasterArgsBuffers.Add(phase2RasterArgs);
+            m_Phase1CountBuffers.Add(phase1Count);
         }
     }
 
@@ -152,8 +287,17 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
     // 全零的话一个实例都不画, 而那与"什么都不可见"分不开。
     if (IsRHISuccess(result))
     {
+        // 两段: [0..15] 是间接绘制参数 (0,1,0,0),
+        //       [16..31] 是间接分派参数 (0,1,1,0)。
+        //
+        // 分派参数的 y/z **必须是 1**。第一版没给它们初值 —— 于是第二阶段
+        // 的分派是 (n, 0, 0), 一个工作组都不起, 整个第二阶段是死代码。
+        // 而"开关遮挡剔除画面相同"那条判据对此**满分通过**: 第一阶段剔掉
+        // 的那些恰好真的被挡住了, 于是补不补都一样。
+        //
+        // 抓到它的是一条新加的元判据: 第二阶段必须真的补回来过东西。
         FRHIBufferDesc bufferDesc = {};
-        bufferDesc.Size        = kDrawArgsBytes;
+        bufferDesc.Size        = kDrawArgsBytes * 2;
         bufferDesc.Usage       = EBufferUsage::TransferSrc;
         bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
         bufferDesc.DebugName   = "MeshletExpandReset";
@@ -167,12 +311,19 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
             if (IsRHISuccess(desc.Device->MapBuffer(m_ResetSource, &mapped)) &&
                 mapped != nullptr)
             {
-                auto* command = static_cast<FDrawIndirectCommand*>(mapped);
+                auto* values = static_cast<UInt32*>(mapped);
 
-                command->VertexCount   = 0;
-                command->InstanceCount = 1;
-                command->FirstVertex   = 0;
-                command->FirstInstance = 0;
+                // 间接绘制: (vertexCount, instanceCount, first, first)
+                values[0] = 0;
+                values[1] = 1;
+                values[2] = 0;
+                values[3] = 0;
+
+                // 间接分派: (x, y, z, 保留) —— y/z 必须是 1
+                values[4] = 0;
+                values[5] = 1;
+                values[6] = 1;
+                values[7] = 0;
 
                 desc.Device->UnmapBuffer(m_ResetSource);
             }
@@ -225,6 +376,15 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
 
             m_MaterialBuffers.Add(materials);
         }
+    }
+
+    // ---- 层次深度金字塔 ----
+    //
+    // 必须在描述符之前 —— 描述符集里要写金字塔的逐级视图。顺序反了的话
+    // 那个数组还是空的, 而"取空数组的第 0 个"是当场崩, 不是报错。
+    if (IsRHISuccess(result))
+    {
+        result = CreateHizResources(desc.Device, desc.SwapchainExtent);
     }
 
     if (IsRHISuccess(result))
@@ -347,6 +507,12 @@ void FMeshletDepthPass::DestroyDepthTarget(IRHIDevice* device)
         m_Framebuffer = FRHIFramebufferHandle();
     }
 
+    if (m_LoadFramebuffer.IsValid())
+    {
+        device->DestroyFramebuffer(m_LoadFramebuffer);
+        m_LoadFramebuffer = FRHIFramebufferHandle();
+    }
+
     if (m_VisibilityView.IsValid())
     {
         device->DestroyTextureView(m_VisibilityView);
@@ -455,7 +621,36 @@ ERHIResult FMeshletDepthPass::CreateRenderPass(IRHIDevice* device)
     fbDesc.Layers          = 1;
     fbDesc.DebugName       = "MeshletDepth_Framebuffer";
 
-    return device->CreateFramebuffer(fbDesc, m_Framebuffer);
+    result = device->CreateFramebuffer(fbDesc, m_Framebuffer);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // ---- 第二遍: 加载而不是清除 ----
+    //
+    // 两阶段遮挡剔除的第二阶段要把补上来的 meshlet 画进**同一对附件**。
+    // 用第一遍那个渲染通道的话附件会被清掉, 第一阶段画的东西就没了。
+    attachments[0].LoadOp        = ELoadOp::Load;
+    attachments[0].InitialLayout = EImageLayout::ShaderReadOnly;
+
+    attachments[1].LoadOp        = ELoadOp::Load;
+    attachments[1].InitialLayout = EImageLayout::DepthStencilAttachment;
+
+    renderPassDesc.DebugName = "MeshletDepth_LoadRenderPass";
+
+    result = device->CreateRenderPass(renderPassDesc, m_LoadRenderPass);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    fbDesc.RenderPass = m_LoadRenderPass;
+    fbDesc.DebugName  = "MeshletDepth_LoadFramebuffer";
+
+    return device->CreateFramebuffer(fbDesc, m_LoadFramebuffer);
 }
 
 // ============================================================================
@@ -563,6 +758,124 @@ ERHIResult FMeshletDepthPass::CreateDescriptors(IRHIDevice* device,
         }
     }
 
+    // ---- Hi-Z 的两套布局 ----
+    //
+    // 拷贝那一套: 0 = 深度 (采样), 1 = 第 0 级 (存储图像)
+    // 归约那一套: 0 = 上一级 (存储图像), 1 = 本级 (存储图像)
+    {
+        FRHIDescriptorBinding bindings[2] = {};
+
+        bindings[0].Binding    = 0;
+        bindings[0].Type       = EDescriptorType::CombinedImageSampler;
+        bindings[0].Count      = 1;
+        bindings[0].StageFlags = EShaderStage::Compute;
+
+        bindings[1].Binding    = 1;
+        bindings[1].Type       = EDescriptorType::StorageImage;
+        bindings[1].Count      = 1;
+        bindings[1].StageFlags = EShaderStage::Compute;
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 2;
+        layoutDesc.DebugName    = "MeshletHizCopySetLayout";
+
+        result = device->CreateDescSetLayout(layoutDesc, m_HizCopySetLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        bindings[0].Type = EDescriptorType::StorageImage;
+
+        layoutDesc.DebugName = "MeshletHizBuildSetLayout";
+
+        result = device->CreateDescSetLayout(layoutDesc, m_HizBuildSetLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
+    // ---- 第二阶段的布局 ----
+    //
+    // 0..4 是存储缓冲区, 5 是金字塔 (采样), 6 是逐视图 UBO
+    {
+        FRHIDescriptorBinding bindings[8] = {};
+
+        for (UInt32 i = 0; i < 8; ++i)
+        {
+            bindings[i].Binding    = i;
+            bindings[i].Type       = EDescriptorType::StorageBuffer;
+            bindings[i].Count      = 1;
+            bindings[i].StageFlags = EShaderStage::Compute;
+        }
+
+        bindings[5].Type = EDescriptorType::CombinedImageSampler;
+        bindings[6].Type = EDescriptorType::UniformBuffer;
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 8;
+        layoutDesc.DebugName    = "MeshletPhase2SetLayout";
+
+        result = device->CreateDescSetLayout(layoutDesc, m_Phase2SetLayout);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
+    // ---- Hi-Z 的描述符集 (与并行帧无关: 金字塔只有一份) ----
+    {
+        result = device->AllocateDescriptorSet(m_HizCopySetLayout,
+                                               m_HizCopySet);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHIDescriptorWrite writes[2];
+
+        writes[0] = FRHIDescriptorWrite::CombinedImageSampler(
+            m_HizCopySet, 0, m_DepthView, m_DepthSampler,
+            EImageLayout::ShaderReadOnly);
+
+        writes[1] = FRHIDescriptorWrite::StorageImage(m_HizCopySet, 1,
+                                                      m_HizLevelViews[0]);
+
+        device->UpdateDescriptorSets(writes, 2);
+
+        for (UInt32 level = 1; level < m_HizLevels; ++level)
+        {
+            FRHIDescriptorSetHandle buildSet;
+
+            result = device->AllocateDescriptorSet(m_HizBuildSetLayout,
+                                                   buildSet);
+
+            if (!IsRHISuccess(result))
+            {
+                return result;
+            }
+
+            FRHIDescriptorWrite buildWrites[2];
+
+            buildWrites[0] = FRHIDescriptorWrite::StorageImage(
+                buildSet, 0, m_HizLevelViews[level - 1]);
+
+            buildWrites[1] = FRHIDescriptorWrite::StorageImage(
+                buildSet, 1, m_HizLevelViews[level]);
+
+            device->UpdateDescriptorSets(buildWrites, 2);
+
+            m_HizBuildSets.Add(buildSet);
+        }
+    }
+
     for (UInt32 i = 0; i < frameCount; ++i)
     {
         FRHIDescriptorSetHandle meshSet;
@@ -596,10 +909,20 @@ ERHIResult FMeshletDepthPass::CreateDescriptors(IRHIDevice* device,
             return result;
         }
 
+        FRHIDescriptorSetHandle phase2Set;
+
+        result = device->AllocateDescriptorSet(m_Phase2SetLayout, phase2Set);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
         m_MeshSets.Add(meshSet);
         m_ExpandSets.Add(expandSet);
         m_FallbackSets.Add(fallbackSet);
         m_ResolveSets.Add(resolveSet);
+        m_Phase2Sets.Add(phase2Set);
     }
 
     return ERHIResult::Success;
@@ -699,6 +1022,90 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
     if (!IsRHISuccess(result))
     {
         return result;
+    }
+
+    // ---- Hi-Z 的两条计算管线 ----
+    {
+        result = shaders.CreateShaderModule(
+            device, FString("Builtin/hiz_copy.comp"), EShaderStage::Compute,
+            m_HizCopyShader);
+
+        if (IsRHISuccess(result))
+        {
+            result = shaders.CreateShaderModule(
+                device, FString("Builtin/hiz_build.comp"),
+                EShaderStage::Compute, m_HizBuildShader);
+        }
+
+        if (IsRHISuccess(result))
+        {
+            result = shaders.CreateShaderModule(
+                device, FString("Builtin/meshlet_cull_phase2.comp"),
+                EShaderStage::Compute, m_Phase2Shader);
+        }
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        result = MakeLayout(m_HizCopySetLayout, EShaderStage::Compute,
+                            sizeof(FHizPushConstants), "MeshletHizCopyLayout",
+                            m_HizCopyLayout);
+
+        if (IsRHISuccess(result))
+        {
+            result = MakeLayout(m_HizBuildSetLayout, EShaderStage::Compute,
+                                sizeof(FHizPushConstants),
+                                "MeshletHizBuildLayout", m_HizBuildLayout);
+        }
+
+        if (IsRHISuccess(result))
+        {
+            result = MakeLayout(m_Phase2SetLayout, EShaderStage::Compute,
+                                sizeof(FPhase2PushConstants),
+                                "MeshletPhase2Layout", m_Phase2Layout);
+        }
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+
+        pipelineDesc.ComputeShader.Shader = m_HizCopyShader;
+        pipelineDesc.PipelineLayout       = m_HizCopyLayout;
+        pipelineDesc.DebugName            = "MeshletHizCopyPipeline";
+
+        result = device->CreateComputePipeline(pipelineDesc, m_HizCopyPipeline);
+
+        if (IsRHISuccess(result))
+        {
+            pipelineDesc.ComputeShader.Shader = m_HizBuildShader;
+            pipelineDesc.PipelineLayout       = m_HizBuildLayout;
+            pipelineDesc.DebugName            = "MeshletHizBuildPipeline";
+
+            result =
+                device->CreateComputePipeline(pipelineDesc, m_HizBuildPipeline);
+        }
+
+        if (IsRHISuccess(result))
+        {
+            pipelineDesc.ComputeShader.Shader = m_Phase2Shader;
+            pipelineDesc.PipelineLayout       = m_Phase2Layout;
+            pipelineDesc.DebugName            = "MeshletPhase2Pipeline";
+
+            result =
+                device->CreateComputePipeline(pipelineDesc, m_Phase2Pipeline);
+        }
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
     }
 
     // ---- 解析的计算管线 ----
@@ -807,7 +1214,8 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
             EDynamicState::Viewport | EDynamicState::Scissor;
 
         pipelineDesc.PipelineLayout = layout;
-        pipelineDesc.RenderPass     = m_RenderPass;
+        pipelineDesc.RenderPass =
+            m_UseLoadRenderPass ? m_LoadRenderPass : m_RenderPass;
         pipelineDesc.SubpassIndex   = 0;
         pipelineDesc.DebugName      = name;
 
@@ -826,9 +1234,43 @@ ERHIResult FMeshletDepthPass::CreatePipelines(IRHIDevice* device)
         }
     }
 
-    return MakeGraphics(m_FallbackVertexShader, EShaderStage::Vertex,
-                        m_FallbackFragmentShader, m_FallbackPipelineLayout,
-                        "MeshletDepthFallbackPipeline", m_FallbackPipeline);
+    result = MakeGraphics(m_FallbackVertexShader, EShaderStage::Vertex,
+                          m_FallbackFragmentShader, m_FallbackPipelineLayout,
+                          "MeshletDepthFallbackPipeline", m_FallbackPipeline);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // ---- 第二遍用的两条管线 ----
+    //
+    // 与上面两条只差渲染通道。Vulkan 的"渲染通道兼容"不看 LoadOp, 所以
+    // 理论上可以共用 —— 但那是靠一条兼容性规则恰好允许, 而规则里没写
+    // "以后也一定允许"。分开建两条, 每条明确属于一个渲染通道。
+    m_UseLoadRenderPass = true;
+
+    if (m_MeshShaderAvailable)
+    {
+        result = MakeGraphics(m_MeshShader, EShaderStage::Mesh,
+                              m_FragmentShader, m_MeshPipelineLayout,
+                              "MeshletDepthMeshPipelineLoad",
+                              m_MeshPipelineLoad);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
+    result = MakeGraphics(m_FallbackVertexShader, EShaderStage::Vertex,
+                          m_FallbackFragmentShader, m_FallbackPipelineLayout,
+                          "MeshletDepthFallbackPipelineLoad",
+                          m_FallbackPipelineLoad);
+
+    m_UseLoadRenderPass = false;
+
+    return result;
 }
 
 // ============================================================================
@@ -966,12 +1408,67 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
                     sizeof(FMeshletResolveResult));
 
             m_Device->UpdateDescriptorSets(resolveWrites, 9);
+
+            FRHIDescriptorWrite phase2Writes[8];
+
+            phase2Writes[0] = FRHIDescriptorWrite::StorageBuffer(
+                m_Phase2Sets[i], 0, cull->GetInstanceBuffer(i), 0,
+                cull->GetInstanceBufferBytes());
+            phase2Writes[1] = FRHIDescriptorWrite::StorageBuffer(
+                m_Phase2Sets[i], 1, cull->GetSceneMeshletBuffer(), 0,
+                cull->GetSceneMeshletBytes());
+            phase2Writes[2] = FRHIDescriptorWrite::StorageBuffer(
+                m_Phase2Sets[i], 2, cull->GetPendingBuffer(i), 0,
+                FMeshletCullPass::GetPendingBufferBytes());
+            phase2Writes[3] = FRHIDescriptorWrite::StorageBuffer(
+                m_Phase2Sets[i], 3, cull->GetVisibleMeshletBuffer(i), 0,
+                cull->GetVisibleMeshletBytes());
+            phase2Writes[4] = FRHIDescriptorWrite::StorageBuffer(
+                m_Phase2Sets[i], 4, cull->GetCounterBuffer(i), 0,
+                sizeof(UInt32) * 4);
+            phase2Writes[5] = FRHIDescriptorWrite::CombinedImageSampler(
+                m_Phase2Sets[i], 5, m_HizFullView, m_HizSampler,
+                EImageLayout::ShaderReadOnly);
+            phase2Writes[6] = FRHIDescriptorWrite::UniformBuffer(
+                m_Phase2Sets[i], 6, cull->GetViewBuffer(i), 0,
+                FMeshletCullPass::GetViewBufferBytes());
+            phase2Writes[7] = FRHIDescriptorWrite::StorageBuffer(
+                m_Phase2Sets[i], 7, cull->GetPendingCounterBuffer(i), 0,
+                sizeof(UInt32) * 4);
+
+            m_Device->UpdateDescriptorSets(phase2Writes, 8);
         }
 
         m_BoundVertexBuffer = cull->GetSceneVertexBuffer();
     }
 
     m_DrawnMeshlets = cull->GetStats().MeshletsVisible;
+
+    // 第二阶段补回来了多少 —— 回读隔着并行帧数, 与别的计数同理
+    {
+        void* phase1Mapped = nullptr;
+        void* finalMapped  = nullptr;
+
+        if (frameIndex < m_Phase1Readbacks.GetSize() &&
+            IsRHISuccess(m_Device->MapBuffer(m_Phase1Readbacks[frameIndex],
+                                             &phase1Mapped)) &&
+            IsRHISuccess(m_Device->MapBuffer(
+                m_Phase2FinalReadbacks[frameIndex], &finalMapped)) &&
+            phase1Mapped != nullptr && finalMapped != nullptr)
+        {
+            const UInt32 phase1 =
+                static_cast<const UInt32*>(phase1Mapped)[0];
+
+            const UInt32 finalCount =
+                static_cast<const UInt32*>(finalMapped)[0];
+
+            m_Phase2Meshlets =
+                (finalCount > phase1) ? (finalCount - phase1) : 0;
+
+            m_Device->UnmapBuffer(m_Phase2FinalReadbacks[frameIndex]);
+            m_Device->UnmapBuffer(m_Phase1Readbacks[frameIndex]);
+        }
+    }
 
     // 工作组数**来自 GPU** —— 剔除通道把可见数拷进了一份间接参数。
     //
@@ -1018,6 +1515,7 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
     }
 
     rasterPush.Params[0] = boundsLimit;
+    rasterPush.Params[1] = 0;
 
     // ---- 回退路径: 先展开 ----
     if (m_Mode == EMode::Fallback)
@@ -1048,6 +1546,7 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
         FMeshletExpandPushConstants expandPush;
         expandPush.Params[0] = boundsLimit;
         expandPush.Params[1] = kMaxExpandedVertices;
+        expandPush.Params[2] = 0;
 
         commandBuffer->PushConstants(m_ExpandPipelineLayout,
                                      EShaderStage::Compute, 0,
@@ -1146,6 +1645,319 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
     }
 
     commandBuffer->EndRenderPass();
+
+    // ================================================================
+    // 两阶段遮挡剔除的后半段
+    //
+    //   1. 用这一帧刚画出来的深度建金字塔
+    //   2. 把第一阶段被遮挡剔掉的重测一遍 (追加到可见表末尾)
+    //   3. 把补上来的那一段画进同一对附件 (不清)
+    //
+    // 为什么这样就不再有近似: 一个物体如果真的被挡住, 那些遮挡物一定在
+    // 第一阶段就画出来了 (它们自己没被挡住, 否则递归下去总有一层是没被
+    // 挡的) —— 所以新金字塔里有它们, 结论正确。一个物体如果没被挡住,
+    // 新金字塔里那片区域的深度就不会比它近, 它活下来。
+    // ================================================================
+    if (m_OcclusionCull)
+    {
+        BuildHiz(commandBuffer, frameIndex);
+
+        // 把这一帧的金字塔交给剔除通道 —— 下一帧的第一阶段用它
+        cull->SetHizPyramid(m_HizFullView, m_HizSampler, m_Extent.Width,
+                            m_Extent.Height, m_HizLevels);
+
+        // ---- 记下第一阶段结束时的可见数 ----
+        //
+        // 第二次绘制要从这里往后画。记之前必须挡一道 —— 第一阶段的
+        // 光栅化还在读那个数 (间接参数), 而第二阶段马上要改它。
+        {
+            FRHIBufferCopyRegion region = {};
+            region.SrcOffset = 0;
+            region.DstOffset = 0;
+            region.Size      = sizeof(UInt32);
+
+            commandBuffer->CopyBuffer(cull->GetCounterBuffer(frameIndex),
+                                      m_Phase1CountBuffers[frameIndex],
+                                      region);
+
+            // 第二阶段的分派参数: 先把 (0,1,1,0) 拷进去, 再用待定数
+            // 覆盖 x。
+            //
+            // 顺序不能反 —— 反了的话 x 会被 0 盖掉。
+            FRHIBufferCopyRegion patternRegion = {};
+            patternRegion.SrcOffset = kDrawArgsBytes;
+            patternRegion.DstOffset = 0;
+            patternRegion.Size      = kDrawArgsBytes;
+
+            commandBuffer->CopyBuffer(m_ResetSource,
+                                      m_Phase2DispatchBuffers[frameIndex],
+                                      patternRegion);
+
+            {
+                FRHIBufferMemoryBarrier patternBarrier = {};
+                patternBarrier.SrcAccessMask = EAccessFlags::TransferWrite;
+                patternBarrier.DstAccessMask = EAccessFlags::TransferWrite;
+                patternBarrier.Buffer = m_Phase2DispatchBuffers[frameIndex];
+
+                commandBuffer->PipelineBarrier(
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::Transfer, nullptr, 0,
+                    &patternBarrier, 1, nullptr, 0);
+            }
+
+            commandBuffer->CopyBuffer(
+                cull->GetPendingCounterBuffer(frameIndex),
+                m_Phase2DispatchBuffers[frameIndex], region);
+
+            FRHIBufferMemoryBarrier barriers[2] = {};
+
+            barriers[0].SrcAccessMask = EAccessFlags::TransferWrite;
+            barriers[0].DstAccessMask = EAccessFlags::ShaderRead;
+            barriers[0].Buffer        = m_Phase1CountBuffers[frameIndex];
+
+            barriers[1].SrcAccessMask = EAccessFlags::TransferWrite;
+            barriers[1].DstAccessMask = EAccessFlags::IndirectCommandRead;
+            barriers[1].Buffer        = m_Phase2DispatchBuffers[frameIndex];
+
+            commandBuffer->PipelineBarrier(
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::ComputeShader |
+                    EPipelineStageFlags::DrawIndirect,
+                nullptr, 0, barriers, 2, nullptr, 0);
+        }
+
+        // ---- 第二阶段的剔除 ----
+        //
+        // 间接分派: 工作组数来自待定计数器, 而那个数只有 GPU 知道。
+        //
+        // params 里的两个数都只是**上界** (待定表的容量), 真正的越界判断
+        // 在着色器里用待定计数器本身做。拿上界当边界是不行的: 越界的线程
+        // 会去读待定表里上一帧留下的记录, 而那是一块位置完全不对的几何体,
+        // 会被当成"这一帧新露出来的"补画出来。
+        {
+            commandBuffer->BindComputePipeline(m_Phase2Pipeline);
+            commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                             m_Phase2Layout, 0,
+                                             m_Phase2Sets[frameIndex]);
+
+            FPhase2PushConstants push;
+            push.Params[0] = kMaxSceneMeshlets;
+            push.Params[1] = kMaxSceneMeshlets;
+
+            commandBuffer->PushConstants(m_Phase2Layout,
+                                         EShaderStage::Compute, 0,
+                                         sizeof(push), &push);
+
+            commandBuffer->DispatchIndirect(
+                m_Phase2DispatchBuffers[frameIndex], 0);
+        }
+
+        // ---- 补画 ----
+        {
+            // 两份都要挡, 而且**可见表那一份是必须的**:
+            //
+            //   * 计数器 —— 下面要拷进绘制的间接参数 (Transfer 读)
+            //   * 可见表 —— 补画的网格着色器 (或回退路径的展开着色器)
+            //     要读第二阶段刚追加进去的那一段
+            //
+            // 少了可见表那一条的后果很隐蔽: 第二阶段的统计一切正常 (它读
+            // 的是计数器), 而画面纹丝不动 —— 补回来的 46 个 meshlet 一个
+            // 都没画上去。开关遮挡剔除的画面差恰好一个像素不变, 前后两次
+            // 都是 66774 个, 这个"完全没变"才是线索。
+            FRHIBufferMemoryBarrier barriers[2] = {};
+
+            barriers[0].SrcAccessMask = EAccessFlags::ShaderWrite;
+            barriers[0].DstAccessMask = EAccessFlags::TransferRead;
+            barriers[0].Buffer        = cull->GetCounterBuffer(frameIndex);
+
+            barriers[1].SrcAccessMask = EAccessFlags::ShaderWrite;
+            barriers[1].DstAccessMask = EAccessFlags::ShaderRead;
+            barriers[1].Buffer = cull->GetVisibleMeshletBuffer(frameIndex);
+
+            commandBuffer->PipelineBarrier(
+                EPipelineStageFlags::ComputeShader,
+                EPipelineStageFlags::Transfer |
+                    EPipelineStageFlags::ComputeShader |
+                    EPipelineStageFlags::VertexShader |
+                    EPipelineStageFlags::MeshShader,
+                nullptr, 0, barriers, 2, nullptr, 0);
+
+            // 第二次绘制的工作组数 = 新的可见数 (着色器自己从起始槽位
+            // 开始, 越界就退出)。
+            //
+            // 与分派参数**一模一样的坑**: 先拷 (0,1,1,0) 的模板, 再用可见
+            // 数覆盖 x。y/z 是 0 的话 vkCmdDrawMeshTasksIndirectEXT 一个
+            // 工作组都不起 —— 第二次绘制一个像素都画不出来。
+            //
+            // 这一个藏得比分派参数那个还深: "第二阶段补回来 N 个"那个统计
+            // 读的是**计算着色器**写的计数器, 它一路正常, 而画面纹丝不动。
+            // 把第二阶段改成无条件补回全部 113 个, 画面差还是分毫不差的
+            // 66774 个像素 —— 三次差值完全相同, 才说明补画那一步整个是空的。
+            FRHIBufferCopyRegion region = {};
+            region.SrcOffset = 0;
+            region.DstOffset = 0;
+            region.Size      = sizeof(UInt32);
+
+            FRHIBufferCopyRegion patternRegion = {};
+            patternRegion.SrcOffset = kDrawArgsBytes;
+            patternRegion.DstOffset = 0;
+            patternRegion.Size      = kDrawArgsBytes;
+
+            commandBuffer->CopyBuffer(m_ResetSource,
+                                      m_Phase2RasterArgsBuffers[frameIndex],
+                                      patternRegion);
+
+            {
+                FRHIBufferMemoryBarrier patternBarrier = {};
+                patternBarrier.SrcAccessMask = EAccessFlags::TransferWrite;
+                patternBarrier.DstAccessMask = EAccessFlags::TransferWrite;
+                patternBarrier.Buffer =
+                    m_Phase2RasterArgsBuffers[frameIndex];
+
+                commandBuffer->PipelineBarrier(
+                    EPipelineStageFlags::Transfer,
+                    EPipelineStageFlags::Transfer, nullptr, 0,
+                    &patternBarrier, 1, nullptr, 0);
+            }
+
+            commandBuffer->CopyBuffer(cull->GetCounterBuffer(frameIndex),
+                                      m_Phase2RasterArgsBuffers[frameIndex],
+                                      region);
+
+            FRHIBufferMemoryBarrier argsBarrier = {};
+            argsBarrier.SrcAccessMask = EAccessFlags::TransferWrite;
+            argsBarrier.DstAccessMask = EAccessFlags::IndirectCommandRead;
+            argsBarrier.Buffer = m_Phase2RasterArgsBuffers[frameIndex];
+
+            commandBuffer->PipelineBarrier(EPipelineStageFlags::Transfer,
+                                           EPipelineStageFlags::DrawIndirect,
+                                           nullptr, 0, &argsBarrier, 1,
+                                           nullptr, 0);
+        }
+
+        // 第二遍渲染通道 —— 附件**加载**而不是清除
+        FRHIRenderPassBeginInfo secondPass = beginInfo;
+        secondPass.RenderPass  = m_LoadRenderPass;
+        secondPass.Framebuffer = m_LoadFramebuffer;
+
+        commandBuffer->BeginRenderPass(secondPass);
+
+        commandBuffer->SetViewport(viewport);
+        commandBuffer->SetScissor(scissor);
+
+        // 起始槽位由第一阶段的可见数给出 —— 但那个数在 GPU 上。
+        //
+        // 网格着色器读不到间接参数以外的 GPU 数据来做偏移, 所以这里退一步:
+        // 从 **0** 开始画整张可见表。第一阶段那一段会被再画一遍, 而深度
+        // 测试与可见性写入都是幂等的 (同样的三角形、同样的深度、同样的
+        // 编号), 画面完全一样。
+        //
+        // 代价是多一遍第一阶段的光栅化。真正的省法是把起始槽位也放进
+        // 间接参数 —— 那要给绘制命令加一个"first workgroup"的概念, 而
+        // Vulkan 的 DrawMeshTasksIndirect 没有。留在这里说清楚, 不假装
+        // 它已经解决了。
+        rasterPush.Params[1] = 0;
+
+        if (m_Mode == EMode::MeshShader)
+        {
+            commandBuffer->BindGraphicsPipeline(m_MeshPipelineLoad);
+            commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
+                                             m_MeshPipelineLayout, 0,
+                                             m_MeshSets[frameIndex]);
+
+            commandBuffer->PushConstants(m_MeshPipelineLayout,
+                                         EShaderStage::Mesh, 0,
+                                         sizeof(rasterPush), &rasterPush);
+
+            commandBuffer->DrawMeshTasksIndirect(
+                m_Phase2RasterArgsBuffers[frameIndex], 0, 1,
+                sizeof(UInt32) * 4);
+        }
+        else
+        {
+            // 回退路径要先把补上来的那一段展开
+            commandBuffer->EndRenderPass();
+
+            {
+                commandBuffer->BindComputePipeline(m_ExpandPipeline);
+                commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                                 m_ExpandPipelineLayout, 0,
+                                                 m_ExpandSets[frameIndex]);
+
+                FMeshletExpandPushConstants expandPush;
+                expandPush.Params[0] = boundsLimit;
+                expandPush.Params[1] = kMaxExpandedVertices;
+                expandPush.Params[2] = 0;
+
+                commandBuffer->PushConstants(m_ExpandPipelineLayout,
+                                             EShaderStage::Compute, 0,
+                                             sizeof(expandPush), &expandPush);
+
+                commandBuffer->DispatchIndirect(
+                    m_Phase2RasterArgsBuffers[frameIndex], 0);
+
+                FRHIBufferMemoryBarrier after[2] = {};
+
+                after[0].SrcAccessMask = EAccessFlags::ShaderWrite;
+                after[0].DstAccessMask = EAccessFlags::ShaderRead;
+                after[0].Buffer        = m_ExpandedBuffers[frameIndex];
+
+                after[1].SrcAccessMask = EAccessFlags::ShaderWrite;
+                after[1].DstAccessMask = EAccessFlags::IndirectCommandRead;
+                after[1].Buffer        = m_DrawArgsBuffers[frameIndex];
+
+                commandBuffer->PipelineBarrier(
+                    EPipelineStageFlags::ComputeShader,
+                    EPipelineStageFlags::VertexShader |
+                        EPipelineStageFlags::DrawIndirect,
+                    nullptr, 0, after, 2, nullptr, 0);
+            }
+
+            commandBuffer->BeginRenderPass(secondPass);
+
+            commandBuffer->SetViewport(viewport);
+            commandBuffer->SetScissor(scissor);
+
+            commandBuffer->BindGraphicsPipeline(m_FallbackPipelineLoad);
+            commandBuffer->BindDescriptorSet(EPipelineBindPoint::Graphics,
+                                             m_FallbackPipelineLayout, 0,
+                                             m_FallbackSets[frameIndex]);
+
+            commandBuffer->PushConstants(m_FallbackPipelineLayout,
+                                         EShaderStage::Vertex, 0,
+                                         sizeof(rasterPush), &rasterPush);
+
+            commandBuffer->DrawIndirect(m_DrawArgsBuffers[frameIndex], 0, 1,
+                                        sizeof(FDrawIndirectCommand));
+        }
+
+        commandBuffer->EndRenderPass();
+
+        // ---- 两个数的回读: 第一阶段可见数, 与第二阶段之后的最终数 ----
+        //
+        // 判据要拿它们的差判"第二阶段是不是真的补回来过东西"。
+        //
+        // **最终数必须自己读**, 不能用剔除通道的统计: 那份统计是剔除通道
+        // 在**自己的** Execute 末尾拷的, 而那时第二阶段还没跑 —— 于是它
+        // 永远等于第一阶段的数, 两者相减恒为零。
+        //
+        // 第一版正是这么写的, 结果是"第二阶段补回来 0 个"恒成立, 而那个
+        // 恒成立掩盖了另一个缺陷 (分派参数的 y/z 没置 1)。**一个恒为零的
+        // 诊断量比没有诊断量更糟**。
+        {
+            FRHIBufferCopyRegion region = {};
+            region.SrcOffset = 0;
+            region.DstOffset = 0;
+            region.Size      = sizeof(UInt32);
+
+            commandBuffer->CopyBuffer(m_Phase1CountBuffers[frameIndex],
+                                      m_Phase1Readbacks[frameIndex], region);
+
+            commandBuffer->CopyBuffer(cull->GetCounterBuffer(frameIndex),
+                                      m_Phase2FinalReadbacks[frameIndex],
+                                      region);
+        }
+    }
 
     // ================================================================
     // 材质解析
@@ -1309,6 +2121,21 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
         device->DestroyRenderPass(m_RenderPass);
     }
 
+    if (m_LoadRenderPass.IsValid())
+    {
+        device->DestroyRenderPass(m_LoadRenderPass);
+    }
+
+    if (m_MeshPipelineLoad.IsValid())
+    {
+        device->DestroyGraphicsPipeline(m_MeshPipelineLoad);
+    }
+
+    if (m_FallbackPipelineLoad.IsValid())
+    {
+        device->DestroyGraphicsPipeline(m_FallbackPipelineLoad);
+    }
+
     if (m_MeshPipeline.IsValid())
     {
         device->DestroyGraphicsPipeline(m_MeshPipeline);
@@ -1329,6 +2156,53 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
         device->DestroyComputePipeline(m_ResolvePipeline);
     }
 
+    // ---- Hi-Z 与第二阶段 ----
+    const auto DestroyComputePipeline = [device](
+                                            FRHIComputePipelineHandle& handle)
+    {
+        if (handle.IsValid())
+        {
+            device->DestroyComputePipeline(handle);
+        }
+    };
+
+    DestroyComputePipeline(m_HizCopyPipeline);
+    DestroyComputePipeline(m_HizBuildPipeline);
+    DestroyComputePipeline(m_Phase2Pipeline);
+
+    for (SizeType i = 0; i < m_HizLevelViews.GetSize(); ++i)
+    {
+        if (m_HizLevelViews[i].IsValid())
+        {
+            device->DestroyTextureView(m_HizLevelViews[i]);
+        }
+    }
+
+    m_HizLevelViews.Clear();
+
+    if (m_HizFullView.IsValid())
+    {
+        device->DestroyTextureView(m_HizFullView);
+    }
+
+    if (m_HizTexture.IsValid())
+    {
+        device->DestroyTexture(m_HizTexture);
+    }
+
+    if (m_HizSampler.IsValid())
+    {
+        device->DestroySampler(m_HizSampler);
+    }
+
+    if (m_DepthSampler.IsValid())
+    {
+        device->DestroySampler(m_DepthSampler);
+    }
+
+    m_HizBuildSets.Clear();
+    m_Phase2Sets.Clear();
+
     if (m_VisibilityStorageView.IsValid())
     {
         device->DestroyTextureView(m_VisibilityStorageView);
@@ -1346,6 +2220,9 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroyLayout(m_ExpandPipelineLayout);
     DestroyLayout(m_FallbackPipelineLayout);
     DestroyLayout(m_ResolvePipelineLayout);
+    DestroyLayout(m_HizCopyLayout);
+    DestroyLayout(m_HizBuildLayout);
+    DestroyLayout(m_Phase2Layout);
 
     const auto DestroySetLayout = [device](FRHIDescSetLayoutHandle& handle)
     {
@@ -1359,6 +2236,9 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroySetLayout(m_ExpandSetLayout);
     DestroySetLayout(m_FallbackSetLayout);
     DestroySetLayout(m_ResolveSetLayout);
+    DestroySetLayout(m_HizCopySetLayout);
+    DestroySetLayout(m_HizBuildSetLayout);
+    DestroySetLayout(m_Phase2SetLayout);
 
     const auto DestroyShader = [device](FRHIShaderHandle& handle)
     {
@@ -1374,6 +2254,9 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroyShader(m_ExpandShader);
     DestroyShader(m_FallbackVertexShader);
     DestroyShader(m_ResolveShader);
+    DestroyShader(m_HizCopyShader);
+    DestroyShader(m_HizBuildShader);
+    DestroyShader(m_Phase2Shader);
 
     const auto DestroyBuffers = [device](TArray<FRHIBufferHandle>& buffers)
     {
@@ -1392,6 +2275,11 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroyBuffers(m_DrawArgsBuffers);
     DestroyBuffers(m_ResolveBuffers);
     DestroyBuffers(m_MaterialBuffers);
+    DestroyBuffers(m_Phase2DispatchBuffers);
+    DestroyBuffers(m_Phase2RasterArgsBuffers);
+    DestroyBuffers(m_Phase1CountBuffers);
+    DestroyBuffers(m_Phase1Readbacks);
+    DestroyBuffers(m_Phase2FinalReadbacks);
 
     if (m_ResetSource.IsValid())
     {
@@ -1404,6 +2292,216 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     m_ResolveSets.Clear();
 
     m_Device = nullptr;
+}
+
+// ============================================================================
+// CreateHizResources — 金字塔纹理、逐级视图、采样器
+//
+// 尺寸不对齐到二的幂。对齐要么放大 (浪费显存与带宽), 要么缩小 (丢掉边上
+// 的遮挡信息 —— 那一条边上的物体会被判成"没有遮挡物"而不剔, 保守但白白
+// 损失剔除率)。逐级减半**向上取整**, 边界处用钳边取样。
+// ============================================================================
+
+ERHIResult FMeshletDepthPass::CreateHizResources(IRHIDevice* device,
+                                                 FRHIExtent2D extent)
+{
+    m_HizLevels = ComputeHizLevels(extent.Width, extent.Height);
+
+    FRHITextureDesc texDesc = {};
+    texDesc.Type        = ETextureType::Texture2D;
+    texDesc.Format      = EPixelFormat::R32_SFLOAT;
+    texDesc.Extent      = { extent.Width, extent.Height, 1 };
+    texDesc.MipLevels   = m_HizLevels;
+    texDesc.ArrayLayers = 1;
+    texDesc.Samples     = ESampleCount::Count1;
+    texDesc.Usage       = static_cast<ETextureUsage>(
+        static_cast<UInt32>(ETextureUsage::Sampled) |
+        static_cast<UInt32>(ETextureUsage::Storage) |
+        static_cast<UInt32>(ETextureUsage::TransferSrc));
+    texDesc.MemoryUsage = EMemoryUsage::GpuOnly;
+    texDesc.DebugName   = "MeshletHiz";
+
+    ERHIResult result = device->CreateTexture(texDesc, m_HizTexture);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // 逐级视图 (存储图像只能绑单级) + 一个覆盖全部级的视图 (采样用)
+    for (UInt32 level = 0; level < m_HizLevels; ++level)
+    {
+        FRHITextureViewDesc viewDesc = {};
+        viewDesc.Texture         = m_HizTexture;
+        viewDesc.ViewType        = ETextureType::Texture2D;
+        viewDesc.Format          = EPixelFormat::R32_SFLOAT;
+        viewDesc.BaseMipLevel    = level;
+        viewDesc.MipLevelCount   = 1;
+        viewDesc.BaseArrayLayer  = 0;
+        viewDesc.ArrayLayerCount = 1;
+
+        FRHITextureViewHandle view;
+
+        result = device->CreateTextureView(viewDesc, view);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+
+        m_HizLevelViews.Add(view);
+    }
+
+    {
+        FRHITextureViewDesc viewDesc = {};
+        viewDesc.Texture         = m_HizTexture;
+        viewDesc.ViewType        = ETextureType::Texture2D;
+        viewDesc.Format          = EPixelFormat::R32_SFLOAT;
+        viewDesc.BaseMipLevel    = 0;
+        viewDesc.MipLevelCount   = m_HizLevels;
+        viewDesc.BaseArrayLayer  = 0;
+        viewDesc.ArrayLayerCount = 1;
+
+        result = device->CreateTextureView(viewDesc, m_HizFullView);
+
+        if (!IsRHISuccess(result))
+        {
+            return result;
+        }
+    }
+
+    // 采样器: 最近邻 + 钳边。
+    //
+    // 线性过滤是错的 —— 插值出来的"最大深度"不是任何一片区域的最大深度,
+    // 而遮挡测试的保守性正建立在"那个数确实是最大值"上。
+    FRHISamplerDesc samplerDesc = {};
+    samplerDesc.MinFilter    = EFilter::Nearest;
+    samplerDesc.MagFilter    = EFilter::Nearest;
+    samplerDesc.MipmapMode   = ESamplerMipmapMode::Nearest;
+    samplerDesc.AddressModeU = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.AddressModeV = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.AddressModeW = ESamplerAddressMode::ClampToEdge;
+    samplerDesc.MaxLod       = static_cast<Float32>(m_HizLevels);
+
+    result = device->CreateSampler(samplerDesc, m_HizSampler);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    // 深度图的采样器 —— 第 0 级拷贝要用
+    return device->CreateSampler(samplerDesc, m_DepthSampler);
+}
+
+// ============================================================================
+// BuildHiz — 把这一帧的深度收成金字塔
+// ============================================================================
+
+void FMeshletDepthPass::BuildHiz(IRHICommandBuffer* commandBuffer,
+                                 UInt32 frameIndex)
+{
+    LIMX_UNUSED(frameIndex);
+
+    commandBuffer->BeginDebugLabel("MeshletHiz", 0.3f, 0.6f, 0.9f);
+
+    // 深度图从附件转成可采样
+    commandBuffer->TransitionImageLayout(
+        m_DepthTexture, EImageLayout::DepthStencilAttachment,
+        EImageLayout::ShaderReadOnly, EPipelineStageFlags::LateFragmentTests,
+        EPipelineStageFlags::ComputeShader,
+        EAccessFlags::DepthStencilAttachmentWrite, EAccessFlags::ShaderRead);
+
+    // 整张金字塔转成通用布局 (存储图像写)
+    //
+    // **必须带上全部 mip 级。** 默认参数只转一级 —— 而金字塔有十一级,
+    // 漏掉的那十级会停在上一次的布局上。验证层会逐级报"布局与描述符声明
+    // 的不符", 而关掉验证层就是未定义行为。
+    commandBuffer->TransitionImageLayout(
+        m_HizTexture, EImageLayout::Undefined, EImageLayout::General,
+        EPipelineStageFlags::TopOfPipe, EPipelineStageFlags::ComputeShader,
+        EAccessFlags::None, EAccessFlags::ShaderWrite, 0, m_HizLevels);
+
+    // ---- 第 0 级: 拷贝 ----
+    {
+        commandBuffer->BindComputePipeline(m_HizCopyPipeline);
+        commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                         m_HizCopyLayout, 0, m_HizCopySet);
+
+        FHizPushConstants push;
+        push.Params[0] = m_Extent.Width;
+        push.Params[1] = m_Extent.Height;
+
+        commandBuffer->PushConstants(m_HizCopyLayout, EShaderStage::Compute, 0,
+                                     sizeof(push), &push);
+
+        commandBuffer->Dispatch(
+            (m_Extent.Width + kHizWorkgroupSize - 1u) / kHizWorkgroupSize,
+            (m_Extent.Height + kHizWorkgroupSize - 1u) / kHizWorkgroupSize, 1);
+    }
+
+    // ---- 逐级归约 ----
+    //
+    // 每一级都要等上一级写完 —— 少一道屏障的表现是金字塔高层混进了
+    // 未写完的数据, 而那是**随机**的遮挡结论: 物体随机消失一帧。
+    commandBuffer->BindComputePipeline(m_HizBuildPipeline);
+
+    for (UInt32 level = 1; level < m_HizLevels; ++level)
+    {
+        FRHIImageMemoryBarrier barrier = {};
+        barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+        barrier.DstAccessMask = EAccessFlags::ShaderRead;
+        barrier.OldLayout     = EImageLayout::General;
+        barrier.NewLayout     = EImageLayout::General;
+        barrier.Texture       = m_HizTexture;
+        barrier.BaseMipLevel  = 0;
+        barrier.MipLevelCount = m_HizLevels;
+
+        commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                       EPipelineStageFlags::ComputeShader,
+                                       nullptr, 0, nullptr, 0, &barrier, 1);
+
+        commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                         m_HizBuildLayout, 0,
+                                         m_HizBuildSets[level - 1]);
+
+        const FRHIExtent2D source = HizLevelExtent(m_Extent, level - 1);
+        const FRHIExtent2D target = HizLevelExtent(m_Extent, level);
+
+        FHizPushConstants push;
+        push.Params[0] = source.Width;
+        push.Params[1] = source.Height;
+        push.Params[2] = target.Width;
+        push.Params[3] = target.Height;
+
+        commandBuffer->PushConstants(m_HizBuildLayout, EShaderStage::Compute,
+                                     0, sizeof(push), &push);
+
+        commandBuffer->Dispatch(
+            (target.Width + kHizWorkgroupSize - 1u) / kHizWorkgroupSize,
+            (target.Height + kHizWorkgroupSize - 1u) / kHizWorkgroupSize, 1);
+    }
+
+    // 转成可采样 —— 剔除通道下一帧要读它。同样要带上全部 mip 级。
+    commandBuffer->TransitionImageLayout(
+        m_HizTexture, EImageLayout::General, EImageLayout::ShaderReadOnly,
+        EPipelineStageFlags::ComputeShader, EPipelineStageFlags::ComputeShader,
+        EAccessFlags::ShaderWrite, EAccessFlags::ShaderRead, 0, m_HizLevels);
+
+    // 深度图转回附件 —— 第二次绘制还要写它
+    commandBuffer->TransitionImageLayout(
+        m_DepthTexture, EImageLayout::ShaderReadOnly,
+        EImageLayout::DepthStencilAttachment,
+        EPipelineStageFlags::ComputeShader,
+        EPipelineStageFlags::EarlyFragmentTests, EAccessFlags::ShaderRead,
+        EAccessFlags::DepthStencilAttachmentWrite);
+
+    commandBuffer->EndDebugLabel();
+}
+
+void FMeshletDepthPass::SetOcclusionCullEnabled(bool enabled)
+{
+    m_OcclusionCull = enabled;
 }
 
 } // namespace Limx
