@@ -266,6 +266,15 @@ struct FLaunchOptions
     /// 光追反射的与场景无关自洽检查 (可跑在有子网格的场景上)
     bool RtReflectionSelfCheck = false;
 
+    /// 几何表按源对象下标索引 (不是实例序号) —— 见函数头
+    bool RtGeometryTableCheck = false;
+
+    /// 光追产出的图有没有到达画面 —— 见函数头
+    bool RtHybridCheck = false;
+
+    /// 双边上采样在深度不连续处不渗色 —— 见函数头
+    bool RtAoUpsampleCheck = false;
+
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
 
@@ -782,6 +791,18 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--rt-reflection-check"))
         {
             options.RtReflectionCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-geometry-table-check"))
+        {
+            options.RtGeometryTableCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-hybrid-check"))
+        {
+            options.RtHybridCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-ao-upsample-check"))
+        {
+            options.RtAoUpsampleCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -5356,6 +5377,1099 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
     LIMX_LOG(LogLaunch, Display, "[光追AO] {}", passed ? "通过" : "失败");
 
     return passed;
+}
+
+// ============================================================================
+// RunRayTracingHybridCheck — 光追产出的图有没有到达画面
+//
+// 前六天的每一条光追判据都是**旁路判据**: 它们把通道产出的那张图读回来,
+// 与解析值逐像素比。那证明了"这张图算得对", 没有证明"画面用了这张图"。
+//
+// 中间隔着的东西不少: 描述符绑定的槽位、光照 UBO 里的位域、着色器里那个
+// if、半透明的护栏。任何一处断了, 旁路判据照样满分通过 —— 因为那张图确实
+// 还是对的, 只是没人读它。这正是本周期反复遇到的那一类缺陷: **失败会落在
+// 通过上**。
+//
+// 三条判据, 都不看颜色本身 (颜色对不对是别的判据的事), 只看**因果**:
+//
+//   一、AO 只能变暗。环境光遮蔽是从环境项里减光, 它没有任何途径让一个
+//       像素变亮。有像素变亮就说明它被乘到了错的项上, 或者符号反了。
+//       容差取 1/255 —— 画面是 8 位的, 一个量化台阶以内的抖动来自 TAA
+//       的抖动序列, 不是 AO。
+//
+//   二、AO 暗的地方画面必须跟着变。反过来的说法更有用: AO 图上有 N 个
+//       像素明显小于 1, 而画面上一个像素都没变的话, 那张图没有到达着色。
+//       判据是"变了的像素数 >= AO 明显小于 1 的像素数的一个下限比例" ——
+//       不要求一一对应 (被光照遮住的、纯自发光的表面 AO 再暗也不变), 只
+//       要求那个比例不能塌到零。实测 0.55, 阈值取 0.20。
+//
+//   三、反射同理: 反射图上命中的像素里, 画面必须有一部分跟着变。
+//       并且反射**只作用于足够光滑的表面** —— 这一条由粗糙度过渡窗口
+//       (0.25..0.45) 决定。窗口本身没法从画面上反推, 但它的后果能:
+//       改到的像素比例必须落在一个区间里。只卡下限的话, "把反射无条件
+//       加到每个像素上"照样通过 —— 而那正是这个窗口存在的理由。
+//
+// 这条判据跑综合场景 —— 那里同时有金属球 (反射看得见) 与柱子群 (AO 看
+// 得见)。墙角场景两样都太单薄。
+// ============================================================================
+
+namespace
+{
+
+/// 把当前设置下的一帧回读成 8 位 RGBA
+static bool CaptureShadedFrame(FRenderContext* context, FRenderer& renderer,
+                               TArray<UInt8>& outPixels)
+{
+    FScreenshotCapture shot;
+
+    if (!shot.Request(context))
+    {
+        return false;
+    }
+
+    renderer.SetPostSceneRenderCallback(
+        [&shot, context]() { shot.RecordCopy(context); });
+
+    renderer.RenderFrame();
+
+    // 立刻摘掉回调 —— shot 是栈上的
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    const bool ok = shot.ReadPixels(context, outPixels);
+
+    shot.Release(context->GetDevice());
+
+    return ok;
+}
+
+/// 把一张 R8 的屏幕空间图回读成 [0,1]
+static bool CaptureR8Screen(FRenderContext*   context,
+                            FRenderer&        renderer,
+                            FRHITextureHandle texture,
+                            EImageLayout      restingLayout,
+                            TArray<Float32>&  outValues)
+{
+    if (!texture.IsValid())
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle readback;
+
+    FRHIBufferDesc desc = {};
+    desc.Usage       = EBufferUsage::TransferDst;
+    desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    desc.Size        = pixelCount;
+    desc.DebugName   = "RtHybrid.R8";
+
+    if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+    {
+        return false;
+    }
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, readback, extent, restingLayout]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                texture, restingLayout, EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::TransferSrc, restingLayout,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(readback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* bytes = static_cast<const UInt8*>(mapped);
+
+            outValues.Clear();
+            outValues.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outValues.Add(static_cast<Float32>(bytes[i]) / 255.0f);
+            }
+
+            device->UnmapBuffer(readback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(readback);
+
+    return ok;
+}
+
+/// 把深度缓冲区 (D32_SFLOAT) 回读成 NDC 深度
+static bool CaptureDepthScreen(FRenderContext* context, FRenderer& renderer,
+                               TArray<Float32>& outDepth)
+{
+    FDepthPrePass* const depthPass = renderer.GetDepthPrePass();
+
+    if (depthPass == nullptr)
+    {
+        return false;
+    }
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle readback;
+
+    FRHIBufferDesc desc = {};
+    desc.Usage       = EBufferUsage::TransferDst;
+    desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+    desc.Size        = pixelCount * 4u;
+    desc.DebugName   = "RtHybrid.Depth";
+
+    if (!IsRHISuccess(device->CreateBuffer(desc, readback)))
+    {
+        return false;
+    }
+
+    const FRHITextureHandle texture = depthPass->GetSharedDepthTexture();
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, texture, readback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::DepthStencilAttachment,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::LateFragmentTests,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::DepthStencilAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(texture, EImageLayout::TransferSrc,
+                                     readback, region);
+
+            cmd->TransitionImageLayout(
+                texture, EImageLayout::TransferSrc,
+                EImageLayout::DepthStencilAttachment,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::EarlyFragmentTests,
+                EAccessFlags::TransferRead,
+                EAccessFlags::DepthStencilAttachmentWrite);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(readback, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* values = static_cast<const Float32*>(mapped);
+
+            outDepth.Clear();
+            outDepth.Reserve(pixelCount);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                outDepth.Add(values[i]);
+            }
+
+            device->UnmapBuffer(readback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(readback);
+
+    return ok;
+}
+
+/// 截屏是每像素三字节 (RGB) —— FScreenshotCapture 已经把 alpha 丢掉了
+inline constexpr SizeType kShotBytesPerPixel = 3;
+
+/// 两幅 8 位图之间"这个像素变了吗"
+///
+/// 门限一个量化台阶: 画面是 8 位的, 差 1 说不清是 AO 还是 TAA 的抖动。
+static bool PixelChanged(const TArray<UInt8>& a, const TArray<UInt8>& b,
+                         SizeType pixel)
+{
+    const SizeType base = pixel * kShotBytesPerPixel;
+
+    for (SizeType c = 0; c < 3; ++c)
+    {
+        const Int32 delta = static_cast<Int32>(b[base + c]) -
+                            static_cast<Int32>(a[base + c]);
+
+        if (delta > 1 || delta < -1)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+} // namespace
+
+static bool RunRayTracingHybridCheck(FRenderContext* context,
+                                     FRenderer&      renderer)
+{
+    bool passed = true;
+
+    // ================================================================
+    // 一、光追 AO
+    // ================================================================
+    if (!renderer.SetRayTracedAoEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 无法关闭光追 AO");
+        return false;
+    }
+
+    TArray<UInt8> withoutAo;
+
+    if (!CaptureShadedFrame(context, renderer, withoutAo))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 关闭态回读失败");
+        return false;
+    }
+
+    if (!renderer.SetRayTracedAoEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 无法启用光追 AO");
+        return false;
+    }
+
+    TArray<UInt8> withAo;
+
+    if (!CaptureShadedFrame(context, renderer, withAo))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 启用态回读失败");
+        return false;
+    }
+
+    TArray<Float32> aoValues;
+
+    FRayTracedAoPass* const aoPass = renderer.GetRayTracedAoPass();
+
+    if (aoPass == nullptr ||
+        !CaptureR8Screen(context, renderer, aoPass->GetAoTexture(),
+                         EImageLayout::ShaderReadOnly, aoValues))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] AO 图回读失败");
+        return false;
+    }
+
+    if (withoutAo.GetSize() != withAo.GetSize() ||
+        withAo.GetSize() != aoValues.GetSize() * kShotBytesPerPixel)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追混合] 三次回读的尺寸对不上 ({} / {} / {})",
+                 withoutAo.GetSize(), withAo.GetSize(), aoValues.GetSize());
+        return false;
+    }
+
+    const SizeType pixelCount = aoValues.GetSize();
+
+    SizeType occludedPixels = 0;
+    SizeType changedPixels  = 0;
+    SizeType brightened     = 0;
+    Int32    worstBrighten  = 0;
+
+    for (SizeType i = 0; i < pixelCount; ++i)
+    {
+        // AO 明显小于 1 的地方。0.04 = R8 的十个量化台阶,
+        // 噪声进不来。
+        const bool occluded = (aoValues[i] < 0.96f);
+
+        if (!occluded)
+        {
+            continue;
+        }
+
+        ++occludedPixels;
+
+        if (PixelChanged(withoutAo, withAo, i))
+        {
+            ++changedPixels;
+        }
+
+        // 变亮的量 —— 三个通道里最大的那个
+        Int32 maxDelta = 0;
+
+        for (SizeType c = 0; c < 3; ++c)
+        {
+            const SizeType byteIndex = i * kShotBytesPerPixel + c;
+
+            const Int32 delta =
+                static_cast<Int32>(withAo[byteIndex]) -
+                static_cast<Int32>(withoutAo[byteIndex]);
+
+            maxDelta = FMath::Max(maxDelta, delta);
+        }
+
+        if (maxDelta > 1)
+        {
+            ++brightened;
+            worstBrighten = FMath::Max(worstBrighten, maxDelta);
+        }
+    }
+
+    const Float32 changedFraction =
+        (occludedPixels > 0)
+            ? static_cast<Float32>(changedPixels) /
+                  static_cast<Float32>(occludedPixels)
+            : 0.0f;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追混合] AO — 遮蔽像素 {} 个, 画面跟着变的 {} 个 ({}), "
+             "变亮的 {} 个 (最多 +{})",
+             occludedPixels, changedPixels, changedFraction,
+             brightened, worstBrighten);
+
+    // ---- 元判据: 场景里得真有遮蔽 ----
+    constexpr SizeType kMinOccluded = 10000;
+
+    if (occludedPixels < kMinOccluded)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追混合] 只有 {} 个遮蔽像素 (需要至少 {}) —— "
+                 "这个场景判不了 AO 有没有到达画面",
+                 occludedPixels, kMinOccluded);
+        passed = false;
+    }
+
+    // ---- 判据一: AO 只能变暗 ----
+    if (brightened != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追混合] {} 个遮蔽像素在开启 AO 之后**变亮**了 "
+                 "(最多 +{}/255) —— AO 被乘到了错的项上, 或者符号反了",
+                 brightened, worstBrighten);
+        passed = false;
+    }
+
+    // ---- 判据二: AO 暗的地方画面必须跟着变 ----
+    //
+    // 不要求一一对应: 被直接光压住的、纯自发光的表面, AO 再暗画面也不变。
+    // 实测 0.55, 阈值取 0.20 —— 留三倍的余量给"换个场景/换个曝光"。
+    constexpr Float32 kMinChangedFraction = 0.20f;
+
+    if (changedFraction < kMinChangedFraction)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追混合] 遮蔽像素里只有 {} 的比例在画面上跟着变 "
+                 "(需要至少 {}) —— AO 图没有到达着色?",
+                 changedFraction, kMinChangedFraction);
+        passed = false;
+    }
+
+    // 复位 —— 失败与否都要复位, 后面还有反射那一段
+    if (!renderer.SetRayTracedAoEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 无法关闭光追 AO (复位)");
+        passed = false;
+    }
+
+    // ================================================================
+    // 二、光追反射
+    // ================================================================
+    TArray<UInt8> withoutReflection;
+
+    if (!CaptureShadedFrame(context, renderer, withoutReflection))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 反射关闭态回读失败");
+        return false;
+    }
+
+    if (!renderer.SetRayTracedReflectionEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 无法启用光追反射");
+        return false;
+    }
+
+    TArray<UInt8> withReflection;
+
+    if (!CaptureShadedFrame(context, renderer, withReflection))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 反射启用态回读失败");
+        return false;
+    }
+
+    SizeType reflectionChanged = 0;
+
+    for (SizeType i = 0; i < pixelCount; ++i)
+    {
+        if (PixelChanged(withoutReflection, withReflection, i))
+        {
+            ++reflectionChanged;
+        }
+    }
+
+    const Float32 reflectionFraction =
+        static_cast<Float32>(reflectionChanged) /
+        static_cast<Float32>(pixelCount);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追混合] 反射 — 画面上变了的像素 {} 个 ({})",
+             reflectionChanged, reflectionFraction);
+
+    // ---- 判据三: 反射必须改到画面, 而且不能改满屏 ----
+    //
+    // 两头都要卡。只卡下限的话, "把反射无条件加到每个像素上"能通过 ——
+    // 而那正是粗糙度窗口存在的理由: 粗糙表面上一条射线给出的是噪声。
+    // 综合场景里够光滑的表面 (金属球与地面) 占 4~6%, 上限取 25%。
+    constexpr Float32 kMinReflectionFraction = 0.005f;
+    constexpr Float32 kMaxReflectionFraction = 0.25f;
+
+    if (reflectionFraction < kMinReflectionFraction)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追混合] 开启反射只改了 {} 的像素 (需要至少 {}) —— "
+                 "反射图没有到达着色?",
+                 reflectionFraction, kMinReflectionFraction);
+        passed = false;
+    }
+
+    if (reflectionFraction > kMaxReflectionFraction)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追混合] 开启反射改了 {} 的像素 (上限 {}) —— "
+                 "粗糙度过渡窗口失效了? 粗糙表面上一条射线给出的是噪声",
+                 reflectionFraction, kMaxReflectionFraction);
+        passed = false;
+    }
+
+    if (!renderer.SetRayTracedReflectionEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追混合] 无法关闭光追反射 (复位)");
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[光追混合] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunRayTracedAoUpsampleCheck — 双边上采样在深度不连续处必须不渗色
+//
+// 这条判据补的是 Day 7 扫描里的两条逃逸, 而它们其实是同一件事:
+//
+//   把双边权重去掉 (退化成双线性)        —— 墙角场景上的判据全绿
+//   把深度线性化的分母符号写反 (历史缺陷)  —— 全绿
+//
+// 逃逸的原因不是判据不够严, 是**场景不够**。墙角场景的地面与墙是连续的,
+// 相机看得到的范围里几乎没有深度不连续 —— 而双边加权的**全部作用**都在
+// 不连续处。平坦区域上双边、双线性、最近邻三者给出的结果完全一样, 实测
+// 三个变体的绝对误差是 0.002621 / 0.002621 / 0.002612, 前两个连小数点后
+// 六位都相同。
+//
+// 所以这条判据跑综合场景: 球与柱子的轮廓、物体与远景之间, 到处是深度
+// 不连续。
+//
+// 判据本身: 把同一个场景解两遍 (全分辨率 / 半分辨率+上采样), 只在**相邻
+// 半分辨率样本跨越深度不连续**的那些像素上比。
+//
+//   双边   同一表面的样本权重高, 另一侧的权重压到零 —— 贴近全分辨率
+//   双线性 两侧一起平均 —— 前景的 AO 渗到背景上
+//
+// 实测 0.006633 对 0.019440, 差三倍, 阈值定在中间。
+//
+// **这条判据抓不到第三种退化。** 深度线性化的分母符号写反时上采样退化成
+// 最近邻, 而最近邻在这条统计量上是 0.006240 —— 比正确的双边还**小**。
+// 那不是巧合: 偶数像素上半分辨率与全分辨率逐位相同, 最近邻总是取其中一个,
+// 于是它比任何混合都更贴近全分辨率。它错在**画面**上 (边缘台阶化), 不错在
+// 这个数上。
+//
+// 那条缺陷现在由别处堵住: 深度线性化只剩一份实现 (depth_common.h), 而
+// 光追深度判据把它的输出与光追命中距离逐像素比到 64 ULP —— 符号一反,
+// 距离变成负数, 那条判据立刻红。判据不必条条都万能, 但每条缺陷都得**有**
+// 一条判据能红。
+//
+// 为什么不看整幅的最大差: 最大差被噪声主导 (每像素十六条射线, 蒙特卡洛
+// 的尾巴很长), 三个变体的最大差都接近 1。均值也不行 —— 不连续处的像素只占
+// 百分之几, 摊到全图就没了。要**限定在那条带上再取均值**。
+//
+// 偶数像素 (x 与 y 都是偶数) 排除在外: 那里上采样的双线性权重是 (1,0,0,0),
+// 取到的就是原样本, 三种权重给出同一个数。留着它们只会把信号稀释四倍。
+// ============================================================================
+
+static bool RunRayTracedAoUpsampleCheck(FRenderContext* context,
+                                        FRenderer&      renderer)
+{
+    FRayTracedAoPass* const aoPass = renderer.GetRayTracedAoPass();
+    FDepthPrePass* const    depthPass = renderer.GetDepthPrePass();
+
+    if (aoPass == nullptr || depthPass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追AO上采样] 通道不存在");
+        return false;
+    }
+
+    if (!renderer.SetRayTracedAoEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO上采样] 无法启用光追 AO — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    const bool originalHalf = aoPass->IsHalfResolution();
+
+    TArray<Float32> fullAo;
+    TArray<Float32> halfAo;
+    TArray<Float32> depthNdc;
+
+    aoPass->SetHalfResolution(false);
+
+    bool ok = CaptureR8Screen(context, renderer, aoPass->GetAoTexture(),
+                              EImageLayout::ShaderReadOnly, fullAo);
+
+    aoPass->SetHalfResolution(true);
+
+    ok = ok && CaptureR8Screen(context, renderer, aoPass->GetAoTexture(),
+                               EImageLayout::ShaderReadOnly, halfAo);
+
+    aoPass->SetHalfResolution(originalHalf);
+
+    ok = ok && CaptureDepthScreen(context, renderer, depthNdc);
+
+    if (!ok || fullAo.GetSize() != halfAo.GetSize() ||
+        fullAo.GetSize() != depthNdc.GetSize() || fullAo.GetSize() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追AO上采样] 回读失败");
+        return false;
+    }
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const FCamera& camera = renderer.GetCamera();
+
+    const Float32 nearPlane = camera.GetNearPlane();
+    const Float32 farPlane  = camera.GetFarPlane();
+
+    const Float32 a = farPlane / (nearPlane - farPlane);
+    const Float32 b = farPlane * nearPlane / (nearPlane - farPlane);
+
+    const auto Linear = [a, b](Float32 ndc) -> Float32
+    {
+        const Float32 denom = ndc + a;
+
+        return b / ((FMath::Abs(denom) < 1.0e-7f) ? -1.0e-7f : denom);
+    };
+
+    // 深度不连续的门限。
+    //
+    // 双边权重用的是 5% 的相对差, 门限取 10% —— 两倍的距离, 保证被算进
+    // "不连续"的像素上双边确实压到了另一侧, 而不是刚好在过渡区里。
+    constexpr Float32 kDiscontinuity = 0.10f;
+
+    SizeType edgePixels = 0;
+    SizeType flatPixels = 0;
+
+    Float64 edgeSum = 0.0;
+    Float64 flatSum = 0.0;
+
+    Float32 edgeWorst = 0.0f;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            // 偶数像素是原样本的复制 —— 三种权重在那里给出同一个数
+            if ((x % 2) == 0 && (y % 2) == 0)
+            {
+                continue;
+            }
+
+            const SizeType index =
+                static_cast<SizeType>(y) * extent.Width + x;
+
+            // 上采样取的四个半分辨率样本 —— 对应全分辨率的偶数像素
+            const UInt32 bx = x / 2;
+            const UInt32 by = y / 2;
+
+            // 中心像素是天空就跳过 —— 那里没有表面要着色, AO 是多少
+            // 都不影响画面。
+            if (depthNdc[index] >= 0.999999f)
+            {
+                continue;
+            }
+
+            Float32 minDepth = 1.0e30f;
+            Float32 maxDepth = 0.0f;
+
+            bool touchesSky = false;
+
+            for (UInt32 dy = 0; dy < 2; ++dy)
+            {
+                for (UInt32 dx = 0; dx < 2; ++dx)
+                {
+                    const UInt32 sx =
+                        FMath::Min((bx + dx) * 2u, extent.Width - 1u);
+
+                    const UInt32 sy =
+                        FMath::Min((by + dy) * 2u, extent.Height - 1u);
+
+                    const SizeType s =
+                        static_cast<SizeType>(sy) * extent.Width + sx;
+
+                    // 四个样本里有天空, 是最强的那种不连续 —— 排除它反而
+                    // 把最该验的情形排除了: 天空处 AO 恒为 1, 双线性会把
+                    // 那个 1 拌进轮廓内侧, 于是物体边上一圈发亮。
+                    if (depthNdc[s] >= 0.999999f)
+                    {
+                        touchesSky = true;
+                        continue;
+                    }
+
+                    const Float32 linear = Linear(depthNdc[s]);
+
+                    minDepth = FMath::Min(minDepth, linear);
+                    maxDepth = FMath::Max(maxDepth, linear);
+                }
+            }
+
+            const Float32 relative =
+                touchesSky
+                    ? 1.0f
+                    : ((maxDepth > 1.0e-4f)
+                           ? ((maxDepth - minDepth) / maxDepth)
+                           : 0.0f);
+
+            const Float32 diff = FMath::Abs(halfAo[index] - fullAo[index]);
+
+            if (relative > kDiscontinuity)
+            {
+                ++edgePixels;
+                edgeSum += static_cast<Float64>(diff);
+                edgeWorst = FMath::Max(edgeWorst, diff);
+            }
+            else
+            {
+                ++flatPixels;
+                flatSum += static_cast<Float64>(diff);
+            }
+        }
+    }
+
+    const Float64 edgeMean =
+        (edgePixels > 0) ? (edgeSum / static_cast<Float64>(edgePixels)) : 0.0;
+
+    const Float64 flatMean =
+        (flatPixels > 0) ? (flatSum / static_cast<Float64>(flatPixels)) : 0.0;
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追AO上采样] 不连续处 {} 个像素 平均差 {} 最大差 {} | "
+             "连续处 {} 个像素 平均差 {} (双边正常时两者相当, 见判据处注释)",
+             edgePixels, edgeMean, edgeWorst, flatPixels, flatMean);
+
+    bool passed = true;
+
+    // ---- 元判据: 场景里得真有深度不连续 ----
+    //
+    // 没有的话这条判据是空的 —— 而墙角场景正是这样, 它是这两条逃逸的成因。
+    constexpr SizeType kMinEdgePixels = 5000;
+
+    if (edgePixels < kMinEdgePixels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO上采样] 只有 {} 个跨越深度不连续的像素 "
+                 "(需要至少 {}) —— 这个场景判不了双边加权",
+                 edgePixels, kMinEdgePixels);
+        passed = false;
+    }
+
+    // ---- 判据: 不连续处的平均差要有界 ----
+    //
+    // 阈值是先量后定的 (综合场景, 1280x720, 每像素十六条射线):
+    //
+    //   双边 (正确)      0.006633
+    //   退化成双线性      0.019440   <- 要红
+    //   退化成最近邻      0.006240   <- 见下
+    //
+    // 取 0.012: 正确值的 1.8 倍, 双线性的 0.6 倍 —— 离两边都不近。
+    constexpr Float64 kMaxEdgeMean = 0.012;
+
+    if (edgeMean > kMaxEdgeMean)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO上采样] 深度不连续处的平均差 {} 超过 {} —— "
+                 "双边权重被去掉了? 前景的 AO 正在渗到背景上",
+                 edgeMean, kMaxEdgeMean);
+        passed = false;
+    }
+
+    // ---- 一条**撤掉**的元判据, 与它撤掉的理由 ----
+    //
+    // 第一版这里还有一条: "不连续处的平均差必须大于连续处的"。想法是
+    // 防住"深度门限没选出任何东西"。
+    //
+    // 它在**正确的实现上就是红的**: 实测不连续处 0.006633, 连续处
+    // 0.006831 —— 不连续处反而更小。
+    //
+    // 而那恰恰是双边加权在做的事: 它把不连续处变成不难的地方。要求
+    // "不连续处更难"等于要求这个滤波器失效。一条判据要求被测对象出错,
+    // 那不是判据严, 是判据写反了。
+    //
+    // 留下这段话是因为撤掉之后代码里什么也看不见, 而下一个人多半会
+    // 想到同一条"元判据"并再写一遍。
+    //
+    // 元判据只剩像素数那一条 —— 而那一条是够的: 门限选不出东西时
+    // edgePixels 会塌到零。
+
+    if (!renderer.SetRayTracedAoEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追AO上采样] 无法关闭光追 AO (复位)");
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追AO上采样] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunRayTracingGeometryTableCheck — 几何表按源对象下标索引, 不是实例序号
+//
+// 这条判据补的是 Day 5 记录在案的那条逃逸。
+//
+// 命中之后着色器手上只有 instanceCustomIndex, 它拿这个数去几何表里查顶点
+// 地址与材质下标。而 FRayTracingScene 写表时有两种写法:
+//
+//   table[sourceIndex]   —— 源对象列表里的第几个 (对的)
+//   table[blasOrdinal]   —— 已经建出来的第几棵 BLAS (错的)
+//
+// 两者只在**有对象被跳过**时才分开。跳过之后, 后面每个对象的两个下标都
+// 差一格 —— 于是所有物体的材质整体错位, 反射里的颜色全串了位。
+//
+// 而三个测试场景一个都不跳过 (墙角 2/2、综合 33/33、OBJ 3/3), 于是那条
+// 变异在画面上、在数值上都毫无痕迹。判据没有覆盖到它, 不是因为判据不够
+// 严, 是因为**场景里没有那件事**。
+//
+// 所以这条判据自己造那件事: 拿真实场景的对象列表, 在中间插一个没有三角形
+// 的对象 (IndexCount = 0 —— 点精灵、纯粹的变换节点都是这样), 单独建一份
+// 加速结构, 把几何表读回来逐条比对。
+//
+// 不改渲染中的那份场景 —— 改了的话所有别的判据都要跟着变, 而它们量的是
+// 画面。这里要的只是 Update() 这个函数的行为。
+// ============================================================================
+
+/// 一个对象**应当**在几何表里留下的那条记录
+static FRayTracingGeometryEntry ExpectedGeometryEntry(
+    IRHIDevice* device, const FRenderObject& object)
+{
+    FRayTracingGeometryEntry entry;
+
+    entry.VertexAddress = device->GetBufferDeviceAddress(object.VertexBuffer);
+
+    entry.IndexAddress =
+        device->GetBufferDeviceAddress(object.IndexBuffer) +
+        static_cast<UInt64>(object.IndexOffset) *
+            ((object.IndexType == EIndexType::UInt16) ? 2u : 4u);
+
+    entry.VertexStride  = object.VertexStride;
+    entry.IndexType     = (object.IndexType == EIndexType::UInt16) ? 0u : 1u;
+    entry.MaterialIndex = object.BindlessMaterialIndex;
+
+    return entry;
+}
+
+static bool GeometryEntriesEqual(const FRayTracingGeometryEntry& a,
+                                 const FRayTracingGeometryEntry& b)
+{
+    return a.VertexAddress == b.VertexAddress &&
+           a.IndexAddress == b.IndexAddress &&
+           a.VertexStride == b.VertexStride &&
+           a.IndexType == b.IndexType &&
+           a.MaterialIndex == b.MaterialIndex;
+}
+
+static bool RunRayTracingGeometryTableCheck(FRenderContext* context,
+                                            FRenderer&      renderer)
+{
+    IRHIDevice* const device = context->GetDevice();
+
+    if (device == nullptr || !device->IsRayTracingSupported())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追几何表] 设备不支持光追 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    // 先让渲染器把场景列表建起来
+    renderer.RenderFrame();
+
+    const TArray<FRenderObject>& sceneObjects = renderer.GetRenderObjects();
+
+    if (sceneObjects.GetSize() < 3)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追几何表] 场景只有 {} 个对象 — 至少要 3 个才能在中间"
+                 "插一个被跳过的",
+                 sceneObjects.GetSize());
+        return false;
+    }
+
+    // ---- 造一份"中间有一个会被跳过"的对象列表 ----
+    //
+    // 插在下标 1: 插在最后的话后面没有对象, 两种写法仍然恒等 —— 那样的
+    // 判据看起来在跑, 实际上什么都没验。
+    constexpr SizeType kSkipAt = 1;
+
+    TArray<FRenderObject> objects;
+
+    for (SizeType i = 0; i < sceneObjects.GetSize(); ++i)
+    {
+        if (i == kSkipAt)
+        {
+            // 没有三角形的对象。IndexCount = 0 是真实存在的情形
+            // (点精灵、纯变换节点), 不是构造出来的畸形数据 —— 用一个
+            // 畸形到会让 Update 走别的分支的值就验错了东西。
+            FRenderObject empty = sceneObjects[i];
+            empty.IndexCount    = 0;
+            empty.DebugName     = "GeometryTableCheck.Skipped";
+
+            objects.Add(empty);
+        }
+
+        objects.Add(sceneObjects[i]);
+    }
+
+    // ---- 元判据: 跳过点之后的对象必须彼此可分 ----
+    //
+    // 错误的写法把 objects[s] 的记录写进 table[s-1]。判据要红, 就得有
+    // 至少一个 s 满足 entry(objects[s]) != entry(objects[s-1]) ——
+    // 全场景共用一对缓冲区、同一个材质的话, 两种写法写出来的表一模一样,
+    // 这条判据就是空的。
+    //
+    // 这一条不是锦上添花: Day 5 的四个量里有三个正是栽在"场景太均匀"上。
+    SizeType distinguishablePairs = 0;
+
+    for (SizeType s = kSkipAt + 1; s < objects.GetSize(); ++s)
+    {
+        const FRayTracingGeometryEntry here =
+            ExpectedGeometryEntry(device, objects[s]);
+
+        const FRayTracingGeometryEntry prev =
+            ExpectedGeometryEntry(device, objects[s - 1]);
+
+        if (!GeometryEntriesEqual(here, prev))
+        {
+            ++distinguishablePairs;
+        }
+    }
+
+    if (distinguishablePairs == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追几何表] 跳过点之后没有任何一对相邻对象是可分的 —— "
+                 "两种索引写法在这个场景里恒等, 这条判据是空的");
+        return false;
+    }
+
+    // ---- 单独建一份加速结构 ----
+    FRayTracingScene scene;
+
+    if (!IsRHISuccess(scene.Initialize(device)))
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追几何表] 加速结构初始化失败");
+        return false;
+    }
+
+    bool ok = IsRHISuccess(scene.Update(objects));
+
+    if (!ok)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追几何表] Update 失败");
+        scene.Shutdown();
+        return false;
+    }
+
+    // ---- 元判据: 那个对象真的被跳过了 ----
+    if (scene.GetSkippedCount() == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追几何表] 一个对象都没被跳过 —— 插进去的那个空对象被"
+                 "接受了? 没有跳过就没有错位, 这条判据是空的");
+        scene.Shutdown();
+        return false;
+    }
+
+    const UInt32 expectedBlas =
+        static_cast<UInt32>(objects.GetSize()) - scene.GetSkippedCount();
+
+    if (scene.GetBlasCount() != expectedBlas)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追几何表] BLAS {} 个, 但对象 {} 个减跳过 {} 个应当是 {}",
+                 scene.GetBlasCount(), objects.GetSize(),
+                 scene.GetSkippedCount(), expectedBlas);
+        ok = false;
+    }
+
+    // ---- 把几何表读回来逐条比对 ----
+    void* mapped = nullptr;
+
+    if (!IsRHISuccess(device->MapBuffer(scene.GetGeometryTable(), &mapped)) ||
+        mapped == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追几何表] 几何表映射失败");
+        scene.Shutdown();
+        return false;
+    }
+
+    const auto* table = static_cast<const FRayTracingGeometryEntry*>(mapped);
+
+    SizeType checked   = 0;
+    SizeType mismatched = 0;
+    SizeType firstBad   = 0;
+
+    for (SizeType s = 0; s < objects.GetSize(); ++s)
+    {
+        // 被跳过的那个对象不写表 —— 那一格里是什么无关紧要,
+        // 因为没有任何实例的自定义下标指向它。
+        if (s == kSkipAt)
+        {
+            continue;
+        }
+
+        const FRayTracingGeometryEntry expected =
+            ExpectedGeometryEntry(device, objects[s]);
+
+        ++checked;
+
+        if (!GeometryEntriesEqual(table[s], expected))
+        {
+            if (mismatched == 0)
+            {
+                firstBad = s;
+            }
+
+            ++mismatched;
+        }
+    }
+
+    // 报错要用的那一条先抄出来 —— 解除映射之后 table 就不能再读了
+    FRayTracingGeometryEntry firstBadEntry;
+
+    if (mismatched != 0)
+    {
+        firstBadEntry = table[firstBad];
+    }
+
+    device->UnmapBuffer(scene.GetGeometryTable());
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追几何表] 对象 {} 个 (跳过 {}), 表项比对 {} 条, 不符 {} 条, "
+             "跳过点之后可分的相邻对 {} 对",
+             objects.GetSize(), scene.GetSkippedCount(), checked, mismatched,
+             distinguishablePairs);
+
+    if (mismatched != 0)
+    {
+        const FRayTracingGeometryEntry expected =
+            ExpectedGeometryEntry(device, objects[firstBad]);
+
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追几何表] {} 条表项与源对象不符 — 第一条是下标 {}: "
+                 "表里 顶点地址 {} 索引地址 {} 材质 {}, "
+                 "应当是 顶点地址 {} 索引地址 {} 材质 {} "
+                 "—— 几何表是按实例序号写的?",
+                 mismatched, firstBad,
+                 firstBadEntry.VertexAddress, firstBadEntry.IndexAddress,
+                 firstBadEntry.MaterialIndex,
+                 expected.VertexAddress, expected.IndexAddress,
+                 expected.MaterialIndex);
+        ok = false;
+    }
+
+    scene.Shutdown();
+
+    LIMX_LOG(LogLaunch, Display, "[光追几何表] {}", ok ? "通过" : "失败");
+
+    return ok;
 }
 
 // ============================================================================
@@ -10895,6 +12009,9 @@ int WINAPI wWinMain(
     bool    rtAoSelfPassed = true;
     bool    rtReflectionCheckPassed = true;
     bool    rtReflectionSelfPassed = true;
+    bool    rtGeometryTablePassed = true;
+    bool    rtHybridPassed = true;
+    bool    rtAoUpsamplePassed = true;
 
     while (window.ProcessMessages())
     {
@@ -10998,6 +12115,24 @@ int WINAPI wWinMain(
             {
                 rtAoSelfPassed =
                     RunRayTracedAoSelfCheck(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtGeometryTableCheck)
+            {
+                rtGeometryTablePassed =
+                    RunRayTracingGeometryTableCheck(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtHybridCheck)
+            {
+                rtHybridPassed =
+                    RunRayTracingHybridCheck(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtAoUpsampleCheck)
+            {
+                rtAoUpsamplePassed =
+                    RunRayTracedAoUpsampleCheck(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -11241,6 +12376,24 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.RtReflectionSelfCheck)
     {
         selfCheckCode = FinalizeSelfCheck(rtReflectionSelfPassed, 24,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtGeometryTableCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtGeometryTablePassed, 26,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtHybridCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtHybridPassed, 27,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtAoUpsampleCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtAoUpsamplePassed, 28,
                                           errorSink, errorsBeforeShutdown);
     }
 

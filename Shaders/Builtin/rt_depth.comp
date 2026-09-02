@@ -17,6 +17,8 @@
 
 #extension GL_EXT_ray_query : require
 
+#include "depth_common.h"
+
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
@@ -66,19 +68,13 @@ layout(row_major, push_constant) uniform Params
 
 /// NDC 深度还原成沿相机前向的距离
 ///
-/// 分母是 (d + a) 而不是 (d - a)。写反的话得到的是负的、随距离减小的
-/// "深度" —— 这个引擎在 gtao_upsample.frag 上栽过一次。
+/// 转调 depth_common.h 里那一份。这里曾经自己写了一份 —— 数学一样,
+/// 于是"共享头里那份写反了"这件事在本文件上没有任何后果, 而本文件正好
+/// 拥有全引擎最严的一条深度判据 (与光追命中距离逐像素比到 64 ULP)。
+/// 并进来之后那条判据同时护住了所有用共享头的地方。
 float LinearizeDepth(float ndcDepth)
 {
-    const float nearPlane = pc.Planes.x;
-    const float farPlane  = pc.Planes.y;
-
-    const float a = farPlane / (nearPlane - farPlane);
-    const float b = farPlane * nearPlane / (nearPlane - farPlane);
-
-    const float denom = ndcDepth + a;
-
-    return b / ((abs(denom) < 1.0e-9) ? -1.0e-9 : denom);
+    return LinearizeViewDepth(ndcDepth, pc.Planes.x, pc.Planes.y);
 }
 
 void main()

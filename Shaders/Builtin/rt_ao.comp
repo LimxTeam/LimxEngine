@@ -21,6 +21,7 @@
 #extension GL_EXT_ray_query : require
 
 #include "gbuffer_common.h"
+#include "depth_common.h"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -61,21 +62,9 @@ layout(row_major, push_constant) uniform Params
 /// 像"采样数不够的噪声", 不像"偏移不够"。
 float DepthQuantum(float ndcDepth)
 {
-    const float nearPlane = pc.Params2.x;
-    const float farPlane  = pc.Params2.y;
-
-    const float a = farPlane / (nearPlane - farPlane);
-    const float b = farPlane * nearPlane / (nearPlane - farPlane);
-
-    const float denom = ndcDepth + a;
-
-    if (abs(denom) < 1.0e-12)
-    {
-        return 1.0e30;
-    }
-
     // d(视空间深度)/d(NDC) × 一个最低位
-    const float slope = abs(b) / (denom * denom);
+    const float slope =
+        ViewDepthSlope(ndcDepth, pc.Params2.x, pc.Params2.y);
 
     return slope * max(abs(ndcDepth), 0.5) * 1.1920929e-7;
 }

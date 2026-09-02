@@ -1,6 +1,6 @@
 #version 450
 
-#include "bilateral_common.h"
+#include "depth_common.h"
 
 // ============================================================================
 // gtao_upsample.frag — 半分辨率 AO 的双边上采样
@@ -44,7 +44,7 @@ layout(push_constant) uniform Params {
 
 /// NDC 深度 → 视空间线性深度 (正值)
 ///
-// 线性化与双边权重都用共享实现 —— 见 bilateral_common.h 顶部那段说明:
+// 线性化与双边权重都用共享实现 —— 见 depth_common.h 顶部那段说明:
 // 这两个函数曾经有过第二份, 而那一份的分母符号写错了整整一个周期。
 //
 // 这里保留一层薄封装只是为了少写两个参数。
