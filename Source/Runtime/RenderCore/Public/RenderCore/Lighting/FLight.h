@@ -212,7 +212,7 @@ struct FLightingUBO
     // 数据, 而它产出的簇索引表必须是 storage buffer (要原子写入) —— 两者
     // 用同一种缓冲区, 绑定与屏障都少一套。
 
-    // vec4: x=活跃光源数量, y=其中方向光的数量, z/w=保留
+    // vec4: x=活跃光源数量, y=其中方向光的数量, z=光追阴影的灯, w=光追开关
     //
     // 方向光排在 storage buffer 的**最前面** [0, DirectionalCount)。这不是
     // 整理癖: 方向光不参与分簇剔除 (它照亮整个场景, 分给每个簇等于没剔除),
@@ -229,7 +229,15 @@ struct FLightingUBO
     /// 可见度, 那是"有影子、位置完全不对"。
     Float32 RayTracedShadowLight = -1.0f;
 
-    Float32 LightCountPad2 = 0.0f;
+    /// 光追产出的开关 —— 第 0 位 = AO 生效, 第 1 位 = 反射生效
+    ///
+    /// 用一个浮点里的位域而不是两个字段: 这个 UBO 的每一个 vec4 都被
+    /// std140 对齐到十六字节, 加一个 float 就要占满一整行。而这两个开关
+    /// 只有开和关。
+    ///
+    /// 由 CPU 侧决定并写进来, 不让着色器去猜"这张图是不是有效的" ——
+    /// 猜的依据只能是图的内容, 而一张全 1 的 AO 与"AO 没跑"长得一样。
+    Float32 RayTracedFlags = 0.0f;
 
     // vec4: xyz=相机世界空间位置, w=保留
     Float32 CameraPositionX = 0.0f;

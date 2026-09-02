@@ -740,11 +740,36 @@ void FRenderer::RenderFrame()
         FLightManager::Get().SetRayTracedShadowLight(-1);
     }
 
+    // 光追产出的开关 —— 写进光照 UBO, 让着色器知道该读哪一张图。
+    //
+    // 由这里决定而不是让着色器按图的内容猜: 一张全 1 的 AO 与"AO 通道
+    // 没跑"长得一模一样, 而那正是最需要分开的两件事。
+    {
+        Float32 flags = 0.0f;
+
+        if (m_RayTracedAoPass && m_RayTracedAoPass->IsEnabled())
+        {
+            flags += 1.0f;
+        }
+
+        if (m_RayTracedReflectionPass &&
+            m_RayTracedReflectionPass->IsEnabled())
+        {
+            flags += 2.0f;
+        }
+
+        FLightManager::Get().SetRayTracedFlags(flags);
+    }
+
     if (m_RayTracedAoPass && m_RayTracedAoPass->IsEnabled())
     {
         m_RayTracedAoPass->SetTlas(m_RayTracingScene.GetTlas());
         m_RayTracedAoPass->SetCameraParams(
-            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix());
+            m_Camera.GetProjectionMatrix() * m_Camera.GetViewMatrix(),
+            m_Camera.GetPosition());
+
+        m_RayTracedAoPass->SetDepthRange(m_Camera.GetNearPlane(),
+                                         m_Camera.GetFarPlane());
     }
 
     if (m_RayTracedReflectionPass && m_RayTracedReflectionPass->IsEnabled())
@@ -1859,7 +1884,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
         //
         // 三张 IBL 贴图先写占位图。着色器里出现的描述符必须在管线绑定时
         // 有效, 留空等到加载环境贴图时再写是不行的 —— 中间任何一帧都会违规。
-        FRHIDescriptorWrite writes[12];
+        FRHIDescriptorWrite writes[14];
 
         writes[0] = FRHIDescriptorWrite::UniformBuffer(
             descSet,
@@ -1929,6 +1954,33 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             m_GtaoPass->GetAoView(), m_LinearClampSampler,
             EImageLayout::ShaderReadOnly);
 
+        // binding 12/13 — 光追 AO 与光追反射
+        //
+        // 与阴影掩码同理: 无条件绑定, 生效与否由 UBO 里的标志位说了算。
+        // 让着色器按图的内容去猜的话, 一张全 1 的 AO 与"AO 没跑"分不开。
+        //
+        // 设备不支持光追时这两张图不存在, 退回 GTAO 那张 —— 那时标志位是
+        // 零, 着色器根本不会读它们, 这里只是不让描述符为空。
+        const FRHITextureViewHandle rtAoView =
+            (m_RayTracedAoPass &&
+             m_RayTracedAoPass->GetAoView().IsValid())
+                ? m_RayTracedAoPass->GetAoView()
+                : m_GtaoPass->GetAoView();
+
+        const FRHITextureViewHandle rtReflectionView =
+            (m_RayTracedReflectionPass &&
+             m_RayTracedReflectionPass->GetReflectionView().IsValid())
+                ? m_RayTracedReflectionPass->GetReflectionView()
+                : m_GtaoPass->GetAoView();
+
+        writes[12] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet, 12, rtAoView, m_LinearClampSampler,
+            EImageLayout::ShaderReadOnly);
+
+        writes[13] = FRHIDescriptorWrite::CombinedImageSampler(
+            descSet, 13, rtReflectionView, m_LinearClampSampler,
+            EImageLayout::ShaderReadOnly);
+
         // binding 9/10 — 聚光灯阴影的每块数据与图集本身
         //
         // 与 binding 1 的级联贴图同理: 图集在整个运行期都是同一张纹理,
@@ -1962,7 +2014,7 @@ ERHIResult FRenderer::CreateLightingDescriptorSets()
             descSet, 11, maskView, m_LinearClampSampler,
             EImageLayout::ShaderReadOnly);
 
-        device->UpdateDescriptorSets(writes, 12);
+        device->UpdateDescriptorSets(writes, 14);
 
         m_LightDescriptorSets.Add(descSet);
     }

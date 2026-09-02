@@ -60,10 +60,40 @@ struct FRtAoPushConstants
     Float32 Radius       = 0.8f;
     Float32 NormalOffset = 1.0e-3f;
     Float32 RayTMin      = 1.0e-3f;
-    Float32 Pad0         = 0.0f;
+
+    /// 像素步长: 1 = 全分辨率, 2 = 半分辨率
+    Float32 PixelStep    = 1.0f;
+
+    Float32 NearPlane = 0.1f;
+    Float32 FarPlane  = 100.0f;
+    Float32 Pad1      = 0.0f;
+    Float32 Pad2      = 0.0f;
+
+    Float32 CameraX = 0.0f;
+    Float32 CameraY = 0.0f;
+    Float32 CameraZ = 0.0f;
+    Float32 CameraW = 0.0f;
 };
 
-static_assert(sizeof(FRtAoPushConstants) == 96,
+/// 与 rt_ao_upsample.comp 的 push constant 块逐字段一致
+struct FRtAoUpsamplePushConstants
+{
+    UInt32 FullWidth  = 0;
+    UInt32 FullHeight = 0;
+    UInt32 HalfWidth  = 0;
+    UInt32 HalfHeight = 0;
+
+    Float32 NearPlane = 0.1f;
+    Float32 FarPlane  = 100.0f;
+    Float32 Pad0      = 0.0f;
+    Float32 Pad1      = 0.0f;
+};
+
+static_assert(sizeof(FRtAoUpsamplePushConstants) == 32,
+              "FRtAoUpsamplePushConstants 必须是 32 字节 — 与 "
+              "rt_ao_upsample.comp 的 push constant 块逐字段一致");
+
+static_assert(sizeof(FRtAoPushConstants) == 128,
               "FRtAoPushConstants 必须是 96 字节 — 与 rt_ao.comp 的 "
               "push constant 块逐字段一致");
 
@@ -134,9 +164,19 @@ ERHIResult FRayTracedAoPass::Setup(const FPassSetupDesc& desc)
         return result;
     }
 
+    result = CreateUpsample(m_Device);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
     LIMX_LOG(LogRenderer, Log,
-             "[光追AO] 初始化完成 — {}x{} R8_UNORM, 半径 {}, 采样 {}",
-             m_Extent.Width, m_Extent.Height, m_Radius, m_SampleCount);
+             "[光追AO] 初始化完成 — {}x{} R8_UNORM (半分辨率 {}x{}), "
+             "半径 {}, 采样 {}",
+             m_Extent.Width, m_Extent.Height,
+             HalfExtent().Width, HalfExtent().Height,
+             m_Radius, m_SampleCount);
 
     return ERHIResult::Success;
 }
@@ -183,7 +223,116 @@ ERHIResult FRayTracedAoPass::CreateTarget(IRHIDevice* device,
     viewDesc.BaseArrayLayer  = 0;
     viewDesc.ArrayLayerCount = 1;
 
-    return device->CreateTextureView(viewDesc, m_AoView);
+    ERHIResult viewResult = device->CreateTextureView(viewDesc, m_AoView);
+
+    if (!IsRHISuccess(viewResult))
+    {
+        return viewResult;
+    }
+
+    // 半分辨率的中间结果 —— 无条件建。
+    //
+    // 按需建的话, 开关一拨就要在录制命令的中途创建资源, 而那要么阻塞
+    // 队列要么错过这一帧。一张 R8 的四分之一图是 230 KiB, 不值得为它
+    // 引入一条"资源可能还没准备好"的路径。
+    const FRHIExtent2D half = HalfExtent();
+
+    texDesc.Extent    = { half.Width, half.Height, 1 };
+    texDesc.DebugName = "RayTracedAoHalf";
+
+    ERHIResult halfResult = device->CreateTexture(texDesc, m_HalfAoTexture);
+
+    if (!IsRHISuccess(halfResult))
+    {
+        return halfResult;
+    }
+
+    viewDesc.Texture = m_HalfAoTexture;
+
+    return device->CreateTextureView(viewDesc, m_HalfAoView);
+}
+
+// ============================================================================
+// CreateUpsample — 双边上采样的管线与描述符
+// ============================================================================
+
+ERHIResult FRayTracedAoPass::CreateUpsample(IRHIDevice* device)
+{
+    FRHIDescriptorBinding bindings[3] = {};
+
+    bindings[0].Binding    = 0;
+    bindings[0].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[0].Count      = 1;
+    bindings[0].StageFlags = EShaderStage::Compute;
+
+    bindings[1].Binding    = 1;
+    bindings[1].Type       = EDescriptorType::CombinedImageSampler;
+    bindings[1].Count      = 1;
+    bindings[1].StageFlags = EShaderStage::Compute;
+
+    bindings[2].Binding    = 2;
+    bindings[2].Type       = EDescriptorType::StorageImage;
+    bindings[2].Count      = 1;
+    bindings[2].StageFlags = EShaderStage::Compute;
+
+    FRHIDescSetLayoutDesc layoutDesc = {};
+    layoutDesc.Bindings     = bindings;
+    layoutDesc.BindingCount = 3;
+    layoutDesc.DebugName    = "RtAoUpsampleSetLayout";
+
+    ERHIResult result =
+        device->CreateDescSetLayout(layoutDesc, m_UpsampleSetLayout);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    result = device->AllocateDescriptorSet(m_UpsampleSetLayout, m_UpsampleSet);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    result = FShaderManager::Get().CreateShaderModule(
+        device, FString("Builtin/rt_ao_upsample.comp"),
+        EShaderStage::Compute, m_UpsampleShader);
+
+    if (!IsRHISuccess(result))
+    {
+        LIMX_LOG(LogRenderer, Error,
+                 "[光追AO] rt_ao_upsample.comp 加载失败");
+        return result;
+    }
+
+    FRHIPushConstantRange pushRange = {};
+    pushRange.StageFlags = EShaderStage::Compute;
+    pushRange.Offset     = 0;
+    pushRange.Size       = sizeof(FRtAoUpsamplePushConstants);
+
+    FRHIPipelineLayoutDesc pipelineLayoutDesc = {};
+    pipelineLayoutDesc.SetLayouts             = &m_UpsampleSetLayout;
+    pipelineLayoutDesc.SetLayoutCount         = 1;
+    pipelineLayoutDesc.PushConstantRanges     = &pushRange;
+    pipelineLayoutDesc.PushConstantRangeCount = 1;
+    pipelineLayoutDesc.DebugName              = "RtAoUpsampleLayout";
+
+    result = device->CreatePipelineLayout(pipelineLayoutDesc, m_UpsampleLayout);
+
+    if (!IsRHISuccess(result))
+    {
+        return result;
+    }
+
+    FRHIComputePipelineDesc pipelineDesc = {};
+    pipelineDesc.ComputeShader.Shader     = m_UpsampleShader;
+    pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+    pipelineDesc.ComputeShader.EntryPoint = "main";
+    pipelineDesc.PipelineLayout           = m_UpsampleLayout;
+    pipelineDesc.DebugName                = "RtAoUpsamplePipeline";
+
+    return device->CreateComputePipeline(pipelineDesc, m_UpsamplePipeline);
 }
 
 // ============================================================================
@@ -314,6 +463,18 @@ void FRayTracedAoPass::Execute(IRHICommandBuffer*        commandBuffer,
             EAccessFlags::None,
             EAccessFlags::ShaderRead);
 
+        if (m_HalfAoTexture.IsValid())
+        {
+            commandBuffer->TransitionImageLayout(
+                m_HalfAoTexture,
+                EImageLayout::Undefined,
+                EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::TopOfPipe,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::None,
+                EAccessFlags::ShaderRead);
+        }
+
         m_LayoutInitialized = true;
     }
 
@@ -359,11 +520,14 @@ void FRayTracedAoPass::Execute(IRHICommandBuffer*        commandBuffer,
     writes[2].Sampler       = m_PointSampler;
     writes[2].ImageLayout   = EImageLayout::ShaderReadOnly;
 
+    // 半分辨率时求解写进半分辨率图, 再由上采样填满全分辨率图
+    const bool half = m_HalfResolution;
+
     writes[3] = FRHIDescriptorWrite();
     writes[3].DescriptorSet = m_DescriptorSet;
     writes[3].Binding       = 3;
     writes[3].Type          = EDescriptorType::StorageImage;
-    writes[3].ImageView     = m_AoView;
+    writes[3].ImageView     = half ? m_HalfAoView : m_AoView;
     writes[3].ImageLayout   = EImageLayout::General;
 
     m_Device->UpdateDescriptorSets(writes, 4);
@@ -384,7 +548,7 @@ void FRayTracedAoPass::Execute(IRHICommandBuffer*        commandBuffer,
     // 两种情形都要能转过去, 而 Undefined 会丢内容 —— 无所谓, 这一帧
     // 每个像素都会被写。
     commandBuffer->TransitionImageLayout(
-        m_AoTexture,
+        half ? m_HalfAoTexture : m_AoTexture,
         EImageLayout::Undefined,
         EImageLayout::General,
         EPipelineStageFlags::FragmentShader,
@@ -396,8 +560,17 @@ void FRayTracedAoPass::Execute(IRHICommandBuffer*        commandBuffer,
     FRtAoPushConstants push;
     push.InvViewProj = m_ViewProj.Inverse();
 
-    push.Width       = m_Extent.Width;
-    push.Height      = m_Extent.Height;
+    // 求解范围与像素步长必须在 PushConstants 之前定下来。
+    //
+    // 写在派发之前但在推送之后, 着色器收到的就还是上一组值 —— 半分辨率
+    // 那次它会按全分辨率的参数在四分之一的网格上跑, 算出的是屏幕左上角
+    // 那一块, 再被上采样拉满整屏。而那看起来像"半分辨率精度差", 不像
+    // "参数没送到"。
+    const FRHIExtent2D solveExtent = half ? HalfExtent() : m_Extent;
+
+    push.Width       = solveExtent.Width;
+    push.Height      = solveExtent.Height;
+    push.PixelStep   = half ? 2.0f : 1.0f;
     push.SampleCount = m_SampleCount;
 
     // 只让会写深度的那一类几何体参与遮蔽。
@@ -409,6 +582,11 @@ void FRayTracedAoPass::Execute(IRHICommandBuffer*        commandBuffer,
     push.Radius       = m_Radius;
     push.NormalOffset = m_NormalOffset;
     push.RayTMin      = m_RayTMin;
+    push.NearPlane    = m_NearPlane;
+    push.FarPlane     = m_FarPlane;
+    push.CameraX      = m_CameraPos.X;
+    push.CameraY      = m_CameraPos.Y;
+    push.CameraZ      = m_CameraPos.Z;
 
     commandBuffer->BindComputePipeline(m_Pipeline);
     commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
@@ -417,18 +595,84 @@ void FRayTracedAoPass::Execute(IRHICommandBuffer*        commandBuffer,
                                   sizeof(push), &push);
 
     constexpr UInt32 kGroup = 8;
-    commandBuffer->Dispatch((m_Extent.Width + kGroup - 1) / kGroup,
-                             (m_Extent.Height + kGroup - 1) / kGroup, 1);
+    commandBuffer->Dispatch((solveExtent.Width + kGroup - 1) / kGroup,
+                             (solveExtent.Height + kGroup - 1) / kGroup, 1);
 
     // ---- 交还布局 ----
     commandBuffer->TransitionImageLayout(
-        m_AoTexture,
+        half ? m_HalfAoTexture : m_AoTexture,
         EImageLayout::General,
         EImageLayout::ShaderReadOnly,
         EPipelineStageFlags::ComputeShader,
         EPipelineStageFlags::FragmentShader,
         EAccessFlags::ShaderWrite,
         EAccessFlags::ShaderRead);
+
+    // ---- 上采样 ----
+    if (half)
+    {
+        FRHIDescriptorWrite upsampleWrites[3];
+
+        upsampleWrites[0] = FRHIDescriptorWrite();
+        upsampleWrites[0].DescriptorSet = m_UpsampleSet;
+        upsampleWrites[0].Binding       = 0;
+        upsampleWrites[0].Type          = EDescriptorType::CombinedImageSampler;
+        upsampleWrites[0].ImageView     = m_HalfAoView;
+        upsampleWrites[0].Sampler       = m_PointSampler;
+        upsampleWrites[0].ImageLayout   = EImageLayout::ShaderReadOnly;
+
+        upsampleWrites[1] = FRHIDescriptorWrite();
+        upsampleWrites[1].DescriptorSet = m_UpsampleSet;
+        upsampleWrites[1].Binding       = 1;
+        upsampleWrites[1].Type          = EDescriptorType::CombinedImageSampler;
+        upsampleWrites[1].ImageView     = m_DepthView;
+        upsampleWrites[1].Sampler       = m_PointSampler;
+        upsampleWrites[1].ImageLayout   = EImageLayout::ShaderReadOnly;
+
+        upsampleWrites[2] = FRHIDescriptorWrite();
+        upsampleWrites[2].DescriptorSet = m_UpsampleSet;
+        upsampleWrites[2].Binding       = 2;
+        upsampleWrites[2].Type          = EDescriptorType::StorageImage;
+        upsampleWrites[2].ImageView     = m_AoView;
+        upsampleWrites[2].ImageLayout   = EImageLayout::General;
+
+        m_Device->UpdateDescriptorSets(upsampleWrites, 3);
+
+        commandBuffer->TransitionImageLayout(
+            m_AoTexture,
+            EImageLayout::Undefined,
+            EImageLayout::General,
+            EPipelineStageFlags::FragmentShader,
+            EPipelineStageFlags::ComputeShader,
+            EAccessFlags::ShaderRead,
+            EAccessFlags::ShaderWrite);
+
+        FRtAoUpsamplePushConstants upsamplePush;
+        upsamplePush.FullWidth  = m_Extent.Width;
+        upsamplePush.FullHeight = m_Extent.Height;
+        upsamplePush.HalfWidth  = HalfExtent().Width;
+        upsamplePush.HalfHeight = HalfExtent().Height;
+        upsamplePush.NearPlane  = m_NearPlane;
+        upsamplePush.FarPlane   = m_FarPlane;
+
+        commandBuffer->BindComputePipeline(m_UpsamplePipeline);
+        commandBuffer->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                          m_UpsampleLayout, 0, m_UpsampleSet);
+        commandBuffer->PushConstants(m_UpsampleLayout, EShaderStage::Compute,
+                                      0, sizeof(upsamplePush), &upsamplePush);
+
+        commandBuffer->Dispatch((m_Extent.Width + kGroup - 1) / kGroup,
+                                 (m_Extent.Height + kGroup - 1) / kGroup, 1);
+
+        commandBuffer->TransitionImageLayout(
+            m_AoTexture,
+            EImageLayout::General,
+            EImageLayout::ShaderReadOnly,
+            EPipelineStageFlags::ComputeShader,
+            EPipelineStageFlags::FragmentShader,
+            EAccessFlags::ShaderWrite,
+            EAccessFlags::ShaderRead);
+    }
 
     commandBuffer->TransitionImageLayout(
         m_DepthTexture,
@@ -453,6 +697,8 @@ ERHIResult FRayTracedAoPass::OnResize(const FPassResizeDesc& desc)
         return ERHIResult::Success;
     }
 
+    m_Device->DestroyTextureView(m_HalfAoView);
+    m_Device->DestroyTexture(m_HalfAoTexture);
     m_Device->DestroyTextureView(m_AoView);
     m_Device->DestroyTexture(m_AoTexture);
 
@@ -471,6 +717,8 @@ void FRayTracedAoPass::ReleaseSwapchainResources(IRHIDevice* device)
         return;
     }
 
+    device->DestroyTextureView(m_HalfAoView);
+    device->DestroyTexture(m_HalfAoTexture);
     device->DestroyTextureView(m_AoView);
     device->DestroyTexture(m_AoTexture);
 }
@@ -481,6 +729,15 @@ void FRayTracedAoPass::Shutdown(IRHIDevice* device)
     {
         return;
     }
+
+    device->DestroyComputePipeline(m_UpsamplePipeline);
+    device->DestroyPipelineLayout(m_UpsampleLayout);
+    device->FreeDescriptorSet(m_UpsampleSet);
+    device->DestroyDescSetLayout(m_UpsampleSetLayout);
+    device->DestroyShader(m_UpsampleShader);
+
+    device->DestroyTextureView(m_HalfAoView);
+    device->DestroyTexture(m_HalfAoTexture);
 
     device->DestroyComputePipeline(m_Pipeline);
     device->DestroyPipelineLayout(m_PipelineLayout);

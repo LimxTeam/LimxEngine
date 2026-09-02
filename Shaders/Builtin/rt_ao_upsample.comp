@@ -1,0 +1,109 @@
+// ============================================================
+// 文件名称：rt_ao_upsample.comp
+// 创建时间：2026-09-01
+// 创建者  ：LimxTeam
+// 设计哲学：半分辨率的 AO 不能按双线性放大 —— 深度不连续处前景与背景的
+//          遮蔽会被平均在一起，物体边缘出现一圈说不清来源的光晕，而那种
+//          光晕看起来像"AO 半径调大了"，调半径根本治不了。
+//          深度加权解决它：只让**在同一个表面上**的邻居参与。
+//          线性化与权重都用 bilateral_common.h 的共享实现 —— 那两个函数
+//          曾经有过第二份，而那一份的符号写错了整整一个周期。
+// 功能描述：把半分辨率的光追 AO 双边上采样到全分辨率。
+// 技术特性：半分辨率的样本落在全分辨率像素的整数倍位置上（每隔一个像素解
+//          一次，而不是把深度降采样再解），所以上采样取的四个邻居对应的
+//          全分辨率深度是精确已知的，不需要再做一次深度重采样。
+// ============================================================
+
+#version 460
+
+#include "bilateral_common.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D halfAo;
+layout(set = 0, binding = 1) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D fullAo;
+
+layout(push_constant) uniform Params
+{
+    // x = 全分辨率宽, y = 全分辨率高, z = 半分辨率宽, w = 半分辨率高
+    uvec4 Extents;
+
+    // x = 近裁剪面, y = 远裁剪面
+    vec4 Planes;
+} pc;
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.Extents.x || pixel.y >= pc.Extents.y)
+    {
+        return;
+    }
+
+    const float centerNdc = texelFetch(sceneDepth, ivec2(pixel), 0).r;
+
+    const float centerDepth =
+        LinearizeViewDepth(centerNdc, pc.Planes.x, pc.Planes.y);
+
+    // 半分辨率的样本 i 落在全分辨率的 2i 上。本像素落在哪两个之间:
+    const vec2 halfCoord = vec2(pixel) * 0.5;
+
+    const ivec2 base = ivec2(floor(halfCoord));
+    const vec2  frac = halfCoord - vec2(base);
+
+    const ivec2 offsets[4] = ivec2[4](
+        ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(1, 1));
+
+    const float bilinear[4] = float[4](
+        (1.0 - frac.x) * (1.0 - frac.y),
+        frac.x * (1.0 - frac.y),
+        (1.0 - frac.x) * frac.y,
+        frac.x * frac.y);
+
+    float sum       = 0.0;
+    float weightSum = 0.0;
+
+    float bestWeight = -1.0;
+    float bestValue  = 1.0;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        const ivec2 halfPixel = clamp(base + offsets[i], ivec2(0),
+                                      ivec2(pc.Extents.zw) - 1);
+
+        const float ao = texelFetch(halfAo, halfPixel, 0).r;
+
+        // 这个半分辨率样本对应的**全分辨率**像素 —— 精确已知, 不需要
+        // 对深度再做一次重采样。
+        const ivec2 fullPixel = clamp(halfPixel * 2, ivec2(0),
+                                      ivec2(pc.Extents.xy) - 1);
+
+        const float neighborNdc =
+            texelFetch(sceneDepth, fullPixel, 0).r;
+
+        const float neighborDepth =
+            LinearizeViewDepth(neighborNdc, pc.Planes.x, pc.Planes.y);
+
+        const float weight =
+            bilinear[i] * BilateralDepthWeight(centerDepth, neighborDepth);
+
+        sum       += ao * weight;
+        weightSum += weight;
+
+        if (weight > bestWeight)
+        {
+            bestWeight = weight;
+            bestValue  = ao;
+        }
+    }
+
+    // 四个邻居全都与本像素不在同一个表面上 (薄物体、一像素宽的缝) 时,
+    // weightSum 会趋近于零。那时退回权重最大的那个 —— 不退的话是 0/0,
+    // 而 AO 是个乘性因子, NaN 会让那个像素整个变黑。
+    const float result =
+        (weightSum > 1.0e-5) ? (sum / weightSum) : bestValue;
+
+    imageStore(fullAo, ivec2(pixel), vec4(result, 0.0, 0.0, 0.0));
+}

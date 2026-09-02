@@ -234,8 +234,14 @@ struct FLaunchOptions
     /// 启用光追环境光遮蔽
     bool RayTracedAo = false;
 
+    /// 光追 AO 在半分辨率上求解 + 双边上采样
+    bool RayTracedAoHalf = false;
+
     /// 光追 AO 自检: 与直角凹角的闭式解逐像素比对, 以退出码报告
     bool RtAoCheck = false;
+
+    /// 光追 AO 的自遮挡自检: 半径极小时 AO 必须处处为 1 (与场景无关)
+    bool RtAoSelfCheck = false;
 
     /// 隐藏窗口 —— 自检与变异验证一轮要跑几十次, 每次弹一个窗口很难受
     ///
@@ -749,9 +755,21 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.RayTracedAo = true;
         }
+        else if (WideEquals(arg, L"--rt-ao-half"))
+        {
+            options.RayTracedAo     = true;
+            options.RayTracedAoHalf = true;
+        }
         else if (WideEquals(arg, L"--rt-ao-check"))
         {
             options.RtAoCheck = true;
+        }
+        else if (WideEquals(arg, L"--rt-ao-self"))
+        {
+            // 这条自检**不进流水线** —— 见 RunRayTracedAoSelfCheck 头上
+            // 那段: 试了三种统计量, 没有一种能把"偏移不够"与"真实的接触
+            // 遮挡"分开。留着是为了让下一个人不必从头试一遍。
+            options.RtAoSelfCheck = true;
         }
         else if (WideEquals(arg, L"--hidden"))
         {
@@ -4278,6 +4296,19 @@ struct FRtAoComparison
     Float64 OccludedMeasuredSum = 0.0;
     Float64 OccludedExpectedSum = 0.0;
 
+    /// 远场 (d > 1.2R, 解析值恒为 1) 的像素数与最大缺口
+    ///
+    /// 这一段抓的是**自遮挡**: 那里半径内什么都没有, AO 必须是 1。小于 1
+    /// 只能是射线打到了自己脚下的三角形 —— 而那是起点的偏移没盖住深度
+    /// 反投影的误差。
+    ///
+    /// 那个误差随距离急剧增大 (透视深度在远处压缩得极厉害), 所以这一段
+    /// 必须取到**足够远**的地方: 只看近处的话, 一个在远处整片自遮挡的
+    /// 实现照样满分通过 —— 这正是第一版判据放过的东西。
+    SizeType FarFieldPixels = 0;
+    Float32  WorstFarDeficit = 0.0f;
+    Float32  FarthestChecked = 0.0f;
+
     Float64 SignedSum   = 0.0;
     Float64 AbsoluteSum = 0.0;
 
@@ -4340,7 +4371,9 @@ static FRtAoComparison CaptureRtAoComparison(FRenderContext* context,
                                              FRenderer&      renderer,
                                              const FCornerAoTable& table,
                                              Float32 radius,
-                                             UInt32  sampleCount)
+                                             UInt32  sampleCount,
+                                             bool    halfResolution = false,
+                                             TArray<Float32>* outAo = nullptr)
 {
     FRtAoComparison result;
 
@@ -4354,6 +4387,7 @@ static FRtAoComparison CaptureRtAoComparison(FRenderContext* context,
 
     aoPass->SetRadius(radius);
     aoPass->SetSampleCount(sampleCount);
+    aoPass->SetHalfResolution(halfResolution);
 
     IRHIDevice* const device = context->GetDevice();
 
@@ -4511,6 +4545,11 @@ static FRtAoComparison CaptureRtAoComparison(FRenderContext* context,
         return result;
     }
 
+    if (outAo != nullptr)
+    {
+        *outAo = ao;
+    }
+
     // ---- 逐像素比对 ----
     const FCamera& camera = renderer.GetCamera();
 
@@ -4580,11 +4619,17 @@ static FRtAoComparison CaptureRtAoComparison(FRenderContext* context,
             // 闭式解假设墙是无限大的。地面与墙都是 20x20 的方片, 所以
             // 只取离边界足够远的部分 —— 靠近边缘的像素能"看到墙外面",
             // 那里的遮蔽比无限墙小, 而那不是实现的错。
+            // 地面是 20x20 的板, 中心在 z=10, 所以它铺到 z=20。
+            //
+            // 上限从 6 放宽到 16: 深度反投影的误差随距离急剧增大, 而自遮挡
+            // 正是在远处才现形。只看到 6 的话, 一个在二十米外整片自遮挡的
+            // 实现照样满分通过 —— 第一版判据就是这样放过去的。
             constexpr Float32 kHalfExtent = 10.0f;
             constexpr Float32 kEdgeMargin = 4.0f;
+            constexpr Float32 kMaxDistance = 16.0f;
 
             if (FMath::Abs(worldX) > kHalfExtent - kEdgeMargin ||
-                worldZ < 0.0f || worldZ > kHalfExtent - kEdgeMargin)
+                worldZ < 0.0f || worldZ > kMaxDistance)
             {
                 continue;
             }
@@ -4597,6 +4642,18 @@ static FRtAoComparison CaptureRtAoComparison(FRenderContext* context,
             result.SignedSum   += static_cast<Float64>(measured - expected);
             result.AbsoluteSum +=
                 static_cast<Float64>(FMath::Abs(measured - expected));
+
+            // 远场: 半径内什么都没有, 解析值恒为 1
+            if (c > 1.2f)
+            {
+                ++result.FarFieldPixels;
+
+                result.WorstFarDeficit =
+                    FMath::Max(result.WorstFarDeficit, 1.0f - measured);
+
+                result.FarthestChecked =
+                    FMath::Max(result.FarthestChecked, worldZ);
+            }
 
             if (c < 1.0f)
             {
@@ -4624,6 +4681,365 @@ static FRtAoComparison CaptureRtAoComparison(FRenderContext* context,
 }
 
 } // namespace
+
+// ============================================================================
+// RunRayTracedAoSelfCheck — 半径极小时 AO 必须处处为 1
+//
+// 这条判据与场景无关, 而那正是它的价值。
+//
+// 搜索半径设成 0.02 个世界单位时, 任何真实几何体都在半径之外 —— 于是解析
+// 答案是**处处恰好 1**, 不需要任何场景知识。小于 1 只能有一个来源: 射线打到
+// 了自己脚下的那个三角形。
+//
+// 那件事什么时候会发生? 世界坐标是从深度缓冲区反投影来的, 它自带一个误差,
+// 而那个误差**随距离急剧增大** —— 透视深度在远处压缩得极厉害, 同一个 float32
+// 最低位在近处代表微米, 在远处代表厘米。起点的偏移是固定值的话, 近处一切
+// 正常, 远处整行像素一起自遮挡。
+//
+// "整行"是因为深度量化把连续的表面切成一条条等深度的带, 带内所有像素的
+// 反投影误差相同 —— 画面上是一道道横纹。而那看起来像"采样数不够的噪声",
+// 不像"偏移不够"。
+//
+// 墙角场景的解析判据抓不到它: 那个场景里相机看得到的地面只铺到 4.7 个单位,
+// 而条纹要到二三十米外才现形。所以这条判据要跑在**有远景的场景**上。
+// ============================================================================
+
+static bool RunRayTracedAoSelfCheck(FRenderContext* context,
+                                    FRenderer&      renderer)
+{
+    if (!renderer.SetRayTracedAoEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO自遮挡] 无法启用 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    FRayTracedAoPass* const aoPass = renderer.GetRayTracedAoPass();
+    FDepthPrePass* const    depth  = renderer.GetDepthPrePass();
+
+    if (aoPass == nullptr || depth == nullptr)
+    {
+        return false;
+    }
+
+    const Float32 originalRadius = aoPass->GetRadius();
+    const UInt32  originalSamples = aoPass->GetSampleCount();
+    const bool    originalHalf   = aoPass->IsHalfResolution();
+
+    // 用**工作半径**, 不用一个极小的半径。
+    //
+    // 第一版用的是 0.02 —— 想法是"半径内什么都没有, AO 必须处处为 1"。
+    // 实测那个想法不成立: 球体压在地面上, 接触圈处两个表面确实相距不到
+    // 0.02, 那里 AO 本来就该小于 1。而且更要命的是, 它**分辨不出这个 bug**:
+    // 有 bug 时 1346 个像素, 修好后 1302 个 —— 差别全在噪声里。
+    //
+    // 自遮挡的条纹只在工作半径下出现: 射线要够长才会绕回来打到自己脚下。
+    // 所以判据也得在工作半径下判, 而"哪里该是 1"改用**距离**来圈定 ——
+    // 远处的墙面周围一个半径内什么都没有。
+    aoPass->SetRadius(0.8f);
+    // 采样数用**默认的 16**, 不调高。
+    //
+    // 调高会把这条判据要抓的东西抹掉: 自遮挡的条纹是"这一行的射线撞不撞
+    // 得到自己脚下"这种阈值效应, 而更多的样本会把带边缘平均掉。判据必须
+    // 在**实际会用的配置**下判 —— 在一个没人会用的配置下通过, 等于没判。
+    aoPass->SetSampleCount(16);
+    aoPass->SetHalfResolution(false);
+
+    IRHIDevice* const device = context->GetDevice();
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    const SizeType pixelCount =
+        static_cast<SizeType>(extent.Width) * extent.Height;
+
+    FRHIBufferHandle aoReadback;
+    FRHIBufferHandle depthReadback;
+
+    {
+        FRHIBufferDesc desc = {};
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+
+        desc.Size      = pixelCount;
+        desc.DebugName = "RtAoSelf.AO";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, aoReadback)))
+        {
+            return false;
+        }
+
+        desc.Size      = pixelCount * 4u;
+        desc.DebugName = "RtAoSelf.Depth";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, depthReadback)))
+        {
+            device->DestroyBuffer(aoReadback);
+            return false;
+        }
+    }
+
+    const FRHITextureHandle aoTexture    = aoPass->GetAoTexture();
+    const FRHITextureHandle depthTexture = depth->GetSharedDepthTexture();
+
+    bool recorded = false;
+
+    renderer.SetPostSceneRenderCallback(
+        [&recorded, context, aoTexture, depthTexture,
+         aoReadback, depthReadback, extent]()
+        {
+            IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+            if (cmd == nullptr)
+            {
+                return;
+            }
+
+            FRHIBufferTextureCopyRegion region = {};
+            region.BufferOffset      = 0;
+            region.BufferRowLength   = 0;
+            region.BufferImageHeight = 0;
+            region.MipLevel          = 0;
+            region.BaseLayer         = 0;
+            region.LayerCount        = 1;
+            region.TextureOffset     = { 0, 0, 0 };
+            region.TextureExtent     = { extent.Width, extent.Height, 1 };
+
+            cmd->TransitionImageLayout(
+                aoTexture, EImageLayout::ShaderReadOnly,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::FragmentShader,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::ShaderRead, EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(aoTexture, EImageLayout::TransferSrc,
+                                     aoReadback, region);
+
+            cmd->TransitionImageLayout(
+                aoTexture, EImageLayout::TransferSrc,
+                EImageLayout::ShaderReadOnly,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::FragmentShader,
+                EAccessFlags::TransferRead, EAccessFlags::ShaderRead);
+
+            cmd->TransitionImageLayout(
+                depthTexture, EImageLayout::DepthStencilAttachment,
+                EImageLayout::TransferSrc,
+                EPipelineStageFlags::LateFragmentTests,
+                EPipelineStageFlags::Transfer,
+                EAccessFlags::DepthStencilAttachmentWrite,
+                EAccessFlags::TransferRead);
+
+            cmd->CopyTextureToBuffer(depthTexture, EImageLayout::TransferSrc,
+                                     depthReadback, region);
+
+            cmd->TransitionImageLayout(
+                depthTexture, EImageLayout::TransferSrc,
+                EImageLayout::DepthStencilAttachment,
+                EPipelineStageFlags::Transfer,
+                EPipelineStageFlags::EarlyFragmentTests,
+                EAccessFlags::TransferRead,
+                EAccessFlags::DepthStencilAttachmentWrite);
+
+            recorded = true;
+        });
+
+    renderer.RenderFrame();
+    renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+    aoPass->SetRadius(originalRadius);
+    aoPass->SetSampleCount(originalSamples);
+    aoPass->SetHalfResolution(originalHalf);
+
+    SizeType geometryPixels = 0;
+    SizeType occludedPixels = 0;
+    Float64  rowStepSum     = 0.0;
+    SizeType rowStepPairs   = 0;
+    Float32  worstDeficit   = 0.0f;
+    Float32  farthestDepth  = 0.0f;
+
+    bool ok = recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* aoMapped    = nullptr;
+        void* depthMapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(aoReadback, &aoMapped)) &&
+            IsRHISuccess(device->MapBuffer(depthReadback, &depthMapped)) &&
+            aoMapped != nullptr && depthMapped != nullptr)
+        {
+            const auto* ao    = static_cast<const UInt8*>(aoMapped);
+            const auto* depth32 = static_cast<const Float32*>(depthMapped);
+
+            const FCamera& camera = renderer.GetCamera();
+
+            const Float32 nearPlane = camera.GetNearPlane();
+            const Float32 farPlane  = camera.GetFarPlane();
+
+            const Float32 a = farPlane / (nearPlane - farPlane);
+            const Float32 b = farPlane * nearPlane / (nearPlane - farPlane);
+
+            for (SizeType i = 0; i < pixelCount; ++i)
+            {
+                // 天空不算 —— 那里没有表面
+                if (depth32[i] >= 0.999999f)
+                {
+                    continue;
+                }
+
+                const Float32 denom = depth32[i] + a;
+
+                const Float32 linear =
+                    (FMath::Abs(denom) > 1.0e-9f) ? (b / denom) : 0.0f;
+
+                farthestDepth = FMath::Max(farthestDepth, linear);
+
+                // 只看远处的表面。
+                //
+                // 近处有球体压在地面上、柱子立在地面上, 那些接触处的遮挡
+                // 是**真的**。而远处的背景墙周围一个半径 (0.8) 之内什么都
+                // 没有 —— 那里的 AO 必须是 1, 小于 1 只能是自遮挡。
+                //
+                // 二十个单位是量出来的: 场景里最远的柱子在十几米处, 二十米
+                // 之外只剩背景墙。
+                if (linear < 20.0f)
+                {
+                    continue;
+                }
+
+                ++geometryPixels;
+
+                const Float32 value = static_cast<Float32>(ao[i]) / 255.0f;
+
+                const Float32 deficit = 1.0f - value;
+
+                if (deficit > 0.02f)
+                {
+                    ++occludedPixels;
+                }
+
+                worstDeficit = FMath::Max(worstDeficit, deficit);
+
+                // 行间差异 —— 条纹的特征。
+                //
+                // 自遮挡的条纹来自深度量化: 量化把连续的表面切成一条条
+                // 等深度的带, 带内所有像素的反投影误差相同, 于是**整行**
+                // 一起被遮挡或一起不被遮挡。相邻行之间因此出现台阶, 而
+                // 真实的遮蔽 (柱子立在地上) 在竖直方向上是连续的。
+                const SizeType row = i / extent.Width;
+                const SizeType col = i % extent.Width;
+
+                if (row + 1 < extent.Height)
+                {
+                    const SizeType below = i + extent.Width;
+
+                    if (depth32[below] < 0.999999f)
+                    {
+                        const Float32 belowDenom = depth32[below] + a;
+
+                        const Float32 belowLinear =
+                            (FMath::Abs(belowDenom) > 1.0e-9f)
+                                ? (b / belowDenom) : 0.0f;
+
+                        // 只在深度连续的地方比 —— 跨越轮廓的两个像素本来
+                        // 就该不同
+                        if (belowLinear > 20.0f &&
+                            FMath::Abs(belowLinear - linear) <
+                                linear * 0.01f)
+                        {
+                            const Float32 belowValue =
+                                static_cast<Float32>(ao[below]) / 255.0f;
+
+                            rowStepSum +=
+                                static_cast<Float64>(
+                                    FMath::Abs(value - belowValue));
+
+                            ++rowStepPairs;
+                        }
+                    }
+                }
+
+                (void)col;
+            }
+
+            device->UnmapBuffer(depthReadback);
+            device->UnmapBuffer(aoReadback);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    device->DestroyBuffer(depthReadback);
+    device->DestroyBuffer(aoReadback);
+
+    if (!ok)
+    {
+        LIMX_LOG(LogLaunch, Error, "[光追AO自遮挡] 回读失败");
+        return false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追AO自遮挡] 半径 0.8 — 二十米外的像素 {} 个 (最远 {} 单位), "
+             "AO 明显小于 1 的 {} 个, 最大缺口 {} | 深度连续处的相邻行差 "
+             "均值 {} ({} 对)",
+             geometryPixels, farthestDepth, occludedPixels, worstDeficit,
+             (rowStepPairs > 0)
+                 ? static_cast<Float32>(rowStepSum /
+                     static_cast<Float64>(rowStepPairs))
+                 : 0.0f,
+             rowStepPairs);
+
+    bool passed = true;
+
+    // ---- 元判据: 得有足够多的几何体, 而且要够远 ----
+    //
+    // 全是近处几何体的话这条判据是空的 —— 自遮挡要到二三十米外才现形。
+    constexpr SizeType kMinPixels = 50000;
+    constexpr Float32  kMinFarDepth = 20.0f;
+
+    if (geometryPixels < kMinPixels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO自遮挡] 二十米外只有 {} 个像素 (需要至少 {}) "
+                 "—— 这个场景没有远景, 判不了自遮挡",
+                 geometryPixels, kMinPixels);
+        passed = false;
+    }
+
+    if (farthestDepth < kMinFarDepth)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO自遮挡] 最远的几何体只有 {} 个单位 (需要至少 {}) "
+                 "—— 自遮挡在近处不现形, 这个场景判不了",
+                 farthestDepth, kMinFarDepth);
+        passed = false;
+    }
+
+    // ---- 判据: 一个像素都不该被遮挡 ----
+    //
+    // 二十米外的表面周围一个半径之内什么都没有, 所以 AO 恒为 1。
+    //
+    // 实测: 起点只沿法线推固定的 1e-3 时, 这里有 六位数 的像素自遮挡
+    // (画面上是一道道横纹); 按深度量子推之后是零。
+    if (occludedPixels != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[光追AO自遮挡] {} 个像素的 AO 明显小于 1 (最大缺口 {}) "
+                 "—— 射线打到了自己脚下的三角形, 起点的偏移没盖住深度反投影"
+                 "的误差",
+                 occludedPixels, worstDeficit);
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[光追AO自遮挡] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
 
 // ── 已知的覆盖边界 (量过, 三条都能从几何上解释) ─────────────────────────
 //
@@ -4693,8 +5109,38 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
                  cmp.OccludedMeanSigned(), cmp.OccludedMeanAbsolute());
 
         LIMX_LOG(LogLaunch, Display,
-                 "[光追AO]   全体 — 有符号误差 {} 绝对误差 {}",
-                 cmp.MeanSigned(), cmp.MeanAbsolute());
+                 "[光追AO]   全体 — 有符号误差 {} 绝对误差 {} | "
+                 "远场 {} 像素 (最远 {}), 最大自遮挡缺口 {}",
+                 cmp.MeanSigned(), cmp.MeanAbsolute(),
+                 cmp.FarFieldPixels, cmp.FarthestChecked,
+                 cmp.WorstFarDeficit);
+
+        // ---- 判据 4: 远场不能自遮挡 ----
+        //
+        // 半径内什么都没有的地方 AO 必须是 1。小于 1 只能是射线打到了自己
+        // 脚下的三角形 —— 起点的偏移没盖住深度反投影的误差。
+        //
+        // 阈值 0.02: R8 的量化步长是 0.004, 而 256 个样本里错一个就是
+        // 0.004。留五倍。实测正确实现是 0。
+        constexpr Float32 kMaxFarDeficit = 0.02f;
+
+        if (cmp.FarFieldPixels < 10000)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[光追AO] 远场只有 {} 个像素 —— 自遮挡判不了",
+                     cmp.FarFieldPixels);
+            passed = false;
+        }
+
+        if (cmp.WorstFarDeficit > kMaxFarDeficit)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[光追AO] 远场最大自遮挡缺口 {} 超过 {} (最远 {} 单位) "
+                     "—— 射线打到了自己脚下的三角形",
+                     cmp.WorstFarDeficit, kMaxFarDeficit,
+                     cmp.FarthestChecked);
+            passed = false;
+        }
 
         // ---- 元判据: 比对的像素要够多, 距离范围要跨过半径 ----
         //
@@ -4790,6 +5236,120 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
                      "[光追AO] 有遮蔽区只有 {} 个像素 (需要至少 {})",
                      cmp.OccludedPixels, kMinOccludedPixels);
             passed = false;
+        }
+    }
+
+
+    // ================================================================
+    // 半分辨率
+    //
+    // 半分辨率不是"把深度降采样再解", 而是**每隔一个像素解一次** —— 于是
+    // 它的结果是全分辨率结果的严格子集。两条判据:
+    //
+    //   1. 偶数像素上两者必须**逐位相同**。不是"接近", 是相同 —— 同一条
+    //      射线、同一个样本图案、同一个深度。有任何差别都说明半分辨率
+    //      那条路上多做了一次重采样, 而重采样过的深度在不连续处是不存在
+    //      的表面。
+    //   2. 上采样之后整幅图仍要过同一条解析判据。插值出来的像素当然不再
+    //      精确, 但误差应当只比全分辨率大一点点 —— 大很多就说明双边加权
+    //      没起作用 (退化成双线性), 而那正是这个引擎栽过一次的地方。
+    // ================================================================
+    {
+        TArray<Float32> fullAo;
+        TArray<Float32> halfAo;
+
+        const FRtAoComparison fullCmp =
+            CaptureRtAoComparison(context, renderer, table, 0.8f,
+                                  kSampleCount, false, &fullAo);
+
+        const FRtAoComparison halfCmp =
+            CaptureRtAoComparison(context, renderer, table, 0.8f,
+                                  kSampleCount, true, &halfAo);
+
+        renderer.GetRayTracedAoPass()->SetHalfResolution(false);
+
+        if (!fullCmp.Valid || !halfCmp.Valid ||
+            fullAo.GetSize() != halfAo.GetSize() || fullAo.GetSize() == 0)
+        {
+            LIMX_LOG(LogLaunch, Error, "[光追AO] 半分辨率的采集失败");
+            passed = false;
+        }
+        else
+        {
+            const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+            SizeType sampledPixels = 0;
+            SizeType sampledDiffer = 0;
+            Float32  worstSampled  = 0.0f;
+
+            for (UInt32 y = 0; y < extent.Height; y += 2)
+            {
+                for (UInt32 x = 0; x < extent.Width; x += 2)
+                {
+                    const SizeType index =
+                        static_cast<SizeType>(y) * extent.Width + x;
+
+                    ++sampledPixels;
+
+                    const Float32 diff =
+                        FMath::Abs(fullAo[index] - halfAo[index]);
+
+                    worstSampled = FMath::Max(worstSampled, diff);
+
+                    if (diff > 0.0f)
+                    {
+                        ++sampledDiffer;
+                    }
+                }
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[光追AO] 半分辨率 — 偶数像素 {} 个, 与全分辨率不同的 "
+                     "{} 个 (最大差 {}) | 有遮蔽区 有符号误差 {} 绝对误差 {} "
+                     "(全分辨率 {} / {})",
+                     sampledPixels, sampledDiffer, worstSampled,
+                     halfCmp.OccludedMeanSigned(),
+                     halfCmp.OccludedMeanAbsolute(),
+                     fullCmp.OccludedMeanSigned(),
+                     fullCmp.OccludedMeanAbsolute());
+
+            // ---- 判据 A: 偶数像素逐位相同 ----
+            //
+            // 这一条不留容差。半分辨率在这些像素上做的是**同一件事**:
+            // 同一条射线、同一个样本图案、同一个深度。差一位都说明那条路
+            // 上多了一次重采样。
+            if (sampledDiffer != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[光追AO] 半分辨率在 {} 个偶数像素上与全分辨率不同 "
+                         "(最大差 {}) —— 半分辨率那条路多做了一次重采样?",
+                         sampledDiffer, worstSampled);
+                passed = false;
+            }
+
+            // ---- 判据 B: 上采样之后仍要过解析判据 ----
+            //
+            // 阈值比全分辨率宽一档: 四分之三的像素是插值出来的, 而 AO 在
+            // 空间上有梯度, 插值必然带来误差。但只宽一档 —— 宽太多的话,
+            // "双边退化成双线性"这类错误就通过了。
+            constexpr Float32 kHalfMaxSigned   = 0.006f;
+            constexpr Float32 kHalfMaxAbsolute = 0.020f;
+
+            if (FMath::Abs(halfCmp.OccludedMeanSigned()) > kHalfMaxSigned)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[光追AO] 半分辨率的平均有符号误差 {} 超过 {}",
+                         halfCmp.OccludedMeanSigned(), kHalfMaxSigned);
+                passed = false;
+            }
+
+            if (halfCmp.OccludedMeanAbsolute() > kHalfMaxAbsolute)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[光追AO] 半分辨率的平均绝对误差 {} 超过 {}",
+                         halfCmp.OccludedMeanAbsolute(), kHalfMaxAbsolute);
+                passed = false;
+            }
         }
     }
 
@@ -10159,8 +10719,15 @@ int WINAPI wWinMain(
     {
         if (renderer.SetRayTracedAoEnabled(true))
         {
+            if (launchOptions.RayTracedAoHalf &&
+                renderer.GetRayTracedAoPass() != nullptr)
+            {
+                renderer.GetRayTracedAoPass()->SetHalfResolution(true);
+            }
+
             LIMX_LOG(LogLaunch, Display,
-                     "[Launch] 光追环境光遮蔽已启用");
+                     "[Launch] 光追环境光遮蔽已启用 ({})",
+                     launchOptions.RayTracedAoHalf ? "半分辨率" : "全分辨率");
         }
         else
         {
@@ -10325,6 +10892,7 @@ int WINAPI wWinMain(
     bool    rtDepthCheckPassed = true;
     bool    rtShadowCheckPassed = true;
     bool    rtAoCheckPassed = true;
+    bool    rtAoSelfPassed = true;
     bool    rtReflectionCheckPassed = true;
     bool    rtReflectionSelfPassed = true;
 
@@ -10424,6 +10992,12 @@ int WINAPI wWinMain(
             {
                 rtAoCheckPassed =
                     RunRayTracedAoChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.RtAoSelfCheck)
+            {
+                rtAoSelfPassed =
+                    RunRayTracedAoSelfCheck(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -10649,6 +11223,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.RtAoCheck)
     {
         selfCheckCode = FinalizeSelfCheck(rtAoCheckPassed, 22, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.RtAoSelfCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(rtAoSelfPassed, 25, errorSink,
                                           errorsBeforeShutdown);
     }
 

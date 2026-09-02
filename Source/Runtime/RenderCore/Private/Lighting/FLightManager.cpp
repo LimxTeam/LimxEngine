@@ -118,7 +118,7 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     //
     // 与阴影图集并存而不是二选一: 光追阴影一次只处理一盏灯, 其余的仍然
     // 走图集。着色器按 UBO 里的开关决定这一盏用哪一个。
-    FRHIDescriptorBinding bindings[12] = {};
+    FRHIDescriptorBinding bindings[14] = {};
 
     bindings[0].Binding    = 0;
     bindings[0].Type       = EDescriptorType::UniformBuffer;
@@ -195,7 +195,18 @@ ERHIResult FLightManager::Initialize(IRHIDevice* device, UInt32 maxFramesInFligh
     bindings[11].Count      = 1;
     bindings[11].StageFlags = EShaderStage::Fragment;
 
-    layoutDesc.BindingCount = 12;
+    // binding 12/13 — 光追 AO 与光追反射
+    //
+    // 与阴影掩码同理: 布局里无条件声明, 生效与否由 UBO 的标志位决定。
+    // 按"支不支持光追"去改布局的话, 同一个引擎在两台机器上会有两套不同的
+    // 描述符集布局 —— 而管线布局是按对象判兼容的, 那意味着两套管线。
+    bindings[12] = bindings[11];
+    bindings[12].Binding = 12;
+
+    bindings[13] = bindings[11];
+    bindings[13].Binding = 13;
+
+    layoutDesc.BindingCount = 14;
     layoutDesc.DebugName    = "LightingDescSetLayout_Set2";
 
     ERHIResult result = m_Device->CreateDescSetLayout(
@@ -621,7 +632,7 @@ void FLightManager::UploadLightData(
     uboData.RayTracedShadowLight =
         static_cast<Float32>(m_RayTracedShadowLight);
 
-    uboData.LightCountPad2   = 0.0f;
+    uboData.RayTracedFlags   = m_RayTracedFlags;
 
     // 分簇参数
     const FClusterSliceMapping mapping =

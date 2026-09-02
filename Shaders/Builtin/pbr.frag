@@ -217,6 +217,15 @@ layout(set = 2, binding = 10) uniform sampler2DShadow spotShadowAtlas;
 // 一步都没有 —— 可见度已经在通道里算完了。
 layout(set = 2, binding = 11) uniform sampler2D rayTracedShadowMask;
 
+// 光追产出的两张屏幕空间图。
+//
+// 与阴影掩码一样, 它们都是**按屏幕像素**索引的, 而深度缓冲区里存的是最靠前
+// 的不透明表面 —— 所以半透明片元一律不能读它们。这一条在阴影上栽过一次:
+// 玻璃自己在阳光下, 却拿到了玻璃背后地面的阴影值, 而所有逐像素的数值判据
+// 都抓不到 (它们比的是图本身, 而图是对的)。
+layout(set = 2, binding = 12) uniform sampler2D rayTracedAo;
+layout(set = 2, binding = 13) uniform sampler2D rayTracedReflection;
+
 const int SHADOW_CASCADE_COUNT = 3;
 
 // ── 片段着色器输出 ──
@@ -896,8 +905,24 @@ void main()
     //
     // 用 gl_FragCoord 而非任何插值来的 UV: AO 是屏幕空间的量, 必须按像素
     // 位置取。
-    ao *= texture(ambientOcclusion,
-                  gl_FragCoord.xy / lighting.clusterParams.zw).r;
+    // 光追 AO 与屏幕空间 AO 二选一, 不叠乘 —— 两者算的是同一件事
+    // (物体之间的遮挡), 乘起来等于把遮挡算了两遍, 结果是缝隙处过暗。
+    //
+    // lightCountVec.w 的第 0 位是"光追 AO 生效"。半透明片元不读, 理由见
+    // 上面绑定处那段。
+    const uint rtFlags = uint(lighting.lightCountVec.w + 0.5);
+
+    const bool screenSpaceOk = (material.BlendMode != BLEND_TRANSLUCENT);
+
+    if ((rtFlags & 1u) != 0u && screenSpaceOk)
+    {
+        ao *= texelFetch(rayTracedAo, ivec2(gl_FragCoord.xy), 0).r;
+    }
+    else
+    {
+        ao *= texture(ambientOcclusion,
+                      gl_FragCoord.xy / lighting.clusterParams.zw).r;
+    }
 
     vec3 emissive = material.EmissiveColor.rgb;
     if ((material.TextureFlags & TEX_EMISSIVE) != 0u)
@@ -1010,7 +1035,34 @@ void main()
         FEnergyTerms energy =
             ComputeEnergyTerms(envBrdf, F0, albedo * (1.0 - metallic));
 
-        vec3 iblColor = energy.SingleScatter * prefiltered +
+        // 光追反射替掉预滤波环境贴图的那一项 —— 但只在够光滑的表面上。
+        //
+        // 一条射线只能采样反射波瓣里的一个方向。镜面 (粗糙度趋零) 时那个
+        // 波瓣就是一条线, 一条射线正好够; 粗糙表面的波瓣是一大片, 一条射线
+        // 给出的是**噪声**, 而预滤波贴图给出的正是那一片的积分。
+        //
+        // 所以按粗糙度在两者之间过渡: 0.25 以下全用光追, 0.45 以上全用
+        // 预滤波。这两个数不是调出来的 —— 0.25 对应的波瓣张角约 15 度,
+        // 一条射线与整片积分的差在那以内还看不出来; 再粗就看得出了。
+        vec3 specularSource = prefiltered;
+
+        if ((rtFlags & 2u) != 0u && screenSpaceOk)
+        {
+            const vec4 rtSample =
+                texelFetch(rayTracedReflection, ivec2(gl_FragCoord.xy), 0);
+
+            // alpha < 0 = 那条射线没命中任何东西, 反射的是天空 ——
+            // 而天空正是预滤波贴图擅长的, 不必换。
+            if (rtSample.w >= 0.0)
+            {
+                const float rtWeight =
+                    1.0 - smoothstep(0.25, 0.45, roughness);
+
+                specularSource = mix(prefiltered, rtSample.rgb, rtWeight);
+            }
+        }
+
+        vec3 iblColor = energy.SingleScatter * specularSource +
                         (energy.MultiScatter + energy.Diffuse) * irradiance;
 
         // 环境遮蔽同时作用于三项。严格说镜面该用单独的镜面遮蔽项,
@@ -1023,6 +1075,27 @@ void main()
         ambient = lighting.ambientColor.xyz *
                   lighting.ambientColor.w *
                   albedo * ao;
+
+        // 没有环境贴图时, 光追反射是这条路上**唯一**的镜面环境项。
+        //
+        // 上面那个分支里它替掉预滤波贴图; 这里没有预滤波贴图可替, 所以
+        // 直接加。不加的话金属在没有 IBL 的场景里完全是黑的 —— 而那正是
+        // 综合场景的情形, 于是 --rt-reflection 一个像素都不改, 看起来像
+        // "反射没接上"。
+        if ((rtFlags & 2u) != 0u && screenSpaceOk)
+        {
+            const vec4 rtSample =
+                texelFetch(rayTracedReflection, ivec2(gl_FragCoord.xy), 0);
+
+            if (rtSample.w >= 0.0)
+            {
+                const float rtWeight =
+                    1.0 - smoothstep(0.25, 0.45, roughness);
+
+                // 按 F0 加权 —— 金属反射得多, 电介质反射得少。
+                ambient += rtSample.rgb * F0 * rtWeight * ao;
+            }
+        }
     }
 
     // ---- 最终颜色 — 线性 HDR, 不在此处做色调映射 ----

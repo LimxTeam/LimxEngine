@@ -222,6 +222,14 @@ public:
 
     /// 获取描述符集布局 (set 2) — 用于构建管线布局
     /// 指定哪一盏灯的阴影走光线追踪 (-1 = 都不走)
+    /// 光追产出的开关 —— 第 0 位 = AO 生效, 第 1 位 = 反射生效
+    void SetRayTracedFlags(Float32 flags) { m_RayTracedFlags = flags; }
+
+    LIMX_NODISCARD Float32 GetRayTracedFlags() const
+    {
+        return m_RayTracedFlags;
+    }
+
     void SetRayTracedShadowLight(Int32 lightIndex)
     {
         m_RayTracedShadowLight = lightIndex;
@@ -284,6 +292,9 @@ private:
 
     /// 哪一盏灯走光追阴影 (-1 = 都不走)
     Int32 m_RayTracedShadowLight = -1;
+
+    /// 光追产出的开关 (位域, 见 SetRayTracedFlags)
+    Float32 m_RayTracedFlags = 0.0f;
 
     FRHIDescSetLayoutHandle     m_DescSetLayout;
     

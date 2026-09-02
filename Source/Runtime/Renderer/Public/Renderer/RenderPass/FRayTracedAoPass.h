@@ -72,9 +72,10 @@ public:
 
     void SetTlas(FRHIAccelStructHandle tlas) { m_Tlas = tlas; }
 
-    void SetCameraParams(const FMatrix& viewProj)
+    void SetCameraParams(const FMatrix& viewProj, const FVector3& position)
     {
-        m_ViewProj = viewProj;
+        m_ViewProj  = viewProj;
+        m_CameraPos = position;
     }
 
     void SetEnabled(bool enabled) { m_Enabled = enabled; }
@@ -88,6 +89,25 @@ public:
     void SetRadius(Float32 radius) { m_Radius = radius; }
 
     LIMX_NODISCARD Float32 GetRadius() const { return m_Radius; }
+
+    /// 半分辨率求解 + 双边上采样
+    ///
+    /// 不是"把深度降采样再解", 而是**每隔一个像素解一次**: 前者要先对深度
+    /// 做一次重采样, 而深度在不连续处不能插值 —— 前景与背景平均出来是一个
+    /// 不存在的表面。后者取到的每个深度都是真实像素上的原值, 于是半分辨率
+    /// 的结果是全分辨率结果的**严格子集**, 同一个像素上两者逐位相同。
+    ///
+    /// 那个性质是一条判据: 半分辨率不是"近似", 是"少算了四分之三"。
+    void SetHalfResolution(bool enabled) { m_HalfResolution = enabled; }
+
+    LIMX_NODISCARD bool IsHalfResolution() const { return m_HalfResolution; }
+
+    /// 近远裁剪面 —— 上采样的深度加权要用
+    void SetDepthRange(Float32 nearPlane, Float32 farPlane)
+    {
+        m_NearPlane = nearPlane;
+        m_FarPlane  = farPlane;
+    }
 
     /// 每像素的采样数
     ///
@@ -111,6 +131,7 @@ private:
     ERHIResult CreateTarget(IRHIDevice* device, FRHIExtent2D extent);
     ERHIResult CreatePipeline(IRHIDevice* device);
     ERHIResult CreateDescriptors(IRHIDevice* device);
+    ERHIResult CreateUpsample(IRHIDevice* device);
 
     IRHIDevice* m_Device = nullptr;
 
@@ -120,6 +141,16 @@ private:
 
     FRHITextureHandle     m_AoTexture;
     FRHITextureViewHandle m_AoView;
+
+    /// 半分辨率的中间结果 —— 只在半分辨率模式下创建
+    FRHITextureHandle     m_HalfAoTexture;
+    FRHITextureViewHandle m_HalfAoView;
+
+    FRHIDescSetLayoutHandle   m_UpsampleSetLayout;
+    FRHIDescriptorSetHandle   m_UpsampleSet;
+    FRHIPipelineLayoutHandle  m_UpsampleLayout;
+    FRHIComputePipelineHandle m_UpsamplePipeline;
+    FRHIShaderHandle          m_UpsampleShader;
 
     FRHITextureHandle     m_DepthTexture;
     FRHITextureViewHandle m_DepthView;
@@ -135,7 +166,8 @@ private:
     FRHIPipelineLayoutHandle  m_PipelineLayout;
     FRHIComputePipelineHandle m_Pipeline;
 
-    FMatrix m_ViewProj = FMatrix::kIdentity;
+    FMatrix  m_ViewProj  = FMatrix::kIdentity;
+    FVector3 m_CameraPos = FVector3(0.0f, 0.0f, 0.0f);
 
     /// 与 GTAO 的默认半径取同一个数 —— 两者要能在同一个场景上直接比
     Float32 m_Radius = 0.8f;
@@ -146,6 +178,20 @@ private:
     /// 射线起点沿法线的偏移与 tMin —— 与光追阴影同理, 盖住深度的量化误差
     Float32 m_NormalOffset = 1.0e-3f;
     Float32 m_RayTMin      = 1.0e-3f;
+
+    bool m_HalfResolution = false;
+
+    Float32 m_NearPlane = 0.1f;
+    Float32 m_FarPlane  = 100.0f;
+
+    /// 半分辨率的尺寸 —— 向上取整
+    ///
+    /// 取整方向要紧: 向下取整时右边与下边最后一列/行没有半分辨率样本,
+    /// 上采样只能靠钳边去够, 而那一条边上的 AO 会横向拖出一道。
+    LIMX_NODISCARD FRHIExtent2D HalfExtent() const
+    {
+        return { (m_Extent.Width + 1u) / 2u, (m_Extent.Height + 1u) / 2u };
+    }
 
     /// 纹理是否已经离开 Undefined 布局
     ///

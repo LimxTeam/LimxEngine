@@ -38,9 +38,47 @@ layout(row_major, push_constant) uniform Params
     // x = 宽, y = 高, z = 采样数, w = 射线掩码
     uvec4 Params0;
 
-    // x = 搜索半径 (世界单位), y = 法线偏移, z = 射线 tMin, w = 保留
+    // x = 搜索半径 (世界单位), y = 法线偏移, z = 射线 tMin,
+    // w = 像素步长 (1 = 全分辨率, 2 = 半分辨率)
     vec4 Params1;
+
+    // x = 近裁剪面, y = 远裁剪面, z/w = 保留
+    vec4 Params2;
+
+    // xyz = 相机世界位置
+    vec4 CameraPos;
 } pc;
+
+/// 这一像素上, 深度缓冲区能分辨的最小世界距离
+///
+/// 世界坐标是从深度反投影来的, 所以它自带一个误差, 而那个误差**随距离急剧
+/// 增大**: 透视深度在远处压缩得极厉害, 同一个 float32 最低位在近处代表微米,
+/// 在远处代表厘米。
+///
+/// 射线起点的偏移必须盖住它。用一个固定值的后果是: 近处一切正常, 远处整行
+/// 像素一起自遮挡 —— 而"整行"是因为深度量化把连续的表面切成了一条条等深度
+/// 的带, 带内所有像素的反投影误差相同。表现是画面上一道道横纹, 而那看起来
+/// 像"采样数不够的噪声", 不像"偏移不够"。
+float DepthQuantum(float ndcDepth)
+{
+    const float nearPlane = pc.Params2.x;
+    const float farPlane  = pc.Params2.y;
+
+    const float a = farPlane / (nearPlane - farPlane);
+    const float b = farPlane * nearPlane / (nearPlane - farPlane);
+
+    const float denom = ndcDepth + a;
+
+    if (abs(denom) < 1.0e-12)
+    {
+        return 1.0e30;
+    }
+
+    // d(视空间深度)/d(NDC) × 一个最低位
+    const float slope = abs(b) / (denom * denom);
+
+    return slope * max(abs(ndcDepth), 0.5) * 1.1920929e-7;
+}
 
 /// Hammersley 低差异序列的第 i 个点
 ///
@@ -90,6 +128,7 @@ void BuildBasis(vec3 n, out vec3 t, out vec3 b)
 
 void main()
 {
+    // 输出像素 —— 半分辨率时它对应全分辨率的 (pixel * 步长)
     const uvec2 pixel = gl_GlobalInvocationID.xy;
 
     if (pixel.x >= pc.Params0.x || pixel.y >= pc.Params0.y)
@@ -97,7 +136,19 @@ void main()
         return;
     }
 
-    const float ndcDepth = texelFetch(sceneDepth, ivec2(pixel), 0).r;
+    // 半分辨率不是"把深度降采样再解", 而是"每隔一个像素解一次"。
+    //
+    // 前者要先对深度做一次重采样, 而深度在不连续处**不能插值** —— 前景与
+    // 背景的深度平均出来是一个不存在的表面, 那里算出的 AO 没有任何意义。
+    // 后者取到的每一个深度都是真实像素上的原值, 于是半分辨率的结果是全
+    // 分辨率结果的**严格子集**: 同一个像素上两者应当逐位相同, 而那是一条
+    // 判据。
+    const uint step = uint(pc.Params1.w + 0.5);
+
+    const uvec2 sourcePixel = pixel * step;
+    const uvec2 sourceExtent = pc.Params0.xy * step;
+
+    const float ndcDepth = texelFetch(sceneDepth, ivec2(sourcePixel), 0).r;
 
     // 天空: 无遮蔽
     if (ndcDepth >= 0.999999)
@@ -106,24 +157,45 @@ void main()
         return;
     }
 
-    const vec2 uv  = (vec2(pixel) + 0.5) / vec2(pc.Params0.xy);
+    const vec2 uv  = (vec2(sourcePixel) + 0.5) / vec2(sourceExtent);
     const vec2 ndc = uv * 2.0 - 1.0;
 
     const vec4 worldH = pc.InvViewProj * vec4(ndc, ndcDepth, 1.0);
     const vec3 worldPos = worldH.xyz / worldH.w;
 
-    const vec2 encodedNormal = texelFetch(sceneNormal, ivec2(pixel), 0).rg;
+    const vec2 encodedNormal =
+        texelFetch(sceneNormal, ivec2(sourcePixel), 0).rg;
     const vec3 normal = DecodeOctahedralNormal(encodedNormal);
 
     vec3 tangent;
     vec3 bitangent;
     BuildBasis(normal, tangent, bitangent);
 
-    const vec3 rayOrigin = worldPos + normal * pc.Params1.y;
+    // 起点要往两个方向推, 而**沿视线那一个才是主要的**。
+    //
+    // 反投影的误差是沿视线方向的 —— 量化发生在深度上。所以正对相机的表面
+    // 上, 法线方向恰好就是视线方向, 沿法线推有效; 而**掠射表面**的法线几乎
+    // 垂直于视线, 沿法线推一点都抵消不了那个误差, 那些像素照样自遮挡。
+    //
+    // 只推法线的后果: 画面上大面积干净了, 只剩轮廓与掠射处一小撮像素还在
+    // 自遮挡 —— 一千多个像素, 看不出来, 但"半径极小时 AO 处处为 1"这条
+    // 判据一眼看得见。
+    //
+    // 十六倍是量出来的: 反投影的误差不止一个最低位 (深度本身是插值出来再
+    // 量化的, 反投影又要过一次矩阵)。
+    const float quantum = DepthQuantum(ndcDepth);
+
+    const vec3 viewDirection = normalize(worldPos - pc.CameraPos.xyz);
+
+    const vec3 rayOrigin = worldPos
+                         - viewDirection * (quantum * 16.0)
+                         + normal * max(pc.Params1.y, quantum * 4.0);
 
     const uint  sampleCount = max(pc.Params0.z, 1u);
     const float radius      = pc.Params1.x;
-    const float rotation    = PixelRotation(pixel);
+    // 旋转按**源像素**算: 按输出像素算的话, 半分辨率与全分辨率在
+    // 同一个像素上会用不同的样本图案, "两者逐位相同"那条判据就不成立了。
+    const float rotation    = PixelRotation(sourcePixel);
 
     uint occluded = 0u;
 
