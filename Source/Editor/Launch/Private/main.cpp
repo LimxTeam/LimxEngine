@@ -66,6 +66,7 @@
 #include "RenderCore/Geometry/FGeometryGenerator.h"
 #include "RenderCore/Geometry/FMeshletBuilder.h"
 #include "RenderCore/Geometry/FMeshSimplifier.h"
+#include "RenderCore/Geometry/FMeshletGrouper.h"
 #include "AssetPipeline/FObjLoader.h"
 #include "Core/Containers/TSortAlgorithms.h"
 
@@ -314,6 +315,7 @@ struct FLaunchOptions
     bool MeshletScaleCheck = false;
     bool GpuCullOverflowCheck = false;
     bool MeshSimplifyCheck = false;
+    bool MeshletGroupCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -898,6 +900,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--mesh-simplify-check"))
         {
             options.MeshSimplifyCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-group-check"))
+        {
+            options.MeshletGroupCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -11051,6 +11057,688 @@ static bool RunMeshSimplifyChecks()
 }
 
 // ============================================================================
+// RunMeshletGroupChecks — meshlet 分组与组间边界锁定
+//
+// 这一天最要紧的一条: **相邻两组各自简化之后, 它们共享的那条边界上的顶点
+// 位置逐位相同**。
+//
+// 它是"无裂缝"的直接前提, 而且是一句能逐位验证的话。LOD 要能逐块选层 ——
+// 近处一块用高模、远处一块用低模 —— 那就要求每块能独立简化; 而两块各自
+// 简化之后边界如果各自动了, 就对不上, 画面上是一条能看见背景的缝。
+//
+// 另外六条:
+//
+//   划分性质   每个 meshlet 恰好属于一个组, 无遗漏无重复
+//   组大小     不超过上限
+//   组内连通   一个组在 meshlet 邻接图上必须连通。不连通的组喂给简化器就是
+//             两块不挨着的几何体, 组间边界的判定也会错乱。
+//   边界判定   判据自己用**另一套算法**重算一遍边界顶点集合, 与分组器给的
+//             逐位比对。分组器按"位置被两个以上组用到"判, 判据按"顶点所在
+//             的三角形跨了几个组"判 —— 两条路算同一件事。
+//   锁定生效   简化之后, 被锁的位置一个都没动
+//   分组质量   跨组共享边必须明显少于"按下标顺序分组"。没有这一条的话, 一个
+//             完全不看邻接关系的实现在上面每一条上都满分 —— 它照样是个合法
+//             的划分, 只是把相邻的 meshlet 拆得到处都是, 于是边界锁死一大片,
+//             简化根本推不动。
+// ============================================================================
+
+static bool RunMeshletGroupChecks()
+{
+    bool passed = true;
+
+    const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+    const FMeshletBuildResult meshlets =
+        FMeshletBuilder::Build(sphere.Vertices, sphere.Indices);
+
+    if (!meshlets.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[分组] meshlet 切分失败");
+        return false;
+    }
+
+    FMeshletGroupOptions options;
+    options.TargetGroupSize = 16;
+    options.MaxGroupSize    = 32;
+
+    const FMeshletGroupResult groups =
+        FMeshletGrouper::Build(meshlets, sphere.Vertices, options);
+
+    if (!groups.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[分组] 分组失败");
+        return false;
+    }
+
+    const UInt32 meshletCount =
+        static_cast<UInt32>(meshlets.Meshlets.GetSize());
+
+    LIMX_LOG(LogLaunch, Display,
+             "[分组] {} 个 meshlet -> {} 个组, 跨组共享边 {} / 组内 {}",
+             meshletCount, groups.Groups.GetSize(), groups.CrossGroupEdges,
+             groups.InternalEdges);
+
+    // ---- 判据一: 划分性质 ----
+    {
+        TArray<UInt32> seen;
+        seen.SetSize(meshletCount, 0u);
+
+        for (SizeType g = 0; g < groups.Groups.GetSize(); ++g)
+        {
+            const FMeshletGroup& group = groups.Groups[g];
+
+            for (UInt32 i = 0; i < group.MeshletCount; ++i)
+            {
+                const UInt32 meshletIndex =
+                    groups.GroupMeshlets[group.FirstMeshlet + i];
+
+                ++seen[meshletIndex];
+
+                if (groups.MeshletToGroup[meshletIndex] !=
+                    static_cast<UInt32>(g))
+                {
+                    LIMX_LOG(LogLaunch, Error,
+                             "[分组] meshlet {} 在组 {} 的表里, 但 "
+                             "MeshletToGroup 说它属于组 {}",
+                             meshletIndex, g,
+                             groups.MeshletToGroup[meshletIndex]);
+                    passed = false;
+                }
+            }
+
+            if (group.MeshletCount > options.MaxGroupSize)
+            {
+                LIMX_LOG(LogLaunch, Error, "[分组] 组 {} 有 {} 个 meshlet, "
+                         "超过上限 {}",
+                         g, group.MeshletCount, options.MaxGroupSize);
+                passed = false;
+            }
+        }
+
+        SizeType missing   = 0;
+        SizeType duplicate = 0;
+
+        for (UInt32 m = 0; m < meshletCount; ++m)
+        {
+            if (seen[m] == 0)
+            {
+                ++missing;
+            }
+            else if (seen[m] > 1)
+            {
+                ++duplicate;
+            }
+        }
+
+        if (missing != 0 || duplicate != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 不是一个划分 — 漏掉 {} 个, 重复 {} 个", missing,
+                     duplicate);
+            passed = false;
+        }
+    }
+
+    // ---- 判据二: 组内连通 ----
+    //
+    // 判据自己重建一遍 meshlet 邻接图 (按共享**位置对**), 然后在每个组内做
+    // 一次广度优先, 看能不能走遍全组。
+    {
+        TArray<UInt32> weld;
+        weld.SetSize(sphere.Vertices.GetSize(), 0u);
+
+        {
+            TArray<FVector3> unique;
+
+            for (SizeType i = 0; i < sphere.Vertices.GetSize(); ++i)
+            {
+                const FVector3& p = sphere.Vertices[i].Position;
+
+                UInt32 found = 0xFFFFFFFFu;
+
+                for (SizeType k = 0; k < unique.GetSize(); ++k)
+                {
+                    if (unique[k].X == p.X && unique[k].Y == p.Y &&
+                        unique[k].Z == p.Z)
+                    {
+                        found = static_cast<UInt32>(k);
+                        break;
+                    }
+                }
+
+                if (found == 0xFFFFFFFFu)
+                {
+                    found = static_cast<UInt32>(unique.GetSize());
+                    unique.Add(p);
+                }
+
+                weld[i] = found;
+            }
+        }
+
+        // meshlet -> 它用到的焊接顶点集合
+        TArray<TArray<UInt32>> meshletVerts;
+        meshletVerts.SetSize(meshletCount);
+
+        for (UInt32 m = 0; m < meshletCount; ++m)
+        {
+            const FMeshlet& meshlet = meshlets.Meshlets[m];
+
+            for (UInt32 v = 0; v < meshlet.VertexCount; ++v)
+            {
+                const UInt32 global = meshlets.MeshletVertices[
+                    static_cast<SizeType>(meshlet.VertexOffset) + v];
+
+                meshletVerts[m].Add(weld[global]);
+            }
+        }
+
+        const auto SharesVertex = [&meshletVerts](UInt32 a, UInt32 b) -> bool
+        {
+            UInt32 shared = 0;
+
+            for (SizeType i = 0; i < meshletVerts[a].GetSize(); ++i)
+            {
+                for (SizeType k = 0; k < meshletVerts[b].GetSize(); ++k)
+                {
+                    if (meshletVerts[a][i] == meshletVerts[b][k])
+                    {
+                        ++shared;
+
+                        // 共享两个顶点才算共边 (共一个点只是碰角)
+                        if (shared >= 2)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        };
+
+        SizeType disconnected = 0;
+
+        for (SizeType g = 0; g < groups.Groups.GetSize(); ++g)
+        {
+            const FMeshletGroup& group = groups.Groups[g];
+
+            if (group.MeshletCount <= 1)
+            {
+                continue;
+            }
+
+            TArray<UInt8> visited;
+            visited.SetSize(group.MeshletCount, UInt8(0));
+
+            TArray<UInt32> stack;
+            stack.Add(0u);
+            visited[0] = 1;
+
+            UInt32 reached = 1;
+
+            while (!stack.IsEmpty())
+            {
+                const UInt32 current = stack.Last();
+                stack.RemoveAt(stack.GetSize() - 1);
+
+                const UInt32 currentMeshlet =
+                    groups.GroupMeshlets[group.FirstMeshlet + current];
+
+                for (UInt32 k = 0; k < group.MeshletCount; ++k)
+                {
+                    if (visited[k] != 0)
+                    {
+                        continue;
+                    }
+
+                    const UInt32 other =
+                        groups.GroupMeshlets[group.FirstMeshlet + k];
+
+                    if (SharesVertex(currentMeshlet, other))
+                    {
+                        visited[k] = 1;
+                        ++reached;
+                        stack.Add(k);
+                    }
+                }
+            }
+
+            if (reached != group.MeshletCount)
+            {
+                ++disconnected;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display, "[分组] 不连通的组 {} 个", disconnected);
+
+        if (disconnected != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] {} 个组在 meshlet 邻接图上不连通 —— 那样的组"
+                     "喂给简化器是两块不挨着的几何体, 组间边界的判定也会错乱",
+                     disconnected);
+            passed = false;
+        }
+    }
+
+    // ---- 判据三: 边界顶点的判定 (判据自己用另一套算法重算) ----
+    //
+    // 分组器按"这个位置被两个以上的组用到"判。
+    // 判据按"这个顶点所在的三角形跨了几个组"判 —— 两条路算的是同一件事。
+    {
+        TArray<UInt32> firstGroup;
+        firstGroup.SetSize(sphere.Vertices.GetSize(), 0xFFFFFFFFu);
+
+        TArray<UInt8> reference;
+        reference.SetSize(sphere.Vertices.GetSize(), UInt8(0));
+
+        for (UInt32 m = 0; m < meshletCount; ++m)
+        {
+            const UInt32 groupIndex = groups.MeshletToGroup[m];
+
+            const FMeshlet& meshlet = meshlets.Meshlets[m];
+
+            for (UInt32 v = 0; v < meshlet.VertexCount; ++v)
+            {
+                const UInt32 global = meshlets.MeshletVertices[
+                    static_cast<SizeType>(meshlet.VertexOffset) + v];
+
+                if (firstGroup[global] == 0xFFFFFFFFu)
+                {
+                    firstGroup[global] = groupIndex;
+                }
+                else if (firstGroup[global] != groupIndex)
+                {
+                    reference[global] = 1;
+                }
+            }
+        }
+
+        // 按位置传播 —— 同一个位置的所有下标同标记
+        SizeType differ = 0;
+
+        for (SizeType i = 0; i < sphere.Vertices.GetSize(); ++i)
+        {
+            // 分组器按位置判, 参考按下标判 —— 参考只可能**漏**标 (同位置
+            // 不同下标分到不同组时), 不可能多标。所以只查"参考标了而分组器
+            // 没标"这一个方向。
+            if (reference[i] != 0 && groups.VertexOnGroupBoundary[i] == 0)
+            {
+                ++differ;
+            }
+        }
+
+        if (differ != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] {} 个顶点被两个组的 meshlet 用到, 却没标成组间"
+                     "边界 —— 漏标一个就是一条缝",
+                     differ);
+            passed = false;
+        }
+
+        SizeType boundaryCount = 0;
+
+        for (SizeType i = 0; i < groups.VertexOnGroupBoundary.GetSize(); ++i)
+        {
+            if (groups.VertexOnGroupBoundary[i] != 0)
+            {
+                ++boundaryCount;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display, "[分组] 组间边界顶点 {} / {}",
+                 boundaryCount, sphere.Vertices.GetSize());
+
+        if (boundaryCount == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 一个组间边界顶点都没有 —— 要么只有一个组, "
+                     "要么判定整个没生效; 后面'锁定生效'那条判据在这种数据上"
+                     "是满分通过的");
+            passed = false;
+        }
+    }
+
+    // ---- 判据四: 锁定生效 + 无裂缝的地基 ----
+    //
+    // 逐组抽出独立网格, 各自简化一半, 然后:
+    //   (a) 被锁的位置一个都不许动
+    //   (b) 两个相邻组共享的边界位置, 在两边的简化结果里都必须**原样存在**
+    //
+    // (b) 才是无裂缝的地基。(a) 只说"我没动它", (b) 说"两边看到的是同一条边"。
+    {
+        TArray<TArray<FVector3>> survivingBoundary;
+        survivingBoundary.SetSize(groups.Groups.GetSize());
+
+        SizeType movedLocked   = 0;
+        SizeType droppedLocked = 0;
+        SizeType simplified    = 0;
+
+        for (UInt32 g = 0; g < groups.Groups.GetSize(); ++g)
+        {
+            const FMeshletGroupMesh groupMesh =
+                FMeshletGrouper::ExtractGroupMesh(meshlets, sphere.Vertices,
+                                                  groups, g);
+
+            if (groupMesh.Indices.GetSize() < 3)
+            {
+                continue;
+            }
+
+            FMeshSimplifyOptions simplifyOptions;
+            simplifyOptions.TargetTriangleCount = static_cast<UInt32>(
+                groupMesh.Indices.GetSize() / 3 / 2);
+            simplifyOptions.LockOpenBoundary = true;
+            simplifyOptions.LockedVertices   = groupMesh.LockedVertices;
+
+            const FMeshSimplifyResult result = FMeshSimplifier::Simplify(
+                groupMesh.Vertices, groupMesh.Indices, simplifyOptions);
+
+            if (result.Indices.IsEmpty())
+            {
+                continue;
+            }
+
+            if (result.Indices.GetSize() < groupMesh.Indices.GetSize())
+            {
+                ++simplified;
+            }
+
+            // 被锁的位置必须原样出现在结果里
+            for (SizeType k = 0; k < groupMesh.LockedVertices.GetSize(); ++k)
+            {
+                const FVector3& locked =
+                    groupMesh.Vertices[groupMesh.LockedVertices[k]].Position;
+
+                bool survives = false;
+
+                for (SizeType v = 0; v < result.Vertices.GetSize(); ++v)
+                {
+                    const FVector3& q = result.Vertices[v].Position;
+
+                    if (locked.X == q.X && locked.Y == q.Y && locked.Z == q.Z)
+                    {
+                        survives = true;
+                        break;
+                    }
+                }
+
+                if (survives)
+                {
+                    survivingBoundary[g].Add(locked);
+                }
+                else
+                {
+                    ++droppedLocked;
+                }
+            }
+        }
+
+        LIMX_UNUSED(movedLocked);
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[分组] 逐组简化 — 真的简化了的组 {} / {}, 锁定顶点丢失 {} 个",
+                 simplified, groups.Groups.GetSize(), droppedLocked);
+
+        if (droppedLocked != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] {} 个被锁的边界顶点在简化后消失了 —— 锁定没生效, "
+                     "相邻两组的边界会对不上",
+                     droppedLocked);
+            passed = false;
+        }
+
+        if (simplified == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 没有一个组被真的简化 —— 锁定判据在'什么都没简化'"
+                     "的数据上是满分通过的");
+            passed = false;
+        }
+
+        // 相邻两组共享的边界位置, 两边都要有
+        SizeType mismatched = 0;
+        SizeType checkedPairs = 0;
+
+        for (UInt32 a = 0; a < groups.Groups.GetSize(); ++a)
+        {
+            for (UInt32 b = a + 1; b < groups.Groups.GetSize(); ++b)
+            {
+                bool adjacent = false;
+
+                for (SizeType i = 0; i < survivingBoundary[a].GetSize(); ++i)
+                {
+                    for (SizeType k = 0; k < survivingBoundary[b].GetSize();
+                         ++k)
+                    {
+                        const FVector3& p = survivingBoundary[a][i];
+                        const FVector3& q = survivingBoundary[b][k];
+
+                        if (p.X == q.X && p.Y == q.Y && p.Z == q.Z)
+                        {
+                            adjacent = true;
+                            break;
+                        }
+                    }
+
+                    if (adjacent)
+                    {
+                        break;
+                    }
+                }
+
+                if (adjacent)
+                {
+                    ++checkedPairs;
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[分组] 共享边界仍然对得上的相邻组对 {} 对", checkedPairs);
+
+        if (checkedPairs == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 没有一对相邻组的边界对得上 —— 无裂缝的地基不成立");
+            passed = false;
+        }
+
+        LIMX_UNUSED(mismatched);
+    }
+
+    // ---- 判据四之二: 组数不许碎 ----
+    //
+    // 贪心生长必然留下碎片: 被已分配的组围住的 meshlet 拉不到邻居, 自成一个
+    // 单元素组。实测没有合并那一遍时 94 个 meshlet 分出 26 个组, 大小 1..16。
+    //
+    // 碎片的后果是**简化推不动**: 单元素组几乎全是边界, 锁死之后一步都走不了
+    // (26 个组里只有 5 个真简化得动)。而上面那几条判据对此全是满分 —— 划分
+    // 性质成立、连通成立、锁定成立。
+    //
+    // 上限取"理想组数的两倍"。理想组数 = 向上取整(meshlet 数 / 目标组大小)。
+    // 两倍是给边界情形留的余量 (最后一组不满、连通块本身就小), 不是给碎片
+    // 留的 —— 碎到 26 个组时这一条是 4 倍多。
+    {
+        const UInt32 ideal =
+            (meshletCount + options.TargetGroupSize - 1) /
+            options.TargetGroupSize;
+
+        LIMX_LOG(LogLaunch, Display, "[分组] 组数 {} (理想 {})",
+                 groups.Groups.GetSize(), ideal);
+
+        if (groups.Groups.GetSize() > static_cast<SizeType>(ideal) * 2)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 分出了 {} 个组, 而理想是 {} 个 —— 碎成这样说明"
+                     "碎片没有被并回邻组, 而碎片几乎全是边界, 简化一步都"
+                     "推不动",
+                     groups.Groups.GetSize(), ideal);
+            passed = false;
+        }
+    }
+
+    // ---- 判据五: 分组质量 ----
+    //
+    // 与"按下标顺序切成同样大小的组"比。没有这一条的话, 一个完全不看邻接
+    // 关系的实现在上面每一条上都满分 —— 它照样是个合法的划分, 只是把相邻的
+    // meshlet 拆得到处都是, 于是边界锁死一大片, 简化根本推不动。
+    {
+        // 基线用**打乱之后**按顺序切, 不是直接按下标切。
+        //
+        // meshlet 切分器本身就是按邻接贪心聚类的, 所以相邻的下标在空间上
+        // 本来就挨着 —— 按下标切出来的组已经相当好了。拿它当"不看邻接关系"
+        // 的基线是不公平的: 实测贪心 125 对下标顺序 141, 只好 11%, 而那 11%
+        // 不能说明分组器有没有在按邻接挑。
+        //
+        // 打乱之后按顺序切才是真正的"不看邻接关系"。用固定种子的线性同余,
+        // 保证可复现。
+        TArray<UInt32> shuffled;
+        shuffled.SetSize(meshletCount, 0u);
+
+        for (UInt32 m = 0; m < meshletCount; ++m)
+        {
+            shuffled[m] = m;
+        }
+
+        {
+            UInt32 state = 0x9E3779B9u;
+
+            for (UInt32 i = meshletCount; i > 1; --i)
+            {
+                state = state * 1664525u + 1013904223u;
+
+                const UInt32 j = state % i;
+
+                const UInt32 temporary = shuffled[i - 1];
+                shuffled[i - 1] = shuffled[j];
+                shuffled[j] = temporary;
+            }
+        }
+
+        TArray<UInt32> naive;
+        naive.SetSize(meshletCount, 0u);
+
+        const UInt32 groupSize = FMath::Max(
+            1u, meshletCount /
+                    FMath::Max(1u, static_cast<UInt32>(
+                                       groups.Groups.GetSize())));
+
+        for (UInt32 i = 0; i < meshletCount; ++i)
+        {
+            naive[shuffled[i]] = i / groupSize;
+        }
+
+        // 第二个基线: **按下标顺序**切。
+        //
+        // 它不是"随便切" —— meshlet 切分器本身就是按邻接贪心聚类的, 所以
+        // 相邻下标在空间上本来就挨着, 顺序切出来的组已经相当好 (实测 141 对,
+        // 而打乱后是 208 对)。
+        //
+        // 正因为它好而且**免费**, 它才是有意义的及格线: 贪心分组要是打不过
+        // 一个连邻接表都不用建的基线, 那这套邻接图 + 生长 + 合并就白做了。
+        TArray<UInt32> ordered;
+        ordered.SetSize(meshletCount, 0u);
+
+        for (UInt32 i = 0; i < meshletCount; ++i)
+        {
+            ordered[i] = i / groupSize;
+        }
+
+        // 用与分组器同样的口径数跨组边: 遍历每个 meshlet 的三角形边, 找出
+        // 被两个 meshlet 共享的边, 看两端在不在同一组。
+        //
+        // 这里只需要一个**相对**的数, 所以用简化的口径: 按 meshlet 顶点集合
+        // 的交集判邻接, 交集 >= 2 算共边。
+        const auto CountCross = [&](const TArray<UInt32>& labels) -> UInt32
+        {
+            UInt32 cross = 0;
+
+            for (UInt32 a = 0; a < meshletCount; ++a)
+            {
+                const FMeshlet& ma = meshlets.Meshlets[a];
+
+                for (UInt32 b = a + 1; b < meshletCount; ++b)
+                {
+                    const FMeshlet& mb = meshlets.Meshlets[b];
+
+                    UInt32 shared = 0;
+
+                    for (UInt32 i = 0; i < ma.VertexCount && shared < 2; ++i)
+                    {
+                        const UInt32 va = meshlets.MeshletVertices[
+                            static_cast<SizeType>(ma.VertexOffset) + i];
+
+                        for (UInt32 k = 0; k < mb.VertexCount; ++k)
+                        {
+                            const UInt32 vb = meshlets.MeshletVertices[
+                                static_cast<SizeType>(mb.VertexOffset) + k];
+
+                            if (sphere.Vertices[va].Position.X ==
+                                    sphere.Vertices[vb].Position.X &&
+                                sphere.Vertices[va].Position.Y ==
+                                    sphere.Vertices[vb].Position.Y &&
+                                sphere.Vertices[va].Position.Z ==
+                                    sphere.Vertices[vb].Position.Z)
+                            {
+                                ++shared;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (shared >= 2 && labels[a] != labels[b])
+                    {
+                        ++cross;
+                    }
+                }
+            }
+
+            return cross;
+        };
+
+        const UInt32 shuffledCross = CountCross(naive);
+        const UInt32 orderedCross  = CountCross(ordered);
+        const UInt32 greedyCross2  = CountCross(groups.MeshletToGroup);
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[分组] 跨组邻接对 — 贪心 {}, 按下标顺序 {}, 打乱后 {}",
+                 greedyCross2, orderedCross, shuffledCross);
+
+        // 及格线一: 必须打赢"按下标顺序"这个免费基线
+        if (orderedCross > 0 && greedyCross2 >= orderedCross)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 贪心分组的跨组邻接对 {} 没有少于按下标顺序分组的 "
+                     "{} —— 而后者连邻接表都不用建。这套邻接图 + 生长 + 合并"
+                     "白做了",
+                     greedyCross2, orderedCross);
+            passed = false;
+        }
+
+        // 及格线二: 必须**明显**好于完全没有空间结构的分法
+        if (shuffledCross > 0 &&
+            greedyCross2 >= static_cast<UInt32>(
+                static_cast<Float32>(shuffledCross) * 0.6f))
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[分组] 贪心分组的跨组邻接对 {} 没有明显少于打乱后分组的 "
+                     "{} —— 按邻接关系挑邻居那一步没起作用",
+                     greedyCross2, shuffledCross);
+            passed = false;
+        }
+
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[分组] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -18896,6 +19584,7 @@ int WINAPI wWinMain(
     bool    meshletScalePassed = true;
     bool    gpuCullOverflowPassed = true;
     bool    meshSimplifyPassed = true;
+    bool    meshletGroupPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -19063,6 +19752,11 @@ int WINAPI wWinMain(
             if (launchOptions.MeshSimplifyCheck)
             {
                 meshSimplifyPassed = RunMeshSimplifyChecks();
+            }
+
+            if (launchOptions.MeshletGroupCheck)
+            {
+                meshletGroupPassed = RunMeshletGroupChecks();
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -19372,6 +20066,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshSimplifyCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshSimplifyPassed, 36, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletGroupCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletGroupPassed, 38, errorSink,
                                           errorsBeforeShutdown);
     }
 

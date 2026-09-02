@@ -806,6 +806,21 @@ FMeshSimplifyResult FMeshSimplifier::Simplify(
         MarkOpenBoundary(state);
     }
 
+    // 调用方指定的锁 —— 按输入顶点下标给, 这里映射到焊接顶点。
+    //
+    // 只要并成同一个位置的输入顶点里有**任何一个**被锁, 这个位置就锁死。
+    // 宁可多锁: 少锁一个的后果是裂缝 (相邻两组的边界对不上), 而多锁一个
+    // 的后果只是那里少简化一点。
+    for (SizeType i = 0; i < options.LockedVertices.GetSize(); ++i)
+    {
+        const UInt32 inputIndex = options.LockedVertices[i];
+
+        if (inputIndex < remap.GetSize())
+        {
+            state.Locked[remap[inputIndex]] = 1;
+        }
+    }
+
     // ---- 候选边入堆 ----
     //
     // 坍缩位置在三个候选里挑: 解出来的最优点、两个端点。最优点在几乎共面
