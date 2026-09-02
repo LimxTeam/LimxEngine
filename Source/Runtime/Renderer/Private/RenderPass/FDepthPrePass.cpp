@@ -369,6 +369,25 @@ void FDepthPrePass::RecordRange(IRHICommandBuffer*        commandBuffer,
             // 与间接路径完全同一个机制。所以两条路径读的是同一处数据、走的
             // 是同一份着色器代码, 逐像素比对时比出来的差异只可能来自剔除与
             // 命令下发。
+            //
+            // 没有逐物体条目的就不画 —— 见 FGpuCullPass 里那段说明。
+            //
+            // 相机段是缓冲区的**第一段**, 所以它被截断的门槛比后两段高得多
+            // (要相机列表自己就超过 kMaxGpuDrawObjects)。但"门槛高"不等于
+            // 走不到, 而阴影那三条路径都判了、这里不判的话, 这条路径就是
+            // 整个不变式上唯一一个缺口 —— 而缺口在哪, 缺陷就出在哪。
+            if (context.GpuCull != nullptr &&
+                static_cast<UInt32>(i) >= context.GpuCull->GetCameraCount())
+            {
+                context.GpuCull->NoteSkippedDraw();
+                continue;
+            }
+
+            if (context.GpuCull != nullptr)
+            {
+                context.GpuCull->NoteIssuedDraw(static_cast<UInt32>(i));
+            }
+
             commandBuffer->DrawIndexed(
                 obj.IndexCount,
                 1,

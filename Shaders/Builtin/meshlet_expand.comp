@@ -53,12 +53,38 @@ layout(std430, set = 0, binding = 4) writeonly buffer ExpandedBuffer {
     uvec2 vertices[];
 } expandedBuffer;
 
-// 间接绘制参数 —— 与 VkDrawIndirectCommand 逐字段一致
+// 间接绘制参数 —— 前四个字段与 VkDrawIndirectCommand 逐字段一致
+//
+// ── 为什么"分配槽位"与"绘制多少"必须是两个数 ──
+//
+// 这里的原子加是**槽位分配器**: 每个三角形先领三个位置, 领到的位置超出
+// 流的容量就把这个三角形丢掉。丢掉本身没得选 (越界写会改掉别的缓冲区)。
+//
+// 要命的是 vertexCount 同时又是 vkCmdDrawIndirect 读的那个数。用同一个
+// 计数器的话, 被丢掉的三角形照样把它加了上去 —— 于是命令处理器按一个
+// **大于流里真实顶点数**的值发顶点, 而顶点着色器拿 gl_VertexIndex 无条件
+// 索引这条流。后果不是"画面上少一块", 是 GPU 读缓冲区之外的地址。
+//
+// 所以分成两个:
+//   requestedVertices  槽位分配器, 想写多少加多少 —— 它大于容量就是溢出
+//                      的证据, 判据看的正是这个数
+//   vertexCount        真正写进流里的顶点数 —— 只有没被丢掉的三角形才更新
+//                      它, 绘制照着它走
+//
+// 写进去的槽位是从 0 开始的**连续前缀** (原子加把 base 密集地发出去, 而
+// 丢弃的判据只与 base 有关且单调), 所以取一个 atomicMax 就是那个前缀的
+// 长度 —— 不需要第二个累加器。
 layout(std430, set = 0, binding = 5) buffer DrawArgsBuffer {
     uint vertexCount;
     uint instanceCount;
     uint firstVertex;
     uint firstInstance;
+
+    // 诊断用, 不参与绘制
+    uint requestedVertices;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
 } drawArgs;
 
 layout(push_constant) uniform Params {
@@ -91,7 +117,9 @@ void main()
     {
         // 一次原子分配三个顶点 —— 分三次的话同一个三角形的三个顶点会
         // 被别的三角形插进来, 于是画出来的是一堆互相穿插的碎片。
-        const uint base = atomicAdd(drawArgs.vertexCount, 3u);
+        //
+        // 加的是**分配器**那个数, 不是绘制用的那个。见上面结构体的说明。
+        const uint base = atomicAdd(drawArgs.requestedVertices, 3u);
 
         if (base + 3u > pc.params.y)
         {
@@ -123,5 +151,11 @@ void main()
                 uvec2(vertexBase + globalVertex,
                       MeshletEncodeVisibility(slot, t));
         }
+
+        // 只有真正写进去的三角形才抬高绘制用的那个数。
+        //
+        // 放在写之后而不是之前: 放之前的话, 一次被丢弃的分配也会抬高它,
+        // 那就退回成同一个计数器了。
+        atomicMax(drawArgs.vertexCount, base + 3u);
     }
 }

@@ -94,6 +94,15 @@ LIMX_NODISCARD UInt32 GetValidationErrorCount();
 /// 清零 —— 只在自检开始前调用
 void ResetValidationErrorCount();
 
+/// 到目前为止丢过几次设备 (VK_ERROR_DEVICE_LOST)
+///
+/// 单独计一个数的理由与验证层那个一样, 而且更硬: 丢设备**从来不是预期的**。
+///
+/// 在此之前它对退出码毫无影响 —— 日志里躺着一行 `vkQueueSubmit 失败: -4`
+/// 和八帧 `WaitForFence 失败`, 而进程照样返回 0。也就是说"跑五次都退出 0"
+/// 这种判据对丢设备是**瞎的**, 而丢设备恰恰是最严重的那一类缺陷。
+LIMX_NODISCARD UInt32 GetDeviceLostCount();
+
 
 // ============================================================================
 // FRHISubmitInfo — 命令提交信息

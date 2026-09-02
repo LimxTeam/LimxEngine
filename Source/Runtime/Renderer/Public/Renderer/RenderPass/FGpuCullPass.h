@@ -284,10 +284,14 @@ public:
     }
 
     /// 本帧要剔除的视图数 (含相机)
-    void SetViewCount(UInt32 count)
-    {
-        m_ViewCount = (count < kMaxCullViews) ? count : kMaxCullViews;
-    }
+    ///
+    /// 超过 kMaxCullViews 时钳到上限 —— 钳位没得选 (间接命令缓冲区就是按
+    /// 那个数开的), 但**必须报出来**。静默钳位的表现是"多出来的那几个视图
+    /// 一个物体都不画", 而那与"这几盏灯照不到东西"长得一样。点光的立方体
+    /// 六面一上来就要占六个视图, 这条路是走得到的。
+    ///
+    /// 实现放在 .cpp —— 报错要用日志类别, 而那个类别是在 .cpp 里声明的。
+    void SetViewCount(UInt32 count);
 
     LIMX_NODISCARD UInt32 GetViewCount() const { return m_ViewCount; }
 

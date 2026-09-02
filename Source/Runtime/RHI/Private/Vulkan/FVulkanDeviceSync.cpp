@@ -58,6 +58,17 @@
 namespace Limx
 {
 
+// 丢设备的计数 —— 见 IRHIDevice.h 里那段说明
+//
+// 定义放在**递增它的这个文件**里, 不放在 Init.cpp: RHI 的单元测试目标链接了
+// Sync.obj 而没有链接 Init.obj, 定义放那边会报未解析的外部符号。
+static UInt32 GDeviceLostCount = 0;
+
+UInt32 GetDeviceLostCount()
+{
+    return GDeviceLostCount;
+}
+
 // ============================================================================
 // 栅栏
 // ============================================================================
@@ -956,6 +967,8 @@ ERHIResult FVulkanDevice::Submit(EQueueType queue,
         // "GPU 读了个非法地址"这类缺陷几乎无效 —— 症状与触发点隔着好几层。
         if (vkResult == VK_ERROR_DEVICE_LOST)
         {
+            ++GDeviceLostCount;
+
             auto getFault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
                 vkGetDeviceProcAddr(m_Device, "vkGetDeviceFaultInfoEXT"));
 

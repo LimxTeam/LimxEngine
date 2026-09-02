@@ -388,6 +388,25 @@ void FForwardPass::RecordOpaqueRange(IRHICommandBuffer*        commandBuffer,
             // 模型矩阵与材质下标在 set 3 的 storage buffer 里 —— 这里传的
             // 是**物体下标**, 经 firstInstance 进到 gl_InstanceIndex。
             // 与间接路径完全同一个机制。
+            //
+            // 没有逐物体条目的就不画 —— 见 FGpuCullPass 里那段说明。
+            //
+            // 相机段是缓冲区的**第一段**, 被截断的门槛比后两段高 (要相机
+            // 列表自己就超过 kMaxGpuDrawObjects)。但阴影与半透明那三条路径
+            // 都判了、这里不判的话, 这条路径就是整个不变式上唯一一个缺口,
+            // 而 GetMaxIssuedIndex 也就看不到它 —— 判据对它一个字都不会说。
+            if (context.GpuCull != nullptr &&
+                static_cast<UInt32>(i) >= context.GpuCull->GetCameraCount())
+            {
+                context.GpuCull->NoteSkippedDraw();
+                continue;
+            }
+
+            if (context.GpuCull != nullptr)
+            {
+                context.GpuCull->NoteIssuedDraw(static_cast<UInt32>(i));
+            }
+
             commandBuffer->DrawIndexed(
                 obj.IndexCount,
                 1,

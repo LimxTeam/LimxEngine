@@ -57,7 +57,27 @@ struct FDrawIndirectCommand
 constexpr UInt64 kExpandedBytes =
     static_cast<UInt64>(sizeof(UInt32)) * 2 * kMaxExpandedVertices;
 
-constexpr UInt64 kDrawArgsBytes = sizeof(FDrawIndirectCommand);
+/// 间接绘制参数块 —— 前 16 字节与 VkDrawIndirectCommand 逐字段一致,
+/// 后 16 字节是诊断量 (槽位分配器发出去的顶点数 + 三个保留字)
+///
+/// 诊断量接在后面而不是另开一个缓冲区: vkCmdDrawIndirect 从偏移 0 读,
+/// 后面的字节它一个都不碰。另开一个的话就多一次归零、一次屏障、一次拷贝,
+/// 而这两个数是同一个着色器在同一次原子操作前后写的 —— 分开放反而给了
+/// "两处不同步"的机会。
+constexpr UInt64 kDrawArgsBytes =
+    sizeof(FDrawIndirectCommand) + sizeof(UInt32) * 4;
+
+/// 间接分派参数的模板 (0, 1, 1, 0)
+constexpr UInt64 kDispatchPatternBytes = sizeof(UInt32) * 4;
+
+/// 归零源里分派模板的偏移 —— 绘制参数在前, 分派模板紧随其后
+constexpr UInt64 kResetDispatchOffset = kDrawArgsBytes;
+
+constexpr UInt64 kResetSourceBytes = kDrawArgsBytes + kDispatchPatternBytes;
+
+/// 间接绘制参数块里诊断量的字下标
+constexpr UInt32 kDrawArgsWrittenWord   = 0;   // vertexCount
+constexpr UInt32 kDrawArgsRequestedWord = 4;   // requestedVertices
 
 /// 与 meshlet_resolve.comp 的 push constant 一致
 struct FMeshletResolvePushConstants
@@ -187,7 +207,8 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
             bufferDesc.Usage = static_cast<EBufferUsage>(
                 static_cast<UInt32>(EBufferUsage::StorageBuffer) |
                 static_cast<UInt32>(EBufferUsage::IndirectBuffer) |
-                static_cast<UInt32>(EBufferUsage::TransferDst));
+                static_cast<UInt32>(EBufferUsage::TransferDst) |
+                static_cast<UInt32>(EBufferUsage::TransferSrc));
             bufferDesc.DebugName = "MeshletExpandDrawArgs";
 
             FRHIBufferHandle drawArgs;
@@ -200,6 +221,46 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
             }
 
             m_DrawArgsBuffers.Add(drawArgs);
+
+            // 间接绘制参数的回读 —— 判据要拿"交出去的顶点数"与"想写的
+            // 顶点数"比。没有这两个数的话, 溢出之后交出去的到底是哪个数
+            // 在外面完全看不见, 而那正是这个缺陷藏身的地方。
+            {
+                FRHIBufferDesc readbackDesc = {};
+                readbackDesc.Size        = kDrawArgsBytes;
+                readbackDesc.Usage       = EBufferUsage::TransferDst;
+                readbackDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+                readbackDesc.DebugName   = "MeshletExpandDrawArgsReadback";
+
+                FRHIBufferHandle drawArgsReadback;
+
+                const ERHIResult readbackResult =
+                    desc.Device->CreateBuffer(readbackDesc, drawArgsReadback);
+
+                if (!IsRHISuccess(readbackResult))
+                {
+                    return readbackResult;
+                }
+
+                // 先清零。回读缓冲区在第一次拷进来之前装的是未初始化的
+                // 主机内存 —— 读它会报出一个不存在的溢出, 而"判据在第一帧
+                // 报假警"比不报还坏: 下一个人会去关掉那条判据。
+                void* zero = nullptr;
+
+                if (IsRHISuccess(
+                        desc.Device->MapBuffer(drawArgsReadback, &zero)) &&
+                    zero != nullptr)
+                {
+                    Memory::MemZero(zero, kDrawArgsBytes);
+                    desc.Device->UnmapBuffer(drawArgsReadback);
+                }
+
+                m_DrawArgsReadbacks.Add(drawArgsReadback);
+
+                // 第一次回读之前那一轮根本没展开过 —— 容量记成默认值,
+                // 于是读到的 (0, 0) 与它比出来是"没溢出"。
+                m_ExpandedCapacityInFlight.Add(kMaxExpandedVertices);
+            }
 
             // 第二阶段的间接分派参数 + 第二次绘制的间接参数 +
             // 第一阶段结束时的可见数
@@ -287,8 +348,12 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
     // 全零的话一个实例都不画, 而那与"什么都不可见"分不开。
     if (IsRHISuccess(result))
     {
-        // 两段: [0..15] 是间接绘制参数 (0,1,0,0),
-        //       [16..31] 是间接分派参数 (0,1,1,0)。
+        // 两段: [0..31] 是间接绘制参数块 (0,1,0,0 + 四个诊断字全零),
+        //       [32..47] 是间接分派参数 (0,1,1,0)。
+        //
+        // 诊断字也要归零 —— requestedVertices 是逐帧累加的分配器, 不清的话
+        // 第二帧起它恒大于容量, "有没有溢出"这个判断就永远是真。一个恒为真
+        // 的诊断量与一个恒为零的一样糟。
         //
         // 分派参数的 y/z **必须是 1**。第一版没给它们初值 —— 于是第二阶段
         // 的分派是 (n, 0, 0), 一个工作组都不起, 整个第二阶段是死代码。
@@ -297,7 +362,7 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
         //
         // 抓到它的是一条新加的元判据: 第二阶段必须真的补回来过东西。
         FRHIBufferDesc bufferDesc = {};
-        bufferDesc.Size        = kDrawArgsBytes * 2;
+        bufferDesc.Size        = kResetSourceBytes;
         bufferDesc.Usage       = EBufferUsage::TransferSrc;
         bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
         bufferDesc.DebugName   = "MeshletExpandReset";
@@ -313,17 +378,22 @@ ERHIResult FMeshletDepthPass::Setup(const FPassSetupDesc& desc)
             {
                 auto* values = static_cast<UInt32*>(mapped);
 
+                Memory::MemZero(values, kResetSourceBytes);
+
                 // 间接绘制: (vertexCount, instanceCount, first, first)
                 values[0] = 0;
                 values[1] = 1;
                 values[2] = 0;
                 values[3] = 0;
 
+                // 诊断字 (requestedVertices + 三个保留) 全零 —— 上面
+                // MemZero 已经写过, 这里不再重复。
+
                 // 间接分派: (x, y, z, 保留) —— y/z 必须是 1
-                values[4] = 0;
-                values[5] = 1;
-                values[6] = 1;
-                values[7] = 0;
+                values[kResetDispatchOffset / sizeof(UInt32) + 0] = 0;
+                values[kResetDispatchOffset / sizeof(UInt32) + 1] = 1;
+                values[kResetDispatchOffset / sizeof(UInt32) + 2] = 1;
+                values[kResetDispatchOffset / sizeof(UInt32) + 3] = 0;
 
                 desc.Device->UnmapBuffer(m_ResetSource);
             }
@@ -1485,6 +1555,55 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
         }
     }
 
+    // ---- 展开顶点流的两个数 ----
+    //
+    // 回读同样隔着并行帧数 —— 读的是同一个帧下标上一轮写下的值。
+    //
+    // 交给 vkCmdDrawIndirect 的顶点数**不许超过流的容量**。超了的话顶点
+    // 着色器会拿 gl_VertexIndex 去索引流之外的地址, 而那不是"画面上多一块
+    // 垃圾", 是 GPU 读非法地址、设备丢失。这条不变式与堆布局无关, 所以它
+    // 是能拿来当判据的那个量; "会不会丢设备"不是。
+    //
+    // 只有回退路径才展开 —— 网格着色器路径下那份缓冲区从来没被写过, 读它
+    // 得到的是未初始化的内容, 而那会报出不存在的溢出。
+    if (m_Mode == EMode::Fallback)
+    {
+        void* mapped = nullptr;
+
+        if (frameIndex < m_DrawArgsReadbacks.GetSize() &&
+            IsRHISuccess(m_Device->MapBuffer(m_DrawArgsReadbacks[frameIndex],
+                                             &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* const words = static_cast<const UInt32*>(mapped);
+
+            // 容量取**那一轮**生效的那个, 不是现在这个。见成员声明处。
+            m_ExpandStats.Capacity  = m_ExpandedCapacityInFlight[frameIndex];
+            m_ExpandStats.Written   = words[kDrawArgsWrittenWord];
+            m_ExpandStats.Requested = words[kDrawArgsRequestedWord];
+
+            if (m_ExpandStats.HasOverflow())
+            {
+                LIMX_LOG(LogRenderer, Error,
+                         "[MeshletDepth] 展开顶点流溢出 — 要写 {} 个顶点 "
+                         "(容量 {}), 实际写进去 {} 个。超出的三角形被丢掉"
+                         "了, 画面上会少东西",
+                         m_ExpandStats.Requested, m_ExpandStats.Capacity,
+                         m_ExpandStats.Written);
+            }
+
+            if (m_ExpandStats.Written > m_ExpandStats.Capacity)
+            {
+                LIMX_LOG(LogRenderer, Error,
+                         "[MeshletDepth] 交给 DrawIndirect 的顶点数 {} 超过"
+                         "流的容量 {} —— 顶点着色器会读到缓冲区之外",
+                         m_ExpandStats.Written, m_ExpandStats.Capacity);
+            }
+
+            m_Device->UnmapBuffer(m_DrawArgsReadbacks[frameIndex]);
+        }
+    }
+
     // 工作组数**来自 GPU** —— 剔除通道把可见数拷进了一份间接参数。
     //
     // 第一版拿"场景 meshlet 总数"当工作组数, 那是错的: 可见表里是
@@ -1558,9 +1677,17 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
                                          m_ExpandPipelineLayout, 0,
                                          m_ExpandSets[frameIndex]);
 
+        // 记下这一轮生效的容量 —— 下一次转到这个帧下标时, 回读到的两个数
+        // 属于这一轮, 要和这个容量比。上面那段回读已经读过旧值了, 所以
+        // 这里覆盖它是安全的。
+        if (frameIndex < m_ExpandedCapacityInFlight.GetSize())
+        {
+            m_ExpandedCapacityInFlight[frameIndex] = GetExpandedCapacity();
+        }
+
         FMeshletExpandPushConstants expandPush;
         expandPush.Params[0] = boundsLimit;
-        expandPush.Params[1] = kMaxExpandedVertices;
+        expandPush.Params[1] = GetExpandedCapacity();
         expandPush.Params[2] = 0;
 
         commandBuffer->PushConstants(m_ExpandPipelineLayout,
@@ -1700,9 +1827,9 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
             //
             // 顺序不能反 —— 反了的话 x 会被 0 盖掉。
             FRHIBufferCopyRegion patternRegion = {};
-            patternRegion.SrcOffset = kDrawArgsBytes;
+            patternRegion.SrcOffset = kResetDispatchOffset;
             patternRegion.DstOffset = 0;
-            patternRegion.Size      = kDrawArgsBytes;
+            patternRegion.Size      = kDispatchPatternBytes;
 
             commandBuffer->CopyBuffer(m_ResetSource,
                                       m_Phase2DispatchBuffers[frameIndex],
@@ -1814,9 +1941,9 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
             region.Size      = sizeof(UInt32);
 
             FRHIBufferCopyRegion patternRegion = {};
-            patternRegion.SrcOffset = kDrawArgsBytes;
+            patternRegion.SrcOffset = kResetDispatchOffset;
             patternRegion.DstOffset = 0;
-            patternRegion.Size      = kDrawArgsBytes;
+            patternRegion.Size      = kDispatchPatternBytes;
 
             commandBuffer->CopyBuffer(m_ResetSource,
                                       m_Phase2RasterArgsBuffers[frameIndex],
@@ -1901,7 +2028,7 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
 
                 FMeshletExpandPushConstants expandPush;
                 expandPush.Params[0] = boundsLimit;
-                expandPush.Params[1] = kMaxExpandedVertices;
+                expandPush.Params[1] = GetExpandedCapacity();
                 expandPush.Params[2] = 0;
 
                 commandBuffer->PushConstants(m_ExpandPipelineLayout,
@@ -2068,6 +2195,37 @@ void FMeshletDepthPass::Execute(IRHICommandBuffer*        commandBuffer,
         commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
                                        EPipelineStageFlags::Transfer, nullptr,
                                        0, &barrier, 1, nullptr, 0);
+    }
+
+    // ================================================================
+    // 展开顶点流的两个数拷去回读缓冲区
+    //
+    // 放在最末尾 —— 两阶段遮挡剔除下展开跑两次, 第二次接着往同一条流里
+    // 追加。中途拷的话读到的是第一次的数, 而溢出恰恰是第二次才发生的那种
+    // 情形会整个漏掉。
+    //
+    // 源阶段是**顶点着色器**而不是计算着色器: 最后碰这块缓冲区的是
+    // vkCmdDrawIndirect 那次读, 而计算着色器的写在它之前已经被上面那道
+    // 屏障发布过了。
+    // ================================================================
+    if (m_Mode == EMode::Fallback && frameIndex < m_DrawArgsReadbacks.GetSize())
+    {
+        FRHIBufferMemoryBarrier barrier = {};
+        barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+        barrier.DstAccessMask = EAccessFlags::TransferRead;
+        barrier.Buffer        = m_DrawArgsBuffers[frameIndex];
+
+        commandBuffer->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                       EPipelineStageFlags::Transfer, nullptr,
+                                       0, &barrier, 1, nullptr, 0);
+
+        FRHIBufferCopyRegion region = {};
+        region.SrcOffset = 0;
+        region.DstOffset = 0;
+        region.Size      = kDrawArgsBytes;
+
+        commandBuffer->CopyBuffer(m_DrawArgsBuffers[frameIndex],
+                                  m_DrawArgsReadbacks[frameIndex], region);
     }
 
     commandBuffer->EndDebugLabel();
@@ -2295,6 +2453,9 @@ void FMeshletDepthPass::Shutdown(IRHIDevice* device)
     DestroyBuffers(m_Phase1CountBuffers);
     DestroyBuffers(m_Phase1Readbacks);
     DestroyBuffers(m_Phase2FinalReadbacks);
+    DestroyBuffers(m_DrawArgsReadbacks);
+
+    m_ExpandedCapacityInFlight.Clear();
 
     if (m_ResetSource.IsValid())
     {

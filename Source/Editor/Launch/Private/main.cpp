@@ -314,6 +314,10 @@ struct FLaunchOptions
     bool MeshletOcclusionCheck = false;
     bool MeshletScaleCheck = false;
     bool GpuCullOverflowCheck = false;
+
+    /// 展开顶点流溢出的判据 —— 见 RunMeshletExpandOverflowChecks
+    bool MeshletExpandOverflowCheck = false;
+
     bool MeshSimplifyCheck = false;
     bool MeshletGroupCheck = false;
 
@@ -911,6 +915,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         {
             options.GpuCullOverflowCheck = true;
         }
+        else if (WideEquals(arg, L"--meshlet-expand-overflow-check"))
+        {
+            options.MeshletExpandOverflowCheck = true;
+        }
         else if (WideEquals(arg, L"--mesh-simplify-check"))
         {
             options.MeshSimplifyCheck = true;
@@ -1043,6 +1051,20 @@ static int FinalizeSelfCheck(bool                     passed,
     // 判据自己的 passed, 而"关闭阶段的 Error"是全部自检跑完之后才开始数的。
     // 渲染过程中的同步错误、布局错误、越界写, 只要没有哪条判据恰好看得见,
     // 就一路绿着过去。
+    // 丢设备优先报 —— 它比验证层的 Error 更严重, 而且它同样从来不是故意的。
+    //
+    // 在此之前"跑五次都退出 0"这种判据对它是**瞎的**: 日志里躺着
+    // `vkQueueSubmit 失败: -4` 和八帧 `WaitForFence 失败`, 而进程返回 0。
+    // 查那个 grid 127 的丢设备时, 我是靠 grep 日志判定的 —— 而那说明退出码
+    // 本身没有把它算进去。
+    if (GetDeviceLostCount() > 0)
+    {
+        LIMX_LOG(LogLaunch, Display,
+                 "[自检] 自检项全部通过, 但运行期丢过 {} 次设备 —— 判定为失败",
+                 GetDeviceLostCount());
+        return 10;
+    }
+
     const UInt32 validationErrors = GetValidationErrorCount();
 
     if (validationErrors > 0)
@@ -12405,6 +12427,216 @@ static bool RunMeshletScaleChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunMeshletExpandOverflowChecks — 交给 DrawIndirect 的顶点数不许超过流的容量
+//
+// ── 这条判据守的是什么 ──
+//
+// 回退路径把可见 meshlet 展开成一条定容的顶点流。展开着色器里那次原子加
+// 是**槽位分配器**: 领到的位置超出容量的三角形被丢掉。丢掉本身没得选 ——
+// 越界写会改掉别的缓冲区, 而那会以完全无关的形式出错。
+//
+// 要命的是那个计数器同时又是 vkCmdDrawIndirect 读的 vertexCount。用同一个
+// 数的话, 被丢掉的三角形照样把它加上去 —— 命令处理器于是按一个**大于流里
+// 真实顶点数**的值发顶点, 而 meshlet_depth_fallback.vert 拿 gl_VertexIndex
+// 无条件索引那条流。后果不是"画面上多一块垃圾", 是 GPU 读缓冲区之外的地址、
+// 设备丢失。这与 --gpu-cull-overflow-check 守的是同一类缺陷: **容量被突破
+// 之后, 消费的一侧照着计数器走, 而不是照着真正写进去的数走。**
+//
+// ── 为什么判据不是"跑一下不丢设备" ──
+//
+// 越界读到的地址是不是已映射, 取决于当时的堆布局。同一个越界在这台机器上
+// 丢设备, 在另一台上什么事都没有 —— 拿它当判据等于让判据去赌运气。本条
+// 判据验的是那条不变式本身: **交出去的顶点数 <= 流的容量**, 而且恰好等于
+// 那个连续前缀的长度。与堆布局无关。
+//
+// ── 为什么要压容量 ──
+//
+// 流按两百万个顶点开的, 靠场景规模撑满它要堆出几十万个可见 meshlet, 那种
+// 场景跑一次要几分钟。走不到的分支就是没有判据的分支 —— 所以给判据一个把
+// 容量压小的入口, 与 --meshlet-scale-check 同一个做法。
+//
+// 三段:
+//   正常容量   -> 不许报溢出, 而且两个数必须相等 (没丢东西)
+//   压小容量   -> 必须报溢出; 交出去的数**不许超过容量**, 且正好是满的前缀
+//   恢复容量   -> 又不许报溢出 (标志不是粘住的), 顶点数回到原值
+// ============================================================================
+
+static bool RunMeshletExpandOverflowChecks(FRenderContext* context,
+                                           FRenderer&      renderer)
+{
+    LIMX_UNUSED(context);
+
+    if (!renderer.SetMeshletDepthEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 无法启用 meshlet 光栅化 — 判据无法执行, "
+                 "判定为失败");
+        return false;
+    }
+
+    FMeshletDepthPass* const pass = renderer.GetMeshletDepthPass();
+
+    if (pass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[展开溢出] 光栅化通道不存在");
+        return false;
+    }
+
+    // 展开只在回退路径上发生 —— 网格着色器路径根本没有这条顶点流。
+    // 切不过去就判失败, 不静默跳过: 静默跳过的判据永远是绿的。
+    if (!pass->SetMode(FMeshletDepthPass::EMode::Fallback))
+    {
+        LIMX_LOG(LogLaunch, Error, "[展开溢出] 无法切到计算展开回退路径");
+        return false;
+    }
+
+    bool passed = true;
+
+    // 回读隔着并行帧数, 每段都要多走几帧才读得到那一段的数
+    const auto Settle = [&renderer]()
+    {
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            renderer.RenderFrame();
+        }
+    };
+
+    // ---- 第一段: 正常容量 ----
+    pass->SetExpandedCapacityOverride(0);
+
+    Settle();
+
+    const FMeshletExpandStats normal = pass->GetExpandStats();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[展开溢出] 正常容量 — 要写 {} 个顶点, 写进去 {} 个 (容量 {})",
+             normal.Requested, normal.Written, normal.Capacity);
+
+    if (normal.Written == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 一个顶点都没展开出来 —— 判据没验到东西。"
+                 "场景里得有可见的 meshlet");
+        passed = false;
+    }
+
+    if (normal.HasOverflow())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 正常容量下就报了溢出 (要写 {} > 容量 {}) —— "
+                 "要么场景真的超了, 要么溢出判断本身写反了",
+                 normal.Requested, normal.Capacity);
+        passed = false;
+    }
+
+    // 没丢东西的时候, "想写多少"与"写进去多少"必须是同一个数。
+    // 不等的话说明分配器与写入这两步已经对不上了, 后面那条不变式即使
+    // 成立也只是碰巧。
+    if (normal.Written != normal.Requested)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 没溢出却写进去 {} 个而想写 {} 个 —— 两个数在"
+                 "不该分开的时候分开了",
+                 normal.Written, normal.Requested);
+        passed = false;
+    }
+
+    // ---- 第二段: 把容量压到装不下 ----
+    //
+    // 压到四分之一, 至少留 3 个 (一个三角形)。压到 0 的话"写进去的那部分
+    // 是满的前缀"这一条平凡成立。
+    const UInt32 squeezed = FMath::Max(3u, normal.Written / 4u);
+
+    pass->SetExpandedCapacityOverride(squeezed);
+
+    Settle();
+
+    const FMeshletExpandStats overflowed = pass->GetExpandStats();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[展开溢出] 压到 {} 个顶点 — 要写 {} 个, 交给 DrawIndirect 的是 "
+             "{} 个",
+             overflowed.Capacity, overflowed.Requested, overflowed.Written);
+
+    if (!overflowed.HasOverflow())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 容量压到 {} 个顶点还报不出溢出 (要写 {} 个) —— "
+                 "超出的三角形被静默丢掉了, 画面上少一块而日志里一个字都没有",
+                 overflowed.Capacity, overflowed.Requested);
+        passed = false;
+    }
+
+    if (overflowed.Requested <= overflowed.Capacity)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 压小容量之后要写的顶点数也跟着变小了 "
+                 "({} <= {}) —— 分配器被容量夹住了, 那样就再也看不出丢过东西",
+                 overflowed.Requested, overflowed.Capacity);
+        passed = false;
+    }
+
+    // ---- 这就是那条不变式 ----
+    //
+    // 交给 vkCmdDrawIndirect 的顶点数不许超过流的容量。超了就是顶点着色器
+    // 拿 gl_VertexIndex 索引到缓冲区之外 —— GPU 读非法地址、设备丢失。
+    if (overflowed.Written > overflowed.Capacity)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 交给 DrawIndirect 的顶点数是 {}, 而流只装得下 "
+                 "{} 个 —— 那次绘制会让顶点着色器按 gl_VertexIndex 读到流"
+                 "之外 (后果是 GPU 读非法地址、设备丢失)",
+                 overflowed.Written, overflowed.Capacity);
+        passed = false;
+    }
+
+    // 也不许少画: 写进去的是从 0 开始的连续前缀, 长度正好是容量向下取整到
+    // 三的倍数。少于这个数说明白白丢掉了本来装得下的三角形。
+    const UInt32 expectedPrefix = (overflowed.Capacity / 3u) * 3u;
+
+    if (overflowed.Written != expectedPrefix)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 溢出时交出去 {} 个顶点, 而满的前缀应当是 {} 个 "
+                 "(容量 {}) —— 多了是越界, 少了是白丢",
+                 overflowed.Written, expectedPrefix, overflowed.Capacity);
+        passed = false;
+    }
+
+    // ---- 第三段: 恢复容量 ----
+    pass->SetExpandedCapacityOverride(0);
+
+    Settle();
+
+    const FMeshletExpandStats restored = pass->GetExpandStats();
+
+    LIMX_LOG(LogLaunch, Display,
+             "[展开溢出] 恢复容量 — 要写 {} 个顶点, 交出去 {} 个 (容量 {})",
+             restored.Requested, restored.Written, restored.Capacity);
+
+    if (restored.HasOverflow())
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 容量恢复之后还在报溢出 —— 计数器没有逐帧归零, "
+                 "那样它之后永远是真的, 也就永远不再指示任何东西");
+        passed = false;
+    }
+
+    if (restored.Written != normal.Written)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[展开溢出] 容量恢复之后顶点数没回到原值 ({} vs {}) —— "
+                 "压容量这件事留下了副作用",
+                 restored.Written, normal.Written);
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[展开溢出] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 
 namespace
 {
@@ -19799,6 +20031,7 @@ int WINAPI wWinMain(
     bool    meshletOcclusionPassed = true;
     bool    meshletScalePassed = true;
     bool    gpuCullOverflowPassed = true;
+    bool    meshletExpandOverflowPassed = true;
     bool    meshSimplifyPassed = true;
     bool    meshletGroupPassed = true;
 
@@ -19963,6 +20196,12 @@ int WINAPI wWinMain(
             {
                 gpuCullOverflowPassed =
                     RunGpuCullOverflowChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletExpandOverflowCheck)
+            {
+                meshletExpandOverflowPassed =
+                    RunMeshletExpandOverflowChecks(&renderContext, renderer);
             }
 
             if (launchOptions.MeshSimplifyCheck)
@@ -20277,6 +20516,12 @@ int WINAPI wWinMain(
     {
         selfCheckCode = FinalizeSelfCheck(gpuCullOverflowPassed, 35, errorSink,
                                           errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletExpandOverflowCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletExpandOverflowPassed, 37,
+                                          errorSink, errorsBeforeShutdown);
     }
 
     if (selfCheckCode == 0 && launchOptions.MeshSimplifyCheck)

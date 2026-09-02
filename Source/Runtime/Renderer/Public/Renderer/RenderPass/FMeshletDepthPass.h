@@ -81,6 +81,33 @@ static_assert(sizeof(FMeshletResolveResult) == 28,
 inline constexpr UInt32 kMaxExpandedVertices = 2097152;
 
 // ============================================================================
+// FMeshletExpandStats — 一次展开的结果
+//
+// 两个数必须分开, 而不是一个。见 meshlet_expand.comp 里那段说明:
+// 槽位分配器加的是"想写多少", 而 vkCmdDrawIndirect 读的必须是"真写了多少"。
+// 合成一个的话, 被丢掉的三角形照样把绘制的顶点数加了上去 —— 顶点着色器
+// 拿 gl_VertexIndex 无条件索引那条流, 于是 GPU 读到缓冲区之外。
+// ============================================================================
+
+struct FMeshletExpandStats
+{
+    /// 本帧生效的流容量 (以顶点计) —— 判据可以把它压小
+    UInt32 Capacity = 0;
+
+    /// 槽位分配器发出去的顶点数 (含被丢掉的那些)
+    ///
+    /// 大于容量就是溢出的证据。没有这个数的话, 溢出与"场景恰好正好装满"
+    /// 在计数上分不开。
+    UInt32 Requested = 0;
+
+    /// 真正写进流里的顶点数 —— 也就是交给 DrawIndirect 的那个数
+    UInt32 Written = 0;
+
+    /// 这一帧有没有溢出过
+    LIMX_NODISCARD bool HasOverflow() const { return Requested > Capacity; }
+};
+
+// ============================================================================
 // FMeshletDepthPass
 // ============================================================================
 
@@ -204,6 +231,38 @@ public:
 
     LIMX_NODISCARD bool IsResolveEnabled() const { return m_ResolveEnabled; }
 
+    // ====================================================================
+    // 展开顶点流的容量与统计
+    // ====================================================================
+
+    /// 上一次展开的统计 —— 回读隔着并行帧数, 与本通道别的计数同理
+    LIMX_NODISCARD const FMeshletExpandStats& GetExpandStats() const
+    {
+        return m_ExpandStats;
+    }
+
+    /// 判据用: 把展开流的容量压到一个很小的数, 逼出溢出
+    ///
+    /// 与 FMeshletCullPass::SetVisibleCapacityOverride 同一个理由 —— 靠场景
+    /// 规模走到这条路径要堆出两百万个顶点的可见几何, 那种场景跑一次要几
+    /// 分钟。走不到的分支就是没有判据的分支。
+    ///
+    /// 压小的只是着色器用来判越界的那个数, 缓冲区本身还是满的 —— 于是
+    /// 判据验的是"交给 DrawIndirect 的顶点数不许超过容量"这条不变式本身,
+    /// 而不是"会不会踩到没映射的页"那件靠堆布局的事。
+    ///
+    /// 0 表示不覆盖。
+    void SetExpandedCapacityOverride(UInt32 capacity)
+    {
+        m_ExpandedCapacityOverride = capacity;
+    }
+
+    LIMX_NODISCARD UInt32 GetExpandedCapacity() const
+    {
+        return (m_ExpandedCapacityOverride != 0) ? m_ExpandedCapacityOverride
+                                                 : kMaxExpandedVertices;
+    }
+
 private:
     ERHIResult CreateDepthTarget(IRHIDevice* device, FRHIExtent2D extent);
     ERHIResult CreateRenderPass(IRHIDevice* device);
@@ -251,6 +310,21 @@ private:
     /// 展开出来的顶点流与间接绘制参数 (逐并行帧)
     TArray<FRHIBufferHandle> m_ExpandedBuffers;
     TArray<FRHIBufferHandle> m_DrawArgsBuffers;
+
+    /// 间接绘制参数的回读 —— 判据要看"交出去的顶点数"与"想写的顶点数"
+    TArray<FRHIBufferHandle> m_DrawArgsReadbacks;
+
+    /// 每个帧下标上一轮展开时**生效的**容量
+    ///
+    /// 回读隔着并行帧数, 读回来的两个数属于上一轮。拿**当前**的容量去比
+    /// 它们的话, 容量刚被改小的那两帧会报出一次并不存在的越界 —— 判据里
+    /// 的假警比漏报还坏, 下一个人会去把那条判据关掉。
+    TArray<UInt32> m_ExpandedCapacityInFlight;
+
+    /// 判据压小的展开流容量; 0 表示不覆盖
+    UInt32 m_ExpandedCapacityOverride = 0;
+
+    FMeshletExpandStats m_ExpandStats;
 
     /// 归零源 —— 间接绘制参数每帧要复位 (vertexCount=0, instanceCount=1)
     FRHIBufferHandle m_ResetSource;

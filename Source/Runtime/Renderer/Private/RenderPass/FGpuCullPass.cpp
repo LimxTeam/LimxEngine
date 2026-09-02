@@ -772,6 +772,23 @@ void FGpuCullPass::ResolveCounter(IRHIDevice* device, UInt32 frameIndex)
 // 访问器
 // ============================================================================
 
+void FGpuCullPass::SetViewCount(UInt32 count)
+{
+    // 钳位没得选 —— 间接命令缓冲区就是按 kMaxCullViews 段开的。但**必须
+    // 报出来**: 静默钳位的表现是"多出来的那几个视图一个物体都不画", 而那与
+    // "这几盏灯本来就照不到东西"长得一样。点光的立方体六面一上来就要占六个
+    // 视图, 这条路是走得到的。
+    if (count > kMaxCullViews)
+    {
+        LIMX_LOG(LogRenderer, Error,
+                 "[GpuCull] 本帧要剔除 {} 个视图, 超过上限 {} — 多出来的"
+                 "那些不会被剔除, 也不会有间接命令 (画面上会少东西)",
+                 count, kMaxCullViews);
+    }
+
+    m_ViewCount = (count < kMaxCullViews) ? count : kMaxCullViews;
+}
+
 FRHIBufferHandle FGpuCullPass::GetIndirectBuffer(UInt32 frameIndex) const
 {
     if (frameIndex >= m_IndirectBuffers.GetSize())
