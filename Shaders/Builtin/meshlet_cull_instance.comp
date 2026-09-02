@@ -1,0 +1,81 @@
+#version 450
+
+// ============================================================================
+// meshlet_cull_instance.comp — 两级剔除的第一级: 实例
+//
+// 一个线程一个实例。用实例的世界包围球对六个视锥平面做一次测试, 活下来的
+// 压实进一张紧凑表, 同时把该实例的 meshlet 数累加进第二级的分派参数。
+//
+// 为什么第一级要压实, 而 draw_cull.comp 那一级不压实:
+//
+//   那一级的输出是**间接绘制命令**, 位置必须与物体下标对应 —— 图形通道
+//   按"同一对顶点/索引缓冲区"分组下命令, 每组要知道自己从第几条开始。
+//
+//   这一级的输出是喂给第二级分派的实例表, 没有任何东西按下标索引它。
+//   不压实的话第二级要为每个不可见实例也起一个工作组, 而工作组数正是
+//   这一级要省下的东西 —— 一个被剔掉的实例可能有几百个 meshlet。
+//
+// 第二级按"一个工作组一个可见实例"分派, 所以分派参数的 x 就是可见实例数。
+// 那个数由本着色器原子累加得到, 而不是 CPU 猜一个上界 —— 猜上界的话,
+// 多出来的工作组会去读越界的实例表。
+// ============================================================================
+
+#include "meshlet_common.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
+    MeshletInstance instances[];
+} instanceBuffer;
+
+// 实例的世界包围球 —— 与 instances 平行的一张表
+//
+// 不塞进 MeshletInstance 里: 那个结构体是第二级也要读的, 而第二级用不到
+// 实例包围球。多 16 字节 × 实例数的带宽, 换第二级少读 16 字节 × 实例数。
+layout(std430, set = 0, binding = 1) readonly buffer InstanceSphereBuffer {
+    vec4 spheres[];
+} sphereBuffer;
+
+// 压实后的可见实例下标
+layout(std430, set = 0, binding = 2) writeonly buffer VisibleInstanceBuffer {
+    uint visible[];
+} visibleBuffer;
+
+// x/y/z = 第二级的分派参数; w = 诊断用的可见实例数 (与 x 同值)
+layout(std430, set = 0, binding = 3) buffer DispatchBuffer {
+    uvec4 args;
+} dispatchBuffer;
+
+layout(push_constant) uniform Params {
+    vec4  planes[6];
+
+    // x = 实例总数, y = 可见实例表的容量, z/w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+
+    if (index >= pc.params.x)
+    {
+        return;
+    }
+
+    if (!MeshletSphereVisible(sphereBuffer.spheres[index], pc.planes))
+    {
+        return;
+    }
+
+    const uint slot = atomicAdd(dispatchBuffer.args.x, 1u);
+
+    // 容量不够时**丢掉**而不是越界写。
+    //
+    // 丢掉是错的 (画面上少一块), 但越界写是把别的缓冲区改掉, 那会以完全
+    // 无关的形式出错。容量由 CPU 按实例数分配, 所以这里溢出只可能是
+    // CPU 侧算错了 —— 判据会看这个数。
+    if (slot < pc.params.y)
+    {
+        visibleBuffer.visible[slot] = index;
+    }
+}

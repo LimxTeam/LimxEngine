@@ -93,6 +93,7 @@ class FShadowAtlasPass;
 class FDepthPrePass;
 class FClusterLightPass;
 class FGpuCullPass;
+class FMeshletCullPass;
 class FRayTracedShadowPass;
 class FRayTracedAoPass;
 class FRayTracedReflectionPass;
@@ -241,6 +242,27 @@ struct FRenderObject
     /// 走 bindless 路径时随 push constant 传给着色器, 逐 draw 不再绑定
     /// 描述符集。走旧路径时不使用。
     UInt32 BindlessMaterialIndex = 0;
+
+    // ========================================================================
+    // 该批次的 meshlet —— 虚拟几何路径用
+    //
+    // 缓冲区是**整个网格**的一份, 区间指出本批次占其中哪一段。每个批次
+    // 一个缓冲区的话, 剔除就得逐批次绑定一次描述符集, 而剔除的全部意义
+    // 就在于一次分派处理整个场景。
+    // ========================================================================
+
+    /// 所属网格的 meshlet 头缓冲区 (非拥有)
+    FRHIBufferHandle MeshletBuffer;
+
+    /// 本批次在该缓冲区里的起点与个数
+    UInt32 MeshletOffset = 0;
+    UInt32 MeshletCount  = 0;
+
+    /// 本批次里最大的 meshlet 包围球半径 (局部空间)
+    ///
+    /// 实例包围球要用它把自己撑到能包住每一个 meshlet 包围球 ——
+    /// 见 FMeshSection::MaxMeshletRadius 上的那段。
+    Float32 MaxMeshletRadius = 0.0f;
 
     /// 调试名称
     const AnsiChar*  DebugName      = "Unnamed";
@@ -495,6 +517,19 @@ public:
     {
         return m_GpuCullPass.Get();
     }
+
+    /// 两级 meshlet 剔除通道
+    LIMX_NODISCARD FMeshletCullPass* GetMeshletCullPass()
+    {
+        return m_MeshletCullPass.Get();
+    }
+
+    /// 开关 meshlet 剔除
+    ///
+    /// 返回是否成功。失败只有一种原因: 通道不存在 (初始化失败)。
+    /// 返回 void 的话, "开了但其实没开"与"开了"分不开 —— 而那正是
+    /// 本周期反复遇到的那一类。
+    LIMX_NODISCARD bool SetMeshletCullEnabled(bool enabled);
 
     /// 场景的光追加速结构 (只读)
     LIMX_NODISCARD const FRayTracingScene& GetRayTracingScene() const
@@ -796,6 +831,7 @@ private:
     TUniquePtr<FDepthPrePass>         m_DepthPrePass;
     TUniquePtr<FClusterLightPass>     m_ClusterLightPass;
     TUniquePtr<FGpuCullPass>          m_GpuCullPass;
+    TUniquePtr<FMeshletCullPass>      m_MeshletCullPass;
 
     /// 场景的光追加速结构 —— 设备不支持光追时保持无效
     FRayTracingScene                  m_RayTracingScene;

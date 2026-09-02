@@ -203,6 +203,10 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         object.IndexBuffer           = mesh->IndexBuffer;
         object.IndexOffset           = 0;
         object.IndexCount            = mesh->IndexCount;
+        object.MeshletBuffer         = mesh->MeshletBuffer;
+        object.MeshletOffset         = 0;
+        object.MeshletCount          = mesh->MeshletCount;
+        object.MaxMeshletRadius      = mesh->MaxMeshletRadius;
         object.IndexType             = mesh->IndexType;
         object.Transform             = worldTransform;
         object.WorldBounds           = TransformBounds(mesh->Bounds,
@@ -247,6 +251,10 @@ UInt32 LMeshTrait::BuildRenderObjects(TArray<FRenderObject>& outObjects) const
         object.IndexBuffer           = mesh->IndexBuffer;
         object.IndexOffset           = section.IndexOffset;
         object.IndexCount            = section.IndexCount;
+        object.MeshletBuffer         = mesh->MeshletBuffer;
+        object.MeshletOffset         = section.MeshletOffset;
+        object.MeshletCount          = section.MeshletCount;
+        object.MaxMeshletRadius      = section.MaxMeshletRadius;
         object.IndexType             = mesh->IndexType;
         object.Transform             = worldTransform;
         object.WorldBounds           = TransformBounds(

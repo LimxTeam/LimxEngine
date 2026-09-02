@@ -58,6 +58,7 @@
 #include "Renderer/RenderPass/FBloomPass.h"
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
+#include "Renderer/RenderPass/FMeshletCullPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
 #include "Renderer/RenderPass/FRayTracedReflectionPass.h"
@@ -281,6 +282,12 @@ struct FLaunchOptions
 
     /// meshlet 切分无损 —— 见函数头
     bool MeshletCheck = false;
+
+    /// 两级 meshlet 剔除
+    bool MeshletCull = false;
+
+    /// 两级剔除与 CPU 参考实现逐个 meshlet 一致 —— 见函数头
+    bool MeshletCullCheck = false;
 
     /// 光追深度自检: 光追深度与光栅化深度逐像素比对, 以退出码报告
     bool RtDepthCheck = false;
@@ -814,6 +821,14 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-check"))
         {
             options.MeshletCheck = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-cull"))
+        {
+            options.MeshletCull = true;
+        }
+        else if (WideEquals(arg, L"--meshlet-cull-check"))
+        {
+            options.MeshletCullCheck = true;
         }
         else if (WideEquals(arg, L"--rt-reflection-self"))
         {
@@ -5386,6 +5401,985 @@ static bool RunRayTracedAoChecks(FRenderContext* context, FRenderer& renderer)
     }
 
     LIMX_LOG(LogLaunch, Display, "[光追AO] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
+// RunMeshletCullChecks — 两级剔除必须与 CPU 参考实现逐个 meshlet 一致
+//
+// 判据的形状: 把 GPU 剔出来的那张可见表读回来, 与一份 CPU 参考实现算出来的
+// 集合逐条比。**不是比数量, 是比集合** —— 数量相同而内容不同是完全可能的
+// (剔错一个、又漏剔一个), 而那在画面上是"某处少一块, 某处多一块"。
+//
+// 参考实现从哪来: 逐字照抄 meshlet_common.h 里那三个函数
+// (MeshletWorldSphere / MeshletSphereVisible / MeshletBackfaceCull)。
+// "逐字照抄"是有意的 —— 各写各的话, 判据比的是"两个实现一不一样",
+// 而两个实现可以一起错。照抄的话, 比的是"GPU 上跑的与 CPU 上跑的是不是
+// 同一段逻辑", 而这条判据真正要拦的正是那些让两者分道扬镳的东西:
+// 描述符绑错、push constant 布局不对、屏障漏了、原子累加溢出。
+//
+// 输入也从 GPU 读: meshlet 头是从**汇总缓冲区**读回来的, 不是 CPU 内存里
+// 那份。这样上传与汇总拷贝这两段路径也进了覆盖 —— 用 CPU 那份的话,
+// "GPU 拷贝写错了地方"这类缺陷完全没有痕迹。
+//
+// 五条判据:
+//   1. 可见集合完全相同 (GPU 与 CPU 参考实现)
+//   2. 计数器自洽: 测试数 = 可见 + 视锥剔 + 背面剔
+//   3. 剔除必须真的剔掉了东西 —— 一个什么都不剔的实现在画面上与正确实现
+//      完全一样, 只是慢
+//   4. 关掉背面剔除之后, 可见集合必须是开着时的**超集**
+//   5. 法线锥无效的 meshlet 一个都不许被背面剔除剔掉
+// ============================================================================
+
+namespace
+{
+
+/// 与 FMeshlet 逐字段一致 —— 从 GPU 读回来的那份就是这个布局
+struct FMeshletGpuView
+{
+    UInt32 VertexOffset;
+    UInt32 VertexCount;
+    UInt32 TriangleOffset;
+    UInt32 TriangleCount;
+
+    Float32 Sphere[4];
+    Float32 Cone[4];
+};
+
+static_assert(sizeof(FMeshletGpuView) == 48,
+              "FMeshletGpuView 必须与 FMeshlet 同布局");
+
+/// 逐字照抄 meshlet_common.h 的 MeshletWorldSphere
+void ReferenceWorldSphere(const Float32 localSphere[4],
+                          const FMeshletInstanceGpu& instance,
+                          Float32 outSphere[4])
+{
+    const Float32* r0 = instance.TransformRow0;
+    const Float32* r1 = instance.TransformRow1;
+    const Float32* r2 = instance.TransformRow2;
+
+    outSphere[0] = r0[0] * localSphere[0] + r0[1] * localSphere[1] +
+                   r0[2] * localSphere[2] + r0[3];
+    outSphere[1] = r1[0] * localSphere[0] + r1[1] * localSphere[1] +
+                   r1[2] * localSphere[2] + r1[3];
+    outSphere[2] = r2[0] * localSphere[0] + r2[1] * localSphere[1] +
+                   r2[2] * localSphere[2] + r2[3];
+
+    const auto ColumnLength = [r0, r1, r2](UInt32 c) -> Float32
+    {
+        return FMath::Sqrt(r0[c] * r0[c] + r1[c] * r1[c] + r2[c] * r2[c]);
+    };
+
+    const Float32 scale = FMath::Max(
+        ColumnLength(0), FMath::Max(ColumnLength(1), ColumnLength(2)));
+
+    outSphere[3] = localSphere[3] * scale;
+}
+
+/// 逐字照抄 meshlet_common.h 的 MeshletUniformScale
+bool ReferenceUniformScale(const FMeshletInstanceGpu& instance)
+{
+    const Float32* r0 = instance.TransformRow0;
+    const Float32* r1 = instance.TransformRow1;
+    const Float32* r2 = instance.TransformRow2;
+
+    const auto ColumnLength = [r0, r1, r2](UInt32 c) -> Float32
+    {
+        return FMath::Sqrt(r0[c] * r0[c] + r1[c] * r1[c] + r2[c] * r2[c]);
+    };
+
+    const Float32 x = ColumnLength(0);
+    const Float32 y = ColumnLength(1);
+    const Float32 z = ColumnLength(2);
+
+    const Float32 maximum = FMath::Max(x, FMath::Max(y, z));
+    const Float32 minimum = FMath::Min(x, FMath::Min(y, z));
+
+    return (maximum - minimum) <= maximum * 1.0e-3f + 1.0e-9f;
+}
+
+/// 逐字照抄 meshlet_common.h 的 MeshletSphereVisible
+///
+/// 多一个出参: 哪些平面把它判成不可见的 (位掩码)。判据要靠它确认
+/// **每一个平面都单独起过作用** —— 只测五个平面这类缺陷, 在"第六个平面
+/// 从来没单独剔掉过任何东西"的场景里完全没有痕迹。
+bool ReferenceSphereVisible(const Float32 sphere[4], const FFrustum& frustum,
+                            UInt32& outFailMask)
+{
+    outFailMask = 0;
+
+    for (Int32 p = 0; p < FFrustum::kPlaneCount; ++p)
+    {
+        const Float32 distance = frustum.Planes[p].Normal.X * sphere[0] +
+                                 frustum.Planes[p].Normal.Y * sphere[1] +
+                                 frustum.Planes[p].Normal.Z * sphere[2] +
+                                 frustum.Planes[p].D;
+
+        if (distance < -sphere[3])
+        {
+            outFailMask |= (1u << p);
+        }
+    }
+
+    return outFailMask == 0;
+}
+
+/// 背面判据走到了哪条 early-out
+enum class EBackfaceBranch : UInt32
+{
+    Tested,
+    InvalidCone,
+    NonUniformScale,
+};
+
+/// 逐字照抄 meshlet_common.h 的 MeshletBackfaceCull
+///
+/// 多一个出参: 走到了哪条 early-out。分支覆盖是判据的一部分 —— 没走到的
+/// 分支上, "GPU 与 CPU 一致"什么也证明不了。
+bool ReferenceBackfaceCull(const Float32 cone[4], const Float32 sphere[4],
+                           const FVector3& cameraPosition,
+                           const FMeshletInstanceGpu& instance,
+                           EBackfaceBranch& outBranch)
+{
+    outBranch = EBackfaceBranch::Tested;
+
+    if (cone[3] <= kInvalidConeCosine)
+    {
+        outBranch = EBackfaceBranch::InvalidCone;
+        return false;
+    }
+
+    if (!ReferenceUniformScale(instance))
+    {
+        outBranch = EBackfaceBranch::NonUniformScale;
+        return false;
+    }
+
+    const Float32* r0 = instance.TransformRow0;
+    const Float32* r1 = instance.TransformRow1;
+    const Float32* r2 = instance.TransformRow2;
+
+    Float32 axis[3] = {
+        r0[0] * cone[0] + r0[1] * cone[1] + r0[2] * cone[2],
+        r1[0] * cone[0] + r1[1] * cone[1] + r1[2] * cone[2],
+        r2[0] * cone[0] + r2[1] * cone[1] + r2[2] * cone[2],
+    };
+
+    const Float32 axisLength = FMath::Sqrt(
+        axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+
+    if (axisLength < 1.0e-20f)
+    {
+        return false;
+    }
+
+    axis[0] /= axisLength;
+    axis[1] /= axisLength;
+    axis[2] /= axisLength;
+
+    const Float32 d[3] = {
+        sphere[0] - cameraPosition.X,
+        sphere[1] - cameraPosition.Y,
+        sphere[2] - cameraPosition.Z,
+    };
+
+    const Float32 distance =
+        FMath::Sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+
+    return (d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2]) >=
+           cone[3] * distance + sphere[3];
+}
+
+/// 一次剔除的结果 —— (实例, meshlet) 对的集合, 按 64 位键排序
+struct FCullCapture
+{
+    bool Valid = false;
+
+    TArray<UInt64> GpuVisible;
+    TArray<UInt64> CpuVisible;
+
+    UInt32 Counters[4] = { 0, 0, 0, 0 };
+
+    /// CPU 参考实现算出的可见实例数
+    UInt32 InstancesVisible = 0;
+
+    // ====================================================================
+    // 分支覆盖 —— 每条判据里的每个分支被走到了几次
+    //
+    // 这些数不是诊断, 是**判据**。Day 9 的第一轮扫描里五条逃逸有四条同一
+    // 个成因: 那个分支在这个视角下根本没被走到, 于是改坏它没有任何后果,
+    // 而 GPU 与 CPU 参考实现"完美一致"。
+    //
+    // 一致性判据对没走到的分支毫无约束。所以每个分支都要有一个计数器,
+    // 而每个计数器都要有一条"必须大于零"的元判据。
+    // ====================================================================
+
+    /// 第 p 个视锥平面**独自**剔掉的 meshlet 数
+    ///
+    /// "独自"要紧: 只统计"被 p 剔掉"的话, 一个 meshlet 同时在三个平面
+    /// 外面就给三个平面各记一笔, 而其中两个平面可能从来没有单独起过作用。
+    UInt32 PlaneExclusiveCulls[6] = { 0, 0, 0, 0, 0, 0 };
+
+    /// 背面判据里三条 early-out 各走了几次
+    UInt32 InvalidConeEarlyOut = 0;
+    UInt32 NonUniformScaleEarlyOut = 0;
+
+    /// 第一级剔掉的实例里, 有几个的 meshlet 在第二级判据下**仍然可见**
+    ///
+    /// 必须恒为零。不为零说明实例包围球不保守 —— 它剔掉了一个其实还有
+    /// meshlet 露在视锥里的实例, 而那是画面上整块东西消失。
+    UInt32 InstanceCullTooAggressive = 0;
+
+    /// 一个能让相机落进包围球的位置 —— 必须是**法线锥有效且缩放均匀**的
+    /// meshlet, 否则背面判据会在更早的 early-out 上返回, "相机在球内"
+    /// 那条永远走不到。
+    ///
+    /// 取半径最大的那个: 半径越大, 相机放进去越不挑位置。
+    FVector3 InsideCameraTarget = FVector3(0.0f, 0.0f, 0.0f);
+    Float32  InsideCameraRadius = 0.0f;
+
+};
+
+/// 一次帧内回调里把三个缓冲区一起读回来
+///
+/// 走**帧内回调**而不是一次性命令缓冲区: 这个引擎没有后者的接口, 而更要紧
+/// 的是, 帧内回调保证读到的是**这一帧剔除刚写完的那份**。另起一次提交的话,
+/// 中间隔着帧的推进, 读到的可能是下一帧覆盖过的值 —— 而那种错只在特定的
+/// 帧序下出现。
+struct FCullReadbackRequest
+{
+    FRHIBufferHandle Source;
+    UInt64           Bytes = 0;
+    TArray<UInt8>*   Target = nullptr;
+
+    FRHIBufferHandle Staging;
+};
+
+bool ReadCullBuffers(FRenderContext* context, FRenderer& renderer,
+                     FCullReadbackRequest* requests, UInt32 count)
+{
+    IRHIDevice* const device = context->GetDevice();
+
+    if (device == nullptr)
+    {
+        return false;
+    }
+
+    bool created = true;
+
+    for (UInt32 i = 0; i < count; ++i)
+    {
+        if (!requests[i].Source.IsValid() || requests[i].Bytes == 0)
+        {
+            created = false;
+            break;
+        }
+
+        FRHIBufferDesc desc = {};
+        desc.Size        = requests[i].Bytes;
+        desc.Usage       = EBufferUsage::TransferDst;
+        desc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        desc.DebugName   = "MeshletCullCheck.Readback";
+
+        if (!IsRHISuccess(device->CreateBuffer(desc, requests[i].Staging)))
+        {
+            created = false;
+            break;
+        }
+    }
+
+    bool recorded = false;
+
+    if (created)
+    {
+        renderer.SetPostSceneRenderCallback(
+            [&recorded, context, requests, count]()
+            {
+                IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+                if (cmd == nullptr)
+                {
+                    return;
+                }
+
+                for (UInt32 i = 0; i < count; ++i)
+                {
+                    FRHIBufferCopyRegion region = {};
+                    region.SrcOffset = 0;
+                    region.DstOffset = 0;
+                    region.Size      = requests[i].Bytes;
+
+                    cmd->CopyBuffer(requests[i].Source, requests[i].Staging,
+                                    region);
+                }
+
+                recorded = true;
+            });
+
+        renderer.RenderFrame();
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+    }
+
+    bool ok = created && recorded;
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        for (UInt32 i = 0; i < count; ++i)
+        {
+            void* mapped = nullptr;
+
+            if (!IsRHISuccess(device->MapBuffer(requests[i].Staging, &mapped)) ||
+                mapped == nullptr)
+            {
+                ok = false;
+                break;
+            }
+
+            const auto* source = static_cast<const UInt8*>(mapped);
+
+            requests[i].Target->Clear();
+            requests[i].Target->Reserve(
+                static_cast<SizeType>(requests[i].Bytes));
+
+            for (UInt64 b = 0; b < requests[i].Bytes; ++b)
+            {
+                requests[i].Target->Add(source[b]);
+            }
+
+            device->UnmapBuffer(requests[i].Staging);
+        }
+    }
+
+    for (UInt32 i = 0; i < count; ++i)
+    {
+        if (requests[i].Staging.IsValid())
+        {
+            device->DestroyBuffer(requests[i].Staging);
+        }
+    }
+
+    return ok;
+}
+
+/// 跑一次剔除, 同时算出 CPU 参考结果
+FCullCapture CaptureMeshletCull(FRenderContext* context, FRenderer& renderer,
+                                bool backfaceCull)
+{
+    FCullCapture capture;
+
+    FMeshletCullPass* const pass = renderer.GetMeshletCullPass();
+
+    if (pass == nullptr)
+    {
+        return capture;
+    }
+
+    pass->SetBackfaceCullEnabled(backfaceCull);
+
+    // 先渲一帧, 让汇总缓冲区与实例表建起来 —— 回读那一帧要用它们的尺寸
+    // 来决定拷多少字节, 而那必须在录回调**之前**知道。
+    renderer.RenderFrame();
+
+    IRHIDevice* const device = context->GetDevice();
+
+    device->WaitIdle();
+
+    const UInt32 meshletCount = pass->GetSceneMeshletCount();
+
+    const TArray<FMeshletInstanceGpu>& instances = pass->GetInstances();
+
+    if (meshletCount == 0 || instances.IsEmpty())
+    {
+        return capture;
+    }
+
+    // ---- 三个缓冲区一起读回 ----
+    //
+    // 可见表要读多少: 上界是"全部实例的 meshlet 数之和" —— 每个 meshlet
+    // 至多在表里出现一次。用计数器的值当长度是不行的, 那要先读一次计数器
+    // 再读一次表, 而两次之间帧已经往前走了。
+    UInt64 pairUpperBound = 0;
+
+    for (SizeType i = 0; i < instances.GetSize(); ++i)
+    {
+        pairUpperBound += instances[i].MeshletRange[1];
+    }
+
+    if (pairUpperBound == 0)
+    {
+        return capture;
+    }
+
+    TArray<UInt8> meshletBytes;
+    TArray<UInt8> counterBytes;
+    TArray<UInt8> visibleBytes;
+
+    const UInt32 frameIndex = context->GetCurrentFrameIndex();
+
+    FCullReadbackRequest requests[3];
+
+    requests[0].Source = pass->GetSceneMeshletBuffer();
+    requests[0].Bytes =
+        static_cast<UInt64>(meshletCount) * sizeof(FMeshletGpuView);
+    requests[0].Target = &meshletBytes;
+
+    requests[1].Source = pass->GetCounterBuffer(frameIndex);
+    requests[1].Bytes  = sizeof(UInt32) * 4;
+    requests[1].Target = &counterBytes;
+
+    requests[2].Source = pass->GetVisibleMeshletBuffer(frameIndex);
+    requests[2].Bytes  = pairUpperBound * sizeof(UInt32) * 2;
+    requests[2].Target = &visibleBytes;
+
+    if (!ReadCullBuffers(context, renderer, requests, 3))
+    {
+        return capture;
+    }
+
+    const auto* meshlets =
+        reinterpret_cast<const FMeshletGpuView*>(meshletBytes.GetData());
+
+    {
+        const auto* counters =
+            reinterpret_cast<const UInt32*>(counterBytes.GetData());
+
+        for (UInt32 i = 0; i < 4; ++i)
+        {
+            capture.Counters[i] = counters[i];
+        }
+    }
+
+    const UInt32 visibleCount = capture.Counters[0];
+
+    if (visibleCount > pairUpperBound)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet剔除] 可见数 {} 超过上界 {} —— 计数器溢出了?",
+                 visibleCount, pairUpperBound);
+        return capture;
+    }
+
+    {
+        const auto* pairs =
+            reinterpret_cast<const UInt32*>(visibleBytes.GetData());
+
+        capture.GpuVisible.Reserve(visibleCount);
+
+        for (UInt32 i = 0; i < visibleCount; ++i)
+        {
+            capture.GpuVisible.Add(
+                (static_cast<UInt64>(pairs[i * 2 + 0]) << 32) |
+                static_cast<UInt64>(pairs[i * 2 + 1]));
+        }
+    }
+
+    // ---- CPU 参考实现 ----
+    const FFrustum& frustum = pass->GetFrustum();
+
+    const FVector3& cameraPosition = pass->GetCameraPosition();
+
+    const TArray<Float32>& instanceSpheres = pass->GetInstanceSpheres();
+
+    if (instanceSpheres.GetSize() != instances.GetSize() * 4)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet剔除] 实例包围球表长度 {} 与实例数 {} 对不上",
+                 instanceSpheres.GetSize(), instances.GetSize());
+        return capture;
+    }
+
+    for (SizeType i = 0; i < instances.GetSize(); ++i)
+    {
+        const FMeshletInstanceGpu& instance = instances[i];
+
+        // ---- 第一级: 实例 ----
+        //
+        // 这一级不能省。第一版的参考实现跳过了它, 理由是"实例包围球包住
+        // 它的每个 meshlet 包围球, 所以第一级剔掉的第二级也会剔掉" ——
+        // 那个直觉**不成立**: meshlet 的包围球会从实例包围盒的角上鼓出去,
+        // 于是一个刚好在视锥外的实例, 它的某个 meshlet 的包围球仍然可能
+        // 与视锥相交。实测差 2 个 meshlet, 判据当场报了出来。
+        //
+        // 教训是参考实现要照着**真实的算法**写, 不是照着一个"应该等价"的
+        // 简化版写。等价性本身是要证明的东西, 而这里它是假的。
+        const Float32 instanceSphere[4] = {
+            instanceSpheres[i * 4 + 0],
+            instanceSpheres[i * 4 + 1],
+            instanceSpheres[i * 4 + 2],
+            instanceSpheres[i * 4 + 3],
+        };
+
+        UInt32 instanceFailMask = 0;
+
+        const bool instanceVisible =
+            ReferenceSphereVisible(instanceSphere, frustum, instanceFailMask);
+
+        const UInt32 base  = instance.MeshletRange[0];
+        const UInt32 count = instance.MeshletRange[1];
+
+        if (instanceVisible)
+        {
+            ++capture.InstancesVisible;
+        }
+
+        for (UInt32 m = 0; m < count; ++m)
+        {
+            const UInt32 meshletIndex = base + m;
+
+            if (meshletIndex >= meshletCount)
+            {
+                continue;
+            }
+
+            const FMeshletGpuView& meshlet = meshlets[meshletIndex];
+
+            Float32 worldSphere[4] = {};
+
+            ReferenceWorldSphere(meshlet.Sphere, instance, worldSphere);
+
+            UInt32 failMask = 0;
+
+            const bool meshletVisible =
+                ReferenceSphereVisible(worldSphere, frustum, failMask);
+
+            // ---- 第一级的保守性 ----
+            //
+            // 实例被第一级剔掉了, 那它的每个 meshlet 都必须在第二级的
+            // 视锥判据下也不可见。不然第一级就剔掉了本来看得见的东西 ——
+            // 而那是画面上整块消失, 与"这块本来就不在视野里"长得一样。
+            //
+            // 这一条是判据里唯一一个**不依赖 GPU**的: 它验的是两级之间
+            // 的关系, 而 GPU 那边被剔的实例压根不会进入第二级, 于是集合
+            // 比对对它没有任何约束。
+            if (!instanceVisible)
+            {
+                if (meshletVisible)
+                {
+                    ++capture.InstanceCullTooAggressive;
+                }
+
+                continue;
+            }
+
+            if (!meshletVisible)
+            {
+                // 只有一个平面判它出局时, 记在那个平面头上
+                UInt32 exclusive = 0xFFFFFFFFu;
+
+                for (UInt32 p = 0; p < 6; ++p)
+                {
+                    if ((failMask & (1u << p)) == 0)
+                    {
+                        continue;
+                    }
+
+                    if (exclusive != 0xFFFFFFFFu)
+                    {
+                        exclusive = 0xFFFFFFFFu;
+                        break;
+                    }
+
+                    exclusive = p;
+                }
+
+                if (exclusive < 6)
+                {
+                    ++capture.PlaneExclusiveCulls[exclusive];
+                }
+
+                continue;
+            }
+
+            // 记下一个"能让相机落进去"的候选。条件是法线锥有效 + 缩放
+            // 均匀 —— 那两条 early-out 排在"相机在球内"之前。
+            if (meshlet.Cone[3] > kInvalidConeCosine &&
+                ReferenceUniformScale(instance) &&
+                worldSphere[3] > capture.InsideCameraRadius)
+            {
+                capture.InsideCameraRadius = worldSphere[3];
+                capture.InsideCameraTarget =
+                    FVector3(worldSphere[0], worldSphere[1], worldSphere[2]);
+            }
+
+            if (backfaceCull)
+            {
+                EBackfaceBranch branch = EBackfaceBranch::Tested;
+
+                const bool culled = ReferenceBackfaceCull(
+                    meshlet.Cone, worldSphere, cameraPosition, instance,
+                    branch);
+
+                switch (branch)
+                {
+                case EBackfaceBranch::InvalidCone:
+                    ++capture.InvalidConeEarlyOut;
+                    break;
+                case EBackfaceBranch::NonUniformScale:
+                    ++capture.NonUniformScaleEarlyOut;
+                    break;
+                default:
+                    break;
+                }
+
+                if (culled)
+                {
+                    continue;
+                }
+            }
+
+            capture.CpuVisible.Add((static_cast<UInt64>(i) << 32) |
+                                   static_cast<UInt64>(meshletIndex));
+        }
+    }
+
+    Sort(capture.GpuVisible.GetData(), capture.GpuVisible.GetSize());
+    Sort(capture.CpuVisible.GetData(), capture.CpuVisible.GetSize());
+
+    capture.Valid = true;
+
+    return capture;
+}
+
+} // namespace
+
+static bool RunMeshletCullChecks(FRenderContext* context, FRenderer& renderer)
+{
+    if (!renderer.SetMeshletCullEnabled(true))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet剔除] 无法启用 — 判据无法执行, 判定为失败");
+        return false;
+    }
+
+    bool passed = true;
+
+    FCamera& camera = renderer.GetCamera();
+
+    const Float32   originalFov      = camera.GetFovY();
+    const FVector3  originalPosition = camera.GetPosition();
+
+    const Float32 savedNear = camera.GetNearPlane();
+    const Float32 savedFar  = camera.GetFarPlane();
+
+    const auto RestoreCamera = [&camera, originalFov, originalPosition,
+                                savedNear, savedFar]()
+    {
+        camera.SetPerspective(originalFov, camera.GetAspectRatio(), savedNear,
+                              savedFar);
+        camera.SetPosition(originalPosition);
+    };
+
+
+    // ================================================================
+    // 四组配置
+    //
+    // 一组配置只能走到一部分分支, 而"GPU 与 CPU 一致"对没走到的分支毫无
+    // 约束 —— 这是 Day 9 第一轮扫描里五条逃逸中四条的成因。所以判据自己
+    // 造出那些条件:
+    //
+    //   窄视场 (15 度)   让视锥剔除真的剔掉东西。默认视角下综合场景
+    //                    **什么都在视锥里**, 视锥判据整个写错都没痕迹。
+    //   宽视场 (100 度)  让法线锥无效的物体 (立方体: 六个面朝六个方向)
+    //                    与非均匀缩放的物体 (地面 40x1x40、柱子 0.5x3.5x0.5)
+    //                    留在视野里, 走到那两条 early-out。
+    //   相机贴地         把相机放进地面那个 meshlet 的包围球里, 走到
+    //                    "相机在球内"那条 early-out。
+    //   关背面剔除       单独验视锥那一路, 并给"背面剔除只能再剔掉东西"
+    //                    那条单调性判据提供对照。
+    // ================================================================
+
+    struct FConfiguration
+    {
+        const AnsiChar* Label;
+        Float32         FovDegrees;
+        Float32         NearPlane;
+        Float32         FarPlane;
+        bool            BackfaceCull;
+        bool            MoveInside;
+    };
+
+    const Float32 defaultNear = camera.GetNearPlane();
+    const Float32 defaultFar  = camera.GetFarPlane();
+
+    // 近平面推远、远平面拉近, 是为了让**近平面与远平面**这两条也单独
+    // 剔掉过东西。默认的 0.1 / 100 之下, 综合场景里没有任何东西落在相机
+    // 身后或者百米之外 —— 于是那两个平面上的判据整个删掉都不会红。
+    const FConfiguration configurations[6] = {
+        { "窄视场 + 背面剔除", 15.0f, defaultNear, defaultFar, true, false },
+        { "窄视场 + 只视锥", 15.0f, defaultNear, defaultFar, false, false },
+        { "宽视场 + 背面剔除", 100.0f, defaultNear, defaultFar, true, false },
+        { "远平面拉到 8", 100.0f, defaultNear, 8.0f, true, false },
+        { "近平面推到 12", 100.0f, 12.0f, defaultFar, true, false },
+        { "相机在包围球内", 60.0f, defaultNear, defaultFar, true, true },
+    };
+
+    constexpr UInt32 kConfigurationCount = 6;
+
+    TArray<FCullCapture> captures;
+
+    // "相机在包围球内"那一组要的位置, 由前几组的采集算出来 —— 场景里
+    // 哪个 meshlet 的包围球最大不是能写死的知识。
+    FVector3 insideTarget = originalPosition;
+
+    for (UInt32 c = 0; c < kConfigurationCount; ++c)
+    {
+        const FConfiguration& configuration = configurations[c];
+
+        camera.SetPerspective(
+            FMath::DegreesToRadians(configuration.FovDegrees),
+            camera.GetAspectRatio(), configuration.NearPlane,
+            configuration.FarPlane);
+
+        camera.SetPosition(configuration.MoveInside ? insideTarget
+                                                    : originalPosition);
+
+        captures.Add(CaptureMeshletCull(context, renderer,
+                                        configuration.BackfaceCull));
+
+        if (!captures.Last().Valid)
+        {
+            LIMX_LOG(LogLaunch, Error, "[Meshlet剔除] {} — 采集失败",
+                     configuration.Label);
+            RestoreCamera();
+            return false;
+        }
+
+        const FCullCapture& capture = captures.Last();
+
+        if (capture.InsideCameraRadius > 0.0f && !configuration.MoveInside)
+        {
+            insideTarget = capture.InsideCameraTarget;
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet剔除] {} — 实例 {} 可见, 测试 {} 个 meshlet, "
+                 "可见 {} (视锥剔 {}, 背面剔 {}); CPU 参考 {} 个",
+                 configuration.Label, capture.InstancesVisible,
+                 capture.Counters[3], capture.Counters[0], capture.Counters[1],
+                 capture.Counters[2], capture.CpuVisible.GetSize());
+
+        // ---- 判据 1: 可见集合完全相同 ----
+        if (capture.GpuVisible.GetSize() != capture.CpuVisible.GetSize())
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet剔除] {} — GPU 留下 {} 个, CPU 参考 {} 个",
+                     configuration.Label, capture.GpuVisible.GetSize(),
+                     capture.CpuVisible.GetSize());
+            passed = false;
+        }
+        else
+        {
+            SizeType mismatched = 0;
+            UInt64   firstGpu   = 0;
+            UInt64   firstCpu   = 0;
+
+            for (SizeType i = 0; i < capture.GpuVisible.GetSize(); ++i)
+            {
+                if (capture.GpuVisible[i] != capture.CpuVisible[i])
+                {
+                    if (mismatched == 0)
+                    {
+                        firstGpu = capture.GpuVisible[i];
+                        firstCpu = capture.CpuVisible[i];
+                    }
+
+                    ++mismatched;
+                }
+            }
+
+            if (mismatched != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet剔除] {} — {} 条不同, 第一条 GPU (实例 {}, "
+                         "meshlet {}) vs CPU (实例 {}, meshlet {})",
+                         configuration.Label, mismatched,
+                         static_cast<UInt32>(firstGpu >> 32),
+                         static_cast<UInt32>(firstGpu & 0xFFFFFFFFull),
+                         static_cast<UInt32>(firstCpu >> 32),
+                         static_cast<UInt32>(firstCpu & 0xFFFFFFFFull));
+                passed = false;
+            }
+        }
+
+        // ---- 判据 2: 计数器自洽 ----
+        const UInt32 sum =
+            capture.Counters[0] + capture.Counters[1] + capture.Counters[2];
+
+        if (sum != capture.Counters[3])
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet剔除] {} — 计数器不自洽: 可见 {} + 视锥剔 {} + "
+                     "背面剔 {} = {}, 但测试数是 {}",
+                     configuration.Label, capture.Counters[0],
+                     capture.Counters[1], capture.Counters[2], sum,
+                     capture.Counters[3]);
+            passed = false;
+        }
+
+        // ---- 判据 3: 第一级必须保守 ----
+        //
+        // 实例包围球剔掉的东西, 逐 meshlet 的视锥判据也必须剔掉。不然
+        // 第一级就剔掉了本来看得见的 meshlet —— 而 GPU 那边被剔的实例
+        // 压根不进第二级, 集合比对对它一个字都不会说。
+        if (capture.InstanceCullTooAggressive != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet剔除] {} — 第一级剔掉的实例里有 {} 个 meshlet "
+                     "在逐 meshlet 判据下仍然可见 —— 实例包围球不保守, "
+                     "画面上会整块消失",
+                     configuration.Label, capture.InstanceCullTooAggressive);
+            passed = false;
+        }
+    }
+
+    RestoreCamera();
+
+    // ================================================================
+    // 判据 4: 背面剔除的单调性
+    //
+    // 同一组视锥下, 开着背面剔除时可见的 meshlet, 关掉之后必须仍然可见。
+    // 反过来说明两条判据互相干扰。
+    // ================================================================
+    {
+        const FCullCapture& withBackface = captures[0];
+        const FCullCapture& onlyFrustum  = captures[1];
+
+        SizeType missing = 0;
+        SizeType j       = 0;
+
+        for (SizeType i = 0; i < withBackface.GpuVisible.GetSize(); ++i)
+        {
+            const UInt64 key = withBackface.GpuVisible[i];
+
+            while (j < onlyFrustum.GpuVisible.GetSize() &&
+                   onlyFrustum.GpuVisible[j] < key)
+            {
+                ++j;
+            }
+
+            if (j >= onlyFrustum.GpuVisible.GetSize() ||
+                onlyFrustum.GpuVisible[j] != key)
+            {
+                ++missing;
+            }
+        }
+
+        if (missing != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet剔除] 开着背面剔除时可见的 {} 个 meshlet, "
+                     "关掉之后反而不可见了 —— 背面剔除不该让东西活过来",
+                     missing);
+            passed = false;
+        }
+    }
+
+    // ================================================================
+    // 判据 5: 分支覆盖
+    //
+    // 这一组元判据是 Day 9 第一轮扫描的直接产物。当时五条逃逸里有四条
+    // 同一个成因: **那个分支在这个视角下根本没被走到**。一致性判据对
+    // 没走到的分支毫无约束, 于是把它改坏了也一样绿。
+    //
+    // 所以每个分支都要有一个计数器, 每个计数器都要有一条"必须大于零"的
+    // 元判据。哪条不满足, 它自己会说是哪条。
+    // ================================================================
+    {
+        UInt32 planeExclusive[6] = { 0, 0, 0, 0, 0, 0 };
+
+        UInt32 invalidCone     = 0;
+        UInt32 nonUniformScale = 0;
+
+        for (SizeType c = 0; c < captures.GetSize(); ++c)
+        {
+            for (UInt32 p = 0; p < 6; ++p)
+            {
+                planeExclusive[p] += captures[c].PlaneExclusiveCulls[p];
+            }
+
+            invalidCone += captures[c].InvalidConeEarlyOut;
+            nonUniformScale += captures[c].NonUniformScaleEarlyOut;
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[Meshlet剔除] 分支覆盖 — 六个平面独自剔掉 "
+                 "{}/{}/{}/{}/{}/{}; 无效法线锥 {}, 非均匀缩放 {}",
+                 planeExclusive[0], planeExclusive[1], planeExclusive[2],
+                 planeExclusive[3], planeExclusive[4], planeExclusive[5],
+                 invalidCone, nonUniformScale);
+
+        for (UInt32 p = 0; p < 6; ++p)
+        {
+            if (planeExclusive[p] == 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[Meshlet剔除] 第 {} 个视锥平面从来没有独自剔掉过"
+                         "任何 meshlet —— 这个平面上的判据是空的, "
+                         "把它整个删掉都不会红",
+                         p);
+                passed = false;
+            }
+        }
+
+        if (invalidCone == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet剔除] 没有一个法线锥无效的 meshlet 走到背面"
+                     "判据 —— 那条 early-out 是空的");
+            passed = false;
+        }
+
+        if (nonUniformScale == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[Meshlet剔除] 没有一个非均匀缩放的实例走到背面判据 "
+                     "—— 那条 early-out 是空的 (场景里需要一个缩放不一致"
+                     "**且法线锥有效**的物体)");
+            passed = false;
+        }
+
+    }
+
+    // ================================================================
+    // 判据 6: 剔除必须真的剔掉了东西
+    // ================================================================
+    if (captures[1].Counters[1] == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet剔除] 视锥一个 meshlet 都没剔掉 —— "
+                 "这个视角下判据是空的");
+        passed = false;
+    }
+
+    if (captures[0].Counters[2] == 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet剔除] 背面一个 meshlet 都没剔掉 —— 判据是空的");
+        passed = false;
+    }
+
+    if (captures[0].InstancesVisible >=
+        static_cast<UInt32>(
+            renderer.GetMeshletCullPass()->GetInstances().GetSize()))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[Meshlet剔除] 第一级一个实例都没剔掉 ({} / {}) —— "
+                 "两级剔除只有一级在干活",
+                 captures[0].InstancesVisible,
+                 renderer.GetMeshletCullPass()->GetInstances().GetSize());
+        passed = false;
+    }
+
+    if (!renderer.SetMeshletCullEnabled(false))
+    {
+        LIMX_LOG(LogLaunch, Error, "[Meshlet剔除] 无法关闭 (复位)");
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[Meshlet剔除] {}", passed ? "通过" : "失败");
 
     return passed;
 }
@@ -11381,6 +12375,32 @@ static void BuildShowcaseScene(LScene* scene, FRenderContext* context,
     //
     // 两块玻璃前后叠放 —— 排序错了的话混合结果不对, 而那是"正确性"而不是
     // "优化"的问题。
+    // ---- 均匀缩放的箱子 ----
+    //
+    // 立方体 (六个面朝六个方向, 法线锥无效) **而且**三轴等比。
+    //
+    // 也是判据逼出来的。背面判据的第一条 early-out 是"法线锥无效就不剔",
+    // 而综合场景原本每一个立方体都是非均匀缩放的 —— 于是**后一条**
+    // early-out (缩放不一致就不剔) 先返回, 第一条被完全遮住: 把它删掉,
+    // 判据一动不动地绿。
+    //
+    // 两条 early-out 互相遮掩这件事, 只有分支覆盖计数能看出来。
+    Spawn(FName("ShowcaseCrate"), cubeHandle, opaque,
+          FVector3(3.6f, 0.7f, 3.0f), FVector3(1.4f, 1.4f, 1.4f));
+
+    // ---- 椭球 ----
+    //
+    // 缩放不一致 (1.8 / 0.7 / 1.2) **而且**法线锥有效 —— 场景里唯一同时
+    // 满足这两条的物体。
+    //
+    // 它是判据逼出来的: meshlet 剔除的背面判据里有一条 early-out 是
+    // "缩放不一致时不剔" (法线在非均匀缩放下要用逆转置变换, 而锥的张角
+    // 也会变)。综合场景原本所有非均匀缩放的物体都是立方体, 而立方体的
+    // 法线锥是无效的 —— 更早的那条 early-out 先返回了, 于是这一条永远
+    // 走不到, 把它整个删掉判据也不会红。
+    Spawn(FName("ShowcaseEllipsoid"), sphereHandle, opaque,
+          FVector3(-3.2f, 1.1f, 2.4f), FVector3(1.8f, 0.7f, 1.2f));
+
     Spawn(FName("ShowcaseGlassFar"), cubeHandle, glass,
           FVector3(-1.5f, 1.5f, 1.0f), FVector3(2.5f, 3.0f, 0.1f));
 
@@ -12467,6 +13487,19 @@ int WINAPI wWinMain(
         }
     }
 
+    if (launchOptions.MeshletCull)
+    {
+        if (renderer.SetMeshletCullEnabled(true))
+        {
+            LIMX_LOG(LogLaunch, Display, "[Launch] 两级 meshlet 剔除已启用");
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[启动] --meshlet-cull 无法启用 —— 剔除通道不存在");
+        }
+    }
+
     if (launchOptions.RayTracedAo)
     {
         if (renderer.SetRayTracedAoEnabled(true))
@@ -12651,6 +13684,7 @@ int WINAPI wWinMain(
     bool    rtHybridPassed = true;
     bool    rtAoUpsamplePassed = true;
     bool    meshletPassed = true;
+    bool    meshletCullPassed = true;
 
     while (window.ProcessMessages())
     {
@@ -12777,6 +13811,12 @@ int WINAPI wWinMain(
             if (launchOptions.MeshletCheck)
             {
                 meshletPassed = RunMeshletChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.MeshletCullCheck)
+            {
+                meshletCullPassed =
+                    RunMeshletCullChecks(&renderContext, renderer);
             }
 
             if (launchOptions.RtReflectionCheck)
@@ -13044,6 +14084,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletPassed, 29,
+                                          errorSink, errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.MeshletCullCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(meshletCullPassed, 30,
                                           errorSink, errorsBeforeShutdown);
     }
 

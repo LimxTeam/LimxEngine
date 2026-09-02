@@ -103,6 +103,11 @@ struct FGrowingMeshlet
         PositionSum = FVector3(0.0f, 0.0f, 0.0f);
         Minimum = FVector3(1.0e30f, 1.0e30f, 1.0e30f);
         Maximum = FVector3(-1.0e30f, -1.0e30f, -1.0e30f);
+
+        for (UInt32 i = 0; i < kSlotCount; ++i)
+        {
+            SlotKeys[i] = 0u;
+        }
     }
 
     /// 当前包围盒对角线的一半 —— 拿它当"这个 meshlet 有多大"
@@ -120,18 +125,72 @@ struct FGrowingMeshlet
                                   diagonal.Z * diagonal.Z);
     }
 
+    /// 全局顶点 -> 局部下标的开放寻址表
+    ///
+    /// 这里曾经是对 Vertices 的线性扫描。那看起来无害 (最多 64 个),
+    /// 但它在最内层: 每考察一个候选三角形要查三次, 而一个 meshlet 长起来
+    /// 要考察几百个候选。Sponza 的导入因此慢了 74 ms, 被导入基准的哨兵
+    /// 当场逮到 —— 那条哨兵存在的理由正是"一次性成本不出现在任何逐帧
+    /// 数字里"。
+    ///
+    /// 128 个槽位装最多 64 个顶点, 装载率不超过一半, 线性探测的期望
+    /// 步数在 1.5 以内。表在 Reset 里清空 —— 128 次写比一次分配便宜得多。
+    static constexpr UInt32 kSlotCount = 128;
+    static constexpr UInt32 kSlotMask = kSlotCount - 1;
+
+    /// 槽位里存的是 全局下标 + 1 (0 表示空槽)
+    UInt32 SlotKeys[kSlotCount] = {};
+    UInt8  SlotValues[kSlotCount] = {};
+
+    LIMX_NODISCARD static UInt32 HashIndex(UInt32 globalIndex)
+    {
+        // 乘一个奇数再取高位 —— 顶点下标常常是连续的, 直接取低位会让
+        // 一整段连续下标挤进相邻槽位, 线性探测退化成线性扫描。
+        return ((globalIndex * 2654435761u) >> 24) & kSlotMask;
+    }
+
     /// 这个全局顶点在局部表里的位置; 不在则返回 kMaxMeshletVertices
     LIMX_NODISCARD UInt32 FindLocal(UInt32 globalIndex) const
     {
-        for (UInt32 i = 0; i < VertexCount; ++i)
+        const UInt32 key = globalIndex + 1u;
+
+        UInt32 slot = HashIndex(globalIndex);
+
+        for (UInt32 probe = 0; probe < kSlotCount; ++probe)
         {
-            if (Vertices[i] == globalIndex)
+            if (SlotKeys[slot] == 0u)
             {
-                return i;
+                return kMaxMeshletVertices;
             }
+
+            if (SlotKeys[slot] == key)
+            {
+                return SlotValues[slot];
+            }
+
+            slot = (slot + 1u) & kSlotMask;
         }
 
         return kMaxMeshletVertices;
+    }
+
+    void InsertLocal(UInt32 globalIndex, UInt32 localIndex)
+    {
+        const UInt32 key = globalIndex + 1u;
+
+        UInt32 slot = HashIndex(globalIndex);
+
+        for (UInt32 probe = 0; probe < kSlotCount; ++probe)
+        {
+            if (SlotKeys[slot] == 0u || SlotKeys[slot] == key)
+            {
+                SlotKeys[slot]   = key;
+                SlotValues[slot] = static_cast<UInt8>(localIndex);
+                return;
+            }
+
+            slot = (slot + 1u) & kSlotMask;
+        }
     }
 
     /// 加进这个三角形要新增几个顶点 (0..3)
@@ -185,6 +244,7 @@ struct FGrowingMeshlet
                 local = VertexCount;
 
                 Vertices[VertexCount] = triangle[k];
+                InsertLocal(triangle[k], VertexCount);
                 ++VertexCount;
 
                 const FVector3& position = vertices[triangle[k]].Position;
@@ -556,6 +616,13 @@ FMeshletBuildResult FMeshletBuilder::Build(
 
             const FVector3 centroid = growing.Centroid();
 
+            // 三角形满了就不必再找候选 —— 原先这一条在 CanFit 里,
+            // 合并之后要显式写出来。
+            if (growing.TriangleCount >= kMaxMeshletTriangles)
+            {
+                break;
+            }
+
             // 候选 = 与当前 meshlet 的任一局部顶点相邻的三角形
             for (UInt32 i = 0; i < growing.VertexCount; ++i)
             {
@@ -573,13 +640,15 @@ FMeshletBuildResult FMeshletBuilder::Build(
                         continue;
                     }
 
-                    if (!growing.CanFit(&indices[t * 3]))
+                    // CanFit 与 NewVertexCount 问的是同一件事, 算一遍
+                    // 就够 —— 这一段在最内层, 每个候选都要走一次。
+                    const UInt32 added =
+                        growing.NewVertexCount(&indices[t * 3]);
+
+                    if (growing.VertexCount + added > kMaxMeshletVertices)
                     {
                         continue;
                     }
-
-                    const UInt32 added =
-                        growing.NewVertexCount(&indices[t * 3]);
 
                     const Float32 distance =
                         DistanceSquared(centroid, centroids[t]);
@@ -680,7 +749,8 @@ FMeshletBuildResult FMeshletBuilder::Build(
         FinalizeMeshlet(growing, vertices, result);
     }
 
-    LIMX_LOG(LogMeshletBuilder, Display,
+    // Log 而不是 Display: 一个网格一行, 而大场景有成百上千个网格。
+    LIMX_LOG(LogMeshletBuilder, Log,
              "[Meshlet] {} 个三角形 / {} 个顶点 切成 {} 个 meshlet",
              triangleCount, vertices.GetSize(), result.Meshlets.GetSize());
 

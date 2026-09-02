@@ -1,0 +1,117 @@
+#version 450
+
+// ============================================================================
+// meshlet_cull.comp — 两级剔除的第二级: meshlet
+//
+// 一个工作组一个**可见实例** (第一级压实出来的那张表), 组内的线程跨步遍历
+// 该实例的全部 meshlet。活下来的压实进一张 (实例, meshlet) 对的表。
+//
+// 为什么一个工作组一个实例, 而不是一个线程一个 meshlet:
+//
+//   一个线程一个 meshlet 要先算出"全场景第 i 个 meshlet 属于哪个实例",
+//   那需要一张前缀和表, 而那张表每帧都要重建 (实例可见性每帧都在变)。
+//   一个工作组一个实例的话, 实例是谁由 gl_WorkGroupID 直接给出。
+//
+//   代价是负载不均: 一个只有 3 个 meshlet 的实例也占一个完整工作组。
+//   真实场景里 meshlet 数的分布很宽, 这个代价是实打实的 —— 但它换掉的
+//   是每帧一趟前缀和外加一次额外的同步。
+//
+// 两条剔除判据都在 meshlet_common.h 里, 与 CPU 的参考实现同一份书写。
+// ============================================================================
+
+#include "meshlet_common.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
+    MeshletInstance instances[];
+} instanceBuffer;
+
+layout(std430, set = 0, binding = 1) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+} meshletBuffer;
+
+layout(std430, set = 0, binding = 2) readonly buffer VisibleInstanceBuffer {
+    uint visible[];
+} visibleBuffer;
+
+// 压实后的可见 meshlet —— x = 实例下标, y = meshlet 下标 (全局)
+layout(std430, set = 0, binding = 3) writeonly buffer VisibleMeshletBuffer {
+    uvec2 visible[];
+} outputBuffer;
+
+// x = 可见 meshlet 数
+// y = 因视锥被剔的数
+// z = 因背面被剔的数
+// w = 参与测试的总数
+//
+// 后三个只作诊断, 但缺了就答不上"剔除到底跑没跑"。一个什么都不剔的实现
+// 在画面上与正确实现完全一样, 只是慢 —— 那正是本周期反复遇到的那一类。
+layout(std430, set = 0, binding = 4) buffer CounterBuffer {
+    uvec4 counters;
+} counterBuffer;
+
+layout(push_constant) uniform Params {
+    vec4 planes[6];
+
+    // xyz = 相机世界位置, w = 保留
+    vec4 cameraPosition;
+
+    // x = 可见实例数, y = 输出表容量, z = 背面剔除开关, w = 保留
+    uvec4 params;
+} pc;
+
+void main()
+{
+    const uint group = gl_WorkGroupID.x;
+
+    if (group >= pc.params.x)
+    {
+        return;
+    }
+
+    const uint instanceIndex = visibleBuffer.visible[group];
+
+    const MeshletInstance instance = instanceBuffer.instances[instanceIndex];
+
+    const uint meshletBase  = instance.meshletRange.x;
+    const uint meshletCount = instance.meshletRange.y;
+
+    for (uint i = gl_LocalInvocationID.x; i < meshletCount;
+         i += gl_WorkGroupSize.x)
+    {
+        const uint meshletIndex = meshletBase + i;
+
+        const Meshlet meshlet = meshletBuffer.meshlets[meshletIndex];
+
+        const vec4 worldSphere = MeshletWorldSphere(
+            meshlet.boundingSphere, instance.transformRow0,
+            instance.transformRow1, instance.transformRow2);
+
+        atomicAdd(counterBuffer.counters.w, 1u);
+
+        if (!MeshletSphereVisible(worldSphere, pc.planes))
+        {
+            atomicAdd(counterBuffer.counters.y, 1u);
+            continue;
+        }
+
+        if (pc.params.z != 0u &&
+            MeshletBackfaceCull(meshlet.normalCone, worldSphere,
+                                pc.cameraPosition.xyz, instance.transformRow0,
+                                instance.transformRow1,
+                                instance.transformRow2))
+        {
+            atomicAdd(counterBuffer.counters.z, 1u);
+            continue;
+        }
+
+        const uint slot = atomicAdd(counterBuffer.counters.x, 1u);
+
+        // 容量不够时丢掉而不是越界写 —— 理由与第一级同。
+        if (slot < pc.params.y)
+        {
+            outputBuffer.visible[slot] = uvec2(instanceIndex, meshletIndex);
+        }
+    }
+}

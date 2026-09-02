@@ -70,6 +70,7 @@
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
+#include "Renderer/RenderPass/FMeshletCullPass.h"
 #include "Renderer/RenderPass/FRayTracedShadowPass.h"
 #include "Renderer/RenderPass/FRayTracedAoPass.h"
 #include "Renderer/RenderPass/FRayTracedReflectionPass.h"
@@ -252,6 +253,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
 
     m_ClusterLightPass = MakeUnique<FClusterLightPass>();
     m_GpuCullPass      = MakeUnique<FGpuCullPass>();
+    m_MeshletCullPass  = MakeUnique<FMeshletCullPass>();
     m_TaaPass          = MakeUnique<FTaaPass>();
     m_GtaoPass         = MakeUnique<FGtaoPass>();
     m_BloomPass        = MakeUnique<FBloomPass>();
@@ -259,6 +261,7 @@ ERHIResult FRenderer::Initialize(FWindow* window, FRenderContext* context)
     m_PassManager->RegisterPass(m_ShadowPass.Get());
     m_PassManager->RegisterPass(m_ShadowAtlasPass.Get());
     m_PassManager->RegisterPass(m_GpuCullPass.Get());
+    m_PassManager->RegisterPass(m_MeshletCullPass.Get());
     m_PassManager->RegisterPass(m_ClusterLightPass.Get());
     m_PassManager->RegisterPass(m_GtaoPass.Get());
     m_PassManager->RegisterPass(m_TaaPass.Get());
@@ -896,6 +899,20 @@ void FRenderer::RenderFrame()
             FGpuCullPass::kCameraView,
             FFrustum::FromViewProjection(m_Camera.GetProjectionMatrix() *
                                          m_Camera.GetViewMatrix()));
+
+        // meshlet 剔除用**同一个**视锥。
+        //
+        // 各算各的话, 两级剔除会在边界上出现分歧 —— 实例级留下的东西
+        // meshlet 级全剔掉, 或者反过来。而那只在物体刚好压着视锥边界时
+        // 出现, 是那种"某个视角下少一块"的缺陷。
+        if (m_MeshletCullPass)
+        {
+            m_MeshletCullPass->SetFrustum(
+                FFrustum::FromViewProjection(m_Camera.GetProjectionMatrix() *
+                                             m_Camera.GetViewMatrix()));
+
+            m_MeshletCullPass->SetCameraPosition(m_Camera.GetPosition());
+        }
 
         // 三级级联各占一个视图。阴影通道没有有效光源时它们的视锥是上一帧
         // 留下的 —— 无所谓, 那时阴影通道只清不画, 没人读那几段命令。
@@ -2243,6 +2260,22 @@ void FRenderer::UpdateUniformBuffer(UInt32 frameIndex)
     // 有任何报错。这类"少一帧延迟"的错位是速度缓冲最典型的失效方式。
     m_PrevViewProjNoJitter = viewProj.ViewProjNoJitter;
     m_HasPrevViewProj      = true;
+}
+
+// ============================================================================
+// SetMeshletCullEnabled
+// ============================================================================
+
+bool FRenderer::SetMeshletCullEnabled(bool enabled)
+{
+    if (!m_MeshletCullPass)
+    {
+        return false;
+    }
+
+    m_MeshletCullPass->SetEnabled(enabled);
+
+    return true;
 }
 
 } // namespace Limx

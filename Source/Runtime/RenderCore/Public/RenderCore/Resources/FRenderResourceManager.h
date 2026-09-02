@@ -274,6 +274,14 @@ private:
         FRHITextureHandle     Texture;
         FRHITextureViewHandle View;
 
+        /// meshlet 的三个缓冲区 —— 与顶点/索引缓冲区同一条退役路径
+        ///
+        /// 走同一条而不是另开一条: 两条路径就有两个"什么时候真的能销毁"的
+        /// 判断, 而它们只要有一处不同步, 表现就是偶发的、依赖帧号的崩溃。
+        FRHIBufferHandle      MeshletBuffer;
+        FRHIBufferHandle      MeshletVertexBuffer;
+        FRHIBufferHandle      MeshletTriangleBuffer;
+
         /// 退役时的帧序号 —— 该帧的提交是最后一批可能引用这些对象的命令
         UInt64 RetireFrame = 0;
     };

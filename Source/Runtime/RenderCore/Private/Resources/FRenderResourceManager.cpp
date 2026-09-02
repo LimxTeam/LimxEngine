@@ -34,6 +34,8 @@
  ******************************************************************************/
 
 #include "RenderCore/Resources/FRenderResourceManager.h"
+
+#include "RenderCore/Geometry/FMeshletBuilder.h"
 #include "RenderCore/Renderer/FRenderContext.h"
 
 namespace Limx
@@ -729,6 +731,218 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
         }
     }
 
+    // ---- 批次划分 ----
+    //
+    // 先把批次算出来: meshlet 按批次切, 而批次来自 SubMeshes。
+    // 没有 SubMeshes 时补一个覆盖全部索引的批次, 让下面这段无需分支。
+    struct FSectionRange
+    {
+        UInt32 IndexOffset = 0;
+        UInt32 IndexCount  = 0;
+    };
+
+    TArray<FSectionRange> sectionRanges;
+
+    for (SizeType i = 0; i < meshData.SubMeshes.GetSize(); ++i)
+    {
+        const FSubMesh& source = meshData.SubMeshes[i];
+
+        if (source.IndexCount == 0)
+        {
+            continue;
+        }
+
+        FSectionRange range;
+        range.IndexOffset = source.IndexOffset;
+        range.IndexCount  = source.IndexCount;
+
+        sectionRanges.Add(range);
+    }
+
+    if (sectionRanges.IsEmpty())
+    {
+        FSectionRange range;
+        range.IndexOffset = 0;
+        range.IndexCount  = static_cast<UInt32>(meshData.Indices.GetSize());
+
+        sectionRanges.Add(range);
+    }
+
+    // ---- meshlet ----
+    //
+    // 切分本身在 CPU 上, 与顶点/索引上传同一次调用里完成。切失败就整个
+    // 网格创建失败 —— 而不是"这个网格没有 meshlet, 别的有"。后者会让
+    // 虚拟几何路径静默地漏画一部分物体。
+    //
+    // 逐批次切, 结果首尾相接拼成一份。拼接时要把每个 meshlet 的
+    // VertexOffset 与 TriangleOffset 加上当前的基址 —— 那两个字段是
+    // 数组下标, 而数组换了。
+    FRHIBufferHandle meshletBuffer;
+    FRHIBufferHandle meshletVertexBuffer;
+    FRHIBufferHandle meshletTriangleBuffer;
+
+    UInt64 meshletBytes = 0;
+
+    FMeshletBuildResult meshlets;
+
+    TArray<UInt32>  sectionMeshletOffsets;
+    TArray<UInt32>  sectionMeshletCounts;
+    TArray<Float32> sectionMaxMeshletRadii;
+
+    for (SizeType s = 0; s < sectionRanges.GetSize(); ++s)
+    {
+        const FSectionRange& range = sectionRanges[s];
+
+        TArray<UInt32> sectionIndices;
+        sectionIndices.Reserve(range.IndexCount);
+
+        for (UInt32 i = 0; i < range.IndexCount; ++i)
+        {
+            const SizeType source =
+                static_cast<SizeType>(range.IndexOffset) + i;
+
+            if (source >= meshData.Indices.GetSize())
+            {
+                break;
+            }
+
+            sectionIndices.Add(meshData.Indices[source]);
+        }
+
+        const FMeshletBuildResult part =
+            FMeshletBuilder::Build(meshData.Vertices, sectionIndices);
+
+        if (!part.IsValid())
+        {
+            m_Device->DestroyBuffer(indexBuffer);
+            m_Device->DestroyBuffer(vertexBuffer);
+
+            LIMX_LOG(LogRenderCore, Error,
+                     "[资源管理器] 批次 {} 的 meshlet 切分失败: "
+                     "{} 个顶点 / {} 个索引",
+                     s, meshData.Vertices.GetSize(),
+                     sectionIndices.GetSize());
+            return handle;
+        }
+
+        const UInt32 vertexBase =
+            static_cast<UInt32>(meshlets.MeshletVertices.GetSize());
+
+        const UInt32 triangleBase =
+            static_cast<UInt32>(meshlets.MeshletTriangles.GetSize() / 3);
+
+        sectionMeshletOffsets.Add(
+            static_cast<UInt32>(meshlets.Meshlets.GetSize()));
+
+        sectionMeshletCounts.Add(
+            static_cast<UInt32>(part.Meshlets.GetSize()));
+
+        Float32 sectionMaxRadius = 0.0f;
+
+        for (SizeType m = 0; m < part.Meshlets.GetSize(); ++m)
+        {
+            FMeshlet meshlet = part.Meshlets[m];
+
+            meshlet.VertexOffset += vertexBase;
+            meshlet.TriangleOffset += triangleBase;
+
+            sectionMaxRadius =
+                FMath::Max(sectionMaxRadius, meshlet.BoundingSphere.W);
+
+            meshlets.Meshlets.Add(meshlet);
+        }
+
+        sectionMaxMeshletRadii.Add(sectionMaxRadius);
+
+        for (SizeType i = 0; i < part.MeshletVertices.GetSize(); ++i)
+        {
+            meshlets.MeshletVertices.Add(part.MeshletVertices[i]);
+        }
+
+        for (SizeType i = 0; i < part.MeshletTriangles.GetSize(); ++i)
+        {
+            meshlets.MeshletTriangles.Add(part.MeshletTriangles[i]);
+        }
+    }
+
+    if (!meshlets.IsValid())
+    {
+        m_Device->DestroyBuffer(indexBuffer);
+        m_Device->DestroyBuffer(vertexBuffer);
+
+        LIMX_LOG(LogRenderCore, Error,
+                 "[资源管理器] meshlet 切分之后一个 meshlet 都没有");
+        return handle;
+    }
+
+    //
+    // 切分本身在 CPU 上, 与顶点/索引上传同一次调用里完成。切失败就整个
+    // 网格创建失败 —— 而不是"这个网格没有 meshlet, 别的有"。后者会让
+    // 虚拟几何路径静默地漏画一部分物体。
+
+    {
+        // 三角形的局部索引每个三字节。GLSL 里没有字节寻址的 storage buffer
+        // (要 GL_EXT_shader_8bit_storage), 所以按 UInt32 打包上传, 着色器
+        // 自己移位取。这一处的代价是四分之一的浪费换一个少一项的扩展依赖。
+        TArray<UInt32> packedTriangles;
+
+        const SizeType byteCount = meshlets.MeshletTriangles.GetSize();
+
+        packedTriangles.SetSize((byteCount + 3) / 4, 0u);
+
+        for (SizeType i = 0; i < byteCount; ++i)
+        {
+            packedTriangles[i / 4] |=
+                static_cast<UInt32>(meshlets.MeshletTriangles[i])
+                << ((i % 4) * 8);
+        }
+
+        const UInt64 headerBytes =
+            static_cast<UInt64>(meshlets.Meshlets.GetSize()) *
+            sizeof(FMeshlet);
+
+        const UInt64 localVertexBytes =
+            static_cast<UInt64>(meshlets.MeshletVertices.GetSize()) *
+            sizeof(UInt32);
+
+        const UInt64 packedBytes =
+            static_cast<UInt64>(packedTriangles.GetSize()) * sizeof(UInt32);
+
+        // meshlet 头缓冲区要带 TransferSrc: 剔除通道把各网格的 meshlet
+        // 拷进一份汇总缓冲区, 而这个缓冲区是那次拷贝的**源**。
+        // 漏了的话不会崩, 验证层会报"用途不含 TRANSFER_SRC", 而关掉验证层
+        // 就是未定义行为 —— 汇总缓冲区里可能是任意内容。
+        const EBufferUsage meshletHeaderUsage = static_cast<EBufferUsage>(
+            static_cast<UInt32>(EBufferUsage::StorageBuffer) |
+            static_cast<UInt32>(EBufferUsage::TransferSrc));
+
+        const bool uploaded =
+            IsRHISuccess(UploadBuffer(meshlets.Meshlets.GetData(),
+                                      headerBytes, meshletHeaderUsage,
+                                      meshletBuffer)) &&
+            IsRHISuccess(UploadBuffer(meshlets.MeshletVertices.GetData(),
+                                      localVertexBytes,
+                                      EBufferUsage::StorageBuffer,
+                                      meshletVertexBuffer)) &&
+            IsRHISuccess(UploadBuffer(packedTriangles.GetData(), packedBytes,
+                                      EBufferUsage::StorageBuffer,
+                                      meshletTriangleBuffer));
+
+        if (!uploaded)
+        {
+            m_Device->DestroyBuffer(meshletTriangleBuffer);
+            m_Device->DestroyBuffer(meshletVertexBuffer);
+            m_Device->DestroyBuffer(meshletBuffer);
+            m_Device->DestroyBuffer(indexBuffer);
+            m_Device->DestroyBuffer(vertexBuffer);
+
+            LIMX_LOG(LogRenderCore, Error, "[资源管理器] meshlet 缓冲区上传失败");
+            return handle;
+        }
+
+        meshletBytes = headerBytes + localVertexBytes + packedBytes;
+    }
+
     // ---- 取槽位 ----
     UInt32 slotIndex = 0;
 
@@ -756,6 +970,24 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
     slot.Resource.VertexStride      = sizeof(FMeshVertex);
     slot.Resource.IndexBufferBytes  = indexBytes;
 
+    slot.Resource.MeshletBuffer         = meshletBuffer;
+    slot.Resource.MeshletVertexBuffer   = meshletVertexBuffer;
+    slot.Resource.MeshletTriangleBuffer = meshletTriangleBuffer;
+    slot.Resource.MeshletCount =
+        static_cast<UInt32>(meshlets.Meshlets.GetSize());
+    slot.Resource.MeshletVertexCount =
+        static_cast<UInt32>(meshlets.MeshletVertices.GetSize());
+    slot.Resource.MeshletTriangleCount =
+        static_cast<UInt32>(meshlets.MeshletTriangles.GetSize() / 3);
+    slot.Resource.MeshletBytes = meshletBytes;
+
+    for (SizeType m = 0; m < meshlets.Meshlets.GetSize(); ++m)
+    {
+        slot.Resource.MaxMeshletRadius =
+            FMath::Max(slot.Resource.MaxMeshletRadius,
+                       meshlets.Meshlets[m].BoundingSphere.W);
+    }
+
     slot.Resource.Sections.Clear();
     slot.Resource.Sections.Reserve(meshData.SubMeshes.GetSize());
 
@@ -763,12 +995,30 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
     {
         const FSubMesh& source = meshData.SubMeshes[i];
 
+        if (source.IndexCount == 0)
+        {
+            continue;
+        }
+
         FMeshSection section;
         section.Name         = source.Name;
         section.IndexOffset  = source.IndexOffset;
         section.IndexCount   = source.IndexCount;
         section.MaterialSlot = source.MaterialIndex;
         section.Bounds       = source.Bounds;
+
+        // 批次与 meshlet 区间是**同一个循环产出的**, 所以下标一一对应。
+        // 分两处算的话, 上面那个 IndexCount == 0 的跳过只要有一处漏了,
+        // 后面所有批次的 meshlet 区间就整体错位一格 —— 而那正是本周期
+        // Day 5 在几何表上踩过的坑。
+        const SizeType sectionIndex = slot.Resource.Sections.GetSize();
+
+        if (sectionIndex < sectionMeshletOffsets.GetSize())
+        {
+            section.MeshletOffset    = sectionMeshletOffsets[sectionIndex];
+            section.MeshletCount     = sectionMeshletCounts[sectionIndex];
+            section.MaxMeshletRadius = sectionMaxMeshletRadii[sectionIndex];
+        }
 
         slot.Resource.Sections.Add(section);
     }
@@ -782,6 +1032,13 @@ FMeshResourceHandle FRenderResourceManager::CreateMesh(const FMeshData& meshData
         section.IndexCount   = slot.Resource.IndexCount;
         section.MaterialSlot = -1;
         section.Bounds       = meshData.Bounds;
+
+        if (!sectionMeshletOffsets.IsEmpty())
+        {
+            section.MeshletOffset    = sectionMeshletOffsets[0];
+            section.MeshletCount     = sectionMeshletCounts[0];
+            section.MaxMeshletRadius = sectionMaxMeshletRadii[0];
+        }
 
         slot.Resource.Sections.Add(section);
     }
@@ -1210,11 +1467,17 @@ void FRenderResourceManager::RetireMeshSlot(FMeshSlot& slot)
     // GPU 对象移出槽位而非就地销毁 —— 上一帧的命令缓冲区可能仍在读它们。
     // 移出之后槽位就干净了, 可以立刻复用。
     if (slot.Resource.VertexBuffer.IsValid() ||
-        slot.Resource.IndexBuffer.IsValid())
+        slot.Resource.IndexBuffer.IsValid() ||
+        slot.Resource.MeshletBuffer.IsValid())
     {
         FPendingRelease entry;
         entry.VertexBuffer = slot.Resource.VertexBuffer;
         entry.IndexBuffer  = slot.Resource.IndexBuffer;
+
+        entry.MeshletBuffer         = slot.Resource.MeshletBuffer;
+        entry.MeshletVertexBuffer   = slot.Resource.MeshletVertexBuffer;
+        entry.MeshletTriangleBuffer = slot.Resource.MeshletTriangleBuffer;
+
         entry.RetireFrame  = GetCurrentFrame();
 
         m_PendingReleases.Add(entry);
@@ -1265,6 +1528,21 @@ void FRenderResourceManager::DestroyPendingRelease(FPendingRelease& entry)
     if (entry.IndexBuffer.IsValid())
     {
         m_Device->DestroyBuffer(entry.IndexBuffer);
+    }
+
+    if (entry.MeshletTriangleBuffer.IsValid())
+    {
+        m_Device->DestroyBuffer(entry.MeshletTriangleBuffer);
+    }
+
+    if (entry.MeshletVertexBuffer.IsValid())
+    {
+        m_Device->DestroyBuffer(entry.MeshletVertexBuffer);
+    }
+
+    if (entry.MeshletBuffer.IsValid())
+    {
+        m_Device->DestroyBuffer(entry.MeshletBuffer);
     }
 
     if (entry.VertexBuffer.IsValid())

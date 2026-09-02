@@ -106,6 +106,35 @@ struct FMeshSection
 
     /// 该批次的局部包围盒
     FBoundingBox Bounds;
+
+    // ========================================================================
+    // 该批次的 meshlet 区间 —— 指向所属 FMeshResource 的 MeshletBuffer
+    //
+    // meshlet 按**批次**切而不是按网格切。一个网格按材质分成若干批次, 而
+    // 材质解析 (虚拟几何的最后一步) 要能从"命中了哪个 meshlet"直接得到
+    // "用哪个材质"。跨材质的 meshlet 没有唯一答案。
+    //
+    // 代价是批次边界上的三角形不能与邻居聚在一起, 于是边界处的 meshlet
+    // 填不满。那是必须付的 —— 省下来的话, 材质就得逐三角形存。
+    // ========================================================================
+
+    UInt32 MeshletOffset = 0;
+    UInt32 MeshletCount  = 0;
+
+    /// 本批次里最大的那个 meshlet 包围球半径 (局部空间)
+    ///
+    /// 两级剔除的第一级用实例包围球, 第二级用逐 meshlet 包围球。第一级
+    /// 剔掉一个实例, 它的 meshlet 就再没机会被第二级看到 —— 所以实例
+    /// 包围球必须**包住它的每一个 meshlet 包围球**。
+    ///
+    /// 这件事不是自动成立的: 实例包围球外接自包围盒, 而 meshlet 的包围球
+    /// 会从包围盒的角上鼓出去。实测综合场景里有 2 个 meshlet 就这样被
+    /// 第一级误剔了 —— 而那在画面上是整块物体消失。
+    ///
+    /// 有了这个数, 实例包围球的半径加上它 (乘以世界缩放) 就一定包得住:
+    /// 每个 meshlet 的球心在包围盒内 (距盒心不超过半对角线), 而球最多
+    /// 再向外伸出自己的半径。
+    Float32 MaxMeshletRadius = 0.0f;
 };
 
 // ============================================================================
@@ -148,6 +177,43 @@ struct FMeshResource
     /// 索引缓冲区字节数
     UInt64 IndexBufferBytes = 0;
 
+    // ========================================================================
+    // meshlet —— 虚拟几何用的簇化表示
+    //
+    // 与顶点/索引缓冲区**同生共死**: 在 CreateMesh 里一起建、一起销毁。
+    //
+    // 不做成"用到时再建"是有意的。惰性构建意味着某些网格有 meshlet、某些
+    // 没有, 而"这个网格为什么没被 meshlet 路径画出来"是一个要翻好几层才能
+    // 答上来的问题。全都有的话, 缺失就只可能是构建失败, 而那是会报错的。
+    //
+    // CPU 侧不留副本 —— 判据要验的是**上传上去的那份**, 所以它从 GPU 读回。
+    // 留副本的话, 判据比的是内存里那份与自己, 上传路径整个不在覆盖里。
+    // ========================================================================
+
+    /// meshlet 头数组 (FMeshlet, 48 字节一个)
+    FRHIBufferHandle MeshletBuffer;
+
+    /// 局部顶点 -> 全局顶点下标 (UInt32)
+    FRHIBufferHandle MeshletVertexBuffer;
+
+    /// 三角形的局部索引 (每三角形三字节, 按 UInt32 打包上传)
+    FRHIBufferHandle MeshletTriangleBuffer;
+
+    UInt32 MeshletCount = 0;
+    UInt32 MeshletVertexCount = 0;
+    UInt32 MeshletTriangleCount = 0;
+
+    /// 全部 meshlet 里最大的那个包围球半径 (局部空间)
+    Float32 MaxMeshletRadius = 0.0f;
+
+    /// 三个 meshlet 缓冲区的字节数之和
+    UInt64 MeshletBytes = 0;
+
+    LIMX_NODISCARD bool HasMeshlets() const
+    {
+        return MeshletBuffer.IsValid() && MeshletCount > 0;
+    }
+
     LIMX_NODISCARD bool IsValid() const
     {
         return VertexBuffer.IsValid() && IndexBuffer.IsValid() &&
@@ -156,7 +222,7 @@ struct FMeshResource
 
     LIMX_NODISCARD UInt64 GetTotalBytes() const
     {
-        return VertexBufferBytes + IndexBufferBytes;
+        return VertexBufferBytes + IndexBufferBytes + MeshletBytes;
     }
 };
 
