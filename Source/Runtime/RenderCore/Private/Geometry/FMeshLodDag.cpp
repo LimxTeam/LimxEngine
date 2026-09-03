@@ -74,6 +74,44 @@ void GrowToContain(FVector4& outer, const FVector4& inner)
 } // namespace
 
 // ============================================================================
+// LOD 选择
+// ============================================================================
+
+Float32 MeshLodProjectError(const FVector4& worldSphere, Float32 worldError,
+                            const FVector3& cameraPosition, Float32 lodScale,
+                            Float32 nearPlane)
+{
+    const FVector3 center(worldSphere.X, worldSphere.Y, worldSphere.Z);
+
+    const Float32 distance =
+        FMath::Max((center - cameraPosition).Length() - worldSphere.W,
+                   nearPlane);
+
+    return worldError * lodScale / distance;
+}
+
+bool MeshLodSelect(const FLodMeshletRecord& record,
+                   const FVector3& cameraPosition, Float32 lodScale,
+                   Float32 nearPlane, Float32 threshold)
+{
+    const Float32 selfScreen = MeshLodProjectError(
+        record.SelfSphere, record.SelfError, cameraPosition, lodScale,
+        nearPlane);
+
+    const Float32 parentScreen = MeshLodProjectError(
+        record.ParentSphere, record.ParentError, cameraPosition, lodScale,
+        nearPlane);
+
+    // 父侧用 >= 而不是 >。
+    //
+    // 阈值恰好等于某个 E(g) 时: 用 >= 的话这个 meshlet 被选中; 用 > 的话它
+    // 落选, 而它的父需要 E(g) < 阈值 也为假 —— **两个都不选, 洞**。
+    // 只在恰好相等时出现, 随机阈值几乎测不到, 所以判据的阈值集合里必须放
+    // "恰好等于某个 E(g)"的值。
+    return selfScreen < threshold && parentScreen >= threshold;
+}
+
+// ============================================================================
 // FMeshLodDagBuilder::Build
 // ============================================================================
 

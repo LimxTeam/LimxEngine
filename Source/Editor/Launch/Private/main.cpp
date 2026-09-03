@@ -323,6 +323,7 @@ struct FLaunchOptions
     bool MeshSimplifyCheck = false;
     bool MeshletGroupCheck = false;
     bool LodDagCheck = false;
+    bool LodSelectCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -951,6 +952,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--lod-dag-check"))
         {
             options.LodDagCheck = true;
+        }
+        else if (WideEquals(arg, L"--lod-select-check"))
+        {
+            options.LodSelectCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -12826,6 +12831,376 @@ static bool RunLodDagChecks()
 }
 
 // ============================================================================
+// RunLodSelectChecks — LOD 选择规则必须不重不漏
+//
+// 规则是 "自身误差 < 阈值 **且** 父误差 >= 阈值"。这一条判据要证的是: 表面上
+// 每一点, 在任意相机、任意阈值下, **恰好**被一个层选中。
+//
+// 三层判据, 各自证明不同的东西:
+//
+//   一、边判据 (便宜、穷尽, 而且它**蕴含**割性质)。
+//      屏幕误差沿 DAG 的每条边严格增 —— 加上两端哨兵 (叶子 0、根 1e30),
+//      表面上任意一点诱导出的链就是严格递增、从 0 到 +inf 的, 而有限的正
+//      阈值恰好落进其中一段。存在则不漏, 唯一则不重。
+//      所以不必枚举路径: 验完全部边就等于验完全部点。
+//
+//   二、逐采样点的命中计数 (直接验那个结论)。
+//      边判据是靠证明推出割性质的, 而证明本身可能哪里没想到。这一条不推,
+//      直接数: 在表面上撒点, 每个点在每一层找到罩着它的那个 meshlet, 数
+//      有几个被选中。必须恰好 1。
+//
+//   三、元判据 (LOD 到底跑没跑)。
+//      选中的三角形数必须随相机拉远**单调不增**, 而且真的在变。没有这一条,
+//      一个"永远选叶子层"的实现在前两条上满分通过 —— 它确实不重不漏。
+//
+// 阈值集合里必须放"恰好等于某个 E(g)"的值。父侧比较写成 > 而不是 >= 时,
+// 那个阈值上父子**都不选** —— 一个洞, 而且只在恰好相等时出现, 随机阈值
+// 几乎测不到。
+// ============================================================================
+
+static bool RunLodSelectChecks()
+{
+    bool passed = true;
+
+    const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+    FMeshLodDagOptions dagOptions;
+    dagOptions.TargetGroupSize = 16;
+    dagOptions.MaxGroupSize    = 32;
+
+    const FMeshLodDagResult dag =
+        FMeshLodDagBuilder::Build(sphere.Vertices, sphere.Indices, dagOptions);
+
+    if (!dag.IsValid() || dag.Levels.GetSize() < 3)
+    {
+        LIMX_LOG(LogLaunch, Error, "[LOD选择] DAG 建得不够深, 判据无从谈起");
+        return false;
+    }
+
+    const SizeType levelCount = dag.Levels.GetSize();
+
+    constexpr Float32 kLodScale  = 540.0f;   // 0.5 * 屏幕高 * P11 的量级
+    constexpr Float32 kNearPlane = 0.1f;
+
+    // ---- 探针相机 ----
+    //
+    // 必须含退化位姿: 相机在某个 LOD 球**内部**、贴着近平面、极远、侧向偏心。
+    // 正对着看是最容易过的那一种, 单靠它验不出"自身球用错了"这类错。
+    TArray<FVector3> cameras;
+
+    cameras.Add(FVector3(0.0f, 0.0f, 0.0f));      // 球心 —— 在每一个 LOD 球内
+    cameras.Add(FVector3(0.0f, 0.0f, 1.05f));     // 贴着表面
+    cameras.Add(FVector3(0.0f, 0.0f, 3.0f));
+    cameras.Add(FVector3(0.0f, 0.0f, 40.0f));     // 极远
+    cameras.Add(FVector3(2.5f, 1.8f, -3.1f));     // 侧向偏心
+    cameras.Add(FVector3(-7.0f, 0.3f, 0.9f));
+
+    // ---- 阈值 ----
+    //
+    // 除了几个常规值, 还要放"恰好等于某个组的屏幕误差"的值 —— 那是 >= 与 >
+    // 之别唯一显形的地方。
+    TArray<Float32> thresholds;
+
+    thresholds.Add(0.25f);
+    thresholds.Add(1.0f);
+    thresholds.Add(4.0f);
+    thresholds.Add(16.0f);
+
+    for (SizeType g = 0; g < dag.Groups.GetSize() && g < 6; ++g)
+    {
+        thresholds.Add(MeshLodProjectError(dag.Groups[g].Sphere,
+                                           dag.Groups[g].Error, cameras[2],
+                                           kLodScale, kNearPlane));
+    }
+
+    // ---- 判据一: 屏幕误差沿每条边严格增, 对每一个探针相机 ----
+    {
+        SizeType violations = 0;
+        SizeType pairs      = 0;
+
+        Float32 worstGap = 0.0f;
+
+        for (SizeType c = 0; c < cameras.GetSize(); ++c)
+        {
+            for (SizeType l = 0; l < levelCount; ++l)
+            {
+                const FLodLevel& level = dag.Levels[l];
+
+                for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+                {
+                    const FLodMeshletRecord& record = level.Records[m];
+
+                    if (record.TargetGroup == kLodInvalidIndex)
+                    {
+                        continue;
+                    }
+
+                    ++pairs;
+
+                    const Float32 selfScreen = MeshLodProjectError(
+                        record.SelfSphere, record.SelfError, cameras[c],
+                        kLodScale, kNearPlane);
+
+                    const Float32 parentScreen = MeshLodProjectError(
+                        record.ParentSphere, record.ParentError, cameras[c],
+                        kLodScale, kNearPlane);
+
+                    if (!(parentScreen > selfScreen))
+                    {
+                        ++violations;
+
+                        worstGap =
+                            FMath::Max(worstGap, selfScreen - parentScreen);
+                    }
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[LOD选择] 边判据 — {} 个 (相机, 父子对), 屏幕误差没有严格"
+                 "递增的 {} 个 (最多倒挂 {})",
+                 pairs, violations, worstGap);
+
+        if (violations != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD选择] {} 个 (相机, 父子对) 上屏幕误差没有严格递增 —— "
+                     "而'恰好命中一次'的证明第二步正是它。倒挂的那一段上父子"
+                     "会同时被选中 (重画) 或同时落选 (洞)",
+                     violations);
+            passed = false;
+        }
+    }
+
+    // ---- 预处理: 每个采样点在每一层被哪个 meshlet 罩着 ----
+    //
+    // 在原始表面上撒点 (每隔若干个三角形取一个重心), 逐层找离它最近的三角形,
+    // 再查那个三角形属于哪个 meshlet。
+    //
+    // 撒点而不是逐三角形: 逐三角形是 O(三角形数 × 层数 × 每层三角形数),
+    // 球体上是两亿次点-三角形距离。撒点把第一个因子压到几百, 而"每一点恰好
+    // 命中一次"这个性质本身是逐点的 —— 采样只是少验了一些点, 不会把错的
+    // 判成对的。
+    const SizeType triangleCount = sphere.Indices.GetSize() / 3;
+
+    const SizeType sampleStride = FMath::Max<SizeType>(1, triangleCount / 300);
+
+    TArray<FVector3> samples;
+
+    for (SizeType t = 0; t < triangleCount; t += sampleStride)
+    {
+        const FVector3& a = sphere.Vertices[sphere.Indices[t * 3 + 0]].Position;
+        const FVector3& b = sphere.Vertices[sphere.Indices[t * 3 + 1]].Position;
+        const FVector3& c = sphere.Vertices[sphere.Indices[t * 3 + 2]].Position;
+
+        samples.Add((a + b + c) / 3.0f);
+    }
+
+    // owner[sample * levelCount + level] = 那一层罩着它的 meshlet 下标
+    TArray<UInt32> owner;
+    owner.SetSize(samples.GetSize() * levelCount, 0xFFFFFFFFu);
+
+    for (SizeType l = 0; l < levelCount; ++l)
+    {
+        const FLodLevel& level = dag.Levels[l];
+
+        // 三角形 -> meshlet
+        TArray<UInt32> triangleOwner;
+        TArray<UInt32> triangleCorners;
+
+        for (SizeType m = 0; m < level.Meshlets.Meshlets.GetSize(); ++m)
+        {
+            const FMeshlet& meshlet = level.Meshlets.Meshlets[m];
+
+            for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+            {
+                for (UInt32 c = 0; c < 3; ++c)
+                {
+                    const SizeType byteOffset =
+                        static_cast<SizeType>(meshlet.TriangleOffset) * 3 +
+                        t * 3 + c;
+
+                    const UInt32 local =
+                        level.Meshlets.MeshletTriangles[byteOffset];
+
+                    triangleCorners.Add(level.Meshlets.MeshletVertices[
+                        static_cast<SizeType>(meshlet.VertexOffset) + local]);
+                }
+
+                triangleOwner.Add(static_cast<UInt32>(m));
+            }
+        }
+
+        for (SizeType s = 0; s < samples.GetSize(); ++s)
+        {
+            Float32 nearest = 3.4e38f;
+            UInt32  best    = 0xFFFFFFFFu;
+
+            for (SizeType t = 0; t < triangleOwner.GetSize(); ++t)
+            {
+                const Float32 distance = PointTriangleDistanceSquared(
+                    samples[s], level.Vertices[triangleCorners[t * 3 + 0]].Position,
+                    level.Vertices[triangleCorners[t * 3 + 1]].Position,
+                    level.Vertices[triangleCorners[t * 3 + 2]].Position);
+
+                if (distance < nearest)
+                {
+                    nearest = distance;
+                    best    = triangleOwner[t];
+                }
+            }
+
+            owner[s * levelCount + l] = best;
+        }
+    }
+
+    // ---- 判据二: 每个采样点恰好被一个层选中 ----
+    {
+        SizeType missCount   = 0;   // 一个都没选中 —— 洞
+        SizeType doubleCount = 0;   // 选中两个以上 —— 重画
+        SizeType checked     = 0;
+
+        for (SizeType c = 0; c < cameras.GetSize(); ++c)
+        {
+            for (SizeType th = 0; th < thresholds.GetSize(); ++th)
+            {
+                for (SizeType s = 0; s < samples.GetSize(); ++s)
+                {
+                    UInt32 hits = 0;
+
+                    for (SizeType l = 0; l < levelCount; ++l)
+                    {
+                        const UInt32 meshletIndex = owner[s * levelCount + l];
+
+                        if (meshletIndex == 0xFFFFFFFFu)
+                        {
+                            continue;
+                        }
+
+                        if (MeshLodSelect(dag.Levels[l].Records[meshletIndex],
+                                          cameras[c], kLodScale, kNearPlane,
+                                          thresholds[th]))
+                        {
+                            ++hits;
+                        }
+                    }
+
+                    ++checked;
+
+                    if (hits == 0)
+                    {
+                        ++missCount;
+                    }
+                    else if (hits > 1)
+                    {
+                        ++doubleCount;
+                    }
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[LOD选择] 覆盖 — 验了 {} 个 (相机, 阈值, 采样点), "
+                 "一层都没选中 {} 个, 选中两层以上 {} 个",
+                 checked, missCount, doubleCount);
+
+        if (missCount != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD选择] {} 个采样点在某个 (相机, 阈值) 下一层都没被"
+                     "选中 —— 那是画面上的洞",
+                     missCount);
+            passed = false;
+        }
+
+        if (doubleCount != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD选择] {} 个采样点被两层以上同时选中 —— 表面被画两遍, "
+                     "Z 冲突",
+                     doubleCount);
+            passed = false;
+        }
+    }
+
+    // ---- 判据三: 元判据 —— LOD 真的在换层 ----
+    //
+    // 没有这一条的话, 一个"永远选叶子层"的实现在上面两条上满分通过 ——
+    // 它确实不重不漏。
+    {
+        const Float32 distances[6] = { 1.5f, 3.0f, 6.0f, 12.0f, 25.0f, 60.0f };
+
+        TArray<SizeType> selectedTriangles;
+
+        for (UInt32 d = 0; d < 6; ++d)
+        {
+            const FVector3 camera(0.0f, 0.0f, distances[d]);
+
+            SizeType triangles = 0;
+
+            for (SizeType l = 0; l < levelCount; ++l)
+            {
+                const FLodLevel& level = dag.Levels[l];
+
+                for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+                {
+                    if (MeshLodSelect(level.Records[m], camera, kLodScale,
+                                      kNearPlane, 1.0f))
+                    {
+                        triangles += level.Meshlets.Meshlets[m].TriangleCount;
+                    }
+                }
+            }
+
+            selectedTriangles.Add(triangles);
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[LOD选择] 距离 1.5/3/6/12/25/60 上选中的三角形数: "
+                 "{} / {} / {} / {} / {} / {}",
+                 selectedTriangles[0], selectedTriangles[1],
+                 selectedTriangles[2], selectedTriangles[3],
+                 selectedTriangles[4], selectedTriangles[5]);
+
+        for (SizeType d = 1; d < selectedTriangles.GetSize(); ++d)
+        {
+            if (selectedTriangles[d] > selectedTriangles[d - 1])
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[LOD选择] 相机拉远之后选中的三角形反而变多了 "
+                         "({} -> {}) —— 屏幕误差应当随距离单调减",
+                         selectedTriangles[d - 1], selectedTriangles[d]);
+                passed = false;
+            }
+        }
+
+        if (selectedTriangles[0] == selectedTriangles[5])
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD选择] 最近与最远选中的三角形数一样 ({}) —— LOD 根本"
+                     "没在换层。一个'永远选叶子层'的实现在覆盖判据上是满分的, "
+                     "它确实不重不漏",
+                     selectedTriangles[0]);
+            passed = false;
+        }
+
+        // 最远处必须真的选到了粗的层 —— 不然"换层"只是换了几个 meshlet
+        if (selectedTriangles[5] * 4 > selectedTriangles[0])
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD选择] 拉到 60 倍距离才减到 {} / {} —— DAG 有 {} 层, "
+                     "本该减到十分之一以下",
+                     selectedTriangles[5], selectedTriangles[0], levelCount);
+            passed = false;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[LOD选择] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -20908,6 +21283,7 @@ int WINAPI wWinMain(
     bool    meshSimplifyPassed = true;
     bool    meshletGroupPassed = true;
     bool    lodDagPassed = true;
+    bool    lodSelectPassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -21092,6 +21468,11 @@ int WINAPI wWinMain(
             if (launchOptions.LodDagCheck)
             {
                 lodDagPassed = RunLodDagChecks();
+            }
+
+            if (launchOptions.LodSelectCheck)
+            {
+                lodSelectPassed = RunLodSelectChecks();
             }
 
             if (launchOptions.PathTraceCheck)
@@ -21439,6 +21820,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.LodDagCheck)
     {
         selfCheckCode = FinalizeSelfCheck(lodDagPassed, 40, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.LodSelectCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(lodSelectPassed, 41, errorSink,
                                           errorsBeforeShutdown);
     }
 
