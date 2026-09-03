@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # benchmark.ps1 — 渲染吞吐基准
 #
 # 在同一份可执行文件上跑四种配置，量化视锥剔除与状态排序各自的收益。
@@ -67,7 +67,20 @@ Set-Location $RootDir
 # 嵌套调用时就未必, 而症状极具误导性: 子进程退出码 0, 日志却还是上一步
 # 留下的陈旧文件, 报出来是"日志中没有基准结果"。
 $Exe = Join-Path $RootDir 'Binaries\Development\Win64\LimxLaunch.exe'
-$Log = Join-Path $RootDir 'Logs\LimxEngine.log'
+# 每次运行**自己**的输出文件, 不碰共享日志。
+#
+# 原来解析的是 Logs\LimxEngine.log —— 一个固定路径的共享文件。任何并发的
+# 引擎进程 (另一条判据、另一个基准、手工跑的一次) 都在往同一个文件里写,
+# 于是这边解析到的可能是别人的日志, 或者被别人清掉之后的空文件。
+#
+# 表现正是"偶发失败": 单独跑三十次一次不红, 而并发时报"日志中没有导入结果"。
+# 实测背景跑一个引擎进程时三次里挂两次。上面那段注释已经记过一次同类问题
+# (工作目录导致读到陈旧日志), 这是同一个坑的另一半 —— 那次修的是"读错目录",
+# 这次是"读到别人的"。
+#
+# 这不是性能预算过紧, 也不是判据不严 —— 是**测量取错了对象**。
+$RunLog = Join-Path ([System.IO.Path]::GetTempPath()) `
+    ("limx-bench-{0}.log" -f [System.Guid]::NewGuid().ToString('N'))
 
 if (-not (Test-Path $Exe)) {
     Write-Host "错误: 未找到 $Exe，请先构建" -ForegroundColor Red
@@ -104,16 +117,42 @@ foreach ($config in $Configurations) {
         continue
     }
 
-    Remove-Item $Log -ErrorAction SilentlyContinue
+    Remove-Item $RunLog -ErrorAction SilentlyContinue
 
-    $argumentList = "--grid $Grid --frames $Frames --warmup $Warmup $($config.Args)"
+    # **必须带 --hidden。**
+    #
+    # 不带的话每一次运行都会弹一个真窗口。这个脚本一次跑好几个配置, 而
+    # verify.ps1 又整个调它 —— 一轮验证下来屏幕会闪十几次。
+    #
+    # verify.ps1 里的 Invoke-Engine 统一加了 --hidden, 但这个脚本是被当作
+    # **脚本**调用的, 不走那条路径, 于是漏在外面。
+    $argumentList = "--hidden --grid $Grid --frames $Frames --warmup $Warmup $($config.Args)"
 
     Write-Host ''
     Write-Host "  运行: $($config.Name)" -ForegroundColor Cyan
 
     $process = Start-Process -FilePath $Exe -ArgumentList $argumentList `
-        -WorkingDirectory $RootDir -PassThru
+        -WorkingDirectory $RootDir -PassThru `
+        -RedirectStandardOutput $RunLog
+
+    # **先摸一下 .Handle。**
+    #
+    # Start-Process -PassThru 返回的进程对象不持有句柄, 于是进程结束之后
+    # ExitCode 读出来是空的 —— 而 `$null -ne 0` 为真, 每一次运行都被判成失败。
+    # 访问一次 .Handle 会让 .NET 把句柄缓存进对象, ExitCode 才有值。
+    #
+    # 必须在**等待之前**摸: 进程已经退出之后再取句柄就晚了。
+    $null = $process.Handle
+
     $process.WaitForExit(300000) | Out-Null
+
+    # 带超时的 WaitForExit(ms) **不填充** ExitCode —— 重定向了标准输出之后
+    # 尤其如此。补一次无参等待让进程对象收干净, 否则 ExitCode 是空的, 而
+    # `-ne 0` 对空值为真, 于是每一次运行都被判成失败。
+    #
+    # 这个坑很值得记: 加重定向本来是为了修"读到别人的日志", 而它顺手把
+    # 退出码判定弄坏了 —— 修一个洞的时候开了另一个。
+    if ($process.HasExited) { $process.WaitForExit() }
 
     if (-not $process.HasExited) {
         $process.Kill()
@@ -133,15 +172,15 @@ foreach ($config in $Configurations) {
         continue
     }
 
-    if (-not (Test-Path $Log)) {
+    if (-not (Test-Path $RunLog)) {
         Write-Host '    未产生日志' -ForegroundColor Red
         $Failed = $true
         continue
     }
 
-    $batchLine  = (Select-String -Path $Log -Pattern '\[基准\] 批次').Line
-    $switchLine = (Select-String -Path $Log -Pattern '\[基准\] 状态切换').Line
-    $timeLine   = (Select-String -Path $Log -Pattern '\[基准\] 帧耗时').Line
+    $batchLine  = (Select-String -Path $RunLog -Pattern '\[基准\] 批次').Line
+    $switchLine = (Select-String -Path $RunLog -Pattern '\[基准\] 状态切换').Line
+    $timeLine   = (Select-String -Path $RunLog -Pattern '\[基准\] 帧耗时').Line
 
     if (-not $timeLine) {
         Write-Host '    日志中没有基准结果' -ForegroundColor Red
@@ -156,13 +195,13 @@ foreach ($config in $Configurations) {
     $worstMs  = if ($timeLine   -match '最差 ([\d.]+) ms') { [double]$Matches[1] } else { 0 }
 
     # GPU 侧
-    $gpuLine = (Select-String -Path $Log -Pattern '\[基准\] GPU 整帧').Line
+    $gpuLine = (Select-String -Path $RunLog -Pattern '\[基准\] GPU 整帧').Line
 
     $gpuMs        = if ($gpuLine -match 'GPU 整帧 ([\d.]+) ms')  { [double]$Matches[1] } else { 0 }
     $unaccountedPct = if ($gpuLine -match '未埋点 [\d.]+ ms \(([\d.]+)%') { [double]$Matches[1] } else { -1 }
 
     # 逐 Pass 明细 —— 打印出来供人看, 不参与判定
-    $passLines = (Select-String -Path $Log -Pattern '\[基准\] GPU Pass').Line
+    $passLines = (Select-String -Path $RunLog -Pattern '\[基准\] GPU Pass').Line
 
     $Results += [PSCustomObject]@{
         配置       = $config.Name
@@ -276,11 +315,15 @@ if (-not $SkipImport) {
             # 都得出了"某项优化引起退化"的错误结论。
             if ($i -gt 1) { Start-Sleep -Seconds 5 }
 
-            Remove-Item $Log -ErrorAction SilentlyContinue
+            Remove-Item $RunLog -ErrorAction SilentlyContinue
 
             $p = Start-Process -FilePath $Exe -PassThru `
-                -WorkingDirectory $RootDir -ArgumentList `
-                "--scene $ImportScene --frames 3 --warmup 1"
+                -WorkingDirectory $RootDir -RedirectStandardOutput $RunLog `
+                -ArgumentList "--hidden --scene $ImportScene --frames 3 --warmup 1"
+
+            # 理由同渲染段: 不先摸 .Handle 的话 ExitCode 是空的
+            $null = $p.Handle
+
             $p.WaitForExit(300000) | Out-Null
 
             if (-not $p.HasExited) {
@@ -297,14 +340,14 @@ if (-not $SkipImport) {
                 continue
             }
 
-            if (-not (Test-Path $Log)) {
+            if (-not (Test-Path $RunLog)) {
                 Write-Host "    第 $i 次: 未产生日志" -ForegroundColor Red
                 $Failed = $true
                 continue
             }
 
-            $totalLine = (Select-String -Path $Log -Pattern '资产导入完成').Line
-            $partLine  = (Select-String -Path $Log -Pattern '分项 — 解析').Line
+            $totalLine = (Select-String -Path $RunLog -Pattern '资产导入完成').Line
+            $partLine  = (Select-String -Path $RunLog -Pattern '分项 — 解析').Line
 
             if (-not $totalLine -or -not $partLine) {
                 Write-Host "    第 $i 次: 日志中没有导入结果" -ForegroundColor Red
