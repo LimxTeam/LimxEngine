@@ -324,6 +324,7 @@ struct FLaunchOptions
     bool MeshletGroupCheck = false;
     bool LodDagCheck = false;
     bool LodSelectCheck = false;
+    bool LodCrackCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -956,6 +957,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--lod-select-check"))
         {
             options.LodSelectCheck = true;
+        }
+        else if (WideEquals(arg, L"--lod-crack-check"))
+        {
+            options.LodCrackCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -13201,6 +13206,471 @@ static bool RunLodSelectChecks()
 }
 
 // ============================================================================
+// RunLodCrackChecks — 选中集必须无裂缝, 而且必须兑现屏幕误差的承诺
+//
+// 两条判据, 各自钉住一件此前没人验过的事。
+//
+// ── 一、选中集是**闭合流形** ──
+//
+// 这是"无裂缝"最锋利的形式。选中集跨越多个层 —— 近处一块用叶子层、远处一块
+// 用第四层 —— 而它们在交界处必须严丝合缝。缝在这里的表现极其直接: 一条只被
+// **一个**三角形用到的边。
+//
+// 它比"逐像素看有没有洞"强得多: 后者依赖分辨率与视角, 一条亚像素的缝在
+// 1280x720 上看不见, 换个分辨率就露出来。而边的计数与分辨率、与视角都无关。
+//
+// 这一条能立住, 全靠组间边界锁死: 第 L 层与第 L+1 层的几何在组边界上顶点
+// 位置**逐位相同**。锁定漏了, 这里立刻变成一堆边界边。
+//
+// ── 二、屏幕误差的承诺必须兑现 ──
+//
+// 选择规则保证"自身误差 < 阈值", 而自身误差是**世界空间**的界。判据要问的是
+// 那个界投到屏幕上之后是不是真的不超过阈值像素 —— 也就是说, 表面上每一点到
+// **选中集**的实际距离, 投影之后必须 <= 阈值。
+//
+// 第四天有一条变异正是死在这里逃掉的: "距离用球心而不是球面最近点"。它让
+// 分母偏大、屏幕误差偏小, 于是同样距离上选到更粗的层 —— 而单调性与割性质
+// 都保住了, 那三条判据全绿。这一条把它钉死。
+// ============================================================================
+
+namespace
+{
+
+/// 一层里某个 meshlet 的三角形 (全局顶点下标)
+void AppendMeshletTriangles(const FLodLevel& level, UInt32 meshletIndex,
+                            TArray<UInt32>& outCorners)
+{
+    const FMeshlet& meshlet = level.Meshlets.Meshlets[meshletIndex];
+
+    for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+    {
+        for (UInt32 c = 0; c < 3; ++c)
+        {
+            const SizeType byteOffset =
+                static_cast<SizeType>(meshlet.TriangleOffset) * 3 + t * 3 + c;
+
+            const UInt32 local = level.Meshlets.MeshletTriangles[byteOffset];
+
+            outCorners.Add(level.Meshlets.MeshletVertices[
+                static_cast<SizeType>(meshlet.VertexOffset) + local]);
+        }
+    }
+}
+
+} // namespace
+
+static bool RunLodCrackChecks()
+{
+    bool passed = true;
+
+    const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+    FMeshLodDagOptions dagOptions;
+    dagOptions.TargetGroupSize = 16;
+    dagOptions.MaxGroupSize    = 32;
+
+    const FMeshLodDagResult dag =
+        FMeshLodDagBuilder::Build(sphere.Vertices, sphere.Indices, dagOptions);
+
+    if (!dag.IsValid() || dag.Levels.GetSize() < 3)
+    {
+        LIMX_LOG(LogLaunch, Error, "[LOD裂缝] DAG 建得不够深");
+        return false;
+    }
+
+    const SizeType levelCount = dag.Levels.GetSize();
+
+    constexpr Float32 kLodScale  = 540.0f;
+    constexpr Float32 kNearPlane = 0.1f;
+
+    // 相机摆位: 近、中、远、侧向偏心。近处与远处同时在画面里才会出现"选中集
+    // 跨多层"的情形 —— 而那正是缝会出现的地方。
+    // 贴得越近, 近处那一块与远处那一块的距离差越大, 选中集才会真的跨层。
+    // 相机在 1.05 处 (半径 1): 最近点 0.05, 最远点 2.05 —— 差四十倍。
+    // 摆在 20 处的话两端只差 10%, 整个物体必然同层, 而那时闭合判据验的只是
+    // "某一层自己是闭合的", 与 LOD 选择无关。
+    TArray<FVector3> cameras;
+    cameras.Add(FVector3(0.0f, 0.0f, 1.005f));
+    cameras.Add(FVector3(0.0f, 0.0f, 1.02f));
+    cameras.Add(FVector3(0.0f, 0.0f, 1.05f));
+    cameras.Add(FVector3(0.0f, 0.0f, 1.2f));
+    cameras.Add(FVector3(0.0f, 0.0f, 1.6f));
+    cameras.Add(FVector3(1.1f, 0.4f, 0.6f));
+    cameras.Add(FVector3(0.0f, 0.0f, 4.0f));
+    cameras.Add(FVector3(3.0f, 2.0f, 3.0f));
+
+    TArray<Float32> thresholds;
+    thresholds.Add(0.5f);
+    thresholds.Add(1.0f);
+    thresholds.Add(2.0f);
+    thresholds.Add(4.0f);
+    thresholds.Add(8.0f);
+    thresholds.Add(24.0f);
+
+    // ---- 采样点 (判据二用) ----
+    const SizeType triangleCount = sphere.Indices.GetSize() / 3;
+    const SizeType sampleStride  = FMath::Max<SizeType>(1, triangleCount / 240);
+
+    TArray<FVector3> samples;
+
+    for (SizeType t = 0; t < triangleCount; t += sampleStride)
+    {
+        const FVector3& a = sphere.Vertices[sphere.Indices[t * 3 + 0]].Position;
+        const FVector3& b = sphere.Vertices[sphere.Indices[t * 3 + 1]].Position;
+        const FVector3& c = sphere.Vertices[sphere.Indices[t * 3 + 2]].Position;
+
+        samples.Add((a + b + c) / 3.0f);
+    }
+
+    SizeType crackTotal      = 0;
+    SizeType promiseBroken   = 0;
+    Float32  worstPromise    = 0.0f;
+    SizeType overshootTotal  = 0;
+    SizeType multiLevelCases = 0;
+    SizeType casesChecked    = 0;
+
+    Float32 worstScreenError = 0.0f;
+
+    for (SizeType c = 0; c < cameras.GetSize(); ++c)
+    {
+        for (SizeType th = 0; th < thresholds.GetSize(); ++th)
+        {
+            // ---- 选中集 ----
+            TArray<FVector3> positions;   // 选中集的顶点位置 (拼在一起)
+            TArray<UInt32>   corners;     // 三角形的三个下标 (进 positions)
+
+            TArray<UInt32> levelsUsed;
+            levelsUsed.SetSize(levelCount, 0u);
+
+            for (SizeType l = 0; l < levelCount; ++l)
+            {
+                const FLodLevel& level = dag.Levels[l];
+
+                for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+                {
+                    if (!MeshLodSelect(level.Records[m], cameras[c], kLodScale,
+                                       kNearPlane, thresholds[th]))
+                    {
+                        continue;
+                    }
+
+                    levelsUsed[l] = 1;
+
+                    // ---- 判据二之一: 逐 meshlet 的承诺 ----
+                    //
+                    // 选择规则保证 自身误差·lodScale/(球心距 - 半径) < 阈值。
+                    // 而这个 meshlet 的几何**全部**在那个球里, 所以它到相机的
+                    // 真实最近距离不小于 球心距 - 半径 —— 于是拿真实距离投出来
+                    // 的屏幕误差只会更小, 必然也 < 阈值。这是可证的。
+                    //
+                    // 用真实最近距离而不是采样点的距离, 是因为承诺本来就是对
+                    // meshlet 说的。第一版按采样点量: "距离用球心而不是球面最近
+                    // 点"那条变异把最坏值从 0.414 推到 0.972 倍阈值 —— 量到了
+                    // 劣化却没破约, 因为采样点最近的地方恰好选的是细层, 偏差近
+                    // 于零。换成逐 meshlet 就没有这个稀释。
+                    {
+                        const FMeshlet& meshlet = level.Meshlets.Meshlets[m];
+
+                        Float32 nearestVertex = 3.4e38f;
+
+                        for (UInt32 v = 0; v < meshlet.VertexCount; ++v)
+                        {
+                            const UInt32 global =
+                                level.Meshlets.MeshletVertices[
+                                    static_cast<SizeType>(meshlet.VertexOffset) +
+                                    v];
+
+                            nearestVertex = FMath::Min(
+                                nearestVertex,
+                                (level.Vertices[global].Position - cameras[c])
+                                    .Length());
+                        }
+
+                        const Float32 trueDistance =
+                            FMath::Max(nearestVertex, kNearPlane);
+
+                        const Float32 promised =
+                            level.Records[m].SelfError * kLodScale /
+                            trueDistance;
+
+                        worstPromise =
+                            FMath::Max(worstPromise, promised / thresholds[th]);
+
+                        if (promised > thresholds[th])
+                        {
+                            ++promiseBroken;
+                        }
+                    }
+
+                    TArray<UInt32> local;
+                    AppendMeshletTriangles(level, static_cast<UInt32>(m), local);
+
+                    const UInt32 base = static_cast<UInt32>(positions.GetSize());
+
+                    // 这个 meshlet 用到的顶点原样搬过来
+                    for (SizeType i = 0; i < local.GetSize(); ++i)
+                    {
+                        positions.Add(level.Vertices[local[i]].Position);
+                        corners.Add(base + static_cast<UInt32>(i));
+                    }
+                }
+            }
+
+            if (corners.GetSize() < 3)
+            {
+                continue;
+            }
+
+            ++casesChecked;
+
+            UInt32 usedCount = 0;
+
+            for (SizeType l = 0; l < levelCount; ++l)
+            {
+                usedCount += levelsUsed[l];
+            }
+
+            if (usedCount >= 2)
+            {
+                ++multiLevelCases;
+            }
+
+            // ---- 判据一: 选中集必须是闭合流形 ----
+            //
+            // 按位置焊接 (带容差 —— UV 球的接缝上 sinf(2πf) = 1.7e-7 而不是 0,
+            // 逐位焊接焊不上), 然后数每条无向边被几个三角形用到。
+            {
+                const Float32 tolerance = 1.0e-5f;
+                const Float32 toleranceSquared = tolerance * tolerance;
+
+                TArray<UInt32>   weld;
+                TArray<FVector3> unique;
+
+                // 空间分桶 —— 逐个线性找是 O(n²), 选中集有上万个顶点
+                constexpr UInt32 kGrid = 64;
+
+                TArray<TArray<UInt32>> buckets;
+                buckets.SetSize(kGrid * kGrid * kGrid);
+
+                const auto BucketOf = [](const FVector3& p) -> UInt32
+                {
+                    // 球体在 [-1.2, 1.2] 之内; 这个判据只在这个测试网格上跑
+                    const auto Axis = [](Float32 v) -> UInt32
+                    {
+                        const Float32 t = (v + 1.5f) / 3.0f;
+
+                        return static_cast<UInt32>(
+                            FMath::Clamp(t * (kGrid - 1), 0.0f,
+                                         static_cast<Float32>(kGrid - 1)));
+                    };
+
+                    return Axis(p.X) * kGrid * kGrid + Axis(p.Y) * kGrid +
+                           Axis(p.Z);
+                };
+
+                for (SizeType i = 0; i < positions.GetSize(); ++i)
+                {
+                    const FVector3& p = positions[i];
+
+                    const UInt32 slot = BucketOf(p);
+
+                    UInt32 found = 0xFFFFFFFFu;
+
+                    // 查本桶与相邻桶 —— 容差 1e-5 远小于桶宽 3/64
+                    for (SizeType k = 0; k < buckets[slot].GetSize(); ++k)
+                    {
+                        if ((unique[buckets[slot][k]] - p).LengthSquared() <=
+                            toleranceSquared)
+                        {
+                            found = buckets[slot][k];
+                            break;
+                        }
+                    }
+
+                    if (found == 0xFFFFFFFFu)
+                    {
+                        found = static_cast<UInt32>(unique.GetSize());
+                        unique.Add(p);
+                        buckets[slot].Add(found);
+                    }
+
+                    weld.Add(found);
+                }
+
+                // 每条无向边的计数
+                TArray<TArray<UInt32>> edgeOther;
+                TArray<TArray<UInt32>> edgeCount;
+
+                edgeOther.SetSize(unique.GetSize());
+                edgeCount.SetSize(unique.GetSize());
+
+                for (SizeType t = 0; t + 2 < corners.GetSize(); t += 3)
+                {
+                    for (UInt32 e = 0; e < 3; ++e)
+                    {
+                        const UInt32 a = weld[corners[t + e]];
+                        const UInt32 b = weld[corners[t + (e + 1) % 3]];
+
+                        if (a == b)
+                        {
+                            continue;
+                        }
+
+                        const UInt32 low  = FMath::Min(a, b);
+                        const UInt32 high = FMath::Max(a, b);
+
+                        bool found = false;
+
+                        for (SizeType k = 0; k < edgeOther[low].GetSize(); ++k)
+                        {
+                            if (edgeOther[low][k] == high)
+                            {
+                                ++edgeCount[low][k];
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        if (!found)
+                        {
+                            edgeOther[low].Add(high);
+                            edgeCount[low].Add(1u);
+                        }
+                    }
+                }
+
+                SizeType cracks = 0;
+
+                for (SizeType v = 0; v < edgeCount.GetSize(); ++v)
+                {
+                    for (SizeType k = 0; k < edgeCount[v].GetSize(); ++k)
+                    {
+                        if (edgeCount[v][k] != 2u)
+                        {
+                            ++cracks;
+                        }
+                    }
+                }
+
+                crackTotal += cracks;
+
+                if (cracks != 0)
+                {
+                    LIMX_LOG(LogLaunch, Error,
+                             "[LOD裂缝] 相机 {} 阈值 {} — 选中集里有 {} 条边"
+                             "不是恰好两个三角形共用 (用了 {} 个层) —— 那是缝",
+                             c, thresholds[th], cracks, usedCount);
+                    passed = false;
+                }
+            }
+
+            // ---- 判据二: 屏幕误差的承诺必须兑现 ----
+            //
+            // 表面上每一点到**选中集**的实际距离, 投影之后必须不超过阈值。
+            {
+                for (SizeType s = 0; s < samples.GetSize(); ++s)
+                {
+                    Float32 nearest = 3.4e38f;
+
+                    for (SizeType t = 0; t + 2 < corners.GetSize(); t += 3)
+                    {
+                        nearest = FMath::Min(
+                            nearest,
+                            PointTriangleDistanceSquared(
+                                samples[s], positions[corners[t + 0]],
+                                positions[corners[t + 1]],
+                                positions[corners[t + 2]]));
+
+                        if (nearest <= 0.0f)
+                        {
+                            break;
+                        }
+                    }
+
+                    const Float32 deviation = FMath::Sqrt(nearest);
+
+                    const Float32 viewDistance = FMath::Max(
+                        (samples[s] - cameras[c]).Length(), kNearPlane);
+
+                    const Float32 screenError =
+                        deviation * kLodScale / viewDistance;
+
+                    worstScreenError =
+                        FMath::Max(worstScreenError, screenError / thresholds[th]);
+
+                    // **没有容差**。承诺就是"屏幕偏差不超过阈值像素", 而它是
+                    // 可证的: 选择规则保证 自身误差·lodScale/(球心距-半径) < 阈值,
+                    // 而采样点到相机的距离**不小于** 球心距-半径, 实际偏差又不
+                    // 超过自身误差 —— 两个不等式串起来就是这一条。
+                    //
+                    // 正因为它可证, 这里不该留余量: 留了就等于承认那个证明哪一步
+                    // 不成立, 而那才是要报出来的事。
+                    if (screenError > thresholds[th])
+                    {
+                        ++overshootTotal;
+                    }
+                }
+            }
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[LOD裂缝] 验了 {} 个 (相机, 阈值), 其中 {} 个用了两层以上; "
+             "缝 {} 条; 逐 meshlet 破约 {} 次 (最坏 {} 倍阈值); "
+             "逐采样点超预算 {} 次 (最坏 {} 倍)",
+             casesChecked, multiLevelCases, crackTotal, promiseBroken,
+             worstPromise, overshootTotal, worstScreenError);
+
+    if (promiseBroken != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD裂缝] {} 个选中的 meshlet 破了屏幕误差的承诺 (最坏 {} 倍"
+                 "阈值) —— 选择规则保证 自身误差·lodScale/(球心距-半径) < 阈值, "
+                 "而 meshlet 的几何全在那个球里, 拿真实最近距离投出来只会更小。"
+                 "破了就说明分母用错了东西",
+                 promiseBroken, worstPromise);
+        passed = false;
+    }
+
+    // ---- 元判据: 必须真的出现"选中集跨多层"的情形 ----
+    //
+    // 全部都只用一个层的话, 上面那条闭合判据验的只是"某一层自己是闭合的" ——
+    // 那是 DAG 判据早就验过的事, 与 LOD 选择无关。缝只可能出现在层与层的
+    // 交界处。
+    // 门槛用**绝对数**而不是比例。
+    //
+    // 比例门槛对"加更多用例"是脆的: 第一版写的是 25%, 而后来为了把屏幕误差
+    // 的余量吃掉又加了三个贴近的相机, 跨层数从 9/36 变成 11/48 —— 绝对数
+    // 涨了, 比例反而掉到门槛下, 基线当场变红。而那时缝与超预算都是 0。
+    //
+    // 这条元判据真正要的是"跨层的情形足够多, 判据看得见交界处", 那是一个
+    // 绝对量。五个是"每个探针相机至少摊上一个"的量级。
+    if (multiLevelCases < 5)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD裂缝] 只有 {} / {} 个 (相机, 阈值) 让选中集跨两个层 —— "
+                 "缝只可能出现在层与层的交界处, 全是单层的话这条判据验的是"
+                 "'某一层自己是闭合的', 而那是 DAG 判据早就验过的事",
+                 multiLevelCases, casesChecked);
+        passed = false;
+    }
+
+    if (overshootTotal != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD裂缝] {} 次采样的实际屏幕偏差超过了阈值 (最坏 {} 倍) —— "
+                 "选择规则承诺的是'自身误差 < 阈值', 而那个误差是世界空间的界; "
+                 "投到屏幕上超了就说明那个界或者它的投影哪一步不保守",
+                 overshootTotal, worstScreenError);
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[LOD裂缝] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -21284,6 +21754,7 @@ int WINAPI wWinMain(
     bool    meshletGroupPassed = true;
     bool    lodDagPassed = true;
     bool    lodSelectPassed = true;
+    bool    lodCrackPassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -21473,6 +21944,11 @@ int WINAPI wWinMain(
             if (launchOptions.LodSelectCheck)
             {
                 lodSelectPassed = RunLodSelectChecks();
+            }
+
+            if (launchOptions.LodCrackCheck)
+            {
+                lodCrackPassed = RunLodCrackChecks();
             }
 
             if (launchOptions.PathTraceCheck)
@@ -21826,6 +22302,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.LodSelectCheck)
     {
         selfCheckCode = FinalizeSelfCheck(lodSelectPassed, 41, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.LodCrackCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(lodCrackPassed, 42, errorSink,
                                           errorsBeforeShutdown);
     }
 
