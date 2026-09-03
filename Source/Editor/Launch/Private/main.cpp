@@ -68,6 +68,7 @@
 #include "RenderCore/Geometry/FMeshletBuilder.h"
 #include "RenderCore/Geometry/FMeshSimplifier.h"
 #include "RenderCore/Geometry/FMeshletGrouper.h"
+#include "RenderCore/Geometry/FMeshLodDag.h"
 #include "AssetPipeline/FObjLoader.h"
 #include "Core/Containers/TSortAlgorithms.h"
 
@@ -321,6 +322,7 @@ struct FLaunchOptions
 
     bool MeshSimplifyCheck = false;
     bool MeshletGroupCheck = false;
+    bool LodDagCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -945,6 +947,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--meshlet-group-check"))
         {
             options.MeshletGroupCheck = true;
+        }
+        else if (WideEquals(arg, L"--lod-dag-check"))
+        {
+            options.LodDagCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -12003,6 +12009,823 @@ static bool RunMeshletGroupChecks()
 }
 
 // ============================================================================
+// RunLodDagChecks — LOD DAG 的七条判据
+//
+// 最要紧的一条是**误差必须是相对原始表面的上界, 逐层成立**。
+//
+// 它必须对**原始**网格量, 不是对上一层量。理由很具体: "误差取 max 而不是
+// 累加"这个错在对上一层量时是绿的 (每一层相对上一层确实没偏那么多), 只有
+// 对原始网格量才红。而那个错的后果是"误差是上界"这句承诺变成假的 —— 第五层
+// 报 0.1 而实际偏 0.6, 画面上远处轮廓走形、细节被抹平, 别的判据全绿。
+//
+// 其余六条:
+//
+//   叶子层无损   第 0 层展开出来的三角形集合与原始索引数组逐个相同 (连绕序)。
+//                DAG 构建不许碰第 0 层 —— 焊接会改顶点下标, 而下游的
+//                "两条光栅化路径逐位相同"建立在下标不变上。
+//   逐层减半     每层三角形数约为上一层的一半; 达不到就必须**停在那里**,
+//                而不是又发一层。
+//   单调         逐 meshlet: 父误差**严格**大于自身误差, 且父球含子球。
+//                两条缺一不可 —— 误差单调而球不单调时, 屏幕误差仍可能反转。
+//   无环         只用父子边做拓扑排序, 摘完的数必须等于 meshlet 总数。
+//                不信层号: 只验层号是在检查一个标签, 不是检查图。
+//   逐层是划分   同一层里没有重复的三角形。抓"重新切 meshlet 时丢了或重了"。
+//   边界不动     组的锁定边界顶点, 在它产出的父 meshlet 里必须**逐位存在**。
+//                这是无裂缝那条证明里"接口封闭"那一步的实测。
+// ============================================================================
+
+namespace
+{
+
+/// 三个下标的规范化 —— 保绕序, 只把最小的转到最前
+struct FTriangleKey
+{
+    UInt32 A = 0;
+    UInt32 B = 0;
+    UInt32 C = 0;
+};
+
+FTriangleKey MakeTriangleKey(UInt32 a, UInt32 b, UInt32 c)
+{
+    FTriangleKey key;
+
+    if (a <= b && a <= c)
+    {
+        key.A = a;
+        key.B = b;
+        key.C = c;
+    }
+    else if (b <= a && b <= c)
+    {
+        key.A = b;
+        key.B = c;
+        key.C = a;
+    }
+    else
+    {
+        key.A = c;
+        key.B = a;
+        key.C = b;
+    }
+
+    return key;
+}
+
+bool TriangleKeyEquals(const FTriangleKey& x, const FTriangleKey& y)
+{
+    return x.A == y.A && x.B == y.B && x.C == y.C;
+}
+
+/// 展开一层的全部 meshlet, 得到三角形列表 (全局顶点下标)
+void ExpandLevel(const FLodLevel& level, TArray<FTriangleKey>& outTriangles)
+{
+    outTriangles.Clear();
+
+    for (SizeType m = 0; m < level.Meshlets.Meshlets.GetSize(); ++m)
+    {
+        const FMeshlet& meshlet = level.Meshlets.Meshlets[m];
+
+        for (UInt32 t = 0; t < meshlet.TriangleCount; ++t)
+        {
+            UInt32 corner[3] = {};
+
+            for (UInt32 c = 0; c < 3; ++c)
+            {
+                const SizeType byteOffset =
+                    static_cast<SizeType>(meshlet.TriangleOffset) * 3 +
+                    t * 3 + c;
+
+                const UInt32 local = level.Meshlets.MeshletTriangles[byteOffset];
+
+                corner[c] = level.Meshlets.MeshletVertices[
+                    static_cast<SizeType>(meshlet.VertexOffset) + local];
+            }
+
+            outTriangles.Add(MakeTriangleKey(corner[0], corner[1], corner[2]));
+        }
+    }
+}
+
+} // namespace
+
+static bool RunLodDagChecks()
+{
+    bool passed = true;
+
+    const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+    FMeshLodDagOptions options;
+    options.TargetGroupSize = 16;
+    options.MaxGroupSize    = 32;
+
+    const FMeshLodDagResult dag =
+        FMeshLodDagBuilder::Build(sphere.Vertices, sphere.Indices, options);
+
+    if (!dag.IsValid())
+    {
+        LIMX_LOG(LogLaunch, Error, "[DAG] 构建失败");
+        return false;
+    }
+
+    const SizeType levelCount = dag.Levels.GetSize();
+
+    LIMX_LOG(LogLaunch, Display, "[DAG] {} 层, {} 个组", levelCount,
+             dag.Groups.GetSize());
+
+    // ---- 元判据: 必须真的建出多层 ----
+    //
+    // 只有一层的话下面每一条都平凡通过: 无环 (没有边)、单调 (没有父子对)、
+    // 逐层减半 (没有第二层)、划分 (第 0 层本来就是划分)。
+    if (levelCount < 3)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[DAG] 只建出 {} 层 —— 下面每一条判据在这种数据上都是平凡"
+                 "通过的",
+                 levelCount);
+        passed = false;
+    }
+
+    if (dag.Groups.IsEmpty())
+    {
+        LIMX_LOG(LogLaunch, Error, "[DAG] 一个组都没有");
+        return false;
+    }
+
+    // ---- 判据一: 叶子层与原始三角形集合完全相同 ----
+    {
+        TArray<FTriangleKey> leaf;
+        ExpandLevel(dag.Levels[0], leaf);
+
+        TArray<FTriangleKey> original;
+
+        for (SizeType t = 0; t + 2 < sphere.Indices.GetSize(); t += 3)
+        {
+            original.Add(MakeTriangleKey(sphere.Indices[t + 0],
+                                         sphere.Indices[t + 1],
+                                         sphere.Indices[t + 2]));
+        }
+
+        LIMX_LOG(LogLaunch, Display, "[DAG] 叶子层 {} 个三角形, 原始 {} 个",
+                 leaf.GetSize(), original.GetSize());
+
+        bool identical = (leaf.GetSize() == original.GetSize());
+
+        if (identical)
+        {
+            // 逐个配对 —— O(n²) 但只在叶子层跑一次
+            TArray<UInt8> used;
+            used.SetSize(original.GetSize(), UInt8(0));
+
+            for (SizeType i = 0; i < leaf.GetSize() && identical; ++i)
+            {
+                bool found = false;
+
+                for (SizeType k = 0; k < original.GetSize(); ++k)
+                {
+                    if (used[k] == 0 &&
+                        TriangleKeyEquals(leaf[i], original[k]))
+                    {
+                        used[k] = 1;
+                        found   = true;
+                        break;
+                    }
+                }
+
+                identical = found;
+            }
+        }
+
+        if (!identical)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] 叶子层与原始三角形集合不同 —— DAG 构建碰了第 0 层。"
+                     "焊接会改顶点下标, 而下游'两条光栅化路径逐位相同'那条"
+                     "判据建立在下标不变上");
+            passed = false;
+        }
+    }
+
+    // ---- 判据二: 逐层减半 ----
+    {
+        TArray<SizeType> triangles;
+
+        for (SizeType l = 0; l < levelCount; ++l)
+        {
+            SizeType count = 0;
+
+            for (SizeType m = 0; m < dag.Levels[l].Meshlets.Meshlets.GetSize();
+                 ++m)
+            {
+                count += dag.Levels[l].Meshlets.Meshlets[m].TriangleCount;
+            }
+
+            triangles.Add(count);
+        }
+
+        for (SizeType l = 1; l < levelCount; ++l)
+        {
+            const Float32 ratio = static_cast<Float32>(triangles[l]) /
+                                  static_cast<Float32>(triangles[l - 1]);
+
+            LIMX_LOG(LogLaunch, Display, "[DAG] 第 {} 层 / 第 {} 层 = {}", l,
+                     l - 1, ratio);
+
+            // 上界放松到 0.75: 锁边界会挡住一部分坍缩, 而组越小边界占比越高。
+            // 超过 0.75 还继续发层的话, 那一层的误差与上一层挤在一起,
+            // LOD 选择会在两层间横跳。
+            if (ratio > 0.75f)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[DAG] 第 {} 层只减到上一层的 {} —— 减不动就该**停在"
+                         "那里**, 而不是又发一层。误差挤在一起的两层会让 LOD "
+                         "选择反复横跳, 表现是相机微动时几何抖动",
+                         l, ratio);
+                passed = false;
+            }
+        }
+    }
+
+    // ---- 判据三: 逐 meshlet 单调 ----
+    {
+        SizeType errorViolations  = 0;
+        SizeType sphereViolations = 0;
+        SizeType radiusViolations = 0;
+        SizeType rootCount        = 0;
+        SizeType pairCount        = 0;
+
+        Float32 worstSphereGap = 0.0f;
+
+        for (SizeType l = 0; l < levelCount; ++l)
+        {
+            const FLodLevel& level = dag.Levels[l];
+
+            for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+            {
+                const FLodMeshletRecord& record = level.Records[m];
+
+                if (record.TargetGroup == kLodInvalidIndex)
+                {
+                    ++rootCount;
+
+                    if (record.ParentError != kLodInfiniteError)
+                    {
+                        LIMX_LOG(LogLaunch, Error,
+                                 "[DAG] 根 meshlet 的父误差不是哨兵值");
+                        passed = false;
+                    }
+
+                    continue;
+                }
+
+                ++pairCount;
+
+                // **严格**大于 —— 相等时选择规则永不成立, 那块表面在每一个
+                // 阈值下都不画
+                if (!(record.ParentError > record.SelfError))
+                {
+                    ++errorViolations;
+                }
+
+                // 父球必须含子球: |C_p - C_s| + r_s <= r_p
+                const FVector3 selfCenter(record.SelfSphere.X,
+                                          record.SelfSphere.Y,
+                                          record.SelfSphere.Z);
+
+                const FVector3 parentCenter(record.ParentSphere.X,
+                                            record.ParentSphere.Y,
+                                            record.ParentSphere.Z);
+
+                const Float32 needed =
+                    (selfCenter - parentCenter).Length() + record.SelfSphere.W;
+
+                // 半径必须不小于误差 —— 运行期那条投影公式保守性的**前提**。
+                //
+                // 半径 e 的误差球在球心距 D 处的精确投影半径是 e/sqrt(D²-e²),
+                // 而公式用的分母是 D-r。只有 r >= e 时 D-r <= sqrt(D²-e²),
+                // 结果才只会偏大 (偏大是安全的一侧: 更早换到细的一层)。
+                //
+                // 之前这一条没有任何判据 —— 把那行 Sphere.W 撑大删掉, 七条
+                // 判据一条都不红。
+                if (record.SelfSphere.W < record.SelfError)
+                {
+                    ++radiusViolations;
+                }
+
+                if (needed > record.ParentSphere.W * 1.0001f + 1.0e-6f)
+                {
+                    ++sphereViolations;
+
+                    worstSphereGap = FMath::Max(
+                        worstSphereGap, needed - record.ParentSphere.W);
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[DAG] 父子对 {} 个, 根 {} 个; 误差不严格增 {} 个, "
+                 "父球包不住子球 {} 个 (最多缺 {})",
+                 pairCount, rootCount, errorViolations, sphereViolations,
+                 worstSphereGap);
+
+        if (pairCount == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] 一个父子对都没有 —— 单调判据没验到东西");
+            passed = false;
+        }
+
+        if (errorViolations != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] {} 个 meshlet 的父误差没有**严格**大于自身误差 —— "
+                     "相等时选择规则'自身 < 阈值且父 >= 阈值'永不成立, 那块"
+                     "表面在每一个阈值下都不画 (一大片墙整块消失)",
+                     errorViolations);
+            passed = false;
+        }
+
+        if (sphereViolations != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] {} 个 meshlet 的父球包不住子球 —— 误差单调而球不"
+                     "单调时, 屏幕误差仍可能在某些相机位置上反转",
+                     sphereViolations);
+            passed = false;
+        }
+
+        if (radiusViolations != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] {} 个 meshlet 的 LOD 球半径小于它的误差 —— "
+                     "运行期投影公式拿 (球心距 - 半径) 当分母, 只有半径不小于"
+                     "误差时它才是保守的",
+                     radiusViolations);
+            passed = false;
+        }
+    }
+
+    // ---- 判据四: 误差是相对**原始**表面的上界, 逐层 ----
+    //
+    // 必须对原始网格量。对上一层量的话, "误差取 max 而不是累加"那个错是绿的。
+    {
+        for (SizeType l = 1; l < levelCount; ++l)
+        {
+            const FLodLevel& level = dag.Levels[l];
+
+            // 这一层里最大的自身误差
+            Float32 maxError = 0.0f;
+
+            for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+            {
+                maxError = FMath::Max(maxError, level.Records[m].SelfError);
+            }
+
+            // 每个原始顶点到这一层表面的最短距离
+            Float32 worst = 0.0f;
+
+            for (SizeType v = 0; v < sphere.Vertices.GetSize(); ++v)
+            {
+                const FVector3& p = sphere.Vertices[v].Position;
+
+                Float32 nearest = 3.4e38f;
+
+                for (SizeType t = 0; t + 2 < level.Indices.GetSize(); t += 3)
+                {
+                    nearest = FMath::Min(
+                        nearest,
+                        PointTriangleDistanceSquared(
+                            p, level.Vertices[level.Indices[t + 0]].Position,
+                            level.Vertices[level.Indices[t + 1]].Position,
+                            level.Vertices[level.Indices[t + 2]].Position));
+
+                    if (nearest <= 0.0f)
+                    {
+                        break;
+                    }
+                }
+
+                worst = FMath::Max(worst, FMath::Sqrt(nearest));
+            }
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[DAG] 第 {} 层 — 原始顶点到本层表面的最大距离 {}, "
+                     "报出来的最大误差 {}",
+                     l, worst, maxError);
+
+            if (worst > maxError * 1.0001f + 1.0e-5f)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[DAG] 第 {} 层的实际偏差 {} 超过报出来的 {} —— "
+                         "误差不是相对**原始**表面的上界。取 max 而不是累加"
+                         "正是这个形状: 对上一层量它是绿的, 只有对原始网格量"
+                         "才红",
+                         l, worst, maxError);
+                passed = false;
+            }
+        }
+    }
+
+    // ---- 判据五: 无环 ----
+    //
+    // 只用父子边做拓扑排序。不信层号 —— 只验层号是在检查一个标签。
+    {
+        // 全局 meshlet 编号: (层, 层内下标) -> 线性号
+        TArray<SizeType> levelBase;
+        SizeType         total = 0;
+
+        for (SizeType l = 0; l < levelCount; ++l)
+        {
+            levelBase.Add(total);
+            total += dag.Levels[l].Records.GetSize();
+        }
+
+        TArray<UInt32> inDegree;
+        inDegree.SetSize(total, 0u);
+
+        TArray<TArray<UInt32>> outEdges;
+        outEdges.SetSize(total);
+
+        for (SizeType g = 0; g < dag.Groups.GetSize(); ++g)
+        {
+            const FLodGroup& group = dag.Groups[g];
+
+            for (SizeType c = 0; c < group.ChildMeshlets.GetSize(); ++c)
+            {
+                const SizeType from =
+                    levelBase[group.Level] + group.ChildMeshlets[c];
+
+                for (SizeType p = 0; p < group.ParentMeshlets.GetSize(); ++p)
+                {
+                    const SizeType to =
+                        levelBase[group.Level + 1] + group.ParentMeshlets[p];
+
+                    outEdges[from].Add(static_cast<UInt32>(to));
+                    ++inDegree[to];
+                }
+            }
+        }
+
+        TArray<UInt32> stack;
+
+        for (SizeType i = 0; i < total; ++i)
+        {
+            if (inDegree[i] == 0)
+            {
+                stack.Add(static_cast<UInt32>(i));
+            }
+        }
+
+        SizeType removed = 0;
+
+        while (!stack.IsEmpty())
+        {
+            const UInt32 node = stack[stack.GetSize() - 1];
+            stack.RemoveAt(stack.GetSize() - 1);
+
+            ++removed;
+
+            for (SizeType k = 0; k < outEdges[node].GetSize(); ++k)
+            {
+                const UInt32 next = outEdges[node][k];
+
+                if (--inDegree[next] == 0)
+                {
+                    stack.Add(next);
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display, "[DAG] 拓扑排序摘掉 {} / {} 个节点",
+                 removed, total);
+
+        if (removed != total)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] 拓扑排序只摘掉 {} 个而总共 {} 个 —— 图里有环",
+                     removed, total);
+            passed = false;
+        }
+    }
+
+    // ---- 判据六: 每一层各自是一个划分 ----
+    {
+        for (SizeType l = 0; l < levelCount; ++l)
+        {
+            TArray<FTriangleKey> triangles;
+            ExpandLevel(dag.Levels[l], triangles);
+
+            SizeType duplicates = 0;
+
+            for (SizeType i = 0; i < triangles.GetSize(); ++i)
+            {
+                for (SizeType k = i + 1; k < triangles.GetSize(); ++k)
+                {
+                    if (TriangleKeyEquals(triangles[i], triangles[k]))
+                    {
+                        ++duplicates;
+                        break;
+                    }
+                }
+            }
+
+            if (duplicates != 0)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[DAG] 第 {} 层里有 {} 个重复三角形 —— 重新切 meshlet "
+                         "时重了。那种错只在某一个阈值带上表现为一块 Z 冲突",
+                         l, duplicates);
+                passed = false;
+            }
+        }
+    }
+
+    // ---- 判据七: 组的边界顶点在父层里逐位存在 ----
+    {
+        SizeType checkedGroups = 0;
+        SizeType missing       = 0;
+
+        for (SizeType g = 0; g < dag.Groups.GetSize(); ++g)
+        {
+            const FLodGroup& group = dag.Groups[g];
+
+            if (group.ParentMeshlets.IsEmpty())
+            {
+                continue;
+            }
+
+            ++checkedGroups;
+
+            const FLodLevel& parentLevel = dag.Levels[group.Level + 1];
+
+            // 父 meshlet 用到的顶点位置
+            TArray<FVector3> parentPositions;
+
+            for (SizeType p = 0; p < group.ParentMeshlets.GetSize(); ++p)
+            {
+                const FMeshlet& meshlet =
+                    parentLevel.Meshlets.Meshlets[group.ParentMeshlets[p]];
+
+                for (UInt32 v = 0; v < meshlet.VertexCount; ++v)
+                {
+                    const UInt32 global = parentLevel.Meshlets.MeshletVertices[
+                        static_cast<SizeType>(meshlet.VertexOffset) + v];
+
+                    parentPositions.Add(parentLevel.Vertices[global].Position);
+                }
+            }
+
+            // 这个组在子层的边界顶点 —— 判据自己重算: 被本组与别的组同时
+            // 用到的位置
+            const FLodLevel& childLevel = dag.Levels[group.Level];
+
+            for (SizeType c = 0; c < group.ChildMeshlets.GetSize(); ++c)
+            {
+                const FMeshlet& meshlet =
+                    childLevel.Meshlets.Meshlets[group.ChildMeshlets[c]];
+
+                for (UInt32 v = 0; v < meshlet.VertexCount; ++v)
+                {
+                    const UInt32 global = childLevel.Meshlets.MeshletVertices[
+                        static_cast<SizeType>(meshlet.VertexOffset) + v];
+
+                    const FVector3& position =
+                        childLevel.Vertices[global].Position;
+
+                    // 这个位置是不是被别的组也用到了
+                    bool sharedWithOther = false;
+
+                    for (SizeType og = 0;
+                         og < dag.Groups.GetSize() && !sharedWithOther; ++og)
+                    {
+                        if (og == g || dag.Groups[og].Level != group.Level)
+                        {
+                            continue;
+                        }
+
+                        for (SizeType oc = 0;
+                             oc < dag.Groups[og].ChildMeshlets.GetSize();
+                             ++oc)
+                        {
+                            const FMeshlet& other =
+                                childLevel.Meshlets.Meshlets[
+                                    dag.Groups[og].ChildMeshlets[oc]];
+
+                            for (UInt32 ov = 0; ov < other.VertexCount; ++ov)
+                            {
+                                const UInt32 og2 =
+                                    childLevel.Meshlets.MeshletVertices[
+                                        static_cast<SizeType>(
+                                            other.VertexOffset) + ov];
+
+                                const FVector3& q =
+                                    childLevel.Vertices[og2].Position;
+
+                                if (q.X == position.X && q.Y == position.Y &&
+                                    q.Z == position.Z)
+                                {
+                                    sharedWithOther = true;
+                                    break;
+                                }
+                            }
+
+                            if (sharedWithOther)
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!sharedWithOther)
+                    {
+                        continue;
+                    }
+
+                    // 边界顶点必须**逐位**出现在父层里
+                    bool survives = false;
+
+                    for (SizeType k = 0; k < parentPositions.GetSize(); ++k)
+                    {
+                        if (parentPositions[k].X == position.X &&
+                            parentPositions[k].Y == position.Y &&
+                            parentPositions[k].Z == position.Z)
+                        {
+                            survives = true;
+                            break;
+                        }
+                    }
+
+                    if (!survives)
+                    {
+                        ++missing;
+                    }
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[DAG] 验了 {} 个组的边界, 父层里找不到的边界顶点 {} 个",
+                 checkedGroups, missing);
+
+        if (checkedGroups == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] 一个有父的组都没有 —— 边界判据没验到东西");
+            passed = false;
+        }
+
+        if (missing != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] {} 个组间边界顶点在父层里找不到 —— 锁定漏了, "
+                     "而相邻两组在那里就对不上。这是无裂缝那条证明里"
+                     "'接口封闭'那一步",
+                     missing);
+            passed = false;
+        }
+    }
+
+    // ---- 判据七之二: 有父的组必须真的简化了 ----
+    //
+    // 一个简化不动的组如果仍然造出父层, 那个父与子逐三角形相同、误差也相同
+    // (本次误差为 0), 于是选择规则在相等时永不成立 —— 那块表面在每一个阈值
+    // 下都不画。
+    //
+    // 这一条与上面的"逐层减半"不同: 那条看的是整层的总数, 一个不动的组混在
+    // 一堆能简化的组里完全看不出来。
+    {
+        SizeType notReduced = 0;
+
+        for (SizeType g = 0; g < dag.Groups.GetSize(); ++g)
+        {
+            const FLodGroup& group = dag.Groups[g];
+
+            if (group.ParentMeshlets.IsEmpty())
+            {
+                continue;
+            }
+
+            SizeType childTriangles = 0;
+
+            for (SizeType c = 0; c < group.ChildMeshlets.GetSize(); ++c)
+            {
+                childTriangles += dag.Levels[group.Level]
+                                      .Meshlets.Meshlets[group.ChildMeshlets[c]]
+                                      .TriangleCount;
+            }
+
+            SizeType parentTriangles = 0;
+
+            for (SizeType p = 0; p < group.ParentMeshlets.GetSize(); ++p)
+            {
+                parentTriangles +=
+                    dag.Levels[group.Level + 1]
+                        .Meshlets.Meshlets[group.ParentMeshlets[p]]
+                        .TriangleCount;
+            }
+
+            if (parentTriangles >= childTriangles)
+            {
+                ++notReduced;
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display, "[DAG] 有父却没减少三角形的组 {} 个",
+                 notReduced);
+
+        if (notReduced != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] {} 个组造了父层却一个三角形都没减少 —— 那样的父与"
+                     "子误差相同, 选择规则在相等时永不成立, 那块表面在每一个"
+                     "阈值下都不画",
+                     notReduced);
+            passed = false;
+        }
+    }
+
+    // ---- 判据八: 平坦网格上父误差仍必须严格大于子误差 ----
+    //
+    // 球面上每一次简化都有实打实的偏差, 所以"去掉增长地板"那条变异在球上
+    // 是绿的 —— 累加出来的父误差自然就比子大。
+    //
+    // 平坦的地方不一样: 共面坍缩的偏差恰好是 0, 那时父误差 == 子误差, 而
+    // 选择规则"自身 < 阈值且父 >= 阈值"在相等时**永不成立** —— 那块表面在
+    // 每一个阈值下都不画。表现是一大片地板整块消失, 而且不随距离变化。
+    //
+    // 这是**场景不够**, 不是判据不严。
+    {
+        const FMeshData plane =
+            FGeometryGenerator::GeneratePlane(4.0f, 4.0f, 48, 48);
+
+        const FMeshLodDagResult flatDag =
+            FMeshLodDagBuilder::Build(plane.Vertices, plane.Indices, options);
+
+        SizeType flatPairs      = 0;
+        SizeType flatViolations = 0;
+        SizeType zeroOwnError   = 0;
+
+        for (SizeType g = 0; g < flatDag.Groups.GetSize(); ++g)
+        {
+            if (flatDag.Groups[g].OwnError == 0.0f)
+            {
+                ++zeroOwnError;
+            }
+        }
+
+        for (SizeType l = 0; l < flatDag.Levels.GetSize(); ++l)
+        {
+            const FLodLevel& level = flatDag.Levels[l];
+
+            for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+            {
+                const FLodMeshletRecord& record = level.Records[m];
+
+                if (record.TargetGroup == kLodInvalidIndex)
+                {
+                    continue;
+                }
+
+                ++flatPairs;
+
+                if (!(record.ParentError > record.SelfError))
+                {
+                    ++flatViolations;
+                }
+            }
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[DAG] 平坦网格 — {} 层, 父子对 {} 个, 本次误差恰为零的组 "
+                 "{} 个, 误差不严格增 {} 个",
+                 flatDag.Levels.GetSize(), flatPairs, zeroOwnError,
+                 flatViolations);
+
+        // 元判据本来想验"平坦网格上必然出现本次误差恰为零的组"。**它不成立**:
+        // 实测零个 —— 简化器的误差是对原始点集全局重量出来的, 而顶点在平面内
+        // 滑动时点到三角形的距离有浮点噪声, 量出来是 3e-6 而不是恰好 0。
+        //
+        // 也就是说"增长地板"防的是一个测度为零的情形, 与遮挡测试那条
+        // `>=` vs `>` 同类。留着它是因为它便宜且方向正确, 但要如实记下:
+        // 它在现在这套误差度量下走不到。
+        LIMX_UNUSED(zeroOwnError);
+
+        if (flatViolations != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[DAG] 平坦网格上 {} 个 meshlet 的父误差没有严格大于自身"
+                     "误差 —— 共面坍缩的偏差是 0, 没有增长地板的话父子相等, "
+                     "而那块表面在每一个阈值下都不画",
+                     flatViolations);
+            passed = false;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[DAG] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -20084,6 +20907,7 @@ int WINAPI wWinMain(
     bool    meshletExpandOverflowPassed = true;
     bool    meshSimplifyPassed = true;
     bool    meshletGroupPassed = true;
+    bool    lodDagPassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -20263,6 +21087,11 @@ int WINAPI wWinMain(
             if (launchOptions.MeshletGroupCheck)
             {
                 meshletGroupPassed = RunMeshletGroupChecks();
+            }
+
+            if (launchOptions.LodDagCheck)
+            {
+                lodDagPassed = RunLodDagChecks();
             }
 
             if (launchOptions.PathTraceCheck)
@@ -20604,6 +21433,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.MeshletGroupCheck)
     {
         selfCheckCode = FinalizeSelfCheck(meshletGroupPassed, 38, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.LodDagCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(lodDagPassed, 40, errorSink,
                                           errorsBeforeShutdown);
     }
 
