@@ -33,6 +33,13 @@ class FRenderContext;
 ///         "跳过"绝不能表现为"通过"。
 LIMX_NODISCARD bool RunPathTraceChecks(FRenderContext* context);
 
+/// 时域累积: N 帧 x 1 spp 必须等价于 1 帧 x N spp
+///
+/// 实时 GI 的形状是"每帧 1 spp, 跨帧累积", 而它成立靠的是"跨帧样本真的独立"
+/// —— 那不是自动成立的。种子在帧间卡住的话每一帧逐位相同, 画面看起来反而更
+/// **稳**, 而稳正是时域累积想要的效果。所以这条判据不看画面, 看方差。
+LIMX_NODISCARD bool RunGiAccumulationChecks(FRenderContext* context);
+
 /// 离线渲染一张 Cornell 盒参考图并写成二进制 PPM
 ///
 /// 判据用不到它 —— 它的用途是让"这个路径追踪器到底在算什么"有一张能看的

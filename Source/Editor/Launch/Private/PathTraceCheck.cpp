@@ -1635,4 +1635,365 @@ bool RenderPathTraceReferenceImage(FRenderContext* context,
     return written;
 }
 
+// ============================================================================
+// RunGiAccumulationChecks — 时域累积必须等价于一次跑满
+//
+// 实时 GI 的形状是"每帧 1 spp, 跨帧累积"。而它要成立, 靠的是一条并不自动
+// 成立的性质: **跨帧的样本之间真的独立**。
+//
+// 种子只要在帧与帧之间卡住, 一百帧就是同一个样本的一百份副本 —— 而那时:
+//
+//   * 均值仍然是那一个样本的值 (有偏, 但看起来"就是有点噪")
+//   * 方差**完全不下降** —— 画面永远那么噪, 而人会以为"再等等就好了"
+//   * 逐帧的图像逐位相同, 看起来非常"稳定"
+//
+// 最后那一点是最阴的: 卡住的种子让画面**看起来更稳**, 而稳正是时域累积
+// 想要的效果。所以这条判据不能看画面, 要看方差。
+//
+// 三条:
+//
+//   一、N 帧 x 1 spp 的均值, 与 1 帧 x N spp 的均值一致 (统计预算之内)。
+//   二、两者的方差都必须按 1/N 下降 —— 这一条抓的是种子卡住。
+//   三、累积的样本计数恰好是 N。少一个都说明有一帧的贡献丢了。
+// ============================================================================
+
+bool RunGiAccumulationChecks(FRenderContext* context)
+{
+    FPathTracer tracer;
+
+    if (tracer.Initialize(context->GetDevice(), context) != ERHIResult::Success)
+    {
+        LIMX_LOG(LogPathTraceCheck, Error, "[时域累积] 追踪器初始化失败");
+        return false;
+    }
+
+    bool passed = true;
+
+    // ---- 场景: 开口 Cornell 盒, 反照率 0.6 ----
+    //
+    // 不用白炉 (反照率 1): 那里每个样本恰好是 1.0, 单样本方差为零 —— 而这条
+    // 判据要验的正是方差怎么下降。方差为零的场景上它什么都验不到。
+    FSceneBuilder builder;
+
+    const UInt32 gray = builder.AddMaterialGray(0.6f, 0.0f);
+
+    FCornellMaterials mat;
+    mat.Floor = mat.Ceiling = mat.Back = gray;
+    mat.Left  = mat.Right   = mat.Front = gray;
+    mat.Blocks = gray;
+
+    BuildCornellBox(builder, mat, false, true);
+
+    FPathTraceScene scene;
+    builder.Fill(scene);
+
+    if (tracer.SetScene(scene) != ERHIResult::Success)
+    {
+        LIMX_LOG(LogPathTraceCheck, Error, "[时域累积] 场景上传失败");
+        tracer.Shutdown();
+        return false;
+    }
+
+    const FPathTraceCamera camera = MakeOutsideCamera();
+
+    constexpr UInt32 kFrames = 64;
+    constexpr UInt32 kWidth  = 64;
+    constexpr UInt32 kHeight = 64;
+
+    const SizeType pixelCount = static_cast<SizeType>(kWidth) * kHeight;
+
+    FPathTraceSettings base;
+    base.Width                     = kWidth;
+    base.Height                    = kHeight;
+    base.MaxBounce                 = 1;   // 一次弹射 —— 这一天的题目
+    base.RussianRouletteStartDepth = 64;
+    base.EnvironmentRadiance       = 1.0f;
+    base.EnvironmentGradientY      = 0.0f;
+    base.NormalOffset              = 1.0e-4f;
+
+    // ---- A: 每帧 1 spp, 跨帧累积 ----
+    TArray<Float64> accumR;
+    TArray<Float64> accumSqR;
+
+    accumR.SetSize(pixelCount, 0.0);
+    accumSqR.SetSize(pixelCount, 0.0);
+
+    SizeType accumulatedSamples = 0;
+
+    for (UInt32 frame = 0; frame < kFrames; ++frame)
+    {
+        FPathTraceSettings settings = base;
+        settings.SamplesPerPixel = 1;
+
+        // **每帧换一个试验号** —— 这就是"跨帧独立"的来源。
+        //
+        // 卡住它 (例如恒为 0) 的话, 每一帧都会画出**逐位相同**的图, 而那
+        // 看起来非常像"时域累积收敛了"。
+        settings.TrialIndex = frame;
+
+        TArray<FPathTracePixel> pixels;
+
+        if (tracer.Render(camera, settings, pixels) != ERHIResult::Success)
+        {
+            LIMX_LOG(LogPathTraceCheck, Error, "[时域累积] 第 {} 帧渲染失败",
+                     frame);
+            tracer.Shutdown();
+            return false;
+        }
+
+        for (SizeType p = 0; p < pixelCount; ++p)
+        {
+            accumR[p]   += pixels[p].SumR;
+            accumSqR[p] += pixels[p].SumSqR;
+        }
+
+        ++accumulatedSamples;
+    }
+
+    // ---- B: 一次跑满 N spp ----
+    TArray<FPathTracePixel> batch;
+
+    {
+        FPathTraceSettings settings = base;
+        settings.SamplesPerPixel = kFrames;
+        settings.TrialIndex      = 0;
+
+        if (tracer.Render(camera, settings, batch) != ERHIResult::Success)
+        {
+            LIMX_LOG(LogPathTraceCheck, Error, "[时域累积] 批量渲染失败");
+            tracer.Shutdown();
+            return false;
+        }
+    }
+
+    // ---- 判据三: 样本计数 ----
+    if (accumulatedSamples != kFrames)
+    {
+        LIMX_LOG(LogPathTraceCheck, Error,
+                 "[时域累积] 累积了 {} 帧而不是 {} 帧", accumulatedSamples,
+                 kFrames);
+        passed = false;
+    }
+
+    // ---- 统计量 ----
+    Float64 meanAccum = 0.0;
+    Float64 meanBatch = 0.0;
+
+    Float64 varAccum = 0.0;
+    Float64 varBatch = 0.0;
+
+    for (SizeType p = 0; p < pixelCount; ++p)
+    {
+        const Float64 a = accumR[p] / static_cast<Float64>(kFrames);
+        const Float64 b = static_cast<Float64>(batch[p].SumR) /
+                          static_cast<Float64>(kFrames);
+
+        meanAccum += a;
+        meanBatch += b;
+
+        // 单样本方差的无偏估计: E[x²] - E[x]²
+        const Float64 a2 = accumSqR[p] / static_cast<Float64>(kFrames);
+        const Float64 b2 = static_cast<Float64>(batch[p].SumSqR) /
+                           static_cast<Float64>(kFrames);
+
+        varAccum += FMath::Max(a2 - a * a, 0.0);
+        varBatch += FMath::Max(b2 - b * b, 0.0);
+    }
+
+    meanAccum /= static_cast<Float64>(pixelCount);
+    meanBatch /= static_cast<Float64>(pixelCount);
+
+    varAccum /= static_cast<Float64>(pixelCount);
+    varBatch /= static_cast<Float64>(pixelCount);
+
+    const Float64 sigma = FMath::Sqrt(FMath::Max(varBatch, 0.0));
+
+    // 误差预算: 5.5·σ/√(帧数 × 像素数)。与第八、九天同一套账。
+    const Float64 budget =
+        5.5 * sigma /
+        FMath::Sqrt(static_cast<Float64>(kFrames) *
+                    static_cast<Float64>(pixelCount));
+
+    const Float64 deviation = (meanAccum > meanBatch) ? (meanAccum - meanBatch)
+                                                      : (meanBatch - meanAccum);
+
+    LIMX_LOG(LogPathTraceCheck, Display,
+             "[时域累积] {} 帧 x 1 spp 均值 {} vs 一次跑满 {} spp 均值 {} — "
+             "偏差 {}, 预算 {}",
+             kFrames, meanAccum, kFrames, meanBatch, deviation, budget);
+
+    LIMX_LOG(LogPathTraceCheck, Display,
+             "[时域累积] 单样本方差 — 累积 {}, 批量 {}", varAccum, varBatch);
+
+    // ---- 判据一: 均值一致 ----
+    //
+    // 比较写成否定形式 —— NaN 会从正向比较里溜走 (第九天的教训)。
+    if (!(deviation <= budget))
+    {
+        LIMX_LOG(LogPathTraceCheck, Error,
+                 "[时域累积] {} 帧累积的均值 {} 与一次跑满的 {} 差 {}, 超过"
+                 "预算 {} —— 两者是同一个积分的两种取法, 差了说明累积那一步"
+                 "丢了或者重了样本",
+                 kFrames, meanAccum, meanBatch, deviation, budget);
+        passed = false;
+    }
+
+    // ---- 判据二: 单样本方差必须一致, 而且非零 ----
+    //
+    // 这一条抓的是**种子卡住**。卡住之后每一帧逐位相同, 于是:
+    //   * 累积出来的单样本方差 -> 0 (所有样本相同)
+    //   * 而批量那边的方差不变
+    // 两者一比就分家了。
+    //
+    // 而画面上, 卡住的种子让每一帧**逐位相同** —— 看起来非常像"收敛了"。
+    // 这正是为什么这条判据不能看画面。
+    const Float64 varianceRatio =
+        varAccum / FMath::Max(varBatch, 1.0e-12);
+
+    LIMX_LOG(LogPathTraceCheck, Display,
+             "[时域累积] 方差比 (累积/批量) {}", varianceRatio);
+
+    if (!(varBatch > 1.0e-6))
+    {
+        LIMX_LOG(LogPathTraceCheck, Error,
+                 "[时域累积] 批量的单样本方差是 {} —— 场景没有噪声的话, "
+                 "'方差怎么下降'这条判据什么都验不到",
+                 varBatch);
+        passed = false;
+    }
+
+    if (!(varianceRatio > 0.7 && varianceRatio < 1.4))
+    {
+        LIMX_LOG(LogPathTraceCheck, Error,
+                 "[时域累积] 累积与批量的单样本方差比是 {} (应当接近 1) —— "
+                 "明显偏小说明跨帧的样本不独立 (种子卡住了), 而那时每一帧"
+                 "逐位相同, 画面看起来反而更'稳'",
+                 varianceRatio);
+        passed = false;
+    }
+
+    // ---- 判据四: 分块派发必须把每一块的贡献都留下 ----
+    //
+    // 追踪器把 spp 分成若干块派发 (每块的路径数上限 4M), 块与块之间靠**累加**
+    // 拼起来。改成覆写的话只剩最后一块的贡献。
+    //
+    // 而这条路径**从来没被任何判据走到过**: 每块的样本数是 4M/像素数, 96x96
+    // 的图上是 455, 而现有判据最多跑 256 spp —— 全都落在一块之内。也就是说
+    // "分块"这段代码此前一个判据都没有。
+    //
+    // 这里用 256x256 的图 (每块 64 spp) 跑 192 spp, 逼出三块。
+    //
+    // 判的不是画面, 是**样本计数**: 主射线命中的像素, 它的命中计数必须**恰好**
+    // 等于 spp。覆写的话它等于最后一块的大小。这一条不需要参考图。
+    {
+        FPathTraceSettings settings = base;
+        settings.Width           = 256;
+        settings.Height          = 256;
+        settings.SamplesPerPixel = 192;
+        settings.TrialIndex      = 7;
+
+        TArray<FPathTracePixel> chunked;
+
+        if (tracer.Render(camera, settings, chunked) != ERHIResult::Success)
+        {
+            LIMX_LOG(LogPathTraceCheck, Error, "[时域累积] 分块渲染失败");
+            passed = false;
+        }
+        else
+        {
+            SizeType hitPixels   = 0;
+            SizeType badCounts   = 0;
+            Float32  worstCount  = 0.0f;
+
+            for (SizeType p = 0; p < chunked.GetSize(); ++p)
+            {
+                if (chunked[p].SumPrimaryHit <= 0.0f)
+                {
+                    continue;
+                }
+
+                ++hitPixels;
+
+                if (chunked[p].SumPrimaryHit !=
+                    static_cast<Float32>(settings.SamplesPerPixel))
+                {
+                    ++badCounts;
+
+                    worstCount = FMath::Max(
+                        worstCount,
+                        FMath::Abs(chunked[p].SumPrimaryHit -
+                                   static_cast<Float32>(
+                                       settings.SamplesPerPixel)));
+                }
+            }
+
+            LIMX_LOG(LogPathTraceCheck, Display,
+                     "[时域累积] 分块 — {} spp 分 {} 块, 命中像素 {}, "
+                     "命中计数不等于 spp 的 {} 个 (最大差 {})",
+                     settings.SamplesPerPixel,
+                     (settings.SamplesPerPixel + 63u) / 64u, hitPixels,
+                     badCounts, worstCount);
+
+            // 元判据: 必须真的有命中像素, 而且必须真的分了块
+            if (hitPixels == 0)
+            {
+                LIMX_LOG(LogPathTraceCheck, Error,
+                         "[时域累积] 分块那一段没有一个命中像素 —— 判据没验"
+                         "到东西");
+                passed = false;
+            }
+
+            if (!(badCounts == 0))
+            {
+                LIMX_LOG(LogPathTraceCheck, Error,
+                         "[时域累积] {} 个像素的命中计数不等于 spp (最大差 {}) "
+                         "—— 分块之间是靠累加拼起来的, 覆写的话只剩最后一块",
+                         badCounts, worstCount);
+                passed = false;
+            }
+
+            // 计数在槽位 1, 而辐射度在槽位 0 —— 两个槽位各自累加, 只改一个
+            // 的话计数那条看不见。所以还要看**辐射度的均值**。
+            //
+            // 覆写时累积的辐射度只剩最后一块 (64 个样本), 而这里仍然除以
+            // 192 —— 均值掉到三分之一。信号极大, 所以容差可以给得很松:
+            // 这里的 10% 是留给"换了分辨率, 取景略有不同"的, 而不是留给实现的。
+            Float64 chunkedMean = 0.0;
+
+            for (SizeType p = 0; p < chunked.GetSize(); ++p)
+            {
+                chunkedMean += static_cast<Float64>(chunked[p].SumR);
+            }
+
+            chunkedMean /= static_cast<Float64>(chunked.GetSize()) *
+                           static_cast<Float64>(settings.SamplesPerPixel);
+
+            const Float64 crossResolutionDeviation =
+                (chunkedMean > meanBatch) ? (chunkedMean - meanBatch)
+                                          : (meanBatch - chunkedMean);
+
+            LIMX_LOG(LogPathTraceCheck, Display,
+                     "[时域累积] 分块的均值 {} vs 未分块的 {} (偏差 {})",
+                     chunkedMean, meanBatch, crossResolutionDeviation);
+
+            if (!(crossResolutionDeviation <= meanBatch * 0.1))
+            {
+                LIMX_LOG(LogPathTraceCheck, Error,
+                         "[时域累积] 分块渲染的均值 {} 与未分块的 {} 差了 {} "
+                         "(超过 10%) —— 分块之间靠累加拼起来, 覆写的话只剩"
+                         "最后一块的贡献, 而分母仍然是全部 spp",
+                         chunkedMean, meanBatch, crossResolutionDeviation);
+                passed = false;
+            }
+        }
+    }
+
+    tracer.Shutdown();
+
+    LIMX_LOG(LogPathTraceCheck, Display, "[时域累积] {}",
+             passed ? "通过" : "失败");
+
+    return passed;
+}
+
 } // namespace Limx

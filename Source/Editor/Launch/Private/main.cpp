@@ -329,6 +329,7 @@ struct FLaunchOptions
     bool LodGpuCheck = false;
     bool LodScaleCheck = false;
     bool SamplerCheck = false;
+    bool GiAccumCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -977,6 +978,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--sampler-check"))
         {
             options.SamplerCheck = true;
+        }
+        else if (WideEquals(arg, L"--gi-accum-check"))
+        {
+            options.GiAccumCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -22955,6 +22960,7 @@ int WINAPI wWinMain(
     bool    lodGpuPassed = true;
     bool    lodScalePassed = true;
     bool    samplerPassed = true;
+    bool    giAccumPassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -23164,6 +23170,11 @@ int WINAPI wWinMain(
             if (launchOptions.SamplerCheck)
             {
                 samplerPassed = RunSamplerChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.GiAccumCheck)
+            {
+                giAccumPassed = RunGiAccumulationChecks(&renderContext);
             }
 
             if (launchOptions.PathTraceCheck)
@@ -23541,6 +23552,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.SamplerCheck)
     {
         selfCheckCode = FinalizeSelfCheck(samplerPassed, 45, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.GiAccumCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(giAccumPassed, 46, errorSink,
                                           errorsBeforeShutdown);
     }
 
