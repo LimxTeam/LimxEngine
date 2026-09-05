@@ -1,0 +1,137 @@
+#version 450
+
+// ============================================================================
+// sampler_probe.comp — 采样器与 MIS 的探针
+//
+// 不参与渲染, 只为判据存在。
+//
+// 它验的东西**有解析值**: 余弦加权半球采样的各阶矩、MIS 权重之和。这类判据
+// 不依赖场景、不依赖材质、不依赖别的任何东西 —— 对不对一比就知道, 而且错的
+// 时候能指出错在哪一阶。
+//
+// 与"梯度炉"的分工: 炉子验的是"合起来那个数对不对" (间接、端到端), 这里验的
+// 是"分布本身对不对" (直接、逐阶)。炉子能抓住采样与 pdf 不匹配, 但抓不住
+// "分布对、pdf 也对, 只是方位角有偏"这种 —— 一阶矩的 x/y 分量会把它顶出来。
+// ============================================================================
+
+#extension GL_EXT_scalar_block_layout : require
+
+#include "sampling_common.h"
+
+layout(local_size_x = 64) in;
+
+/// 每个线程的累加结果
+struct SamplerProbeResult
+{
+    // Σcosθ, Σcos²θ, Σcos³θ, 样本数
+    vec4 CosMoments;
+
+    // Σ方向 (局部坐标系), 保留
+    vec4 DirectionSum;
+
+    // Σ(pdf·π/cosθ) —— 恒等于样本数; Σ|w_balance + w_other - 1|,
+    // Σ|w_power + w_other - 1|, MIS 组合数
+    vec4 MisSums;
+};
+
+layout(scalar, set = 0, binding = 0) writeonly buffer ResultBuffer {
+    SamplerProbeResult results[];
+} resultBuffer;
+
+layout(push_constant) uniform Params
+{
+    // x = 线程数, y = 每线程样本数, z = 试验号 (种子偏移), w = 保留
+    uvec4 Params;
+} pc;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+
+    if (index >= pc.Params.x)
+    {
+        return;
+    }
+
+    // 种子先落成一个变量 —— SamplingPcgNext 收的是 inout, 不能直接喂表达式
+    uint rng = index * 2654435761u + pc.Params.z * 40503u + 1u;
+
+    // 先空转一次, 让相邻线程的种子散开
+    SamplingPcgNext(rng);
+
+    vec4 cosMoments   = vec4(0.0);
+    vec4 directionSum = vec4(0.0);
+    vec4 misSums      = vec4(0.0);
+
+    const uint sampleCount = pc.Params.y;
+
+    for (uint s = 0u; s < sampleCount; ++s)
+    {
+        const float u1 = SamplingNextFloat(rng);
+        const float u2 = SamplingNextFloat(rng);
+
+        float cosTheta = 0.0;
+
+        const vec3 direction = SampleCosineHemisphere(u1, u2, cosTheta);
+
+        cosMoments.x += cosTheta;
+        cosMoments.y += cosTheta * cosTheta;
+        cosMoments.z += cosTheta * cosTheta * cosTheta;
+        cosMoments.w += 1.0;
+
+        directionSum.xyz += direction;
+
+        // 采出来的方向**必须是单位向量**。
+        //
+        // 此前的矩全都只用 cosθ (它与 r 无关), 而 x/y 分量在方位角上平均为零
+        // —— 于是"r = u1 而不是 sqrt(u1)"这条变异整个逃掉了: 分布已经不是
+        // 余弦加权, 而三阶矩、一阶矩一个都没动。
+        //
+        // 长度是唯一看得见 r 的量: r 与 cosθ 必须满足 r² + cos²θ = 1。
+        directionSum.w += abs(length(direction) - 1.0);
+
+        // pdf 与 cosθ 必须一致: pdf·π/cosθ 恒等于 1。
+        //
+        // 这一条抓的是"采样与 pdf 分家"—— 采样函数改了而 pdf 函数没跟着改
+        // (或者反过来)。它比矩更早、更直接: 矩要几百万个样本才收敛到能判,
+        // 而这一条**逐样本**就成立。
+        const float pdf = CosineHemispherePdf(cosTheta);
+
+        misSums.x += (cosTheta > 0.0)
+                         ? (pdf * 3.14159265359 / cosTheta)
+                         : 1.0;
+
+        // ---- MIS 权重之和 ----
+        //
+        // 拿这一轮的两个随机数造一对 pdf, 跨十几个数量级 —— 包括一边极小、
+        // 一边极大的情形, 那正是幂启发式的平方最容易溢出的地方。
+        // e^±45 —— 大约 3.5e19。平方之后 1.2e39, **溢出 float32** (3.4e38)。
+        //
+        // 第一版取 e^±15, 平方才 1e13, 离溢出还差二十六个数量级 —— 于是
+        // "幂启发式不先归一化"那条变异整个逃掉了。判据要造出溢出, 才验得到
+        // 那一步归一化的意义。
+        //
+        // 这个量级不是编的: 小光源上的立体角 pdf 轻易上千, 而路径追踪里
+        // 几次弹射之后的联合 pdf 是它们的乘积。
+        const float pdfA = exp(u1 * 90.0 - 45.0);
+        const float pdfB = exp(u2 * 90.0 - 45.0);
+
+        const float balanceA = MisBalanceHeuristic(pdfA, pdfB);
+        const float balanceB = MisBalanceHeuristic(pdfB, pdfA);
+
+        const float powerA = MisPowerHeuristic(pdfA, pdfB);
+        const float powerB = MisPowerHeuristic(pdfB, pdfA);
+
+        misSums.y += abs(balanceA + balanceB - 1.0);
+        misSums.z += abs(powerA + powerB - 1.0);
+        misSums.w += 1.0;
+    }
+
+    SamplerProbeResult result;
+
+    result.CosMoments   = cosMoments;
+    result.DirectionSum = directionSum;
+    result.MisSums      = misSums;
+
+    resultBuffer.results[index] = result;
+}

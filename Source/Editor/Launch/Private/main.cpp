@@ -328,6 +328,7 @@ struct FLaunchOptions
     bool LodCrackCheck = false;
     bool LodGpuCheck = false;
     bool LodScaleCheck = false;
+    bool SamplerCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -972,6 +973,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--lod-scale-check"))
         {
             options.LodScaleCheck = true;
+        }
+        else if (WideEquals(arg, L"--sampler-check"))
+        {
+            options.SamplerCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -14447,6 +14452,422 @@ static bool RunLodScaleChecks()
 }
 
 // ============================================================================
+// RunSamplerChecks — 采样器与 MIS 必须对得上解析值
+//
+// 第八天的白炉与梯度炉验的是"合起来那个数对不对" (间接、端到端)。这一条验的
+// 是**分布本身**, 而且对得上的是解析值:
+//
+//     ∫ (cosθ/π) dω                = 1        pdf 归一
+//     E[cosθ]   = ∫ cosθ·(cosθ/π) dω  = 2/3
+//     E[cos²θ]  = ∫ cos²θ·(cosθ/π) dω = 1/2
+//     E[cos³θ]                       = 2/5
+//     E[方向]                        = (0, 0, 2/3)
+//
+// 为什么两条都要: 炉子抓得住"采样与 pdf 不匹配", 但抓不住"分布对、pdf 也对,
+// 只是方位角有偏" —— 一阶矩的 x/y 分量会把它顶出来, 而各向同性的炉子对它
+// 完全无感 (方位角上的偏差在球面平均里抵消掉了)。
+//
+// MIS 那两条更硬: 权重之和必须恒为 1, 那是无偏性的全部依据 —— 少了丢能量,
+// 多了凭空多出能量。判据拿跨十五个数量级的 pdf 对去验, 包括幂启发式的平方
+// 最容易溢出的地方。
+// ============================================================================
+
+namespace
+{
+
+/// 与 sampler_probe.comp 里的 SamplerProbeResult 逐字节对齐
+struct FSamplerProbeResult
+{
+    Float32 CosMoments[4];     // Σcosθ, Σcos²θ, Σcos³θ, 样本数
+    Float32 DirectionSum[4];   // Σ方向
+    Float32 MisSums[4];        // Σ(pdf·π/cosθ), Σ|平衡和-1|, Σ|幂和-1|, 组合数
+};
+
+static_assert(sizeof(FSamplerProbeResult) == 48,
+              "探针结果必须与 sampler_probe.comp 里的结构一致");
+
+} // namespace
+
+static bool RunSamplerChecks(FRenderContext* context, FRenderer& renderer)
+{
+    bool passed = true;
+
+    IRHIDevice* const device = context->GetDevice();
+
+    constexpr UInt32 kThreads          = 4096;
+    constexpr UInt32 kSamplesPerThread = 512;
+
+    const Float64 totalSamples =
+        static_cast<Float64>(kThreads) * kSamplesPerThread;
+
+    FRHIShaderHandle          shader;
+    FRHIDescSetLayoutHandle   setLayout;
+    FRHIPipelineLayoutHandle  pipelineLayout;
+    FRHIComputePipelineHandle pipeline;
+    FRHIDescriptorSetHandle   descriptorSet;
+    FRHIBufferHandle          resultBuffer;
+
+    bool ok = true;
+
+    {
+        FShaderManager& shaders = FShaderManager::Get();
+
+        if (!shaders.IsInitialized())
+        {
+            shaders.Initialize();
+        }
+
+        ok = IsRHISuccess(shaders.CreateShaderModule(
+            device, FString("Builtin/sampler_probe.comp"),
+            EShaderStage::Compute, shader));
+    }
+
+    if (ok)
+    {
+        FRHIDescriptorBinding binding = {};
+        binding.Binding    = 0;
+        binding.Type       = EDescriptorType::StorageBuffer;
+        binding.Count      = 1;
+        binding.StageFlags = EShaderStage::Compute;
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = &binding;
+        layoutDesc.BindingCount = 1;
+        layoutDesc.DebugName    = "SamplerProbeSetLayout";
+
+        ok = IsRHISuccess(device->CreateDescSetLayout(layoutDesc, setLayout));
+    }
+
+    if (ok)
+    {
+        FRHIPushConstantRange pushRange = {};
+        pushRange.StageFlags = EShaderStage::Compute;
+        pushRange.Offset     = 0;
+        pushRange.Size       = sizeof(UInt32) * 4;
+
+        FRHIPipelineLayoutDesc layoutDesc = {};
+        layoutDesc.SetLayouts             = &setLayout;
+        layoutDesc.SetLayoutCount         = 1;
+        layoutDesc.PushConstantRanges     = &pushRange;
+        layoutDesc.PushConstantRangeCount = 1;
+        layoutDesc.DebugName              = "SamplerProbeLayout";
+
+        ok = IsRHISuccess(
+            device->CreatePipelineLayout(layoutDesc, pipelineLayout));
+    }
+
+    if (ok)
+    {
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Shader     = shader;
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+        pipelineDesc.PipelineLayout           = pipelineLayout;
+        pipelineDesc.DebugName                = "SamplerProbePipeline";
+
+        ok = IsRHISuccess(device->CreateComputePipeline(pipelineDesc, pipeline));
+    }
+
+    if (ok)
+    {
+        FRHIBufferDesc bufferDesc = {};
+        bufferDesc.Size = static_cast<UInt64>(kThreads) *
+                          sizeof(FSamplerProbeResult);
+        bufferDesc.Usage       = EBufferUsage::StorageBuffer;
+        bufferDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        bufferDesc.DebugName   = "SamplerProbeResults";
+
+        ok = IsRHISuccess(device->CreateBuffer(bufferDesc, resultBuffer));
+    }
+
+    if (ok)
+    {
+        ok = IsRHISuccess(
+            device->AllocateDescriptorSet(setLayout, descriptorSet));
+    }
+
+    if (ok)
+    {
+        FRHIDescriptorWrite write = FRHIDescriptorWrite::StorageBuffer(
+            descriptorSet, 0, resultBuffer, 0,
+            static_cast<UInt64>(kThreads) * sizeof(FSamplerProbeResult));
+
+        device->UpdateDescriptorSets(&write, 1);
+    }
+
+    bool recorded = false;
+
+    if (ok)
+    {
+        renderer.SetPostSceneRenderCallback(
+            [&recorded, context, pipeline, pipelineLayout, descriptorSet,
+             resultBuffer]()
+            {
+                IRHICommandBuffer* cmd = context->GetCurrentCommandBuffer();
+
+                if (cmd == nullptr)
+                {
+                    return;
+                }
+
+                cmd->BindComputePipeline(pipeline);
+                cmd->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                       pipelineLayout, 0, descriptorSet);
+
+                UInt32 push[4] = { kThreads, kSamplesPerThread, 0u, 0u };
+
+                cmd->PushConstants(pipelineLayout, EShaderStage::Compute, 0,
+                                   sizeof(push), push);
+
+                cmd->Dispatch((kThreads + 63u) / 64u, 1, 1);
+
+                FRHIBufferMemoryBarrier barrier = {};
+                barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+                barrier.DstAccessMask = EAccessFlags::HostRead;
+                barrier.Buffer        = resultBuffer;
+
+                cmd->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                     EPipelineStageFlags::Host, nullptr, 0,
+                                     &barrier, 1, nullptr, 0);
+
+                recorded = true;
+            });
+
+        renderer.RenderFrame();
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        ok = recorded;
+    }
+
+    if (ok)
+    {
+        device->WaitIdle();
+
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(resultBuffer, &mapped)) &&
+            mapped != nullptr)
+        {
+            const auto* results =
+                static_cast<const FSamplerProbeResult*>(mapped);
+
+            Float64 sumCos    = 0.0;
+            Float64 sumCos2   = 0.0;
+            Float64 sumCos3   = 0.0;
+            Float64 sumCount  = 0.0;
+            Float64 sumUnitDeviation = 0.0;
+            Float64 sumDirX   = 0.0;
+            Float64 sumDirY   = 0.0;
+            Float64 sumDirZ   = 0.0;
+            Float64 sumPdfId  = 0.0;
+            Float64 sumBalance = 0.0;
+            Float64 sumPower   = 0.0;
+            Float64 sumMisCount = 0.0;
+
+            for (UInt32 i = 0; i < kThreads; ++i)
+            {
+                sumCos   += results[i].CosMoments[0];
+                sumCos2  += results[i].CosMoments[1];
+                sumCos3  += results[i].CosMoments[2];
+                sumCount += results[i].CosMoments[3];
+
+                sumDirX += results[i].DirectionSum[0];
+                sumDirY += results[i].DirectionSum[1];
+                sumDirZ += results[i].DirectionSum[2];
+                sumUnitDeviation += results[i].DirectionSum[3];
+
+                sumPdfId    += results[i].MisSums[0];
+                sumBalance  += results[i].MisSums[1];
+                sumPower    += results[i].MisSums[2];
+                sumMisCount += results[i].MisSums[3];
+            }
+
+            device->UnmapBuffer(resultBuffer);
+
+            // ---- 元判据: 探针真的跑了 ----
+            if (sumCount != totalSamples || sumMisCount != totalSamples)
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[采样器] 样本计数 {} / {} 与预期 {} 不符 —— 探针"
+                         "没跑满或者回读错位",
+                         sumCount, sumMisCount, totalSamples);
+                passed = false;
+            }
+
+            const Float64 meanCos  = sumCos / totalSamples;
+            const Float64 meanCos2 = sumCos2 / totalSamples;
+            const Float64 meanCos3 = sumCos3 / totalSamples;
+
+            const Float64 meanDirX = sumDirX / totalSamples;
+            const Float64 meanDirY = sumDirY / totalSamples;
+            const Float64 meanDirZ = sumDirZ / totalSamples;
+
+            // ---- 误差预算 ----
+            //
+            // 与第八天同一套账: 5.5·σ/√N。5.5 是 Bonferroni 的余量 (这里同时
+            // 判七个量, 双侧误判率要压到 1e-8 量级)。
+            //
+            // σ 用解析方差: Var[cosθ] = E[cos²θ] - E[cosθ]² = 1/2 - 4/9 = 1/18。
+            // 用解析值而不是实测: 实测的 σ 本身受被验对象影响, 采样器错了的话
+            // σ 也跟着错, 预算会跟着变宽 —— 那正是"判据的失败模式落在通过上"。
+            const Float64 sigmaCos  = FMath::Sqrt(1.0 / 18.0);
+            const Float64 sigmaCos2 = FMath::Sqrt(1.0 / 3.0 - 0.25);
+            const Float64 sigmaDir  = FMath::Sqrt(0.25);
+
+            const Float64 budgetCos  = 5.5 * sigmaCos / FMath::Sqrt(totalSamples);
+            const Float64 budgetCos2 = 5.5 * sigmaCos2 / FMath::Sqrt(totalSamples);
+            const Float64 budgetDir  = 5.5 * sigmaDir / FMath::Sqrt(totalSamples);
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[采样器] {} 个样本 — E[cosθ] {} (解析 0.666667, 预算 {}), "
+                     "E[cos²θ] {} (0.5), E[cos³θ] {} (0.4)",
+                     totalSamples, meanCos, budgetCos, meanCos2, meanCos3);
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[采样器] E[方向] ({}, {}, {}) — 解析 (0, 0, 0.666667), "
+                     "预算 {}",
+                     meanDirX, meanDirY, meanDirZ, budgetDir);
+
+            const Float64 expectations[3] = { 2.0 / 3.0, 0.5, 0.4 };
+            const Float64 measured[3]     = { meanCos, meanCos2, meanCos3 };
+            const Float64 budgets[3]      = { budgetCos, budgetCos2,
+                                              budgetCos2 };
+
+            const AnsiChar* names[3] = { "E[cosθ]", "E[cos²θ]", "E[cos³θ]" };
+
+            for (UInt32 k = 0; k < 3; ++k)
+            {
+                const Float64 deviation =
+                    (measured[k] > expectations[k])
+                        ? (measured[k] - expectations[k])
+                        : (expectations[k] - measured[k]);
+
+                // 同样写成否定形式 —— 理由见下面 MIS 那段
+                if (!(deviation <= budgets[k]))
+                {
+                    LIMX_LOG(LogLaunch, Error,
+                             "[采样器] {} 实测 {} 而解析 {} —— 偏差 {} 超过"
+                             "预算 {}。分布不对, 而各向同性的炉子对这种错"
+                             "完全无感",
+                             names[k], measured[k], expectations[k], deviation,
+                             budgets[k]);
+                    passed = false;
+                }
+            }
+
+            // 方位角的偏 —— 一阶矩的 x/y 分量。炉子在球面上平均掉了它。
+            if (!(FMath::Abs(meanDirX) <= budgetDir) ||
+                !(FMath::Abs(meanDirY) <= budgetDir))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[采样器] 一阶矩的横向分量 ({}, {}) 超过预算 {} —— "
+                         "方位角上有偏。这种错在各向同性的炉子里完全隐形: "
+                         "球面平均把它抵消掉了",
+                         meanDirX, meanDirY, budgetDir);
+                passed = false;
+            }
+
+            if (!(FMath::Abs(meanDirZ - 2.0 / 3.0) <= budgetDir))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[采样器] 一阶矩的法线分量 {} 而解析 2/3, 超过预算 {}",
+                         meanDirZ, budgetDir);
+                passed = false;
+            }
+
+            // ---- 采出来的方向必须是单位向量 ----
+            //
+            // 这一条是逐样本的恒等式, 不是统计量。它是唯一看得见 r 那一支的
+            // 量: 矩全都只用 cosθ, 而 x/y 分量在方位角上平均为零 —— 变异
+            // "r = u1 而不是 sqrt(u1)" 因此整个逃掉过一次。
+            const Float64 meanUnitDeviation = sumUnitDeviation / totalSamples;
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[采样器] 方向长度偏离 1 的平均量 {}", meanUnitDeviation);
+
+            if (!(meanUnitDeviation <= 1.0e-6))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[采样器] 采出来的方向不是单位向量 (平均偏离 {}) —— "
+                         "r 与 cosθ 必须满足 r² + cos²θ = 1。矩看不见这一支: "
+                         "它们只用 cosθ, 而横向分量在方位角上平均为零",
+                         meanUnitDeviation);
+                passed = false;
+            }
+
+            // ---- pdf 与采样必须逐样本一致 ----
+            //
+            // pdf·π/cosθ 恒等于 1。这一条不是统计的 —— 它逐样本成立, 所以
+            // 预算只是浮点舍入。它抓的是"采样函数改了而 pdf 函数没跟着改",
+            // 而那种错要几百万个样本才能从矩里看出来。
+            const Float64 meanPdfIdentity = sumPdfId / totalSamples;
+
+            LIMX_LOG(LogLaunch, Display,
+                     "[采样器] pdf·π/cosθ 的均值 {} (应当恒为 1)",
+                     meanPdfIdentity);
+
+            if (!(FMath::Abs(meanPdfIdentity - 1.0) <= 1.0e-5))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[采样器] pdf·π/cosθ 的均值是 {} 而不是 1 —— 采样与"
+                         "pdf 分家了。这一条逐样本成立, 不是统计量",
+                         meanPdfIdentity);
+                passed = false;
+            }
+
+            // ---- MIS 权重之和 ----
+            LIMX_LOG(LogLaunch, Display,
+                     "[采样器] MIS 权重和偏离 1 的平均量 — 平衡 {}, 幂 {}",
+                     sumBalance / totalSamples, sumPower / totalSamples);
+
+            // 权重和必须是 1, 而这是**代数恒等式**: a/(a+b) + b/(a+b) = 1。
+            // 所以预算只留浮点舍入, 不留任何余地。少了丢能量, 多了凭空
+            // 多出能量 —— 而两者在画面上都表现为"这个场景就该这么亮/暗"。
+            // 比较写成**否定形式**, 因为 NaN 会从正向比较里溜走。
+            //
+            // `NaN > 1e-6` 是 false —— 于是权重变成 NaN 时判据反而通过。
+            // 变异"幂启发式不先归一化"正是这么逃掉一次的: pdf 平方溢出
+            // float32 变成 inf, inf/inf = NaN, 而 NaN 让整条比较静默为假。
+            //
+            // 写成 `!(x <= 预算)` 之后 NaN 落在失败一侧: NaN <= x 也是 false,
+            // 取反就是 true。
+            const Float64 balanceDeviation = sumBalance / totalSamples;
+            const Float64 powerDeviation   = sumPower / totalSamples;
+
+            if (!(balanceDeviation <= 1.0e-6) || !(powerDeviation <= 1.0e-6))
+            {
+                LIMX_LOG(LogLaunch, Error,
+                         "[采样器] MIS 权重之和不是 1 (平衡偏 {}, 幂偏 {}) —— "
+                         "那是无偏性的全部依据: 少了丢能量, 多了凭空多出能量。"
+                         "偏差是 NaN 的话通常是 pdf 平方溢出了 float32",
+                         balanceDeviation, powerDeviation);
+                passed = false;
+            }
+        }
+        else
+        {
+            LIMX_LOG(LogLaunch, Error, "[采样器] 回读失败");
+            passed = false;
+        }
+    }
+    else
+    {
+        LIMX_LOG(LogLaunch, Error, "[采样器] 资源创建失败");
+        passed = false;
+    }
+
+    device->DestroyBuffer(resultBuffer);
+    device->DestroyComputePipeline(pipeline);
+    device->DestroyPipelineLayout(pipelineLayout);
+    device->DestroyDescSetLayout(setLayout);
+    device->DestroyShader(shader);
+
+    LIMX_LOG(LogLaunch, Display, "[采样器] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -22533,6 +22954,7 @@ int WINAPI wWinMain(
     bool    lodCrackPassed = true;
     bool    lodGpuPassed = true;
     bool    lodScalePassed = true;
+    bool    samplerPassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -22737,6 +23159,11 @@ int WINAPI wWinMain(
             if (launchOptions.LodScaleCheck)
             {
                 lodScalePassed = RunLodScaleChecks();
+            }
+
+            if (launchOptions.SamplerCheck)
+            {
+                samplerPassed = RunSamplerChecks(&renderContext, renderer);
             }
 
             if (launchOptions.PathTraceCheck)
@@ -23108,6 +23535,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.LodScaleCheck)
     {
         selfCheckCode = FinalizeSelfCheck(lodScalePassed, 44, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.SamplerCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(samplerPassed, 45, errorSink,
                                           errorsBeforeShutdown);
     }
 
