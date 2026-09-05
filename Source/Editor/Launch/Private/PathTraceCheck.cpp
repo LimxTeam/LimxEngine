@@ -1718,8 +1718,6 @@ bool RunGiAccumulationChecks(FRenderContext* context)
     accumR.SetSize(pixelCount, 0.0);
     accumSqR.SetSize(pixelCount, 0.0);
 
-    SizeType accumulatedSamples = 0;
-
     for (UInt32 frame = 0; frame < kFrames; ++frame)
     {
         FPathTraceSettings settings = base;
@@ -1746,8 +1744,6 @@ bool RunGiAccumulationChecks(FRenderContext* context)
             accumR[p]   += pixels[p].SumR;
             accumSqR[p] += pixels[p].SumSqR;
         }
-
-        ++accumulatedSamples;
     }
 
     // ---- B: 一次跑满 N spp ----
@@ -1766,14 +1762,18 @@ bool RunGiAccumulationChecks(FRenderContext* context)
         }
     }
 
-    // ---- 判据三: 样本计数 ----
-    if (accumulatedSamples != kFrames)
-    {
-        LIMX_LOG(LogPathTraceCheck, Error,
-                 "[时域累积] 累积了 {} 帧而不是 {} 帧", accumulatedSamples,
-                 kFrames);
-        passed = false;
-    }
+    // ---- 曾经的"判据三: 样本计数"已删除 ----
+    //
+    // 它数的是**宿主循环自己的迭代次数**: 一个跑 kFrames 次的 for 循环, 每轮
+    // ++accumulatedSamples, 然后断言它等于 kFrames。结构上不可能不等 —— 判据
+    // 恒真, 占着一个判据的位置却什么都不验。
+    //
+    // 它本来想验的性质是"每一帧的贡献都真的落下了", 而那件事上面两条已经
+    // 覆盖: 少一帧则均值偏, 重一帧则方差比偏。
+    //
+    // 想过一个替代品 —— 逐像素的累积主命中计数必须恰好等于 kFrames。它不
+    // 成立: 主射线带亚像素抖动 (path_trace.comp:329), 轮廓像素上这个计数
+    // 本来就在 0 与 kFrames 之间。宁可删掉, 也不换一条同样验不到东西的。
 
     // ---- 统计量 ----
     Float64 meanAccum = 0.0;
@@ -1927,11 +1927,18 @@ bool RunGiAccumulationChecks(FRenderContext* context)
                 }
             }
 
+            // 块数要**问追踪器**, 不能自己按 (spp + 63) / 64 算。
+            //
+            // 那个 64 是从引擎的每块路径数上限 (4M) 除以像素数反推出来的,
+            // 而判据看不见那个常量。上限一旦改大, 这一段就悄悄退化成单块
+            // 派发 —— 分块逻辑一行没走, 而判据照样全绿, 日志里还印着"分 3 块"。
+            // GetLastDispatchCount() 是这条路径唯一的可观测出口。
+            const UInt32 dispatchCount = tracer.GetLastDispatchCount();
+
             LIMX_LOG(LogPathTraceCheck, Display,
-                     "[时域累积] 分块 — {} spp 分 {} 块, 命中像素 {}, "
+                     "[时域累积] 分块 — {} spp 实际分 {} 次派发, 命中像素 {}, "
                      "命中计数不等于 spp 的 {} 个 (最大差 {})",
-                     settings.SamplesPerPixel,
-                     (settings.SamplesPerPixel + 63u) / 64u, hitPixels,
+                     settings.SamplesPerPixel, dispatchCount, hitPixels,
                      badCounts, worstCount);
 
             // 元判据: 必须真的有命中像素, 而且必须真的分了块
@@ -1940,6 +1947,15 @@ bool RunGiAccumulationChecks(FRenderContext* context)
                 LIMX_LOG(LogPathTraceCheck, Error,
                          "[时域累积] 分块那一段没有一个命中像素 —— 判据没验"
                          "到东西");
+                passed = false;
+            }
+
+            if (!(dispatchCount > 1u))
+            {
+                LIMX_LOG(LogPathTraceCheck, Error,
+                         "[时域累积] 这一段只派发了 {} 次 —— 它整个存在的理由"
+                         "就是走分块路径, 单块的话下面两条判据验的是别的东西",
+                         dispatchCount);
                 passed = false;
             }
 

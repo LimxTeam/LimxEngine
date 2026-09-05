@@ -20090,6 +20090,12 @@ static bool RunGBufferChecks(FRenderContext* context,
     const FMatrix viewProjA =
         camera.GetProjectionMatrix() * camera.GetViewMatrix();
 
+    // 帧 B 会把这一个当作"上一帧"用 —— 所以必须**在帧 B 之前**取。
+    //
+    // 必须拷贝而不是引用: 帧 B 的 UpdateViewProj 末尾会把这个成员整个
+    // 覆盖成帧 B 自己的矩阵。持引用的话下面比的就是帧 B 跟帧 B, 恒等于 0。
+    const FMatrix prevForFrameB = renderer.GetPrevViewProjNoJitter();
+
     // ---- 阶段 B: 转动 ----
     camera.SetRotation(baseYaw + kYawDelta, basePitch);
 
@@ -20116,10 +20122,17 @@ static bool RunGBufferChecks(FRenderContext* context,
         return false;
     }
 
-    // 渲染器实际用的上一帧矩阵必须就是阶段 A 那个。这一条直接钉住"保存
-    // 时机错位"这类 bug —— 它比后面的逐像素比较更早、更明确地失败。
-    const FMatrix& rendererPrev = renderer.GetPrevViewProjNoJitter();
-
+    // 帧 B 当作"上一帧"用的那个矩阵, 必须就是阶段 A 的矩阵。
+    //
+    // 这是一条**诊断**而不是独立判据: 实测三个保存时机变异 (挪到消费之前、
+    // 存带抖动的、只存第一帧), 它红的时候下面的逐像素速度判据也红, 一次都
+    // 没有单独抓到过谁。留着是因为它在像素循环之前就失败, 且直接点出原因;
+    // 别把它算进覆盖率。
+    //
+    // 此前这里比的是**帧 B 之后**读到的值与 viewProjB —— 那读到的已经是帧 B
+    // 自己的矩阵了, 与注释宣称的"上一帧"不是一回事。改成在帧 B 之前取, 比的
+    // 才是帧 B 真正消费的那个值。(实测两种比法在上述三个变异上结果相同, 所以
+    // 这次改的是语义, 不是检测力。)
     Float32 prevMatrixDrift = 0.0f;
 
     for (Int32 row = 0; row < 4; ++row)
@@ -20128,7 +20141,7 @@ static bool RunGBufferChecks(FRenderContext* context,
         {
             prevMatrixDrift = FMath::Max(
                 prevMatrixDrift,
-                FMath::Abs(rendererPrev.M[row][col] - viewProjB.M[row][col]));
+                FMath::Abs(prevForFrameB.M[row][col] - viewProjA.M[row][col]));
         }
     }
 
@@ -20137,7 +20150,7 @@ static bool RunGBufferChecks(FRenderContext* context,
     if (prevMatrixDrift > 1.0e-5f)
     {
         LIMX_LOG(LogLaunch, Error,
-                 "[GBuffer] 渲染器保存的上一帧矩阵与本帧矩阵不符 "
+                 "[GBuffer] 帧 B 用的上一帧矩阵与阶段 A 的矩阵不符 "
                  "(最大偏差 {}) —— 保存时机错位",
                  prevMatrixDrift);
         passed = false;
