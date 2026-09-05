@@ -69,6 +69,7 @@
 #include "RenderCore/Geometry/FMeshSimplifier.h"
 #include "RenderCore/Geometry/FMeshletGrouper.h"
 #include "RenderCore/Geometry/FMeshLodDag.h"
+#include "Core/HAL/FPlatformTime.h"
 #include "AssetPipeline/FObjLoader.h"
 #include "Core/Containers/TSortAlgorithms.h"
 
@@ -326,6 +327,7 @@ struct FLaunchOptions
     bool LodSelectCheck = false;
     bool LodCrackCheck = false;
     bool LodGpuCheck = false;
+    bool LodScaleCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -966,6 +968,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--lod-gpu-check"))
         {
             options.LodGpuCheck = true;
+        }
+        else if (WideEquals(arg, L"--lod-scale-check"))
+        {
+            options.LodScaleCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -14195,6 +14201,252 @@ static bool RunLodGpuChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunLodScaleChecks — DAG 构建在规模上必须站得住
+//
+// 这一条不验几何, 验的是**能不能用**。
+//
+// 接资源管线的前提是"导入时把 DAG 建出来"。而简化器的收尾是一遍全局扫描
+// (每个原始点对全部存活三角形取最近), 那是 O(点数 × 三角形数)。组的规模一大,
+// 它就是整条管线的瓶颈 —— 而那种瓶颈不会让任何判据变红, 只会让导入从一秒变
+// 成一分钟, 直到有人受不了去关掉 LOD。
+//
+// 所以这里量三件事:
+//
+//   一、构建耗时随三角形数怎么长。线性还是二次, 一张表就看出来。
+//   二、每一档的 DAG 都必须仍然满足那几条不变式 (单调、无环、叶子无损)。
+//      规模上去之后不变式塌掉是很常见的 —— 分组更碎、简化更容易停滞。
+//   三、最大的那一档必须在**预算**之内。预算不是拍脑袋: 取"导入 Sponza 的
+//      现有预算 2520 ms"的一半, 因为 DAG 是加在导入之上的新成本, 它不该比
+//      原来的整个导入还贵。
+// ============================================================================
+
+static bool RunLodScaleChecks()
+{
+    bool passed = true;
+
+    struct FScaleCase
+    {
+        const AnsiChar* Label;
+        UInt32          Slices;
+        UInt32          Stacks;
+    };
+
+    const FScaleCase cases[5] = {
+        { "球体 32x24",  32u, 24u },
+        { "球体 48x32",  48u, 32u },
+        { "球体 64x48",  64u, 48u },
+        { "球体 96x64",  96u, 64u },
+        { "球体 128x96", 128u, 96u },
+    };
+
+    FMeshLodDagOptions options;
+    options.TargetGroupSize = 16;
+    options.MaxGroupSize    = 32;
+
+    TArray<SizeType> triangleCounts;
+    TArray<Float64>  buildSeconds;
+
+    for (UInt32 c = 0; c < 5; ++c)
+    {
+        const FMeshData mesh = FGeometryGenerator::GenerateSphere(
+            1.0f, cases[c].Slices, cases[c].Stacks);
+
+        const SizeType triangles = mesh.Indices.GetSize() / 3;
+
+        const Float64 start = FPlatformTime::Seconds();
+
+        const FMeshLodDagResult dag =
+            FMeshLodDagBuilder::Build(mesh.Vertices, mesh.Indices, options);
+
+        const Float64 elapsed = FPlatformTime::Seconds() - start;
+
+        triangleCounts.Add(triangles);
+        buildSeconds.Add(elapsed);
+
+        if (!dag.IsValid())
+        {
+            LIMX_LOG(LogLaunch, Error, "[LOD规模] {} — DAG 构建失败",
+                     cases[c].Label);
+            passed = false;
+            continue;
+        }
+
+        // ---- 不变式必须在每一档上都成立 ----
+        //
+        // 只验 O(n) 的那几条 (单调、无环、叶子三角形数)。逐层量误差是
+        // O(点数 × 三角形数), 在最大那一档上要跑几分钟 —— 那条由
+        // --lod-dag-check 在固定规模上验, 这里验的是"规模上去之后结构还在"。
+        SizeType errorViolations  = 0;
+        SizeType sphereViolations = 0;
+        SizeType pairs            = 0;
+
+        for (SizeType l = 0; l < dag.Levels.GetSize(); ++l)
+        {
+            const FLodLevel& level = dag.Levels[l];
+
+            for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+            {
+                const FLodMeshletRecord& record = level.Records[m];
+
+                if (record.TargetGroup == kLodInvalidIndex)
+                {
+                    continue;
+                }
+
+                ++pairs;
+
+                if (!(record.ParentError > record.SelfError))
+                {
+                    ++errorViolations;
+                }
+
+                const FVector3 selfCenter(record.SelfSphere.X,
+                                          record.SelfSphere.Y,
+                                          record.SelfSphere.Z);
+
+                const FVector3 parentCenter(record.ParentSphere.X,
+                                            record.ParentSphere.Y,
+                                            record.ParentSphere.Z);
+
+                if ((selfCenter - parentCenter).Length() + record.SelfSphere.W >
+                    record.ParentSphere.W * 1.0001f + 1.0e-6f)
+                {
+                    ++sphereViolations;
+                }
+            }
+        }
+
+        SizeType leafTriangles = 0;
+
+        for (SizeType m = 0; m < dag.Levels[0].Meshlets.Meshlets.GetSize(); ++m)
+        {
+            leafTriangles += dag.Levels[0].Meshlets.Meshlets[m].TriangleCount;
+        }
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[LOD规模] {} — {} 三角形, {} 层, 父子对 {}, 构建 {} ms "
+                 "({} 三角形/秒)",
+                 cases[c].Label, triangles, dag.Levels.GetSize(), pairs,
+                 elapsed * 1000.0,
+                 static_cast<Float64>(triangles) / FMath::Max(elapsed, 1.0e-9));
+
+        if (leafTriangles != triangles)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD规模] {} — 叶子层 {} 个三角形而原始 {} 个",
+                     cases[c].Label, leafTriangles, triangles);
+            passed = false;
+        }
+
+        if (errorViolations != 0 || sphereViolations != 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD规模] {} — 单调性在这个规模上塌了 (误差 {} 个, "
+                     "球 {} 个) —— 规模一大分组更碎、简化更容易停滞, 不变式"
+                     "不会自动跟着成立",
+                     cases[c].Label, errorViolations, sphereViolations);
+            passed = false;
+        }
+
+        if (pairs == 0)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD规模] {} — 一个父子对都没有, 这一档没验到东西",
+                     cases[c].Label);
+            passed = false;
+        }
+    }
+
+    // ---- 增长阶数 ----
+    //
+    // 相邻两档的 (耗时比 / 三角形数比) 的对数比, 就是局部的阶。线性是 1,
+    // 二次是 2。报出来而不是判定: 阶数本身随实现变, 而真正该卡的是下面那条
+    // 绝对预算。但它必须**印出来** —— 悄悄变成二次而总时间还没超预算时,
+    // 这个数是唯一的预警。
+    for (SizeType i = 1; i < triangleCounts.GetSize(); ++i)
+    {
+        const Float64 sizeRatio = static_cast<Float64>(triangleCounts[i]) /
+                                  static_cast<Float64>(triangleCounts[i - 1]);
+
+        const Float64 timeRatio =
+            buildSeconds[i] / FMath::Max(buildSeconds[i - 1], 1.0e-9);
+
+        // FMath::Log 收 Float32 —— 阶数只是个诊断量, 显式降精度而不是让
+        // 编译器隐式截断 (那会撞 /W4 /WX)。
+        const Float32 order =
+            FMath::Log(static_cast<Float32>(timeRatio)) /
+            FMath::Log(static_cast<Float32>(sizeRatio));
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[LOD规模] {} -> {} 三角形: 耗时 x{}, 局部阶 {}",
+                 triangleCounts[i - 1], triangleCounts[i], timeRatio, order);
+
+        // 阶数要判, 不只是印。
+        //
+        // 这个算法**应当**是线性的: 简化器的收尾是 O(点数 × 三角形数), 但它
+        // 跑在**组**上 (每组至多 32 个 meshlet, 也就是几千个三角形), 而组数
+        // 随规模线性增长。所以总量线性。
+        //
+        // 局部阶超过 1.5 意味着那个"组的规模有界"塌了 —— 例如分组退化成一个
+        // 巨大的组, 或者收尾那一遍不知怎么变回了全网格。实测 0.79 到 1.05,
+        // 1.5 离噪声很远, 又离二次 (2.0) 有余量。
+        if (order > 1.5f)
+        {
+            LIMX_LOG(LogLaunch, Error,
+                     "[LOD规模] {} -> {} 三角形的局部阶是 {} —— 这个算法应当"
+                     "线性 (简化器的 O(n²) 收尾跑在**组**上, 而组的规模有界)。"
+                     "超线性说明组的规模有界这条塌了",
+                     triangleCounts[i - 1], triangleCounts[i], order);
+            passed = false;
+        }
+    }
+
+    // ---- 绝对预算 ----
+    //
+    // 取导入 Sponza 那条预算 (2520 ms) 的一半。DAG 是加在导入之上的新成本,
+    // 它不该比原来的整个导入还贵 —— 否则接管线的那一天必然是"先关掉 LOD"。
+    constexpr Float64 kBuildBudgetMs = 1260.0;
+
+    const Float64 largestMs = buildSeconds[buildSeconds.GetSize() - 1] * 1000.0;
+
+    if (largestMs > kBuildBudgetMs)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD规模] 最大一档 ({} 三角形) 构建耗时 {} ms, 超过预算 "
+                 "{} ms —— 预算取的是导入 Sponza 那条的一半: DAG 是加在导入"
+                 "之上的新成本, 比整个导入还贵的话, 接管线那天的第一件事就是"
+                 "把它关掉",
+                 triangleCounts[triangleCounts.GetSize() - 1], largestMs,
+                 kBuildBudgetMs);
+        passed = false;
+    }
+
+    // ---- 外推到真实资产 ----
+    //
+    // 这个数不判定, 但必须印出来: 它是"DAG 该在什么时候建"这个架构问题的
+    // 全部依据。
+    {
+        const Float64 throughput =
+            static_cast<Float64>(triangleCounts[triangleCounts.GetSize() - 1]) /
+            FMath::Max(buildSeconds[buildSeconds.GetSize() - 1], 1.0e-9);
+
+        constexpr Float64 kSponzaTriangles = 262000.0;
+
+        LIMX_LOG(LogLaunch, Display,
+                 "[LOD规模] 吞吐 {} 三角形/秒 —— 外推到 Sponza ({} 三角形) "
+                 "约 {} ms, 而导入本身的中位数是 1250 ms。也就是说 DAG 若在"
+                 "**导入时**建, 导入会变成原来的 {} 倍。它属于烘焙期。",
+                 throughput, kSponzaTriangles,
+                 kSponzaTriangles / throughput * 1000.0,
+                 1.0 + kSponzaTriangles / throughput * 1000.0 / 1250.0);
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[LOD规模] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -22280,6 +22532,7 @@ int WINAPI wWinMain(
     bool    lodSelectPassed = true;
     bool    lodCrackPassed = true;
     bool    lodGpuPassed = true;
+    bool    lodScalePassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -22479,6 +22732,11 @@ int WINAPI wWinMain(
             if (launchOptions.LodGpuCheck)
             {
                 lodGpuPassed = RunLodGpuChecks(&renderContext, renderer);
+            }
+
+            if (launchOptions.LodScaleCheck)
+            {
+                lodScalePassed = RunLodScaleChecks();
             }
 
             if (launchOptions.PathTraceCheck)
@@ -22844,6 +23102,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.LodGpuCheck)
     {
         selfCheckCode = FinalizeSelfCheck(lodGpuPassed, 43, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.LodScaleCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(lodScalePassed, 44, errorSink,
                                           errorsBeforeShutdown);
     }
 
