@@ -56,6 +56,7 @@
 #include "RenderCore/Lighting/FClusterGrid.h"
 #include "Renderer/RenderPass/FClusterLightPass.h"
 #include "Renderer/RenderPass/FGtaoPass.h"
+#include "Renderer/RenderPass/FTaaPass.h"
 #include "Renderer/RenderPass/FBloomPass.h"
 #include "Renderer/RenderPass/FShadowAtlasPass.h"
 #include "Renderer/RenderPass/FGpuCullPass.h"
@@ -172,6 +173,9 @@ struct FLaunchOptions
 
     /// TAA 自检: 断言解析结果比任何单帧都更接近多帧平均, 以退出码报告
     bool TaaCheck = false;
+
+    /// 时域重投影自检 —— 令 blend=0 使解析输出直接暴露重投影映射
+    bool ReprojectCheck = false;
 
     /// 启用屏幕空间环境光遮蔽
     bool Gtao = false;
@@ -570,6 +574,7 @@ bool WideEquals(const WideChar* a, const WideChar* b)
 ///   --gbuffer-check  G-Buffer 自检: 法线编码与速度矢量校验, 以退出码报告
 ///   --taa            启用时域抗锯齿 (Halton 2,3 抖动 + 解析通道)
 ///   --taa-check      TAA 自检: 与多帧平均比对, 以退出码报告
+///   --reproject-check 时域重投影自检: 与解析预测逐像素比对, 以退出码报告
 ///   --gtao           启用屏幕空间环境光遮蔽
 ///   --gtao-half      GTAO 在半分辨率上求解 + 双边上采样
 ///   --ao-half-check  半分辨率 AO 自检: 与全分辨率逐像素比对, 以退出码报告
@@ -1015,6 +1020,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--taa-check"))
         {
             options.TaaCheck = true;
+        }
+        else if (WideEquals(arg, L"--reproject-check"))
+        {
+            options.ReprojectCheck = true;
         }
         else if (WideEquals(arg, L"--taa"))
         {
@@ -19038,6 +19047,843 @@ static bool RunTaaChecks(FRenderContext* context, FRenderer& renderer)
 }
 
 // ============================================================================
+// RunReprojectChecks — 让 TAA 的重投影本身可判
+//
+// 现有的 --taa-check **全程相机静止**。静止时速度恒为零, 于是 taa.frag 里的
+// historyUV 恒等于 fragUV —— 重投影、出屏拒绝这两段代码只以恒等映射的形式
+// 被走过。一个把 historyUV 写死成 fragUV 的实现在那条判据下拿满分。
+//
+// 这一条把重投影**映射本身**暴露出来, 靠的是一个恒等式而不是新的着色器输出:
+//
+//     令 blend.x = 0 (当前帧权重为零) 且 γ 足够大使方差裁剪失效, 则
+//
+//         outResolve(p) ≡ history(historyUV(p))
+//
+// 于是解析输出就是"历史图被重投影映射搬运之后的样子"。拿它与 CPU 独立算出的
+// 预测比, 重投影准不准变成逐像素的数, 而不是"看着糊不糊"。
+//
+// 为什么两帧的 blend 不同: 帧 A 用 blend.x = 1 (纯当前帧), 于是历史缓冲里
+// 装的是真实场景; 帧 B 才切到 0。两帧都设 0 的话画面里永远没有场景内容,
+// 判据比的是一片常数, 恒真。
+//
+// CPU 侧的预测**不抄着色器那一行**, 而是从相机矩阵重新推:
+//     像素 -> NDC -> (用 inverse(viewProjB)) 远平面世界点 -> (用 viewProjA)
+//     -> NDC' -> uv'
+// 这条路径不碰速度缓冲、不碰 taa.frag 的任何中间量。两者相符才说明符号、
+// 0.5 缩放、Y 轴三个约定都对 —— 抄着色器的话验的只剩"这段代码等于它自己"。
+//
+// 相机只转不平移: 纯旋转下同一条视线上的所有点投到同一个像素, 重投影与深度
+// 无关, 于是远平面上那个点算出的 uv' 就是精确解。而深度在前向通道之后是
+// DontCare 的, 本来也读不到。
+//
+// 两侧都要判 (RunGBufferChecks 阶段 B/C 的范式):
+//   * 静止时必须恒等 —— 否则重投影在不该动的时候动了;
+//   * 动起来时位移必须真的非零 —— 否则上一条被"写死成恒等映射"免费满足。
+// 只判前一条的实现正是今天要抓的那个。
+//
+// ── 覆盖边界 (三条, 都要明说) ──
+//
+// 一、**几乎分不出"重投影正确"与"根本不用历史"。** 纯旋转 + 静态场景下,
+//     把历史重投影过来与直接渲染当前帧给出的是同一张图 —— 那正是重投影的
+//     定义。两者唯一的差别是**重采样模糊**: 重投影出来的是双线性采样过的,
+//     重新渲染的是锐利的。
+//
+//     实测这个差别有多薄: 把 ReprojectIsOnScreen 改成恒为假 (每个像素都
+//     丢弃历史、输出当前帧), 43813 个受判像素里只有 **3 个**超预算, 所需
+//     系数最大 15.17 而预算系数是 12。余量 1.26 倍。
+//
+//     3 个像素不算抓住, 那是噪声。预算取 16 而不是 12, 这条变异就整个走掉。
+//     **所以不要把"恒拒绝"算进这条判据的覆盖。** 它由 --taa-check 的第一条
+//     真正覆盖 (TAA 输出必须比任何单帧都更接近多帧均值, 而恒拒绝 = 单帧)。
+//     两条判据必须同时存在, 删掉 --taa-check 就打开了这里的洞。
+//
+// 二、**只抓得住粗的重投影错误。** 预算里占大头的不是重投影误差, 而是
+//     "GPU 先混合后色调映射, CPU 在映射后的图上插值"这个不交换 —— 详见
+//     kResidualGradientSlack 旁边的账。要抓亚像素精度得回读色调映射前的
+//     解析纹理。
+//
+// 三、**物体运动完全没覆盖。** gbuffer.vert 只有相机的 prevViewProj, 没有
+//     prevModel, 所以移动物体的速度恒为零。这里只让相机动。
+// ============================================================================
+
+namespace
+{
+
+/// FScreenshotCapture::ReadPixels 回读的是**每像素 3 字节**的 RGB
+///
+/// 不是 RGBA。按 4 索引会越界写坏堆, 而症状是进程在之后某个不相干的地方
+/// 以 0x80000003 死掉 —— 与真正的原因隔着几万行。
+constexpr SizeType kScreenshotChannels = 3;
+
+/// 在 8 位 RGB 图上做双线性取样, 返回三个通道的 [0,255] 浮点值
+///
+/// 与 GPU 的双线性对齐: 纹素中心在 (i + 0.5) / N, 所以 uv 先乘尺寸再减 0.5。
+/// 边缘按 clamp-to-edge 夹住。
+static void SampleBilinearRGB(const TArray<UInt8>& image, UInt32 width,
+                              UInt32 height, Float32 u, Float32 v,
+                              Float32 outRgb[3])
+{
+    const Float32 x = u * static_cast<Float32>(width) - 0.5f;
+    const Float32 y = v * static_cast<Float32>(height) - 0.5f;
+
+    const Int32 x0 = static_cast<Int32>(FMath::Floor(x));
+    const Int32 y0 = static_cast<Int32>(FMath::Floor(y));
+
+    const Float32 fx = x - static_cast<Float32>(x0);
+    const Float32 fy = y - static_cast<Float32>(y0);
+
+    const Int32 maxX = static_cast<Int32>(width) - 1;
+    const Int32 maxY = static_cast<Int32>(height) - 1;
+
+    const Int32 cx0 = FMath::Clamp(x0, 0, maxX);
+    const Int32 cx1 = FMath::Clamp(x0 + 1, 0, maxX);
+    const Int32 cy0 = FMath::Clamp(y0, 0, maxY);
+    const Int32 cy1 = FMath::Clamp(y0 + 1, 0, maxY);
+
+    for (Int32 c = 0; c < 3; ++c)
+    {
+        const SizeType i00 =
+            (static_cast<SizeType>(cy0) * width + cx0) * kScreenshotChannels +
+            c;
+        const SizeType i10 =
+            (static_cast<SizeType>(cy0) * width + cx1) * kScreenshotChannels +
+            c;
+        const SizeType i01 =
+            (static_cast<SizeType>(cy1) * width + cx0) * kScreenshotChannels +
+            c;
+        const SizeType i11 =
+            (static_cast<SizeType>(cy1) * width + cx1) * kScreenshotChannels +
+            c;
+
+        const Float32 top =
+            static_cast<Float32>(image[i00]) * (1.0f - fx) +
+            static_cast<Float32>(image[i10]) * fx;
+        const Float32 bottom =
+            static_cast<Float32>(image[i01]) * (1.0f - fx) +
+            static_cast<Float32>(image[i11]) * fx;
+
+        outRgb[c] = top * (1.0f - fy) + bottom * fy;
+    }
+}
+
+/// 本像素与四邻的最大通道差 —— 局部梯度的一个上界估计
+///
+/// 判据要靠它定预算: 重投影偏了 d 个像素, 颜色上的后果约等于 梯度 x d。
+/// 梯度为零的地方无论重投影多离谱, 颜色都不变 —— 那里这条判据什么都验不到,
+/// 所以它们必须被排除, 而且"被排除的比例"本身要成为一条元判据。
+static Float32 LocalGradient(const TArray<UInt8>& image, UInt32 width,
+                             UInt32 height, UInt32 x, UInt32 y)
+{
+    const SizeType center =
+        (static_cast<SizeType>(y) * width + x) * kScreenshotChannels;
+
+    Float32 maxDelta = 0.0f;
+
+    const Int32 offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+
+    for (Int32 k = 0; k < 4; ++k)
+    {
+        const Int32 nx = static_cast<Int32>(x) + offsets[k][0];
+        const Int32 ny = static_cast<Int32>(y) + offsets[k][1];
+
+        if (nx < 0 || ny < 0 || nx >= static_cast<Int32>(width) ||
+            ny >= static_cast<Int32>(height))
+        {
+            continue;
+        }
+
+        const SizeType neighbor =
+            (static_cast<SizeType>(ny) * width + nx) * kScreenshotChannels;
+
+        for (Int32 c = 0; c < 3; ++c)
+        {
+            const Float32 delta =
+                FMath::Abs(static_cast<Float32>(image[center + c]) -
+                           static_cast<Float32>(image[neighbor + c]));
+
+            maxDelta = FMath::Max(maxDelta, delta);
+        }
+    }
+
+    return maxDelta;
+}
+
+} // namespace
+
+static bool RunReprojectChecks(FRenderContext* context, FRenderer& renderer)
+{
+    FTaaPass* const taa = renderer.GetTaaPass();
+
+    if (taa == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[重投影] TAA 通道不存在");
+        return false;
+    }
+
+    FCamera& camera = renderer.GetCamera();
+
+    const Float32 baseYaw   = camera.GetYaw();
+    const Float32 basePitch = camera.GetPitch();
+
+    // 2.9 度 —— 与 --gbuffer-check 同一个量。够大使位移远超速度缓冲的量化
+    // 台阶, 又够小使绝大多数像素的历史仍然落在屏内 (出屏的那些进不了比对,
+    // 位移太大会把可判集合掏空)。
+    constexpr Float32 kYawDelta = 0.05f;
+
+    // 让方差裁剪失效。裁剪范围是 均值 ± γ·标准差, γ 取得足够大之后
+    // clamp 变成恒等 —— 除非局部标准差**恰好**为零, 而那种像素梯度也为零,
+    // 本来就被下面的梯度掩码排除掉了。
+    constexpr Float32 kDisableClipGamma = 1.0e6f;
+
+    // 只在梯度足够大的像素上判。梯度为零处重投影再离谱颜色也不变 —— 那里
+    // 这条判据什么都验不到, 留着只会稀释统计量。8/255 约是三个量化档。
+    constexpr Float32 kGradientFloor = 8.0f;
+
+    // 残差预算 = 系数 x 局部梯度 + 常数项。
+    //
+    // 系数由实测定: 综合场景上"残差/梯度"的中位数是 0, 99% 是 0.36,
+    // 99.9% 是 2.48, 最大 6.02。取 12 是最大值的两倍。
+    //
+    // 为什么这个数不能更小 —— 预算里占大头的**不是**重投影误差:
+    //
+    //   GPU 采的是色调映射**前**的 HDR 历史缓冲, 之后整条后处理链再做映射;
+    //   而这里的 CPU 预测采的是映射**后**的 8 位图。于是比的是
+    //
+    //       tonemap(bilinear(HDR))   与   bilinear(tonemap(HDR))
+    //
+    //   双线性与 ACES 不交换, 在亮暗交界处两者差几倍于局部的 8 位梯度是
+    //   正常的。这是"通过色调映射器测量"的结构性代价。
+    //
+    // 所以这条判据的覆盖边界要说清楚: 它抓得住**粗**的重投影错误 —— 符号
+    // 翻转、漏掉 0.5、翻 Y, 那几种的位移是真实位移的两倍 (这里约 95 像素),
+    // 取到的历史与预测毫不相干; 它抓不住亚像素级的重投影精度。要抓后者得
+    // 回读色调映射前的解析纹理, 那是另一天的事。
+    constexpr Float32 kResidualGradientSlack = 12.0f;
+
+    // 常数项吸收 8 位量化 (两档) 与双线性权重的舍入
+    constexpr Float32 kResidualFloor = 4.0f;
+
+    // 关掉泛光: 它是空间性的, 会把邻域的能量搬进本像素, 于是"逐像素等于
+    // 重投影后的历史"这个恒等式不再成立。色调映射是逐像素的, 无妨。
+    renderer.SetBloomEnabled(false);
+
+    // 抖动必须关: 开着的话帧 A 的画面带一个亚像素偏移, 而 CPU 侧的解析预测
+    // 用的是无抖动矩阵, 两者差半个像素 —— 那个差会被算进残差, 淹掉判据要
+    // 抓的东西。先 SetTaaEnabled(true) 打开解析通道, 再单独关掉抖动。
+    renderer.SetTaaEnabled(true);
+    renderer.SetTemporalJitterEnabled(false);
+
+    const FRHIExtent2D extent = context->GetSwapchainExtent();
+
+    if (extent.Width < 64 || extent.Height < 64)
+    {
+        LIMX_LOG(LogLaunch, Error, "[重投影] 交换链太小: {}x{}", extent.Width,
+                 extent.Height);
+        return false;
+    }
+
+    bool passed = true;
+
+    // ---- 阶段 A: 纯当前帧, 把真实场景灌进历史缓冲 ----
+    taa->SetBlendFactor(1.0f);
+    taa->SetClipGamma(1.0f);
+
+    camera.SetRotation(baseYaw, basePitch);
+
+    TArray<UInt8> imageA;
+
+    // 多渲几帧让历史与解析都落到位姿 A 上 —— 只渲一帧的话历史里还留着
+    // 上一个位姿的内容, 而那正是这条判据要区分的东西。
+    for (UInt32 i = 0; i < 3; ++i)
+    {
+        if (!CaptureShadedFrame(context, renderer, imageA))
+        {
+            return false;
+        }
+    }
+
+    if (imageA.GetSize() != static_cast<SizeType>(extent.Width) *
+                                extent.Height * kScreenshotChannels)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 回读了 {} 字节, 而 {}x{} 每像素 {} 通道应当是 {} "
+                 "—— 按错的跨距索引会越界写坏堆, 而进程会在几万行之外死掉",
+                 imageA.GetSize(), extent.Width, extent.Height,
+                 kScreenshotChannels,
+                 static_cast<SizeType>(extent.Width) * extent.Height *
+                     kScreenshotChannels);
+        return false;
+    }
+
+    // ---- 阶段 B: 相机不动, 纯历史 ----
+    //
+    // 静止时速度恒为零, 重投影必须是恒等映射, 于是输出必须**逐像素等于**
+    // 阶段 A 的画面。这一条单独存在时是可以被"写死成恒等映射"免费满足的,
+    // 所以它必须与阶段 C 成对出现。
+    taa->SetBlendFactor(0.0f);
+    taa->SetClipGamma(kDisableClipGamma);
+
+    TArray<UInt8> imageStatic;
+
+    if (!CaptureShadedFrame(context, renderer, imageStatic))
+    {
+        return false;
+    }
+
+    if (imageStatic.GetSize() != imageA.GetSize())
+    {
+        LIMX_LOG(LogLaunch, Error, "[重投影] 帧尺寸在采集途中变了");
+        return false;
+    }
+
+    SizeType staticMismatch = 0;
+    Float32  staticWorst    = 0.0f;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const SizeType base =
+                (static_cast<SizeType>(y) * extent.Width + x) *
+                kScreenshotChannels;
+
+            for (Int32 c = 0; c < 3; ++c)
+            {
+                const Float32 delta =
+                    FMath::Abs(static_cast<Float32>(imageStatic[base + c]) -
+                               static_cast<Float32>(imageA[base + c]));
+
+                staticWorst = FMath::Max(staticWorst, delta);
+
+                if (delta > 1.0f)
+                {
+                    ++staticMismatch;
+                }
+            }
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[重投影] 静止: 与上一帧差超过 1/255 的通道数 {} (最大差 {})",
+             staticMismatch, staticWorst);
+
+    // ---- 阶段 C: 转动, 纯历史 ----
+    const FMatrix viewProjA =
+        camera.GetProjectionMatrix() * camera.GetViewMatrix();
+
+    camera.SetRotation(baseYaw + kYawDelta, basePitch);
+
+    TArray<UInt8> imageMoved;
+
+    if (!CaptureShadedFrame(context, renderer, imageMoved))
+    {
+        return false;
+    }
+
+    const FMatrix viewProjB =
+        camera.GetProjectionMatrix() * camera.GetViewMatrix();
+
+    const FMatrix inverseB = viewProjB.Inverse();
+
+    // ---- 阶段 D: 同一位姿, 纯当前帧 + 法线缓冲 ----
+    //
+    // 出屏的像素走的是 taa.frag 的提前返回, 输出的是**当前帧**。要判那条
+    // 路径就得有当前帧长什么样。
+    //
+    // 同一帧里还要把法线缓冲取下来, 因为**天空必须被排除**:
+    //
+    //   速度缓冲在天空处是清成 0 的 (没有几何, 没有上一帧位置可言)。于是
+    //   着色器对天空像素算出 historyUV = fragUV, 判定为屏内、照常取历史;
+    //   而这里的解析预测假设每个像素都跟着相机转, 把它们算成出屏。两边的
+    //   集合定义不一致 —— 实测有 15446 个像素落在这个分歧里, 而那是判据
+    //   的模型错了, 不是实现错了。
+    //
+    // 法线缓冲的哨兵 (|x| 或 |y| 超过 1) 正好标出"这个像素没有几何", 与
+    // --gbuffer-check 用的是同一个判定。
+    FDepthPrePass* const depthPass = renderer.GetDepthPrePass();
+
+    if (depthPass == nullptr)
+    {
+        LIMX_LOG(LogLaunch, Error, "[重投影] 深度预通道不存在");
+        return false;
+    }
+
+    taa->SetBlendFactor(1.0f);
+
+    TArray<UInt8>    imageCurrentB;
+    TArray<FVector2> normalB;
+
+    {
+        FScreenshotCapture shot;
+        FGBufferCapture    gbuffer;
+
+        if (!shot.Request(context))
+        {
+            return false;
+        }
+
+        if (!gbuffer.Request(context))
+        {
+            shot.Release(context->GetDevice());
+            return false;
+        }
+
+        renderer.SetPostSceneRenderCallback(
+            [&shot, &gbuffer, context, depthPass]()
+            {
+                shot.RecordCopy(context);
+                gbuffer.RecordCopy(context, depthPass);
+            });
+
+        renderer.RenderFrame();
+
+        renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+        const bool shotOk = shot.ReadPixels(context, imageCurrentB);
+        const bool gbufOk = gbuffer.Resolve(context);
+
+        if (gbufOk)
+        {
+            normalB = gbuffer.GetNormal();
+        }
+
+        shot.Release(context->GetDevice());
+        gbuffer.Release(context->GetDevice());
+
+        if (!shotOk || !gbufOk)
+        {
+            LIMX_LOG(LogLaunch, Error, "[重投影] 阶段 D 回读失败");
+            return false;
+        }
+    }
+
+    if (normalB.GetSize() !=
+        static_cast<SizeType>(extent.Width) * extent.Height)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 法线缓冲尺寸 {} 与交换链 {}x{} 不符",
+                 normalB.GetSize(), extent.Width, extent.Height);
+        return false;
+    }
+
+    // ---- 逐像素比对 ----
+    SizeType evaluated     = 0;
+    SizeType offScreen     = 0;
+    SizeType overBudget    = 0;
+    SizeType lowGradient   = 0;
+    Float32  worstResidual = 0.0f;
+
+    SizeType offScreenMismatch = 0;
+    Float32  offScreenWorst    = 0.0f;
+
+    // 负对照: 假重投影 (historyUV := fragUV) 会给出什么残差。
+    //
+    // 不需要真的去跑一遍假实现 —— 假实现的输出就是 imageA(p) 本身, 而那张
+    // 图已经在手上。于是"这套判据有没有能力抓住假实现"变成一个能在同一次
+    // 采集里、用**同一套预算**算出来的数。
+    //
+    // 这一条的价值不在抓假实现 (判据二已经抓了), 而在于它是唯一一条会因为
+    // **有人把预算调松**而变红的机制。判据最常见的腐烂方向不是写错, 是后来
+    // 被一点点放宽, 而放宽到某一步之后判据二就再也红不了了 —— 那时这一条
+    // 会先红。
+    SizeType fakeOverBudget = 0;
+
+    // 位移与梯度的直方图 —— 取中位数用, 免得为了排序再开一份数组
+    constexpr Int32 kDisplacementBins = 512;
+    SizeType displacementHistogram[kDisplacementBins] = {};
+    SizeType displacementCount = 0;
+
+    // 残差 / 梯度 的分布 —— 预算的系数从这里读出来
+    constexpr Int32 kSlackBins = 1024;
+    SizeType slackHistogram[kSlackBins] = {};
+
+    // 有效像素的空间分布 —— 16x16 的格子
+    constexpr Int32 kCellsPerSide = 16;
+    constexpr Int32 kCellCount    = kCellsPerSide * kCellsPerSide;
+
+    bool cellOccupied[kCellCount] = {};
+
+    SizeType skyPixels = 0;
+
+    for (UInt32 y = 0; y < extent.Height; ++y)
+    {
+        for (UInt32 x = 0; x < extent.Width; ++x)
+        {
+            const SizeType index =
+                static_cast<SizeType>(y) * extent.Width + x;
+
+            // 没有几何的像素 (天空) 整个排除 —— 它们的速度是清成 0 的,
+            // 于是着色器与这里的解析模型对"历史在哪"的答案本来就不同。
+            if (FMath::Abs(normalB[index].X) > 1.0f ||
+                FMath::Abs(normalB[index].Y) > 1.0f)
+            {
+                ++skyPixels;
+                continue;
+            }
+
+            const Float32 ndcX =
+                (static_cast<Float32>(x) + 0.5f) /
+                    static_cast<Float32>(extent.Width) * 2.0f - 1.0f;
+            const Float32 ndcY =
+                (static_cast<Float32>(y) + 0.5f) /
+                    static_cast<Float32>(extent.Height) * 2.0f - 1.0f;
+
+            // 反投影到远平面。纯旋转下同一视线上任何点算出的 uv' 相同,
+            // 所以取哪个深度都行 —— 而深度本来也读不到。
+            const FVector4 farClip(ndcX, ndcY, 1.0f, 1.0f);
+            const FVector4 farWorld = inverseB.TransformVector4(farClip);
+
+            if (FMath::Abs(farWorld.W) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            const FVector4 worldPoint(farWorld.X / farWorld.W,
+                                      farWorld.Y / farWorld.W,
+                                      farWorld.Z / farWorld.W, 1.0f);
+
+            const FVector4 prevClip = viewProjA.TransformVector4(worldPoint);
+
+            if (FMath::Abs(prevClip.W) < 1.0e-9f)
+            {
+                continue;
+            }
+
+            const Float32 prevNdcX = prevClip.X / prevClip.W;
+            const Float32 prevNdcY = prevClip.Y / prevClip.W;
+
+            const Float32 prevU = prevNdcX * 0.5f + 0.5f;
+            const Float32 prevV = prevNdcY * 0.5f + 0.5f;
+
+            const SizeType pixelBase =
+                (static_cast<SizeType>(y) * extent.Width + x) *
+                kScreenshotChannels;
+
+            // 出屏的像素走的是 taa.frag 的提前返回, 输出**当前帧**。
+            //
+            // 这一条不是凑数的: "把出屏判定删掉、钳到边缘照样采"这种实现
+            // (真实 TAA 里最常见的边缘拖尾) 会让这些像素变成边缘那一列的
+            // 涂抹, 与当前帧完全不同。实测把 ReprojectIsOnScreen 改成恒真
+            // 之后, 判据一二三里只有这一条会红。
+            if (prevU < 0.0f || prevU > 1.0f || prevV < 0.0f || prevV > 1.0f)
+            {
+                ++offScreen;
+
+                for (Int32 c = 0; c < 3; ++c)
+                {
+                    const Float32 delta = FMath::Abs(
+                        static_cast<Float32>(imageMoved[pixelBase + c]) -
+                        static_cast<Float32>(imageCurrentB[pixelBase + c]));
+
+                    offScreenWorst = FMath::Max(offScreenWorst, delta);
+
+                    if (delta > 1.0f)
+                    {
+                        ++offScreenMismatch;
+                        break;
+                    }
+                }
+
+                continue;
+            }
+
+            const Float32 curU =
+                (static_cast<Float32>(x) + 0.5f) /
+                static_cast<Float32>(extent.Width);
+            const Float32 curV =
+                (static_cast<Float32>(y) + 0.5f) /
+                static_cast<Float32>(extent.Height);
+
+            const Float32 dxPixels =
+                (prevU - curU) * static_cast<Float32>(extent.Width);
+            const Float32 dyPixels =
+                (prevV - curV) * static_cast<Float32>(extent.Height);
+
+            const Float32 displacement =
+                FMath::Sqrt(dxPixels * dxPixels + dyPixels * dyPixels);
+
+            const Int32 bin = FMath::Clamp(
+                static_cast<Int32>(displacement * 8.0f), 0,
+                kDisplacementBins - 1);
+
+            ++displacementHistogram[bin];
+            ++displacementCount;
+
+            const Float32 gradient =
+                LocalGradient(imageA, extent.Width, extent.Height, x, y);
+
+            if (gradient < kGradientFloor)
+            {
+                ++lowGradient;
+                continue;
+            }
+
+            Float32 predicted[3] = {};
+
+            SampleBilinearRGB(imageA, extent.Width, extent.Height, prevU,
+                              prevV, predicted);
+
+            Float32 residual = 0.0f;
+
+            for (Int32 c = 0; c < 3; ++c)
+            {
+                residual = FMath::Max(
+                    residual,
+                    FMath::Abs(
+                        static_cast<Float32>(imageMoved[pixelBase + c]) -
+                        predicted[c]));
+            }
+
+            ++evaluated;
+
+            {
+                const Int32 cellX = FMath::Clamp(
+                    static_cast<Int32>(x * kCellsPerSide / extent.Width), 0,
+                    kCellsPerSide - 1);
+                const Int32 cellY = FMath::Clamp(
+                    static_cast<Int32>(y * kCellsPerSide / extent.Height), 0,
+                    kCellsPerSide - 1);
+
+                cellOccupied[cellY * kCellsPerSide + cellX] = true;
+            }
+
+            worstResidual = FMath::Max(worstResidual, residual);
+
+            // "这个像素要多大的系数才放得过" —— 预算就是从这个量的分布定的,
+            // 而不是先写一个数再看它过不过。
+            const Float32 requiredSlack = residual / gradient;
+
+            const Int32 slackBin = FMath::Clamp(
+                static_cast<Int32>(requiredSlack * 64.0f), 0,
+                kSlackBins - 1);
+
+            ++slackHistogram[slackBin];
+
+            // 预算与局部梯度成正比: 重投影偏了 d 个像素, 颜色上的后果约等于
+            // 梯度 x d。合法的 d 有两个来源 —— 速度缓冲的半精度量化, 以及
+            // 双线性与色调映射不交换 (GPU 先混合再映射, CPU 在映射后的图上
+            // 插值)。两者都是亚像素级。系数与常数项在下面实测之后确定。
+            const Float32 budget = kResidualGradientSlack * gradient +
+                                   kResidualFloor;
+
+            if (!(residual <= budget))
+            {
+                ++overBudget;
+            }
+
+            // 负对照 —— 同一套预算, 换成假实现会给出的那个残差
+            Float32 fakeResidual = 0.0f;
+
+            for (Int32 c = 0; c < 3; ++c)
+            {
+                fakeResidual = FMath::Max(
+                    fakeResidual,
+                    FMath::Abs(static_cast<Float32>(imageA[pixelBase + c]) -
+                               predicted[c]));
+            }
+
+            if (!(fakeResidual <= budget))
+            {
+                ++fakeOverBudget;
+            }
+        }
+    }
+
+    // 位移中位数
+    Float32 medianDisplacement = 0.0f;
+
+    {
+        SizeType half = displacementCount / 2;
+        SizeType seen = 0;
+
+        for (Int32 b = 0; b < kDisplacementBins; ++b)
+        {
+            seen += displacementHistogram[b];
+
+            if (seen >= half)
+            {
+                medianDisplacement = static_cast<Float32>(b) / 8.0f;
+                break;
+            }
+        }
+    }
+
+    // 所需系数的几个分位点
+    Float32 slackP50  = 0.0f;
+    Float32 slackP99  = 0.0f;
+    Float32 slackP999 = 0.0f;
+    Float32 slackMax  = 0.0f;
+
+    if (evaluated > 0)
+    {
+        const SizeType targets[3] = { evaluated / 2, evaluated * 99 / 100,
+                                      evaluated * 999 / 1000 };
+        Float32* const outputs[3] = { &slackP50, &slackP99, &slackP999 };
+
+        Int32    which = 0;
+        SizeType seen  = 0;
+
+        for (Int32 b = 0; b < kSlackBins; ++b)
+        {
+            if (slackHistogram[b] > 0)
+            {
+                slackMax = static_cast<Float32>(b) / 64.0f;
+            }
+
+            seen += slackHistogram[b];
+
+            while (which < 3 && seen >= targets[which])
+            {
+                *outputs[which] = static_cast<Float32>(b) / 64.0f;
+                ++which;
+            }
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[重投影] 转动: 参与比对 {} 像素, 出屏 {}, 梯度不足 {}, "
+             "超预算 {}, 最大残差 {}, 位移中位数 {} 像素",
+             evaluated, offScreen, lowGradient, overBudget, worstResidual,
+             medianDisplacement);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[重投影] 所需系数 (残差/梯度) — 中位 {}, 99% {}, 99.9% {}, "
+             "最大 {}",
+             slackP50, slackP99, slackP999, slackMax);
+
+    LIMX_LOG(LogLaunch, Display,
+             "[重投影] 天空排除 {}, 出屏 {} 像素, 与当前帧不符 {} (最大差 {}); "
+             "负对照超预算 {} / {}",
+             skyPixels, offScreen, offScreenMismatch, offScreenWorst,
+             fakeOverBudget, evaluated);
+
+    // ---- 判据一: 静止必须恒等 ----
+    if (staticMismatch != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 相机不动时输出与上一帧差了 {} 个通道 (最大 {}) "
+                 "—— 速度恒为零, 重投影必须是恒等映射",
+                 staticMismatch, staticWorst);
+        passed = false;
+    }
+
+    // ---- 判据二: 转动之后必须与解析预测相符 ----
+    if (!(overBudget == 0))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] {} 个像素的输出与解析预测差超预算 (最大残差 {}) "
+                 "—— 令 blend=0 且裁剪失效时输出必须恒等于重投影后的历史, "
+                 "对不上说明符号 / 0.5 缩放 / Y 轴三个约定里有一个错了",
+                 overBudget, worstResidual);
+        passed = false;
+    }
+
+    // ---- 判据三: 出屏的像素必须输出当前帧 ----
+    //
+    // 出屏 = 这块内容上一帧还不存在, 没有历史可用, 只能用当前帧。
+    // "钳到边缘照样采历史"是真实 TAA 里最常见的失效, 表现为转头时新转入的
+    // 那条边缘挂着屏幕另一侧的内容。
+    if (offScreenMismatch != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] {} 个出屏像素的输出与当前帧不符 (最大差 {}) —— "
+                 "出屏时必须丢弃历史直接用当前帧, 而不是把坐标钳到边缘照样采",
+                 offScreenMismatch, offScreenWorst);
+        passed = false;
+    }
+
+    // ---- 元判据: 出屏集必须非空 ----
+    if (!(offScreen >= 1000))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 只有 {} 个像素的历史落到屏幕外 —— 判据三空过",
+                 offScreen);
+        passed = false;
+    }
+
+    // ---- 元判据: 负对照必须被同一套预算顶红 ----
+    //
+    // 假重投影 (historyUV := fragUV) 在这套预算下必须有至少一成的像素超标。
+    // 不满足说明预算已经松到判据二抓不住假实现了 —— 那时判据二还是绿的,
+    // 只有这一条会红。
+    // 门槛取 1%。实测正确实现下负对照的超标比例是 2.7% (1203 / 43819),
+    // 所以留了 2.7 倍余量 —— 预算大约翻一倍这一条就会先红, 而那正是它的
+    // 用途。比例不能定得更高: 判据二是 overBudget == 0, 一个像素超标就红,
+    // 所以 2.7% 早已远远够用; 门槛定成"一成"只会让这条元判据自己假红。
+    if (!(fakeOverBudget * 100 >= evaluated))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 负对照只有 {} / {} 个像素超预算 (不足百分之一) —— "
+                 "一个把 historyUV 写死成 fragUV 的假实现能从这套预算里走掉, "
+                 "判据二已经失去分辨力",
+                 fakeOverBudget, evaluated);
+        passed = false;
+    }
+
+    // ---- 元判据: 位移必须真的非零 ----
+    //
+    // 没有这一条, 一个把 historyUV 写死成 fragUV 的实现在判据一上满分、
+    // 在判据二上也满分 (预测退化成"取自己")。现有的 --taa-check 全程静止,
+    // 落的正是这个洞。
+    if (!(medianDisplacement >= 1.5f))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 位移中位数只有 {} 像素 —— 重投影退化成恒等映射, "
+                 "判据二比的是每个像素跟它自己",
+                 medianDisplacement);
+        passed = false;
+    }
+
+    // ---- 元判据: 可判集合必须够大, 而且要铺得开 ----
+    //
+    // 不判"占全图的比例": 渲染出来的画面绝大部分是平滑的, 综合场景上梯度
+    // 过关的像素也只有 4.8%。按比例卡等于永远红。
+    //
+    // 判两件事:
+    //   一、绝对数量 —— 少于一万个点的话统计量本身不稳;
+    //   二、**铺开** —— 把画面切成 16x16 的格子, 有效像素必须落进至少一半
+    //       的格子里。全挤在一个物体的轮廓上的话, 那条轮廓的重投影对了不
+    //       等于整幅画对了。这一条抄的是法线判据里"占用了多少个方向格"的
+    //       思路 (那里防的是"整张图是同一个常量")。
+    Int32 occupiedCells = 0;
+
+    for (Int32 c = 0; c < kCellCount; ++c)
+    {
+        if (cellOccupied[c])
+        {
+            ++occupiedCells;
+        }
+    }
+
+    LIMX_LOG(LogLaunch, Display, "[重投影] 有效像素占用 {} / {} 个格子",
+             occupiedCells, kCellCount);
+
+    if (!(evaluated >= 10000))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 只有 {} 个像素参与比对 —— 梯度掩码把判据掏空了",
+                 evaluated);
+        passed = false;
+    }
+
+    if (!(occupiedCells * 2 >= kCellCount))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[重投影] 有效像素只落在 {} / {} 个格子里 —— 全挤在少数几处, "
+                 "那几处的重投影对了不等于整幅画对了",
+                 occupiedCells, kCellCount);
+        passed = false;
+    }
+
+    // ---- 收尾: 恢复被改动的状态 ----
+    camera.SetRotation(baseYaw, basePitch);
+
+    LIMX_LOG(LogLaunch, Display, "[重投影] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunLightCullChecks — 分簇着色与暴力法的逐像素比对
 //
 // 这是分簇光照最强的一条验收判据: **同一帧、同一个着色器、只翻转一个布尔
@@ -22940,6 +23786,7 @@ int WINAPI wWinMain(
     bool    clusterCheckPassed = true;
     bool    lightCullCheckPassed = true;
     bool    taaCheckPassed = true;
+    bool    reprojectCheckPassed = true;
     bool    aoCheckPassed = true;
     bool    bloomCheckPassed = true;
     bool    shadowCheckPassed = true;
@@ -23259,6 +24106,14 @@ int WINAPI wWinMain(
                 taaCheckPassed = RunTaaChecks(&renderContext, renderer);
             }
 
+            // 重投影自检: 会改动相机朝向与 TAA 的混合系数, 与 G-Buffer 自检
+            // 同理必须放在截屏之前。
+            if (launchOptions.ReprojectCheck)
+            {
+                reprojectCheckPassed =
+                    RunReprojectChecks(&renderContext, renderer);
+            }
+
             // G-Buffer 自检: 会自己再渲三帧并改动相机朝向, 所以必须放在
             // 截屏之前 —— 否则截到的是自检最后那一帧的朝向。
             if (launchOptions.GBufferCheck)
@@ -23367,6 +24222,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.TaaCheck)
     {
         selfCheckCode = FinalizeSelfCheck(taaCheckPassed, 11, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.ReprojectCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(reprojectCheckPassed, 47, errorSink,
                                           errorsBeforeShutdown);
     }
 

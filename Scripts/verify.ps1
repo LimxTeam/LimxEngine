@@ -607,6 +607,23 @@ Invoke-Step 'TAA 自检 (与多帧平均比对)' -RequiresGpu {
     Invoke-Engine '--frames 20 --warmup 5 --taa-check'
 }
 
+# 时域重投影自检 —— 需要真实 GPU。
+#
+# 上面那条 TAA 判据**全程相机静止**。静止时速度恒为零, 于是 taa.frag 里的
+# historyUV 恒等于 fragUV —— 重投影那段代码只以恒等映射的形式被走过。一个
+# 把 historyUV 写死成 fragUV 的实现在它下面拿满分 (实测: 那条变异让本判据
+# 红而 --taa-check 全绿)。
+#
+# 这一条把重投影映射本身暴露出来: 令 blend.x = 0 且 γ 大到裁剪失效, 则
+# 解析输出恒等于"历史图被重投影搬运之后的样子", 拿它与 CPU 从相机矩阵独立
+# 算出的预测逐像素比。
+#
+# 必须用 --showcase: 默认场景大片纯色, 梯度过关的像素只有 6974 个, 而梯度
+# 为零处重投影再离谱颜色也不变 —— 那不是判据不够, 是场景不够。
+Invoke-Step '时域重投影自检 (与解析预测逐像素比对)' -RequiresGpu {
+    Invoke-Engine '--showcase --frames 20 --warmup 5 --reproject-check'
+}
+
 # 分簇光照自检 —— 需要真实 GPU。
 #
 # 两条判据覆盖的是完全不同的失效方式:

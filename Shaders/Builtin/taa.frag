@@ -26,6 +26,8 @@
 
 #version 450
 
+#include "reproject_common.h"
+
 layout(location = 0) in vec2 fragUV;
 
 // [0] 解析结果 —— 固定的一张纹理, 后处理采样它
@@ -76,19 +78,19 @@ void main()
 
     // ---- 重投影 ----
     //
-    // 速度是 NDC 的差值, NDC 与 UV 之间差一个 0.5 的缩放 (NDC 跨 2 个单位,
-    // UV 跨 1 个)。Y 轴不必翻: Vulkan 的 NDC y 向下, 图像的 UV y 也向下。
+    // 规则本身搬进了 reproject_common.h —— 那里的每个函数都是纯函数, 于是
+    // CPU 能独立实现同一个规则, --reproject-check 拿两者逐像素比。留在这里
+    // 的话, 符号 / 0.5 缩放 / Y 轴这三个约定就只能靠"看画面糊不糊"来验。
     //
     // 取速度用的是**本像素**的速度而不是邻域里速度最大的那个。后者 (常见的
     // "closest depth" 技巧) 能减少运动物体边缘的重影, 但需要深度缓冲, 而
     // 深度在前向通道之后是 DontCare 的。这是一处已知的取舍。
     vec2 velocity = texture(velocityBuffer, fragUV).rg;
 
-    vec2 historyUV = fragUV - velocity * 0.5;
+    vec2 historyUV = ReprojectToHistoryUV(fragUV, velocity);
 
     // 重投影落到屏幕外 = 这块内容上一帧还不存在, 没有历史可用
-    if (historyUV.x < 0.0 || historyUV.x > 1.0 ||
-        historyUV.y < 0.0 || historyUV.y > 1.0)
+    if (!ReprojectIsOnScreen(historyUV))
     {
         outResolve = vec4(current, 1.0);
         outHistory = vec4(current, 1.0);
