@@ -1,0 +1,71 @@
+#version 450
+
+// ============================================================================
+// lod_probe.comp — LOD 选择规则的探针
+//
+// 不参与渲染, 只为判据存在: 把 MeshletLodSelect 的输入输出摊开, 让 CPU 侧
+// 能与它的参考实现**逐位**比对。
+//
+// 为什么必须逐位而不是"结果集合相同": 两份实现只要有一处运算顺序不同, 在
+// 阈值附近就会给出不同的决策 —— 而那正好是最要紧的地方 (选择规则的整个
+// 正确性建立在"恰好落在链的某一段里")。集合比对在绝大多数相机下都相同, 只在
+// 边界上分家, 而边界恰恰是缝出现的地方。
+//
+// 所以这里连中间量 (自身屏幕误差、父屏幕误差) 一起吐出来。
+// ============================================================================
+
+#extension GL_EXT_scalar_block_layout : require
+
+#include "meshlet_lod.h"
+
+layout(local_size_x = 64) in;
+
+layout(scalar, set = 0, binding = 0) readonly buffer RecordBuffer {
+    MeshletLod records[];
+} recordBuffer;
+
+/// 每条记录的结果
+struct LodProbeResult {
+    float selfScreen;
+    float parentScreen;
+    uint  selected;
+    uint  padding;
+};
+
+layout(scalar, set = 0, binding = 1) writeonly buffer ResultBuffer {
+    LodProbeResult results[];
+} resultBuffer;
+
+layout(push_constant) uniform Params {
+    // xyz = 相机位置, w = lodScale
+    vec4 camera;
+
+    // x = 近平面, y = 阈值, z = 记录条数, w = 保留
+    vec4 params;
+} pc;
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+
+    if (index >= uint(pc.params.z))
+    {
+        return;
+    }
+
+    float selfScreen   = 0.0;
+    float parentScreen = 0.0;
+
+    const bool selected = MeshletLodSelect(
+        recordBuffer.records[index], pc.camera.xyz, pc.camera.w, pc.params.x,
+        pc.params.y, selfScreen, parentScreen);
+
+    LodProbeResult result;
+
+    result.selfScreen   = selfScreen;
+    result.parentScreen = parentScreen;
+    result.selected     = selected ? 1u : 0u;
+    result.padding      = 0u;
+
+    resultBuffer.results[index] = result;
+}

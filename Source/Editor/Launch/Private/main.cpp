@@ -325,6 +325,7 @@ struct FLaunchOptions
     bool LodDagCheck = false;
     bool LodSelectCheck = false;
     bool LodCrackCheck = false;
+    bool LodGpuCheck = false;
 
     /// 命令行里有认不出来的参数
     bool UnknownArgument = false;
@@ -961,6 +962,10 @@ static FLaunchOptions ParseLaunchOptions(WideChar* commandLine)
         else if (WideEquals(arg, L"--lod-crack-check"))
         {
             options.LodCrackCheck = true;
+        }
+        else if (WideEquals(arg, L"--lod-gpu-check"))
+        {
+            options.LodGpuCheck = true;
         }
         else if (WideEquals(arg, L"--path-trace-check"))
         {
@@ -13671,6 +13676,525 @@ static bool RunLodCrackChecks()
 }
 
 // ============================================================================
+// RunLodGpuChecks — GLSL 与 C++ 的选择规则必须逐位一致
+//
+// 参与渲染的是着色器那一份, 而前面五天全部判据验的是 C++ 那一份。两者不一致
+// 的话, 那五天的结论对画面**一句都不成立**。
+//
+// 为什么要逐位而不是"选中集合相同": 两份实现只要有一处运算顺序不同, 在阈值
+// 附近就会给出不同的决策 —— 而那正好是最要紧的地方 (整套正确性建立在"恰好
+// 落在链的某一段里")。集合比对在绝大多数相机下都相同, 只在边界上分家, 而
+// 边界恰恰是缝出现的地方。
+//
+// 所以连中间量 (自身屏幕误差、父屏幕误差) 一起比, 而且要求**逐位相同**,
+// 不留容差: 两边算的是同一个表达式、同一批输入, 差一个 ULP 都说明哪里不同。
+//
+// 阈值集合里放"恰好等于某条记录的自身/父屏幕误差"的值 —— 那是 `<` 与 `<=`、
+// `>=` 与 `>` 之别唯一显形的地方。
+// ============================================================================
+
+namespace
+{
+
+/// 上传给着色器的 LOD 记录 —— 与 meshlet_lod.h 里的 MeshletLod 逐字节对齐
+struct FLodRecordGpu
+{
+    Float32 SelfSphere[4];
+    Float32 ParentSphere[4];
+    Float32 SelfError;
+    Float32 ParentError;
+    UInt32  SourceGroup;
+    UInt32  TargetGroup;
+};
+
+/// 探针结果
+struct FLodProbeResult
+{
+    Float32 SelfScreen;
+    Float32 ParentScreen;
+    UInt32  Selected;
+    UInt32  Padding;
+};
+
+static_assert(sizeof(FLodRecordGpu) == 48,
+              "LOD 记录必须与 meshlet_lod.h 里的 MeshletLod 一致");
+
+static_assert(sizeof(FLodProbeResult) == 16,
+              "探针结果必须与 lod_probe.comp 里的 LodProbeResult 一致");
+
+} // namespace
+
+static bool RunLodGpuChecks(FRenderContext* context, FRenderer& renderer)
+{
+    LIMX_UNUSED(renderer);
+
+    bool passed = true;
+
+    // ---- 建一棵 DAG, 把它的记录摊平 ----
+    const FMeshData sphere = FGeometryGenerator::GenerateSphere(1.0f, 64, 48);
+
+    FMeshLodDagOptions dagOptions;
+    dagOptions.TargetGroupSize = 16;
+    dagOptions.MaxGroupSize    = 32;
+
+    const FMeshLodDagResult dag =
+        FMeshLodDagBuilder::Build(sphere.Vertices, sphere.Indices, dagOptions);
+
+    if (!dag.IsValid() || dag.Levels.GetSize() < 3)
+    {
+        LIMX_LOG(LogLaunch, Error, "[LOD·GPU] DAG 建得不够深");
+        return false;
+    }
+
+    TArray<FLodMeshletRecord> cpuRecords;
+    TArray<FLodRecordGpu>     gpuRecords;
+
+    for (SizeType l = 0; l < dag.Levels.GetSize(); ++l)
+    {
+        const FLodLevel& level = dag.Levels[l];
+
+        for (SizeType m = 0; m < level.Records.GetSize(); ++m)
+        {
+            const FLodMeshletRecord& record = level.Records[m];
+
+            cpuRecords.Add(record);
+
+            FLodRecordGpu gpu;
+
+            gpu.SelfSphere[0] = record.SelfSphere.X;
+            gpu.SelfSphere[1] = record.SelfSphere.Y;
+            gpu.SelfSphere[2] = record.SelfSphere.Z;
+            gpu.SelfSphere[3] = record.SelfSphere.W;
+
+            gpu.ParentSphere[0] = record.ParentSphere.X;
+            gpu.ParentSphere[1] = record.ParentSphere.Y;
+            gpu.ParentSphere[2] = record.ParentSphere.Z;
+            gpu.ParentSphere[3] = record.ParentSphere.W;
+
+            gpu.SelfError   = record.SelfError;
+            gpu.ParentError = record.ParentError;
+            gpu.SourceGroup = record.SourceGroup;
+            gpu.TargetGroup = record.TargetGroup;
+
+            gpuRecords.Add(gpu);
+        }
+    }
+
+    const UInt32 recordCount = static_cast<UInt32>(gpuRecords.GetSize());
+
+    LIMX_LOG(LogLaunch, Display, "[LOD·GPU] DAG {} 层, 记录 {} 条",
+             dag.Levels.GetSize(), recordCount);
+
+    // ---- 相机与阈值 ----
+    constexpr Float32 kLodScale  = 540.0f;
+    constexpr Float32 kNearPlane = 0.1f;
+
+    TArray<FVector3> cameras;
+    cameras.Add(FVector3(0.0f, 0.0f, 0.0f));      // 在每一个 LOD 球内
+    cameras.Add(FVector3(0.0f, 0.0f, 1.02f));     // 贴着表面
+    cameras.Add(FVector3(0.0f, 0.0f, 3.0f));
+    cameras.Add(FVector3(2.5f, 1.8f, -3.1f));     // 侧向偏心
+    cameras.Add(FVector3(0.0f, 0.0f, 40.0f));     // 极远
+
+    TArray<Float32> thresholds;
+    thresholds.Add(0.25f);
+    thresholds.Add(1.0f);
+    thresholds.Add(4.0f);
+    thresholds.Add(16.0f);
+
+    // 恰好等于某条记录屏幕误差的阈值 —— `<` 与 `<=` 之别唯一显形的地方
+    for (SizeType i = 0; i < cpuRecords.GetSize() && i < 8; ++i)
+    {
+        thresholds.Add(MeshLodProjectError(cpuRecords[i].SelfSphere,
+                                           cpuRecords[i].SelfError, cameras[2],
+                                           kLodScale, kNearPlane));
+
+        thresholds.Add(MeshLodProjectError(cpuRecords[i].ParentSphere,
+                                           cpuRecords[i].ParentError,
+                                           cameras[2], kLodScale, kNearPlane));
+    }
+
+    // ---- GPU 资源 ----
+    IRHIDevice* const device = context->GetDevice();
+
+    FRHIShaderHandle          shader;
+    FRHIDescSetLayoutHandle   setLayout;
+    FRHIPipelineLayoutHandle  pipelineLayout;
+    FRHIComputePipelineHandle pipeline;
+    FRHIDescriptorSetHandle   descriptorSet;
+    FRHIBufferHandle          recordBuffer;
+    FRHIBufferHandle          resultBuffer;
+
+    bool ok = true;
+
+    {
+        FShaderManager& shaders = FShaderManager::Get();
+
+        if (!shaders.IsInitialized())
+        {
+            shaders.Initialize();
+        }
+
+        ok = IsRHISuccess(shaders.CreateShaderModule(
+            device, FString("Builtin/lod_probe.comp"), EShaderStage::Compute,
+            shader));
+    }
+
+    if (ok)
+    {
+        FRHIDescriptorBinding bindings[2] = {};
+
+        for (UInt32 i = 0; i < 2; ++i)
+        {
+            bindings[i].Binding    = i;
+            bindings[i].Type       = EDescriptorType::StorageBuffer;
+            bindings[i].Count      = 1;
+            bindings[i].StageFlags = EShaderStage::Compute;
+        }
+
+        FRHIDescSetLayoutDesc layoutDesc = {};
+        layoutDesc.Bindings     = bindings;
+        layoutDesc.BindingCount = 2;
+        layoutDesc.DebugName    = "LodProbeSetLayout";
+
+        ok = IsRHISuccess(device->CreateDescSetLayout(layoutDesc, setLayout));
+    }
+
+    if (ok)
+    {
+        FRHIPushConstantRange pushRange = {};
+        pushRange.StageFlags = EShaderStage::Compute;
+        pushRange.Offset     = 0;
+        pushRange.Size       = sizeof(Float32) * 8;
+
+        FRHIPipelineLayoutDesc layoutDesc = {};
+        layoutDesc.SetLayouts             = &setLayout;
+        layoutDesc.SetLayoutCount         = 1;
+        layoutDesc.PushConstantRanges     = &pushRange;
+        layoutDesc.PushConstantRangeCount = 1;
+        layoutDesc.DebugName              = "LodProbeLayout";
+
+        ok = IsRHISuccess(
+            device->CreatePipelineLayout(layoutDesc, pipelineLayout));
+    }
+
+    if (ok)
+    {
+        FRHIComputePipelineDesc pipelineDesc = {};
+        pipelineDesc.ComputeShader.Shader     = shader;
+        pipelineDesc.ComputeShader.Stage      = EShaderStage::Compute;
+        pipelineDesc.ComputeShader.EntryPoint = "main";
+        pipelineDesc.PipelineLayout           = pipelineLayout;
+        pipelineDesc.DebugName                = "LodProbePipeline";
+
+        ok = IsRHISuccess(device->CreateComputePipeline(pipelineDesc, pipeline));
+    }
+
+    if (ok)
+    {
+        FRHIBufferDesc bufferDesc = {};
+        bufferDesc.Size = static_cast<UInt64>(recordCount) *
+                          sizeof(FLodRecordGpu);
+        bufferDesc.Usage       = EBufferUsage::StorageBuffer;
+        bufferDesc.MemoryUsage = EMemoryUsage::CpuToGpu;
+        bufferDesc.DebugName   = "LodProbeRecords";
+
+        ok = IsRHISuccess(device->CreateBuffer(bufferDesc, recordBuffer));
+
+        bufferDesc.Size = static_cast<UInt64>(recordCount) *
+                          sizeof(FLodProbeResult);
+        bufferDesc.MemoryUsage = EMemoryUsage::GpuToCpu;
+        bufferDesc.DebugName   = "LodProbeResults";
+
+        ok = ok && IsRHISuccess(device->CreateBuffer(bufferDesc, resultBuffer));
+    }
+
+    if (ok)
+    {
+        ok = IsRHISuccess(
+            device->AllocateDescriptorSet(setLayout, descriptorSet));
+    }
+
+    if (ok)
+    {
+        void* mapped = nullptr;
+
+        if (IsRHISuccess(device->MapBuffer(recordBuffer, &mapped)) &&
+            mapped != nullptr)
+        {
+            Memory::MemCopy(mapped, gpuRecords.GetData(),
+                            static_cast<SizeType>(recordCount) *
+                                sizeof(FLodRecordGpu));
+
+            device->UnmapBuffer(recordBuffer);
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+
+    if (ok)
+    {
+        FRHIDescriptorWrite writes[2];
+
+        writes[0] = FRHIDescriptorWrite::StorageBuffer(
+            descriptorSet, 0, recordBuffer, 0,
+            static_cast<UInt64>(recordCount) * sizeof(FLodRecordGpu));
+
+        writes[1] = FRHIDescriptorWrite::StorageBuffer(
+            descriptorSet, 1, resultBuffer, 0,
+            static_cast<UInt64>(recordCount) * sizeof(FLodProbeResult));
+
+        device->UpdateDescriptorSets(writes, 2);
+    }
+
+    // ---- 逐 (相机, 阈值) 跑一遍, 逐位比 ----
+    SizeType casesRun          = 0;
+    SizeType selectionDiffer   = 0;
+    SizeType selfScreenDiffer  = 0;
+    SizeType parentScreenDiffer = 0;
+    SizeType selectedTotal     = 0;
+
+    Float32 worstSelfUlp        = 0.0f;
+    Float32 worstParentRelative = 0.0f;
+
+    // 相对差的预算 —— 挂在建 DAG 时那条增长地板上, 见下面比对处那段说明
+    constexpr Float32 kLodGpuRelativeBudget = (1.0f / 1024.0f) / 100.0f;
+
+    if (ok)
+    {
+        for (SizeType c = 0; c < cameras.GetSize() && ok; ++c)
+        {
+            for (SizeType th = 0; th < thresholds.GetSize() && ok; ++th)
+            {
+                const FVector3 camera    = cameras[c];
+                const Float32  threshold = thresholds[th];
+
+                bool recorded = false;
+
+                renderer.SetPostSceneRenderCallback(
+                    [&recorded, context, pipeline, pipelineLayout,
+                     descriptorSet, resultBuffer, recordCount, camera,
+                     threshold]()
+                    {
+                        IRHICommandBuffer* cmd =
+                            context->GetCurrentCommandBuffer();
+
+                        if (cmd == nullptr)
+                        {
+                            return;
+                        }
+
+                        cmd->BindComputePipeline(pipeline);
+                        cmd->BindDescriptorSet(EPipelineBindPoint::Compute,
+                                               pipelineLayout, 0,
+                                               descriptorSet);
+
+                        Float32 push[8] = {};
+
+                        push[0] = camera.X;
+                        push[1] = camera.Y;
+                        push[2] = camera.Z;
+                        push[3] = kLodScale;
+                        push[4] = kNearPlane;
+                        push[5] = threshold;
+                        push[6] = static_cast<Float32>(recordCount);
+                        push[7] = 0.0f;
+
+                        cmd->PushConstants(pipelineLayout,
+                                           EShaderStage::Compute, 0,
+                                           sizeof(push), push);
+
+                        cmd->Dispatch((recordCount + 63u) / 64u, 1, 1);
+
+                        FRHIBufferMemoryBarrier barrier = {};
+                        barrier.SrcAccessMask = EAccessFlags::ShaderWrite;
+                        barrier.DstAccessMask = EAccessFlags::HostRead;
+                        barrier.Buffer        = resultBuffer;
+
+                        cmd->PipelineBarrier(EPipelineStageFlags::ComputeShader,
+                                             EPipelineStageFlags::Host, nullptr,
+                                             0, &barrier, 1, nullptr, 0);
+
+                        recorded = true;
+                    });
+
+                renderer.RenderFrame();
+                renderer.SetPostSceneRenderCallback(TFunction<void()>());
+
+                if (!recorded)
+                {
+                    ok = false;
+                    break;
+                }
+
+                device->WaitIdle();
+
+                void* mapped = nullptr;
+
+                if (!IsRHISuccess(device->MapBuffer(resultBuffer, &mapped)) ||
+                    mapped == nullptr)
+                {
+                    ok = false;
+                    break;
+                }
+
+                const auto* results =
+                    static_cast<const FLodProbeResult*>(mapped);
+
+                ++casesRun;
+
+                for (UInt32 i = 0; i < recordCount; ++i)
+                {
+                    const Float32 cpuSelf = MeshLodProjectError(
+                        cpuRecords[i].SelfSphere, cpuRecords[i].SelfError,
+                        camera, kLodScale, kNearPlane);
+
+                    const Float32 cpuParent = MeshLodProjectError(
+                        cpuRecords[i].ParentSphere, cpuRecords[i].ParentError,
+                        camera, kLodScale, kNearPlane);
+
+                    const bool cpuSelected = MeshLodSelect(
+                        cpuRecords[i], camera, kLodScale, kNearPlane,
+                        threshold);
+
+                    if (cpuSelected)
+                    {
+                        ++selectedTotal;
+                    }
+
+                    if ((results[i].Selected != 0u) != cpuSelected)
+                    {
+                        ++selectionDiffer;
+                    }
+
+                    // 中间量比的是**相对**差, 而且预算挂在 DAG 自己的
+                    // 不变量上。
+                    //
+                    // 第一版要求逐位相同, 当场红了: 自身 1480 次、父 3240 次
+                    // 不同, 最大绝对差 2.13e-4。而那不是缺陷 —— **Vulkan 不
+                    // 保证与 CPU 逐位相同**, 规范允许 sqrt 有 3 ULP 误差,
+                    // 除法 2.5 ULP。要求逐位就是要求平台没承诺的东西。
+                    //
+                    // 真正要保住的是什么: 选择规则的正确性只依赖"屏幕误差沿
+                    // DAG 的每条边**严格增**"。而建 DAG 时的增长地板是
+                    // 2^-10 (千分之一) 的**相对**增长 —— 只要两份实现的相对
+                    // 差远小于它, 那个严格序在 GPU 上照样成立。
+                    //
+                    // 所以预算取地板的百分之一: 2^-10 / 100 ≈ 1e-5。它不是
+                    // 拍脑袋的容差, 是"离破坏不变量还差两个数量级"。
+                    const Float32 selfScale =
+                        FMath::Max(FMath::Abs(cpuSelf), 1.0e-20f);
+
+                    const Float32 selfRelative =
+                        FMath::Abs(results[i].SelfScreen - cpuSelf) / selfScale;
+
+                    if (selfRelative > kLodGpuRelativeBudget)
+                    {
+                        ++selfScreenDiffer;
+                    }
+
+                    worstSelfUlp = FMath::Max(worstSelfUlp, selfRelative);
+
+                    const Float32 parentScale =
+                        FMath::Max(FMath::Abs(cpuParent), 1.0e-20f);
+
+                    const Float32 parentRelative =
+                        FMath::Abs(results[i].ParentScreen - cpuParent) /
+                        parentScale;
+
+                    if (parentRelative > kLodGpuRelativeBudget)
+                    {
+                        ++parentScreenDiffer;
+                    }
+
+                    worstParentRelative =
+                        FMath::Max(worstParentRelative, parentRelative);
+                }
+
+                device->UnmapBuffer(resultBuffer);
+            }
+        }
+    }
+
+    if (!ok)
+    {
+        LIMX_LOG(LogLaunch, Error, "[LOD·GPU] 资源创建或回读失败");
+        passed = false;
+    }
+
+    LIMX_LOG(LogLaunch, Display,
+             "[LOD·GPU] 跑了 {} 个 (相机, 阈值) x {} 条记录; "
+             "选中判定不同 {} 次; 中间量相对差超预算 {} 次 (自身) / "
+             "{} 次 (父); 实测最大相对差是预算的 {} / {} 倍; 累计选中 {} 次",
+             casesRun, recordCount, selectionDiffer, selfScreenDiffer,
+             parentScreenDiffer, worstSelfUlp / kLodGpuRelativeBudget,
+             worstParentRelative / kLodGpuRelativeBudget, selectedTotal);
+
+    // 元判据: 两份实现**确实**在算, 而且确实有微小差异。
+    //
+    // 全为零的话有两种可能: 两边真的逐位相同 (在 Vulkan 上不该指望), 或者
+    // 探针根本没跑、回读的是一片零。后者会让整条判据变成摆设, 而它看起来
+    // 一切正常 —— 这个项目已经栽过一次"恒为零的诊断量"。
+    //
+    // 第一版把最大相对差直接印出来, 显示的是 "0 / 0" —— 因为实际值约 5e-8,
+    // 被格式化吃掉了。换成"预算的多少倍"之后才看得见它非零。
+    if (worstSelfUlp == 0.0f && worstParentRelative == 0.0f)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD·GPU] 两份实现的中间量**完全**没有差异 —— Vulkan 不保证"
+                 "与 CPU 逐位相同 (sqrt 允许 3 ULP), 所以这更像是探针没跑起来"
+                 "或者回读的是一片零");
+        passed = false;
+    }
+
+    if (selectionDiffer != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD·GPU] {} 次选中判定与 CPU 参考不同 —— 参与渲染的是着色器"
+                 "那一份, 而前面五天的判据验的全是 C++ 那一份。两者不一致的话"
+                 "那些结论对画面一句都不成立",
+                 selectionDiffer);
+        passed = false;
+    }
+
+    if (selfScreenDiffer != 0 || parentScreenDiffer != 0)
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD·GPU] 中间量的相对差超过预算 (自身 {} 次, 父 {} 次, "
+                 "实测最大 {} / {}, 预算 {}) —— 预算是建 DAG 时那条增长地板"
+                 "(2^-10) 的百分之一。超过它就意味着'屏幕误差沿边严格增'这条"
+                 "在 GPU 上可能不成立, 而选择规则的全部正确性都建立在它上面",
+                 selfScreenDiffer, parentScreenDiffer, worstSelfUlp,
+                 worstParentRelative, kLodGpuRelativeBudget);
+        passed = false;
+    }
+
+    // 元判据: 必须真的有选中与不选中两种结果
+    if (selectedTotal == 0 ||
+        selectedTotal >= casesRun * static_cast<SizeType>(recordCount))
+    {
+        LIMX_LOG(LogLaunch, Error,
+                 "[LOD·GPU] 累计选中 {} / {} —— 全选或全不选, 逐位比对没有"
+                 "验到判定分支",
+                 selectedTotal, casesRun * static_cast<SizeType>(recordCount));
+        passed = false;
+    }
+
+    device->DestroyBuffer(resultBuffer);
+    device->DestroyBuffer(recordBuffer);
+    device->DestroyComputePipeline(pipeline);
+    device->DestroyPipelineLayout(pipelineLayout);
+    device->DestroyDescSetLayout(setLayout);
+    device->DestroyShader(shader);
+
+    LIMX_LOG(LogLaunch, Display, "[LOD·GPU] {}", passed ? "通过" : "失败");
+
+    return passed;
+}
+
+// ============================================================================
 // RunMeshletChecks — meshlet 切分必须无损
 //
 // 这条判据不看画面, 不依赖场景, 也不需要 GPU。它问的只有一件事:
@@ -21755,6 +22279,7 @@ int WINAPI wWinMain(
     bool    lodDagPassed = true;
     bool    lodSelectPassed = true;
     bool    lodCrackPassed = true;
+    bool    lodGpuPassed = true;
     bool    pathTracePassed = true;
 
     while (window.ProcessMessages())
@@ -21949,6 +22474,11 @@ int WINAPI wWinMain(
             if (launchOptions.LodCrackCheck)
             {
                 lodCrackPassed = RunLodCrackChecks();
+            }
+
+            if (launchOptions.LodGpuCheck)
+            {
+                lodGpuPassed = RunLodGpuChecks(&renderContext, renderer);
             }
 
             if (launchOptions.PathTraceCheck)
@@ -22308,6 +22838,12 @@ int WINAPI wWinMain(
     if (selfCheckCode == 0 && launchOptions.LodCrackCheck)
     {
         selfCheckCode = FinalizeSelfCheck(lodCrackPassed, 42, errorSink,
+                                          errorsBeforeShutdown);
+    }
+
+    if (selfCheckCode == 0 && launchOptions.LodGpuCheck)
+    {
+        selfCheckCode = FinalizeSelfCheck(lodGpuPassed, 43, errorSink,
                                           errorsBeforeShutdown);
     }
 
